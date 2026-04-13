@@ -226,8 +226,7 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
         }
     });
 
-    // resize window to smallest reasonable size
-    resize(0, 0);
+    resize(sizeHint().expandedTo(minimumSize()));
     updateWorkflowPeerHint();
     updateWorkflowIndicators();
 }

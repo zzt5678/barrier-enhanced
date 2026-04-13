@@ -29,6 +29,7 @@
 #include "ext/lodepng/lodepng.h"
 
 static std::string convertBMPToPNG(const std::string& dibData);
+static std::string convertPNGToDIB(const std::string& pngData);
 
 //
 // MSWindowsClipboard
@@ -118,6 +119,18 @@ MSWindowsClipboard::add(EFormat format, const std::string& data)
             if (win32Data != NULL) {
                 UINT win32Format = converter->getWin32Format();
                 m_facade->write(win32Data, win32Format);
+            }
+        }
+    }
+
+    if (format == IClipboard::kPNG) {
+        std::string dibData = convertPNGToDIB(data);
+        if (!dibData.empty()) {
+            MSWindowsClipboardBitmapConverter bitmapConverter;
+            HANDLE dibHandle = bitmapConverter.fromIClipboard(dibData);
+            if (dibHandle != NULL) {
+                LOG((CLOG_DEBUG "also publishing PNG clipboard payload as CF_DIB"));
+                m_facade->write(dibHandle, CF_DIB);
             }
         }
     }
@@ -384,4 +397,58 @@ static std::string convertBMPToPNG(const std::string& dibData)
     }
 
     return std::string(reinterpret_cast<const char*>(png.data()), png.size());
+}
+
+static std::string convertPNGToDIB(const std::string& pngData)
+{
+    std::vector<unsigned char> rgba;
+    unsigned width = 0;
+    unsigned height = 0;
+
+    unsigned error = lodepng::decode(rgba, width, height,
+                                     reinterpret_cast<const unsigned char*>(pngData.data()),
+                                     pngData.size(),
+                                     LCT_RGBA, 8);
+    if (error != 0) {
+        LOG((CLOG_WARN "PNG decode failed while preparing CF_DIB: %s", lodepng_error_text(error)));
+        return {};
+    }
+
+    if (width == 0 || height == 0) {
+        LOG((CLOG_WARN "PNG decode produced empty image"));
+        return {};
+    }
+
+    BITMAPINFOHEADER header;
+    ZeroMemory(&header, sizeof(header));
+    header.biSize = sizeof(BITMAPINFOHEADER);
+    header.biWidth = static_cast<LONG>(width);
+    header.biHeight = static_cast<LONG>(height);
+    header.biPlanes = 1;
+    header.biBitCount = 32;
+    header.biCompression = BI_RGB;
+    header.biSizeImage = width * height * 4;
+    header.biXPelsPerMeter = 3780;
+    header.biYPelsPerMeter = 3780;
+
+    std::string dibData(reinterpret_cast<const char*>(&header), sizeof(header));
+    dibData.resize(sizeof(header) + header.biSizeImage);
+
+    unsigned char* dst = reinterpret_cast<unsigned char*>(&dibData[sizeof(header)]);
+    for (unsigned y = 0; y < height; ++y) {
+        const unsigned srcY = height - 1 - y;
+        const unsigned char* srcRow = &rgba[srcY * width * 4];
+        unsigned char* dstRow = dst + (y * width * 4);
+
+        for (unsigned x = 0; x < width; ++x) {
+            const unsigned char* srcPixel = srcRow + (x * 4);
+            unsigned char* dstPixel = dstRow + (x * 4);
+            dstPixel[0] = srcPixel[2];
+            dstPixel[1] = srcPixel[1];
+            dstPixel[2] = srcPixel[0];
+            dstPixel[3] = srcPixel[3];
+        }
+    }
+
+    return dibData;
 }
