@@ -334,7 +334,6 @@ TCPSocket::doRead()
     // Increased from 4096 to 65536 for better throughput on large transfers
     // (e.g., clipboard images). This reduces syscall overhead.
     UInt8 buffer[65536];
-    memset(buffer, 0, sizeof(buffer));
     size_t bytesRead = 0;
 
     bytesRead = ARCH->readSocket(m_socket, buffer, sizeof(buffer));

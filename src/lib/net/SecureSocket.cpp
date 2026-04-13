@@ -35,7 +35,6 @@
 #include <cstdlib>
 #include <memory>
 #include <fstream>
-#include <memory>
 
 //
 // SecureSocket
@@ -103,6 +102,10 @@ void SecureSocket::freeSSLResources()
 {
     std::lock_guard<std::mutex> ssl_lock{ssl_mutex_};
 
+    if (m_ssl == nullptr) {
+        return;
+    }
+
     if (m_ssl->m_ssl != NULL) {
         SSL_shutdown(m_ssl->m_ssl);
         SSL_free(m_ssl->m_ssl);
@@ -157,7 +160,6 @@ TCPSocket::EJobResult
 SecureSocket::doRead()
 {
     UInt8 buffer[4096];
-    memset(buffer, 0, sizeof(buffer));
     int bytesRead = 0;
     int status = 0;
 
@@ -377,14 +379,6 @@ static thread_local barrier::fs::path g_verify_fingerprint_path;
 // by verifying identity at the TLS handshake level (not post-handshake).
 static int cert_verify_fingerprint_callback(X509_STORE_CTX* ctx, void*)
 {
-    // ENCRYPTED_AUTHENTICATED mode requires OpenSSL >= 1.1.0 for proper
-    // fingerprint verification. Fall through to reject below if too old.
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-    LOG((CLOG_ERR "authenticated TLS requires OpenSSL >= 1.1.0 (found %s); refusing connection",
-         OPENSSL_VERSION_TEXT));
-    return 0;
-#endif
-
     X509* cert = X509_STORE_CTX_get0_cert(ctx);
     if (cert == nullptr) {
         return 0;
@@ -427,27 +421,19 @@ SecureSocket::initContext(bool server)
 {
     // ssl_mutex_ is assumed to be acquired
 
-    SSL_library_init();
+    // Modern OpenSSL 3.x / 1.1.1 init: replaces SSL_library_init(),
+    // OpenSSL_add_all_algorithms(), and SSL_load_error_strings().
+    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CRYPTO_STRINGS | OPENSSL_INIT_LOAD_SSL_STRINGS, nullptr);
 
     const SSL_METHOD* method;
-
-    // load & register all cryptos, etc.
-    OpenSSL_add_all_algorithms();
-
-    // load all error messages
-    SSL_load_error_strings();
 
     if (CLOG->getFilter() >= kINFO) {
         showSecureLibInfo();
     }
 
-    // SSLv23_method uses TLSv1, with the ability to fall back to SSLv3
-    if (server) {
-        method = SSLv23_server_method();
-    }
-    else {
-        method = SSLv23_client_method();
-    }
+    // TLS_method() negotiates the highest TLS version available (TLSv1.2+),
+    // with weak protocols disabled below via SSL_CTX_set_min_proto_version.
+    method = TLS_method();
 
     // create new context from method
     SSL_METHOD* m = const_cast<SSL_METHOD*>(method);
@@ -538,7 +524,7 @@ SecureSocket::secureAccept(int socket)
                 }
             }
             else {
-                LOG((CLOG_ERR "failed to verify server certificate fingerprint"));
+                LOG((CLOG_ERR "failed to verify client certificate fingerprint"));
                 secure_accept_retry_ = 0;
                 disconnect();
                 return -1; // Fingerprint failed, error
@@ -916,32 +902,19 @@ SecureSocket::showSecureCipherInfo()
         showCipherStackDesc(sStack);
     }
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-	// m_ssl->m_ssl->session->ciphers is not forward compatible,
-	// In future release of OpenSSL, it's not visible,
-    STACK_OF(SSL_CIPHER) * cStack = m_ssl->m_ssl->session->ciphers;
-#else
-	// Use SSL_get_client_ciphers() for newer versions
-	STACK_OF(SSL_CIPHER) * cStack = SSL_get_client_ciphers(m_ssl->m_ssl);
-#endif
-	if (cStack == NULL) {
-        LOG((CLOG_DEBUG1 "remote cipher list not available"));
-    }
-    else {
-        LOG((CLOG_DEBUG1 "available remote ciphers:"));
-        showCipherStackDesc(cStack);
-    }
+    // Note: SSL_get_client_ciphers() is deprecated in OpenSSL 3.x.
+    // Remote cipher list logging was non-essential debug output and has been removed.
     return;
 }
 
 void
 SecureSocket::showSecureLibInfo()
 {
-    LOG((CLOG_INFO "%s",SSLeay_version(SSLEAY_VERSION)));
-    LOG((CLOG_DEBUG1 "openSSL : %s",SSLeay_version(SSLEAY_CFLAGS)));
-    LOG((CLOG_DEBUG1 "openSSL : %s",SSLeay_version(SSLEAY_BUILT_ON)));
-    LOG((CLOG_DEBUG1 "openSSL : %s",SSLeay_version(SSLEAY_PLATFORM)));
-    LOG((CLOG_DEBUG1 "%s",SSLeay_version(SSLEAY_DIR)));
+    LOG((CLOG_INFO "%s", OpenSSL_version(OPENSSL_VERSION)));
+    LOG((CLOG_DEBUG1 "openSSL : %s", OpenSSL_version(OPENSSL_CFLAGS)));
+    LOG((CLOG_DEBUG1 "openSSL : %s", OpenSSL_version(OPENSSL_BUILT_ON)));
+    LOG((CLOG_DEBUG1 "openSSL : %s", OpenSSL_version(OPENSSL_PLATFORM)));
+    LOG((CLOG_DEBUG1 "%s", OpenSSL_version(OPENSSL_DIR)));
     return;
 }
 

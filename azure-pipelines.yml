@@ -85,6 +85,9 @@ jobs:
       displayName: Install Dependencies
     - script: sh -x ./clean_build.sh
       displayName: Clean Build
+    - script: |
+        cd build && ctest --output-on-failure -R "^(guiunittests|unittests)$"
+      displayName: Run stable unit tests
 
 - job: MacBuild
   displayName: Mac Build

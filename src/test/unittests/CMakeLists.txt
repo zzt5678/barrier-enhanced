@@ -45,17 +45,18 @@ elseif (UNIX)
     file(GLOB platform_headers "platform/XWindows*.h")
 endif()
 
-list(APPEND sources ${platform_headers})
-list(APPEND headers ${platform_sources})
-
-include_directories(
-    ../../
-    ../../../ext
-)
+list(APPEND sources ${platform_sources})
+list(APPEND headers ${platform_headers})
 
 if (UNIX)
     include_directories(
-        ../../..
+        ../../
+        ../../../ext
+    )
+else()
+    include_directories(
+        ../../
+        ../../../ext
     )
 endif()
 
@@ -66,3 +67,4 @@ endif()
 add_executable(unittests ${sources})
 target_link_libraries(unittests
     arch base client server common io net platform server synlib mt ipc ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES} ${libs} ${OPENSSL_LIBS})
+add_test(unittests unittests)

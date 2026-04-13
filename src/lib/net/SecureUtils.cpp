@@ -166,11 +166,26 @@ void generate_pem_self_signed_cert(const std::string& path)
     }
     auto private_key_free = finally([private_key](){ EVP_PKEY_free(private_key); });
 
-    auto* rsa = RSA_generate_key(2048, RSA_F4, nullptr, nullptr);
-    if (!rsa) {
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+    if (!ctx) {
+        throw std::runtime_error("Failed to create EVP_PKEY_CTX for RSA key generation");
+    }
+    auto ctx_free = finally([ctx]() { EVP_PKEY_CTX_free(ctx); });
+
+    if (EVP_PKEY_keygen_init(ctx) <= 0) {
+        throw std::runtime_error("Failed to initialize RSA key generation");
+    }
+
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0) {
+        throw std::runtime_error("Failed to set RSA key length");
+    }
+
+    EVP_PKEY* generated_key = nullptr;
+    if (EVP_PKEY_keygen(ctx, &generated_key) <= 0) {
         throw std::runtime_error("Failed to generate RSA key");
     }
-    EVP_PKEY_assign_RSA(private_key, rsa);
+
+    EVP_PKEY_assign_RSA(private_key, generated_key);
 
     auto* cert = X509_new();
     if (!cert) {

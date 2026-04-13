@@ -20,10 +20,14 @@
 #include "arch/XArch.h"
 #include "common/Version.h"
 #include "base/Log.h"
+#include "config.h"
 
+#if HAVE_LIBCURL
 #include <sstream>
 #include <curl/curl.h>
+#endif
 
+#if HAVE_LIBCURL
 class CurlFacade {
 public:
     CurlFacade();
@@ -34,26 +38,6 @@ public:
 private:
     CURL*                m_curl;
 };
-
-//
-// ArchInternetUnix
-//
-
-std::string ArchInternetUnix::get(const std::string& url)
-{
-    CurlFacade curl;
-    return curl.get(url);
-}
-
-std::string ArchInternetUnix::urlEncode(const std::string& url)
-{
-    CurlFacade curl;
-    return curl.urlEncode(url);
-}
-
-//
-// CurlFacade
-//
 
 static size_t
 curlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
@@ -119,4 +103,29 @@ std::string CurlFacade::urlEncode(const std::string& url)
     curl_free(resultCStr);
 
     return result;
+}
+#endif
+
+//
+// ArchInternetUnix
+//
+
+std::string ArchInternetUnix::get(const std::string& url)
+{
+#if HAVE_LIBCURL
+    CurlFacade curl;
+    return curl.get(url);
+#else
+    throw XArch("libcurl support is not available in this build.");
+#endif
+}
+
+std::string ArchInternetUnix::urlEncode(const std::string& url)
+{
+#if HAVE_LIBCURL
+    CurlFacade curl;
+    return curl.urlEncode(url);
+#else
+    throw XArch("libcurl support is not available in this build.");
+#endif
 }

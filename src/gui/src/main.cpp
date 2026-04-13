@@ -29,6 +29,8 @@
 #include <QtGui>
 #include <QSettings>
 #include <QMessageBox>
+#include <QLockFile>
+#include <QDir>
 
 #if defined(Q_OS_MAC)
 #include <Carbon/Carbon.h>
@@ -67,6 +69,18 @@ int main(int argc, char* argv[])
     /* Workaround for QTBUG-40332 - "High ping when QNetworkAccessManager is instantiated" */
     ::setenv ("QT_BEARER_POLL_TIMEOUT", "-1", 1);
 #endif
+
+	// Single instance lock - prevent multiple barrier GUI instances
+	// This fixes the tray icon duplication issue when restarting barrier
+	QLockFile lockFile(QDir::temp().absoluteFilePath("barrier-gui.lock"));
+	lockFile.setStaleLockTime(0);  // Remove stale lock on startup
+	if (!lockFile.tryLock(100)) {
+		QMessageBox::warning(nullptr, "Barrier",
+			"Barrier is already running.\n\n"
+			"If you need to restart, please quit the existing instance first.");
+		return 1;
+	}
+
 	QCoreApplication::setOrganizationName("Debauchee");
 	QCoreApplication::setOrganizationDomain("github.com");
 	QCoreApplication::setApplicationName("Barrier");

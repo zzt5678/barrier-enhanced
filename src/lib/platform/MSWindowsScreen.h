@@ -94,8 +94,8 @@ public:
     virtual void        fakeMouseRelativeMove(SInt32 dx, SInt32 dy) const override;
     virtual void        fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const override;
 
-    // IKeyState overrides
-    virtual void        updateKeys() override;
+    // Internal helper to resync keyboard state when the active desk changes.
+    void                updateKeys();
     virtual void        fakeKeyDown(KeyID id, KeyModifierMask mask,
                             KeyButton button) override;
     virtual bool        fakeKeyRepeat(KeyID id, KeyModifierMask mask,

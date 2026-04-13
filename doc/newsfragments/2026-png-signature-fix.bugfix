@@ -1,0 +1,2 @@
+Fixed PNG signature validation to accept all line-ending variants (CRLF and LF),
+improving compatibility with PNG files from various sources.

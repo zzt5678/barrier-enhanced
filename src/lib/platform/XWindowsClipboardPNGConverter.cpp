@@ -149,8 +149,8 @@ XWindowsClipboardPNGConverter::convertPNGToBMP(const std::string& pngData, UInt3
     // BMP info header (BITMAPINFOHEADER = 40 bytes)
     UInt8 header[40] = {0};
     *reinterpret_cast<UInt32*>(header + 0) = 40;  // biSize
-    *reinterpret_cast<Int32*>(header + 4) = static_cast<Int32>(width);  // biWidth
-    *reinterpret_cast<Int32*>(header + 8) = -static_cast<Int32>(height);  // biHeight (negative for top-down)
+    *reinterpret_cast<SInt32*>(header + 4) = static_cast<SInt32>(width);  // biWidth
+    *reinterpret_cast<SInt32*>(header + 8) = -static_cast<SInt32>(height);  // biHeight (negative for top-down)
     *reinterpret_cast<UInt16*>(header + 12) = 1;  // biPlanes
     *reinterpret_cast<UInt16*>(header + 14) = 32;  // biBitCount
     *reinterpret_cast<UInt32*>(header + 16) = 0;  // biCompression (BI_RGB)
@@ -158,7 +158,7 @@ XWindowsClipboardPNGConverter::convertPNGToBMP(const std::string& pngData, UInt3
     bmp.append(reinterpret_cast<const char*>(header), 40);
 
     // BMP pixel data (BGRA, bottom-up)
-    for (Int32 y = static_cast<Int32>(height) - 1; y >= 0; --y) {
+    for (SInt32 y = static_cast<SInt32>(height) - 1; y >= 0; --y) {
         for (UInt32 x = 0; x < width; ++x) {
             UInt32 offset = (y * width + x) * 4;
             bmp.push_back(static_cast<char>(image[offset + 2])); // B

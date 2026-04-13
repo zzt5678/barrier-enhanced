@@ -221,6 +221,9 @@ public:
     */
     void                fakeInputEnd();
 
+    //! Fake releasing all currently pressed keys
+    void                fakeAllKeysUp();
+
     //! Change dragging status
     void                setDraggingStarted(bool started);
 

@@ -16,12 +16,14 @@
  */
 
 #include "arch/Arch.h"
+#include "config.h"
 
 #include "test/global/gtest.h"
 
 #define TEST_URL "https://symless.com/tests/?testString"
 //#define TEST_URL "http://localhost/barrier/tests/?testString"
 
+#if HAVE_LIBCURL
 TEST(ArchInternetTests, DISABLED_get)
 {
     ARCH_INTERNET internet;
@@ -35,3 +37,14 @@ TEST(ArchInternetTests, urlEncode)
     std::string result = internet.urlEncode("hello=+&world");
     ASSERT_EQ("hello%3D%2B%26world", result);
 }
+#else
+TEST(ArchInternetTests, DISABLED_get)
+{
+    SUCCEED();
+}
+
+TEST(ArchInternetTests, DISABLED_urlEncode)
+{
+    SUCCEED();
+}
+#endif

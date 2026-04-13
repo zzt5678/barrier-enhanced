@@ -3,6 +3,7 @@ config.h
 .DS_Store
 *.pyc
 *.o
+*.a
 *~
 \.*.swp
 *build-gui-Desktop_Qt*
@@ -10,8 +11,6 @@ config.h
 /lib
 /build
 /CMakeFiles
-/ext/cryptopp562
-/ext/openssl
 /src/gui/Makefile*
 /src/gui/object_script*
 /src/gui/tmp
@@ -32,3 +31,7 @@ CMakeCache.txt
 # Transient in-project-directory dependencies
 /deps/
 /out/build/x64-Debug
+/extincludes/
+/extlibs/
+/include/
+/_build_ntests/

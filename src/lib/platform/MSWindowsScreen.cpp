@@ -1877,9 +1877,9 @@ std::string& MSWindowsScreen::getDraggingFilename()
         fakeMouseButton(kButtonLeft, false);
 
         std::string filename;
-        DOUBLE timeout = ARCH->time() + .5f;
+        const DOUBLE timeout = ARCH->time() + 1.5f;
         while (ARCH->time() < timeout) {
-            ARCH->sleep(.05f);
+            ARCH->sleep(.025f);
             filename = m_dropTarget->getDraggingFilename();
             if (!filename.empty()) {
                 break;

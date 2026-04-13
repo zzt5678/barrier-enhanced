@@ -359,6 +359,12 @@ Screen::fakeInputEnd()
     m_screen->fakeInputEnd();
 }
 
+void
+Screen::fakeAllKeysUp()
+{
+    m_screen->fakeAllKeysUp();
+}
+
 bool
 Screen::isOnScreen() const
 {

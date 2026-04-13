@@ -2106,7 +2106,7 @@ XWindowsScreen::selectXIRawMotion()
 }
 
 void
-XWindowsScreen::handleXIRawButtonEvent(const XIRawButtonEvent* const event) const
+XWindowsScreen::handleXIRawButtonEvent(const XIRawButtonEvent* const event)
 {
 	// Convert XI_RawButton event to XButtonEvent-like structure for reuse.
 	// Use XQueryPointer for current modifier state, matching the established

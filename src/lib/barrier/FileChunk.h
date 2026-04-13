@@ -32,7 +32,7 @@ public:
     FileChunk(size_t size);
 
     static FileChunk*    start(const String& size);
-    static FileChunk*    data(UInt8* data, size_t dataSize);
+    static FileChunk*    data(const UInt8* data, size_t dataSize);
     static FileChunk*    end();
     static int            assemble(
                             barrier::IStream* stream,

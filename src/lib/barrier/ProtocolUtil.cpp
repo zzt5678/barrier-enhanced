@@ -81,20 +81,12 @@ ProtocolUtil::vwritef(barrier::IStream* stream,
     }
 
     // fill buffer
-    UInt8* buffer = new UInt8[size];
-    writef_void(buffer, fmt, args);
+    std::vector<UInt8> buffer(size);
+    writef_void(buffer.data(), fmt, args);
 
-    try {
-        // write buffer
-        stream->write(buffer, size);
-        LOG((CLOG_DEBUG2 "wrote %d bytes", size));
-
-        delete[] buffer;
-    }
-    catch (XBase&) {
-        delete[] buffer;
-        throw;
-    }
+    // write buffer
+    stream->write(buffer.data(), size);
+    LOG((CLOG_DEBUG2 "wrote %d bytes", size));
 }
 
 void
@@ -168,8 +160,9 @@ ProtocolUtil::vreadf(barrier::IStream* stream, const char* fmt, va_list args)
                 // convert it
                 void* v = va_arg(args, void*);
                 switch (len) {
-                case 1:
+                case 1: {
                     // 1 byte integer
+                    static_cast<std::vector<UInt8>*>(v)->reserve(n);
                     for (UInt32 i = 0; i < n; ++i) {
                         read(stream, buffer, 1);
                         static_cast<std::vector<UInt8>*>(v)->push_back(
@@ -177,9 +170,11 @@ ProtocolUtil::vreadf(barrier::IStream* stream, const char* fmt, va_list args)
                         LOG((CLOG_DEBUG2 "readf: read %d byte integer[%d]: %d (0x%x)", len, i, static_cast<std::vector<UInt8>*>(v)->back(), static_cast<std::vector<UInt8>*>(v)->back()));
                     }
                     break;
+                }
 
-                case 2:
+                case 2: {
                     // 2 byte integer
+                    static_cast<std::vector<UInt16>*>(v)->reserve(n);
                     for (UInt32 i = 0; i < n; ++i) {
                         read(stream, buffer, 2);
                         static_cast<std::vector<UInt16>*>(v)->push_back(
@@ -189,9 +184,11 @@ ProtocolUtil::vreadf(barrier::IStream* stream, const char* fmt, va_list args)
                         LOG((CLOG_DEBUG2 "readf: read %d byte integer[%d]: %d (0x%x)", len, i, static_cast<std::vector<UInt16>*>(v)->back(), static_cast<std::vector<UInt16>*>(v)->back()));
                     }
                     break;
+                }
 
-                case 4:
+                case 4: {
                     // 4 byte integer
+                    static_cast<std::vector<UInt32>*>(v)->reserve(n);
                     for (UInt32 i = 0; i < n; ++i) {
                         read(stream, buffer, 4);
                         static_cast<std::vector<UInt32>*>(v)->push_back(
@@ -202,6 +199,7 @@ ProtocolUtil::vreadf(barrier::IStream* stream, const char* fmt, va_list args)
                         LOG((CLOG_DEBUG2 "readf: read %d byte integer[%d]: %d (0x%x)", len, i, static_cast<std::vector<UInt32>*>(v)->back(), static_cast<std::vector<UInt32>*>(v)->back()));
                     }
                     break;
+                }
                 }
                 break;
             }

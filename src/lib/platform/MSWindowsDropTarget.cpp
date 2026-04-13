@@ -22,6 +22,7 @@
 
 #include <stdio.h>
 #include <Shlobj.h>
+#include <Shellapi.h>
 
 void getDropData(IDataObject *pDataObject);
 
@@ -91,7 +92,7 @@ MSWindowsDropTarget::queryDataObject(IDataObject* dataObject)
 }
 
 void
-MSWindowsDropTarget::setDraggingFilename(char* const filename)
+MSWindowsDropTarget::setDraggingFilename(const std::string& filename)
 {
     m_dragFilename = filename;
 }
@@ -111,34 +112,38 @@ MSWindowsDropTarget::clearDraggingFilename()
 void
 getDropData(IDataObject* dataObject)
 {
-    // construct a FORMATETC object
     FORMATETC fmtEtc = { CF_HDROP, 0, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
     STGMEDIUM stgMed;
 
-    // See if the dataobject contains any DROP stored as a HGLOBAL
     if (dataObject->QueryGetData(&fmtEtc) == S_OK) {
         if (dataObject->GetData(&fmtEtc, &stgMed) == S_OK) {
-            // get data here
             PVOID data = GlobalLock(stgMed.hGlobal);
+            if (data != nullptr) {
+                const HDROP drop = static_cast<HDROP>(stgMed.hGlobal);
+                const UINT fileCount = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+                if (fileCount > 0) {
+                    const UINT pathLength = DragQueryFileW(drop, 0, nullptr, 0);
+                    if (pathLength > 0) {
+                        std::wstring wideFilename(pathLength + 1, L'\0');
+                        const UINT copied = DragQueryFileW(drop, 0, &wideFilename[0], pathLength + 1);
+                        wideFilename.resize(copied);
 
-            // data object global handler contains:
-            // DROPFILESfilename1 filename2 two spaces as the end
-            // TODO: get multiple filenames
-            wchar_t* wcData = (wchar_t*)((LPBYTE)data + sizeof(DROPFILES));
+                        const int utf8Size = WideCharToMultiByte(
+                            CP_UTF8, 0, wideFilename.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                        if (utf8Size > 1) {
+                            std::string filename(static_cast<size_t>(utf8Size - 1), '\0');
+                            WideCharToMultiByte(
+                                CP_UTF8, 0, wideFilename.c_str(), -1,
+                                &filename[0], utf8Size, nullptr, nullptr);
+                            MSWindowsDropTarget::instance().setDraggingFilename(filename);
+                        }
+                    }
+                }
 
-            // convert wchar to char
-            char* filename = new char[wcslen(wcData) + 1];
-            filename[wcslen(wcData)] = '\0';
-            wcstombs(filename, wcData, wcslen(wcData));
+                GlobalUnlock(stgMed.hGlobal);
+            }
 
-            MSWindowsDropTarget::instance().setDraggingFilename(filename);
-
-            GlobalUnlock(stgMed.hGlobal);
-
-            // release the data using the COM API
             ReleaseStgMedium(&stgMed);
-
-            delete[] filename;
         }
     }
 }

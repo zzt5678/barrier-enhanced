@@ -4,6 +4,7 @@
 #include "config.h"
 
 #include <X11/X.h>
+#include <X11/Xmd.h>
 #include <X11/Xutil.h>
 #define XK_MISCELLANY
 #define XK_XKB_KEYS
@@ -28,6 +29,40 @@
 #endif
 #ifdef HAVE_XI2
 #	include <X11/extensions/XInput2.h>
+#endif
+
+// XIRawButtonEvent may not exist in older XInput2 versions
+// Provide a fallback definition if not available
+#ifdef HAVE_XI2
+#ifndef XIRawButtonEventDefined
+#define XIRawButtonEventDefined
+typedef struct {
+    int           type;
+    unsigned long serial;
+    Bool          send_event;
+    Display       *display;
+    int           extension;
+    int           evtype;
+    Time          time;
+    int           deviceid;
+    int           sourceid;
+    int           detail;
+    int           flags;
+    XIValuatorState valuators;
+    double        *raw_values;
+    XIButtonState buttons;
+} XIRawButtonEvent;
+#endif
+
+// XI_GenericEvent may not be defined in older XInput2 versions
+#ifndef XI_GenericEvent
+#define XI_GenericEvent 35
+#endif
+
+// GenericEvent for cookie type check
+#ifndef GenericEvent
+#define GenericEvent 35
+#endif
 #endif
 
 class IXWindowsImpl {

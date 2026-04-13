@@ -21,10 +21,10 @@ project (barrier C CXX)
 option (BARRIER_BUILD_GUI "Build the GUI" ON)
 option (BARRIER_BUILD_INSTALLER "Build the installer" ON)
 option (BARRIER_BUILD_TESTS "Build the tests" ON)
-option (BARRIER_USE_EXTERNAL_GTEST "Use external installation of Google Test framework" OFF)
+option (BARRIER_USE_EXTERNAL_GTEST "Use external installation of Google Test framework" ON)
 
 set (CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set (CMAKE_CXX_STANDARD 14)
+set (CMAKE_CXX_STANDARD 17)
 set (CMAKE_CXX_EXTENSIONS OFF)
 set (CMAKE_CXX_STANDARD_REQUIRED ON)
 set (CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
@@ -128,14 +128,23 @@ if (UNIX)
     find_package (Threads REQUIRED)
     list (APPEND libs Threads::Threads)
 
-    # curl is used on both Linux and Mac
-    find_package (CURL)
-    if (CURL_FOUND)
-        include_directories(${CURL_INCLUDE_DIRS})
-        list (APPEND libs ${CURL_LIBRARIES})
-
-    else()
-        message (FATAL_ERROR "Missing library: curl")
+    option (BARRIER_USE_LIBCURL "Enable libcurl-backed internet helpers on Unix" ON)
+    set (HAVE_LIBCURL 0)
+    if (BARRIER_USE_LIBCURL)
+        find_package (CURL)
+        if (CURL_FOUND)
+            set (HAVE_LIBCURL 1)
+            include_directories(${CURL_INCLUDE_DIRS})
+            # Use system curl shared lib on Linux (xdev-usr has only static lib with many missing deps).
+            if (UNIX AND NOT APPLE)
+                list (APPEND libs curl brotlicommon brotlidec brotlienc ssh2 ssl crypto gssapi_krb5 ldap lber z pthread idn2 nghttp2 rtmp zstd psl ssh2 ssl crypto)
+                link_directories("/usr/lib/x86_64-linux-gnu")
+            else()
+                list (APPEND libs ${CURL_LIBRARIES})
+            endif()
+        else()
+            message (WARNING "libcurl not found; Unix internet helpers will be built in disabled mode")
+        endif()
     endif()
 
     if (APPLE)
@@ -185,6 +194,10 @@ if (UNIX)
         set (HAVE_X11_EXTENSIONS_XRANDR_H "${X11_EXTENSIONS_XRANDR_H}")
         set (CMAKE_EXTRA_INCLUDE_FILES)
 
+        # Add bundled extincludes so cmake header checks find bundled X11 headers
+        # when system X11 dev packages are not installed.
+        set (CMAKE_REQUIRED_INCLUDES "${CMAKE_REQUIRED_INCLUDES};${CMAKE_SOURCE_DIR}/extincludes")
+
         check_include_files ("${XKBlib};X11/extensions/dpms.h" HAVE_X11_EXTENSIONS_DPMS_H)
         check_include_files ("X11/extensions/Xinerama.h" HAVE_X11_EXTENSIONS_XINERAMA_H)
         check_include_files ("${XKBlib};X11/extensions/XKBstr.h" HAVE_X11_EXTENSIONS_XKBSTR_H)
@@ -206,12 +219,18 @@ if (UNIX)
             message (FATAL_ERROR "Missing header: dns_sd.h")
         endif()
 
-        check_library_exists ("SM;ICE" IceConnectionNumber "" HAVE_ICE)
-        check_library_exists ("Xext;X11" DPMSQueryExtension "" HAVE_Xext)
-        check_library_exists ("Xtst;Xext;X11" XTestQueryExtension "" HAVE_Xtst)
-        check_library_exists ("Xinerama" XineramaQueryExtension "" HAVE_Xinerama)
-        check_library_exists ("Xi" XISelectEvents "" HAVE_Xi)
-        check_library_exists ("Xrandr" XRRQueryExtension "" HAVE_Xrandr)
+        set (CMAKE_LIBRARY_PATH "${CMAKE_SOURCE_DIR}/extlibs;${CMAKE_LIBRARY_PATH}")
+
+        # Add -L for extlibs so check_library_exists finds .so symlinks when
+        # system lib dirs lack .so symlinks (only have .so.X versioned files).
+        set (CMAKE_REQUIRED_LINK_OPTIONS "-L${CMAKE_SOURCE_DIR}/extlibs")
+
+        check_library_exists ("SM;ICE" IceConnectionNumber "${CMAKE_SOURCE_DIR}/extlibs" HAVE_ICE)
+        check_library_exists ("Xext;X11" DPMSQueryExtension "${CMAKE_SOURCE_DIR}/extlibs" HAVE_Xext)
+        check_library_exists ("Xtst;Xext;X11" XTestQueryExtension "${CMAKE_SOURCE_DIR}/extlibs" HAVE_Xtst)
+        check_library_exists ("Xinerama" XineramaQueryExtension "${CMAKE_SOURCE_DIR}/extlibs" HAVE_Xinerama)
+        check_library_exists ("Xi" XISelectEvents "${CMAKE_SOURCE_DIR}/extlibs" HAVE_Xi)
+        check_library_exists ("Xrandr" XRRQueryExtension "${CMAKE_SOURCE_DIR}/extlibs" HAVE_Xrandr)
 
         if (HAVE_ICE)
 
@@ -302,35 +321,21 @@ elseif (${CMAKE_SYSTEM_NAME} MATCHES "Windows")
     )
 endif()
 
-include_directories("${CMAKE_SOURCE_DIR}/ext/gulrak-filesystem/include")
 include_directories("${CMAKE_SOURCE_DIR}/ext/lodepng")
+include_directories("${CMAKE_SOURCE_DIR}")
+include_directories(BEFORE "${CMAKE_SOURCE_DIR}/extincludes")
+link_directories("${CMAKE_SOURCE_DIR}/extlibs" "/usr/lib/x86_64-linux-gnu")
 
 #
 # OpenSSL
 #
 if (${CMAKE_SYSTEM_NAME} MATCHES "Windows")
-    # Prefer system OpenSSL 1.1.1+ (required for TLS 1.3 / CVE fixes).
-    # Fall back to vendored OpenSSL 1.0.2 only if system package is unavailable.
     find_package(OpenSSL 1.1.1 QUIET)
     if (OpenSSL_FOUND)
         set(OPENSSL_LIBS OpenSSL::SSL OpenSSL::Crypto)
         message(STATUS "Using system OpenSSL: ${OPENSSL_VERSION}")
     else()
-        # WARNING: vendored OpenSSL 1.0.2 is EOL and has known CVEs.
-        # Install OpenSSL 1.1.1 via chocolatey: choco install openssl.light
-        # or via vcpkg: vcpkg install openssl-windows
-        message(WARNING "System OpenSSL 1.1.1 not found, falling back to vendored OpenSSL 1.0.2 (EOL — update recommended)")
-        set (OPENSSL_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/ext/openssl/windows)
-        if (CMAKE_SIZEOF_VOID_P EQUAL 8)
-            set (OPENSSL_ROOT "${OPENSSL_ROOT}/x64")
-        else()
-            set (OPENSSL_ROOT "${OPENSSL_ROOT}/x86")
-        endif()
-        include_directories (BEFORE SYSTEM ${OPENSSL_ROOT}/include)
-        set (OPENSSL_LIBS
-            ${OPENSSL_ROOT}/lib/libeay32.lib
-            ${OPENSSL_ROOT}/lib/ssleay32.lib
-        )
+        message(FATAL_ERROR "OpenSSL 1.1.1+ is required on Windows. Install system OpenSSL 1.1.1+ via Chocolatey, vcpkg, or your package manager.")
     endif()
 elseif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     find_program(APT_PROGRAM "apt")
@@ -356,30 +361,18 @@ elseif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
             ${OPENSSL_ROOT}/lib/libcrypto.a
             z
         )
-    elseif (IS_DIRECTORY /usr/local/opt/openssl AND BREW_PROGRAM)
-        # brew
-        set (OPENSSL_ROOT /usr/local/opt/openssl)
-
-        include_directories (BEFORE SYSTEM ${OPENSSL_ROOT}/include)
-
-        set (OPENSSL_LIBS
-            ${OPENSSL_ROOT}/lib/libssl.a
-            ${OPENSSL_ROOT}/lib/libcrypto.a
-        )
-    elseif (IS_DIRECTORY /opt/homebrew/opt/openssl AND BREW_PROGRAM)
-        # brew
-        set (OPENSSL_ROOT /opt/homebrew/opt/openssl)
-
-        include_directories (BEFORE SYSTEM ${OPENSSL_ROOT}/include)
-
-        set (OPENSSL_LIBS
-            ${OPENSSL_ROOT}/lib/libssl.a
-            ${OPENSSL_ROOT}/lib/libcrypto.a
-        )
+    elseif (BREW_PROGRAM)
+        # macOS with Homebrew: use find_package to locate OpenSSL/LibreSSL.
+        # Replaces the removed hardcoded brew openssl@1.1 paths which are no
+        # longer provided by Homebrew (removed in 2020).
+        find_package(OpenSSL 1.1.1 REQUIRED)
+        set(OPENSSL_LIBS OpenSSL::SSL OpenSSL::Crypto)
     endif()
 
 elseif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     set (OPENSSL_LIBS ssl crypto)
+    # Force use of system libraries instead of anaconda
+    # (anaconda curl/openssl lack optional dependencies like ldap, lber)
 else()
     find_library (lib_ssl ssl)
     find_library (lib_crypto crypto)
@@ -468,6 +461,8 @@ else()
     message (STATUS "NOT configuring the installer")
 endif()
 
-enable_testing()
+if (BARRIER_BUILD_TESTS)
+    enable_testing()
+endif()
 
 add_subdirectory (src)

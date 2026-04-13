@@ -85,8 +85,8 @@ void SslCertificate::generate_fingerprint(const barrier::fs::path& cert_path)
 
 bool SslCertificate::is_certificate_valid(const barrier::fs::path& path)
 {
-    OpenSSL_add_all_algorithms();
-    ERR_load_crypto_strings();
+    // OpenSSL 1.1.1+/3.x: global library init is handled by SecureSocket::initContext.
+    // OpenSSL_add_all_algorithms() and ERR_load_crypto_strings() are no longer needed.
 
     auto fp = barrier::fopen_utf8_path(path, "r");
     if (!fp) {

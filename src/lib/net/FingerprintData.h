@@ -18,6 +18,7 @@
 #ifndef BARRIER_LIB_NET_FINGERPRINT_DATA_H
 #define BARRIER_LIB_NET_FINGERPRINT_DATA_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,17 @@ struct FingerprintData {
     bool valid() const { return !algorithm.empty(); }
 
     bool operator==(const FingerprintData& other) const;
+
+    // Default constructor
+    FingerprintData() = default;
+
+    // Construct from algorithm name + hash data
+    FingerprintData(const std::string& algo, const std::vector<std::uint8_t>& d)
+        : algorithm(algo), data(d) {}
+
+    // Construct from hash byte range with SHA256 algorithm
+    FingerprintData(const std::uint8_t* begin, const std::uint8_t* end)
+        : algorithm("sha256"), data(begin, end) {}
 };
 
 const char* fingerprint_type_to_string(FingerprintType type);
