@@ -60,7 +60,7 @@ DragInformation::parseDragInfo(DragFileList& dragFileList, UInt32 fileNum, Strin
             di.setFilename(filename);
             dragFileList.push_back(di);
         }
-        startPos = findResult1 + 1;
+        startPos = findResult2 + 1;
 
         //set filesize
         findResult2 = data.find(',', startPos);

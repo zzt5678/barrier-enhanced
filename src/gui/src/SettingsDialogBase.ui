@@ -203,6 +203,32 @@
        </widget>
       </item>
      </layout>
+   </widget>
+  </item>
+   <item>
+    <widget class="QGroupBox" name="m_pGroupFeatures">
+     <property name="title">
+      <string>Features</string>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_2">
+      <item>
+       <widget class="QCheckBox" name="m_pCheckBoxEnableDragDrop">
+        <property name="text">
+         <string>Enable file and image drag &amp; drop</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="m_pCheckBoxGameMode">
+        <property name="text">
+         <string>Enable game mode for server use</string>
+        </property>
+        <property name="toolTip">
+         <string>Locks the cursor to the active screen on startup and prefers lower-latency behavior for gaming.</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
     </widget>
    </item>
    <item>
@@ -337,6 +363,8 @@
   <tabstop>m_pCheckBoxMinimizeToTray</tabstop>
   <tabstop>m_pCheckBoxAutoHide</tabstop>
   <tabstop>m_pCheckBoxAutoStart</tabstop>
+  <tabstop>m_pCheckBoxEnableDragDrop</tabstop>
+  <tabstop>m_pCheckBoxGameMode</tabstop>
   <tabstop>m_pSpinBoxPort</tabstop>
   <tabstop>m_pLineEditInterface</tabstop>
   <tabstop>m_pCheckBoxEnableCrypto</tabstop>

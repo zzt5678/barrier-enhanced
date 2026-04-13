@@ -170,7 +170,14 @@ Log::print(const char* file, int line, const char* fmt, ...)
         char timestamp[50];
         time_t t;
         time(&t);
-        struct tm* tm = localtime_r(&t, &tmBuffer);
+        struct tm* tm = nullptr;
+#if defined(_WIN32)
+        if (localtime_s(&tmBuffer, &t) == 0) {
+            tm = &tmBuffer;
+        }
+#else
+        tm = localtime_r(&t, &tmBuffer);
+#endif
         if (tm == nullptr) {
             memset(&tmBuffer, 0, sizeof(tmBuffer));
             tm = &tmBuffer;

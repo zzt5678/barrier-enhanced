@@ -138,6 +138,7 @@ public:
     match the given modifier mask.
     */
     void                keyUp(KeyID id, KeyModifierMask, KeyButton);
+    void                fakeAllKeysUp();
 
     //! Notify of mouse press
     /*!
@@ -220,9 +221,6 @@ public:
     Undoes whatever \c fakeInputBegin() did.
     */
     void                fakeInputEnd();
-
-    //! Fake releasing all currently pressed keys
-    void                fakeAllKeysUp();
 
     //! Change dragging status
     void                setDraggingStarted(bool started);

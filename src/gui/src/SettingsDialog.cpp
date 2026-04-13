@@ -30,11 +30,19 @@
 #include <QMessageBox>
 #include <QFileDialog>
 #include <QDir>
+#include <QCheckBox>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QSpinBox>
 
 SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
-    QDialog(parent, Qt::WindowTitleHint | Qt::WindowSystemMenuHint),
+    QDialog(parent, Qt::Dialog | Qt::WindowTitleHint | Qt::WindowSystemMenuHint | Qt::WindowCloseButtonHint),
     Ui::SettingsDialogBase(),
-       m_appConfig(config)
+    m_appConfig(config),
+    m_pCheckBoxWorkflowEnabled(new QCheckBox(tr("Enable lightweight workflow handoff"), this)),
+    m_pCheckBoxWorkflowSuggestions(new QCheckBox(tr("Enable suggestion cards"), this)),
+    m_pSpinBoxWorkflowHistoryLimit(new QSpinBox(this)),
+    m_pSpinBoxWorkflowDormantSeconds(new QSpinBox(this))
 {
     setupUi(this);
 
@@ -50,8 +58,31 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     m_pCheckBoxAutoHide->setChecked(appConfig().getAutoHide());
     m_pCheckBoxAutoStart->setChecked(appConfig().getAutoStart());
     m_pCheckBoxMinimizeToTray->setChecked(appConfig().getMinimizeToTray());
+    m_pCheckBoxEnableDragDrop->setChecked(appConfig().getEnableDragDrop());
+    m_pCheckBoxGameMode->setChecked(appConfig().getGameMode());
+    m_pCheckBoxWorkflowEnabled->setChecked(appConfig().getWorkflowEnabled());
+    m_pCheckBoxWorkflowSuggestions->setChecked(appConfig().getSuggestionsEnabled());
+    m_pSpinBoxWorkflowHistoryLimit->setRange(10, 500);
+    m_pSpinBoxWorkflowHistoryLimit->setValue(appConfig().getWorkflowHistoryLimit());
+    m_pSpinBoxWorkflowDormantSeconds->setRange(10, 600);
+    m_pSpinBoxWorkflowDormantSeconds->setValue(appConfig().getWorkflowDormantSeconds());
     m_pCheckBoxEnableCrypto->setChecked(m_appConfig.getCryptoEnabled());
     checkbox_require_client_certificate->setChecked(m_appConfig.getRequireClientCertificate());
+
+    auto* historyRow = new QHBoxLayout;
+    historyRow->addWidget(new QLabel(tr("Workflow history limit:"), this));
+    historyRow->addWidget(m_pSpinBoxWorkflowHistoryLimit);
+    historyRow->addStretch();
+
+    auto* dormantRow = new QHBoxLayout;
+    dormantRow->addWidget(new QLabel(tr("Dormant after seconds:"), this));
+    dormantRow->addWidget(m_pSpinBoxWorkflowDormantSeconds);
+    dormantRow->addStretch();
+
+    verticalLayout_2->addWidget(m_pCheckBoxWorkflowEnabled);
+    verticalLayout_2->addWidget(m_pCheckBoxWorkflowSuggestions);
+    verticalLayout_2->addLayout(historyRow);
+    verticalLayout_2->addLayout(dormantRow);
 
 #if defined(Q_OS_WIN)
     m_pComboElevate->setCurrentIndex(static_cast<int>(appConfig().elevateMode()));
@@ -77,6 +108,12 @@ void SettingsDialog::accept()
     m_appConfig.setAutoHide(m_pCheckBoxAutoHide->isChecked());
     m_appConfig.setAutoStart(m_pCheckBoxAutoStart->isChecked());
     m_appConfig.setMinimizeToTray(m_pCheckBoxMinimizeToTray->isChecked());
+    m_appConfig.setEnableDragDrop(m_pCheckBoxEnableDragDrop->isChecked());
+    m_appConfig.setGameMode(m_pCheckBoxGameMode->isChecked());
+    m_appConfig.setWorkflowEnabled(m_pCheckBoxWorkflowEnabled->isChecked());
+    m_appConfig.setSuggestionsEnabled(m_pCheckBoxWorkflowSuggestions->isChecked());
+    m_appConfig.setWorkflowHistoryLimit(m_pSpinBoxWorkflowHistoryLimit->value());
+    m_appConfig.setWorkflowDormantSeconds(m_pSpinBoxWorkflowDormantSeconds->value());
     m_appConfig.saveSettings();
     QDialog::accept();
 }

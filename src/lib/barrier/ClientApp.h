@@ -79,4 +79,5 @@ private:
     Client*            m_client;
     barrier::Screen*m_clientScreen;
     NetworkAddress*    m_serverAddress;
+    double             m_restartTimeout;
 };

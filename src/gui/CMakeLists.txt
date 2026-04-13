@@ -21,12 +21,14 @@ set(GUI_COMMON_HEADER_FILES
 
 set(GUI_SOURCE_FILES
     src/AboutDialog.cpp
+    src/ActionBus.cpp
     src/ActionDialog.cpp
     src/AddClientDialog.cpp
     src/AppConfig.cpp
     src/BarrierLocale.cpp
     src/BaseConfig.cpp
     src/CommandProcess.cpp
+    src/CommandPaletteDialog.cpp
     src/DataDownloader.cpp
     src/DisplayIsValid.cpp
     src/FingerprintAcceptDialog.cpp
@@ -52,6 +54,8 @@ set(GUI_SOURCE_FILES
     src/SslCertificate.cpp
     src/TrashScreenWidget.cpp
     src/VersionChecker.cpp
+    src/WorkflowHubDialog.cpp
+    src/WorkflowStore.cpp
     src/ZeroconfBrowser.cpp
     src/ZeroconfRegister.cpp
     src/ZeroconfServer.cpp
@@ -61,12 +65,14 @@ set(GUI_SOURCE_FILES
 
 set(GUI_HEADER_FILES
     src/AboutDialog.h
+    src/ActionBus.h
     src/ActionDialog.h
     src/AddClientDialog.h
     src/AppConfig.h
     src/BarrierLocale.h
     src/BaseConfig.h
     src/CommandProcess.h
+    src/CommandPaletteDialog.h
     src/DataDownloader.h
     src/DisplayIsValid.h
     src/ElevateMode.h
@@ -93,6 +99,9 @@ set(GUI_HEADER_FILES
     src/SslCertificate.h
     src/TrashScreenWidget.h
     src/VersionChecker.h
+    src/WorkflowHubDialog.h
+    src/WorkflowStore.h
+    src/WorkflowTypes.h
     src/ZeroconfBrowser.h
     src/ZeroconfRecord.h
     src/ZeroconfRegister.h
@@ -136,12 +145,32 @@ target_compile_definitions (barrier PRIVATE -DBARRIER_VERSION_STAGE="${BARRIER_V
 target_compile_definitions (barrier PRIVATE -DBARRIER_REVISION="${BARRIER_REVISION}")
 
 if (WIN32)
-    include_directories ($ENV{BONJOUR_SDK_HOME}/Include)
+    file(TO_CMAKE_PATH "$ENV{BONJOUR_SDK_HOME}" BONJOUR_SDK_HOME)
+    string(STRIP "${BONJOUR_SDK_HOME}" BONJOUR_SDK_HOME)
+    include_directories ("${BONJOUR_SDK_HOME}/Include")
     find_library (DNSSD_LIB dnssd.lib
-                  HINTS ENV BONJOUR_SDK_HOME
+                  HINTS "${BONJOUR_SDK_HOME}"
                   PATH_SUFFIXES "Lib/x64")
     set_target_properties (barrier PROPERTIES LINK_FLAGS "/NODEFAULTLIB:LIBCMT")
     target_link_libraries (barrier ${DNSSD_LIB})
+
+    get_target_property(QT_QMAKE_EXECUTABLE Qt5::qmake IMPORTED_LOCATION)
+    if (QT_QMAKE_EXECUTABLE)
+        get_filename_component(QT_BIN_DIR "${QT_QMAKE_EXECUTABLE}" DIRECTORY)
+        set(WINDEPLOYQT_EXECUTABLE "${QT_BIN_DIR}/windeployqt.exe")
+    endif()
+
+    add_custom_command(
+        TARGET barrier POST_BUILD
+        COMMAND "${CMAKE_COMMAND}"
+            -DWINDEPLOYQT_EXECUTABLE=${WINDEPLOYQT_EXECUTABLE}
+            -DQT_BIN_DIR=${QT_BIN_DIR}
+            -DOPENSSL_ROOT_HINT=${OPENSSL_ROOT_DIR}
+            -DOUTPUT_DIR=$<TARGET_FILE_DIR:barrier>
+            -DTARGET_FILE=$<TARGET_FILE:barrier>
+            -P "${CMAKE_CURRENT_LIST_DIR}/DeployWindowsGui.cmake"
+        VERBATIM
+    )
 elseif (APPLE)
     find_library(APPSERVICES_LIB ApplicationServices)
     target_link_libraries(barrier ${APPSERVICES_LIB})

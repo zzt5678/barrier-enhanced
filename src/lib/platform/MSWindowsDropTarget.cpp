@@ -125,7 +125,8 @@ getDropData(IDataObject* dataObject)
                     const UINT pathLength = DragQueryFileW(drop, 0, nullptr, 0);
                     if (pathLength > 0) {
                         std::wstring wideFilename(pathLength + 1, L'\0');
-                        const UINT copied = DragQueryFileW(drop, 0, &wideFilename[0], pathLength + 1);
+                        const UINT copied = DragQueryFileW(
+                            drop, 0, &wideFilename[0], pathLength + 1);
                         wideFilename.resize(copied);
 
                         const int utf8Size = WideCharToMultiByte(
@@ -143,6 +144,7 @@ getDropData(IDataObject* dataObject)
                 GlobalUnlock(stgMed.hGlobal);
             }
 
+            // release the data using the COM API
             ReleaseStgMedium(&stgMed);
         }
     }

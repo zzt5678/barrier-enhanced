@@ -32,10 +32,27 @@
 
 #include <fstream>
 #include <stdexcept>
+#include <vector>
 
 using namespace std;
 
-static const size_t g_chunkSize = 32 * 1024; //32kb
+namespace {
+
+size_t getChunkSize(size_t totalSize)
+{
+    if (totalSize >= 256 * 1024 * 1024) {
+        return 256 * 1024;
+    }
+    if (totalSize >= 32 * 1024 * 1024) {
+        return 128 * 1024;
+    }
+    if (totalSize >= 4 * 1024 * 1024) {
+        return 64 * 1024;
+    }
+    return 32 * 1024;
+}
+
+}
 
 bool StreamChunker::s_isChunkingFile = false;
 bool StreamChunker::s_interruptFile = false;
@@ -66,7 +83,8 @@ StreamChunker::sendFile(const char* filename,
 
     // send chunk messages with a fixed chunk size
     size_t sentLength = 0;
-    size_t chunkSize = g_chunkSize;
+    const size_t chunkSize = getChunkSize(size);
+    std::vector<char> chunkBuffer(chunkSize);
     file.seekg (0, std::ios::beg);
 
     while (true) {
@@ -79,20 +97,21 @@ StreamChunker::sendFile(const char* filename,
         events->addEvent(Event(events->forFile().keepAlive(), eventTarget));
 
         // make sure we don't read too much from the mock data.
-        if (sentLength + chunkSize > size) {
-            chunkSize = size - sentLength;
+        size_t bytesToRead = chunkSize;
+        if (sentLength + bytesToRead > size) {
+            bytesToRead = size - sentLength;
         }
 
-        char* chunkData = new char[chunkSize];
-        file.read(chunkData, chunkSize);
-        UInt8* data = reinterpret_cast<UInt8*>(chunkData);
-        FileChunk* fileChunk = FileChunk::data(data, chunkSize);
-        delete[] chunkData;
+        file.read(chunkBuffer.data(), bytesToRead);
+        if (!file) {
+            throw runtime_error("failed to read file");
+        }
+        FileChunk* fileChunk = FileChunk::data(
+            reinterpret_cast<const UInt8*>(chunkBuffer.data()), bytesToRead);
 
         events->addEvent(Event(events->forFile().fileChunkSending(), eventTarget, fileChunk));
 
-        sentLength += chunkSize;
-        file.seekg (sentLength, std::ios::beg);
+        sentLength += bytesToRead;
 
         if (sentLength == size) {
             break;
@@ -126,22 +145,23 @@ StreamChunker::sendClipboard(
 
     // send clipboard chunk with a fixed size
     size_t sentLength = 0;
-    size_t chunkSize = g_chunkSize;
+    const size_t chunkSize = 32 * 1024;
 
     while (true) {
         events->addEvent(Event(events->forFile().keepAlive(), eventTarget));
 
         // make sure we don't read too much from the mock data.
-        if (sentLength + chunkSize > size) {
-            chunkSize = size - sentLength;
+        size_t bytesToSend = chunkSize;
+        if (sentLength + bytesToSend > size) {
+            bytesToSend = size - sentLength;
         }
 
-        String chunk(data.substr(sentLength, chunkSize).c_str(), chunkSize);
+        String chunk(data.substr(sentLength, bytesToSend).c_str(), bytesToSend);
         ClipboardChunk* dataChunk = ClipboardChunk::data(id, sequence, chunk);
 
         events->addEvent(Event(events->forClipboard().clipboardSending(), eventTarget, dataChunk));
 
-        sentLength += chunkSize;
+        sentLength += bytesToSend;
         if (sentLength == size) {
             break;
         }

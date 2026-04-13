@@ -216,6 +216,12 @@ Screen::keyUp(KeyID, KeyModifierMask, KeyButton button)
 }
 
 void
+Screen::fakeAllKeysUp()
+{
+    m_screen->fakeAllKeysUp();
+}
+
+void
 Screen::mouseDown(ButtonID button)
 {
     m_screen->fakeMouseButton(button, true);
@@ -357,12 +363,6 @@ Screen::fakeInputEnd()
 
     m_fakeInput = false;
     m_screen->fakeInputEnd();
-}
-
-void
-Screen::fakeAllKeysUp()
-{
-    m_screen->fakeAllKeysUp();
 }
 
 bool

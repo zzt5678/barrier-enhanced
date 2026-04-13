@@ -25,6 +25,8 @@
 #include "BarrierLocale.h"
 
 class AppConfig;
+class QCheckBox;
+class QSpinBox;
 
 class SettingsDialog : public QDialog, public Ui::SettingsDialogBase
 {
@@ -42,6 +44,10 @@ class SettingsDialog : public QDialog, public Ui::SettingsDialogBase
     private:
         AppConfig& m_appConfig;
         BarrierLocale m_Locale;
+        QCheckBox* m_pCheckBoxWorkflowEnabled;
+        QCheckBox* m_pCheckBoxWorkflowSuggestions;
+        QSpinBox* m_pSpinBoxWorkflowHistoryLimit;
+        QSpinBox* m_pSpinBoxWorkflowDormantSeconds;
 
     private slots:
         void on_m_pComboLanguage_currentIndexChanged(int index);

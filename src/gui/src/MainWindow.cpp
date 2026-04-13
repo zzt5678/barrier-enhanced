@@ -27,10 +27,14 @@
 #include "DataDownloader.h"
 #include "CommandProcess.h"
 #include "FingerprintAcceptDialog.h"
+#include "ActionBus.h"
+#include "CommandPaletteDialog.h"
 #include "QUtility.h"
 #include "ProcessorArch.h"
 #include "SslCertificate.h"
 #include "ShutdownCh.h"
+#include "WorkflowHubDialog.h"
+#include "WorkflowStore.h"
 #include "base/String.h"
 #include "common/DataDirectories.h"
 #include "net/FingerprintDatabase.h"
@@ -46,6 +50,7 @@
 #include <QFileDialog>
 #include <QDesktopServices>
 #include <QDesktopWidget>
+#include <QClipboard>
 
 #if defined(Q_OS_MAC)
 #include <ApplicationServices/ApplicationServices.h>
@@ -118,7 +123,13 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_SuppressEmptyServerWarning(false),
     m_ExpectedRunningState(kStopped),
     m_pSslCertificate(NULL),
-    m_pLogWindow(new LogWindow(nullptr))
+    m_pLogWindow(new LogWindow(nullptr)),
+    m_pWorkflowStore(NULL),
+    m_pActionBus(NULL),
+    m_pWorkflowHubDialog(NULL),
+    m_pCommandPaletteDialog(NULL),
+    m_pActionWorkflowHub(NULL),
+    m_pActionCommandPalette(NULL)
 {
     // explicitly unset DeleteOnClose so the window can be show and hidden
     // repeatedly until Barrier is finished
@@ -138,12 +149,39 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
         qWarning() << "Failed to load stylesheet:" << styleFile.fileName();
     }
 
+    m_pWorkflowStore = new WorkflowStore(appConfig, this);
+    m_pWorkflowStore->attachClipboard(QApplication::clipboard());
+    m_pActionBus = new ActionBus(*m_pWorkflowStore, this);
+
+    m_pActionWorkflowHub = new QAction(tr("Workflow &Hub"), this);
+    m_pActionWorkflowHub->setToolTip(tr("Open clipboard history, task handoff, suggestions, and transfer receipts."));
+    m_pActionWorkflowHub->setShortcut(QKeySequence(Qt::CTRL + Qt::Key_H));
+    m_pActionCommandPalette = new QAction(tr("Command &Palette"), this);
+    m_pActionCommandPalette->setToolTip(tr("Run lightweight workflow commands."));
+    m_pActionCommandPalette->setShortcut(QKeySequence(Qt::CTRL + Qt::SHIFT + Qt::Key_P));
+    addAction(m_pActionCommandPalette);
+
+    connect(m_pWorkflowStore, &WorkflowStore::notificationRequested,
+            this, &MainWindow::handleWorkflowNotification);
+    connect(m_pWorkflowStore, &WorkflowStore::runtimeModeChanged,
+            this, &MainWindow::updateWorkflowIndicators);
+    connect(m_pWorkflowStore, &WorkflowStore::historyChanged,
+            this, &MainWindow::updateWorkflowIndicators);
+    connect(m_pWorkflowStore, &WorkflowStore::suggestionsChanged,
+            this, &MainWindow::updateWorkflowIndicators);
+    connect(m_pWorkflowStore, &WorkflowStore::receiptsChanged,
+            this, &MainWindow::updateWorkflowIndicators);
+    connect(m_pActionBus, &ActionBus::notificationRequested,
+            this, &MainWindow::handleWorkflowNotification);
+
     createMenuBar();
     loadSettings();
     initConnections();
 
     m_pLabelScreenName->setText(getScreenName());
     m_pLabelIpAddresses->setText(getIPAddresses());
+    m_pCheckBoxEnableDragDrop->setChecked(appConfig.getEnableDragDrop());
+    m_pCheckBoxGameMode->setChecked(appConfig.getGameMode());
 
 #if defined(Q_OS_WIN)
     // ipc must always be enabled, so that we can disable command when switching to desktop mode.
@@ -160,6 +198,9 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
 #elif defined(Q_OS_LINUX)
     resize(700, 530);
     setMinimumSize(700, 0);
+#elif defined(Q_OS_WIN)
+    resize(820, 620);
+    setMinimumSize(760, 540);
 #endif
 
     m_SuppressAutoConfigWarning = true;
@@ -169,6 +210,7 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_pComboServerList->hide();
     m_pLabelPadlock->hide();
     frame_fingerprint_details->hide();
+    refreshControlState();
 
     updateSSLFingerprint();
 
@@ -186,6 +228,8 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
 
     // resize window to smallest reasonable size
     resize(0, 0);
+    updateWorkflowPeerHint();
+    updateWorkflowIndicators();
 }
 
 MainWindow::~MainWindow()
@@ -245,7 +289,11 @@ void MainWindow::createTrayIcon()
 
     m_pTrayIconMenu->addAction(m_pActionStartBarrier);
     m_pTrayIconMenu->addAction(m_pActionStopBarrier);
+    m_pTrayIconMenu->addAction(m_pActionSettings);
     m_pTrayIconMenu->addAction(m_pActionShowLog);
+    m_pTrayIconMenu->addSeparator();
+    m_pTrayIconMenu->addAction(m_pActionWorkflowHub);
+    m_pTrayIconMenu->addAction(m_pActionCommandPalette);
     m_pTrayIconMenu->addSeparator();
 
     m_pTrayIconMenu->addAction(m_pActionMinimize);
@@ -282,6 +330,9 @@ void MainWindow::createMenuBar()
     m_pMenuBar->addAction(m_pMenuHelp->menuAction());
 
     m_pMenuBarrier->addAction(m_pActionShowLog);
+    m_pMenuBarrier->addAction(m_pActionWorkflowHub);
+    m_pMenuBarrier->addAction(m_pActionCommandPalette);
+    m_pMenuBarrier->addSeparator();
     m_pMenuBarrier->addAction(m_pActionSettings);
     m_pMenuBarrier->addAction(m_pActionMinimize);
     m_pMenuBarrier->addSeparator();
@@ -309,10 +360,13 @@ void MainWindow::loadSettings()
 void MainWindow::initConnections()
 {
     connect(m_pActionMinimize, SIGNAL(triggered()), this, SLOT(hide()));
-    connect(m_pActionRestore, SIGNAL(triggered()), this, SLOT(showNormal()));
+    connect(m_pActionRestore, SIGNAL(triggered()), this, SLOT(showControlCenter()));
+    connect(m_pButtonSettings, SIGNAL(clicked()), this, SLOT(on_m_pActionSettings_triggered()));
     connect(m_pActionStartBarrier, SIGNAL(triggered()), this, SLOT(startBarrier()));
     connect(m_pActionStopBarrier, SIGNAL(triggered()), this, SLOT(stopBarrier()));
     connect(m_pActionShowLog, SIGNAL(triggered()), this, SLOT(showLogWindow()));
+    connect(m_pActionWorkflowHub, SIGNAL(triggered()), this, SLOT(showWorkflowHub()));
+    connect(m_pActionCommandPalette, SIGNAL(triggered()), this, SLOT(showCommandPalette()));
     connect(m_pActionQuit, SIGNAL(triggered()), qApp, SLOT(quit()));
 }
 
@@ -325,6 +379,9 @@ void MainWindow::saveSettings()
     settings().setValue("useInternalConfig", m_pRadioInternalConfig->isChecked());
     settings().setValue("groupClientChecked", m_pGroupClient->isChecked());
     settings().setValue("serverHostname", m_pLineEditHostname->text());
+    appConfig().setEnableDragDrop(m_pCheckBoxEnableDragDrop->isChecked());
+    appConfig().setGameMode(m_pCheckBoxGameMode->isChecked());
+    appConfig().saveSettings();
 
     settings().sync();
 }
@@ -350,10 +407,25 @@ void MainWindow::trayActivated(QSystemTrayIcon::ActivationReason reason)
         }
         else
         {
-            showNormal();
-            activateWindow();
+            showControlCenter();
         }
     }
+}
+
+void MainWindow::showControlCenter()
+{
+    setWindowState(windowState() & ~Qt::WindowMinimized);
+    setMinimumSize(QSize(760, 540));
+    if (width() < minimumWidth() || height() < minimumHeight()) {
+        resize(qMax(width(), minimumWidth()), qMax(height(), minimumHeight()));
+    }
+
+    const QRect availableGeometry = QApplication::desktop()->availableGeometry(this);
+    move(availableGeometry.center() - rect().center());
+
+    showNormal();
+    raise();
+    activateWindow();
 }
 
 void MainWindow::logOutput()
@@ -411,6 +483,9 @@ void MainWindow::updateFromLogLine(const QString &line)
     // TODO: this code makes Andrew cry
     checkConnected(line);
     checkFingerprint(line);
+    if (m_pWorkflowStore) {
+        m_pWorkflowStore->recordLogLine(line);
+    }
 }
 
 void MainWindow::checkConnected(const QString& line)
@@ -421,6 +496,7 @@ void MainWindow::checkConnected(const QString& line)
         line.contains("server status: active"))
     {
         setBarrierState(barrierConnected);
+        updateWorkflowPeerHint();
 
         if (!appConfig().startedBefore() && isVisible()) {
                 QMessageBox::information(
@@ -551,7 +627,7 @@ void MainWindow::startBarrier()
 
 #ifndef Q_OS_LINUX
 
-    if (m_ServerConfig.enableDragAndDrop()) {
+    if (appConfig().getEnableDragDrop()) {
         args << "--enable-drag-drop";
     }
 
@@ -562,11 +638,8 @@ void MainWindow::startBarrier()
     }
 
 #if defined(Q_OS_WIN)
-    // on windows, the profile directory changes depending on the user that
-    // launched the process (e.g. when launched with elevation). setting the
-    // profile dir on launch ensures it uses the same profile dir is used
-    // no matter how its relaunched.
-    args << "--profile-dir" << QString::fromStdString("\"" + barrier::DataDirectories::profile().u8string() + "\"");
+    // QProcess passes arguments without shell parsing, so do not embed quotes.
+    args << "--profile-dir" << QString::fromStdString(barrier::DataDirectories::profile().u8string());
 #endif
 
     if ((barrier_type() == BarrierType::Client && !clientArgs(args, app))
@@ -610,7 +683,7 @@ void MainWindow::startBarrier()
 
     if (serviceMode)
     {
-        QString command(app + " " + args.join(" "));
+        QString command(QString("\"%1\" %2").arg(app, args.join(" ")));
         m_IpcClient.sendCommand(command, appConfig().elevateMode());
     }
 }
@@ -627,11 +700,6 @@ bool MainWindow::clientArgs(QStringList& args, QString& app)
         return false;
     }
 
-#if defined(Q_OS_WIN)
-    // wrap in quotes so a malicious user can't start \Program.exe as admin.
-    app = QString("\"%1\"").arg(app);
-#endif
-
     if (appConfig().logToFile())
     {
         appConfig().persistLogDir();
@@ -643,7 +711,7 @@ bool MainWindow::clientArgs(QStringList& args, QString& app)
     if (m_pCheckBoxAutoConfig->isChecked()) {
         if (m_pComboServerList->count() != 0) {
             QString serverIp = m_pComboServerList->currentText();
-            args << "[" + serverIp + "]:" + QString::number(appConfig().port());
+            args << QString("%1:%2").arg(serverIp, QString::number(appConfig().port()));
             return true;
         }
     } else if (m_pLineEditHostname->text().isEmpty()) {
@@ -655,7 +723,7 @@ bool MainWindow::clientArgs(QStringList& args, QString& app)
         return false;
     }
 
-    args << "[" + m_pLineEditHostname->text() + "]:" + QString::number(appConfig().port());
+    args << QString("%1:%2").arg(m_pLineEditHostname->text(), QString::number(appConfig().port()));
 
     return true;
 }
@@ -724,11 +792,6 @@ bool MainWindow::serverArgs(QStringList& args, QString& app)
         return false;
     }
 
-#if defined(Q_OS_WIN)
-    // wrap in quotes so a malicious user can't start \Program.exe as admin.
-    app = QString("\"%1\"").arg(app);
-#endif
-
     if (appConfig().logToFile())
     {
         appConfig().persistLogDir();
@@ -738,6 +801,9 @@ bool MainWindow::serverArgs(QStringList& args, QString& app)
 
     if (!appConfig().getRequireClientCertificate()) {
         args << "--disable-client-cert-checking";
+    }
+    if (appConfig().getGameMode()) {
+        args << "--game-mode";
     }
 
     QString configFilename = this->configFilename();
@@ -796,7 +862,17 @@ void MainWindow::stopDesktop()
     if (barrierProcess()->isOpen()) {
         // try to shutdown child gracefully
         barrierProcess()->write(&ShutdownCh, 1);
-        barrierProcess()->waitForFinished(5000);
+        barrierProcess()->waitForFinished(1500);
+        if (barrierProcess()->state() != QProcess::NotRunning) {
+            appendLogInfo("desktop process did not stop gracefully; terminating it");
+            barrierProcess()->terminate();
+            barrierProcess()->waitForFinished(2000);
+        }
+        if (barrierProcess()->state() != QProcess::NotRunning) {
+            appendLogInfo("desktop process did not terminate; killing it");
+            barrierProcess()->kill();
+            barrierProcess()->waitForFinished(2000);
+        }
         barrierProcess()->close();
     }
 
@@ -879,6 +955,8 @@ void MainWindow::setBarrierState(qBarrierState state)
     setIcon(state);
 
     m_BarrierState = state;
+    updateWorkflowPeerHint();
+    updateWorkflowIndicators();
 }
 
 void MainWindow::setVisible(bool visible)
@@ -978,7 +1056,10 @@ void MainWindow::changeEvent(QEvent* event)
 bool MainWindow::event(QEvent* event)
 {
     if (event->type() == QEvent::LayoutRequest) {
-        setFixedSize(sizeHint());
+        const QSize preferredSize = sizeHint().expandedTo(minimumSize());
+        if (width() < preferredSize.width() || height() < preferredSize.height()) {
+            resize(qMax(width(), preferredSize.width()), qMax(height(), preferredSize.height()));
+        }
     }
     return QMainWindow::event(event);
 }
@@ -1072,6 +1153,7 @@ void MainWindow::on_m_pGroupClient_toggled(bool on)
     if (on) {
         updateZeroconfService();
     }
+    refreshControlState();
 }
 
 void MainWindow::on_m_pGroupServer_toggled(bool on)
@@ -1080,6 +1162,7 @@ void MainWindow::on_m_pGroupServer_toggled(bool on)
     if (on) {
         updateZeroconfService();
     }
+    refreshControlState();
 }
 
 bool MainWindow::on_m_pButtonBrowseConfigFile_clicked()
@@ -1115,8 +1198,20 @@ void MainWindow::on_m_pActionAbout_triggered()
 
 void MainWindow::on_m_pActionSettings_triggered()
 {
-    if (SettingsDialog(this, appConfig()).exec() == QDialog::Accepted)
+    showControlCenter();
+
+    SettingsDialog dialog(this, appConfig());
+    dialog.setWindowModality(Qt::ApplicationModal);
+    dialog.raise();
+    dialog.activateWindow();
+
+    if (dialog.exec() == QDialog::Accepted)
+    {
+        m_pCheckBoxEnableDragDrop->setChecked(appConfig().getEnableDragDrop());
+        m_pCheckBoxGameMode->setChecked(appConfig().getGameMode());
+        refreshControlState();
         updateSSLFingerprint();
+    }
 }
 
 void MainWindow::autoAddScreen(const QString name)
@@ -1150,6 +1245,9 @@ void MainWindow::showConfigureServer(const QString& message)
     ServerConfigDialog dlg(this, serverConfig(), appConfig().screenName());
     dlg.message(message);
     dlg.exec();
+    m_pCheckBoxEnableDragDrop->setChecked(serverConfig().enableDragAndDrop());
+    appConfig().setEnableDragDrop(serverConfig().enableDragAndDrop());
+    appConfig().saveSettings();
 }
 
 void MainWindow::on_m_pButtonConfigureServer_clicked()
@@ -1375,7 +1473,96 @@ void MainWindow::windowStateChanged()
         hide();
 }
 
+void MainWindow::refreshControlState()
+{
+    const bool serverMode = barrier_type() == BarrierType::Server;
+    m_pCheckBoxGameMode->setEnabled(serverMode);
+    m_pLabelFeatureHint->setText(serverMode
+        ? tr("Game mode is available because this machine is acting as the server. Drag & drop stays available for supported desktop targets.")
+        : tr("Client mode keeps quick connect and tray control active. Switch this machine to server mode to enable game mode."));
+    updateWorkflowPeerHint();
+}
+
+void MainWindow::on_m_pCheckBoxEnableDragDrop_clicked(bool checked)
+{
+    appConfig().setEnableDragDrop(checked);
+    appConfig().saveSettings();
+}
+
+void MainWindow::on_m_pCheckBoxGameMode_clicked(bool checked)
+{
+    appConfig().setGameMode(checked);
+    appConfig().saveSettings();
+}
+
 void MainWindow::showLogWindow()
 {
     m_pLogWindow->show();
+}
+
+void MainWindow::showWorkflowHub()
+{
+    if (m_pWorkflowHubDialog == NULL) {
+        m_pWorkflowHubDialog = new WorkflowHubDialog(*m_pWorkflowStore, *m_pActionBus, this);
+    }
+
+    m_pWorkflowHubDialog->show();
+    m_pWorkflowHubDialog->raise();
+    m_pWorkflowHubDialog->activateWindow();
+}
+
+void MainWindow::showCommandPalette()
+{
+    if (m_pCommandPaletteDialog == NULL) {
+        m_pCommandPaletteDialog = new CommandPaletteDialog(*m_pWorkflowStore, *m_pActionBus, this);
+        connect(m_pCommandPaletteDialog, &CommandPaletteDialog::workflowHubRequested,
+                this, &MainWindow::showWorkflowHub);
+    }
+
+    m_pCommandPaletteDialog->show();
+    m_pCommandPaletteDialog->raise();
+    m_pCommandPaletteDialog->activateWindow();
+}
+
+void MainWindow::handleWorkflowNotification(const QString& title, const QString& body)
+{
+    if (m_pTrayIcon && m_pTrayIcon->isVisible()) {
+        m_pTrayIcon->showMessage(title, body, QSystemTrayIcon::Information, 3500);
+    }
+}
+
+void MainWindow::updateWorkflowIndicators()
+{
+    if (!m_pTrayIcon || !m_pWorkflowStore) {
+        return;
+    }
+
+    m_pTrayIcon->setToolTip(QStringLiteral("Barrier\nWorkflow %1\n%2 history item(s), %3 suggestion(s)")
+        .arg(m_pWorkflowStore->runtimeModeText())
+        .arg(m_pWorkflowStore->history().size())
+        .arg(m_pWorkflowStore->suggestions().size()));
+}
+
+void MainWindow::updateWorkflowPeerHint()
+{
+    if (!m_pWorkflowStore) {
+        return;
+    }
+
+    if (barrierState() == barrierDisconnected) {
+        m_pWorkflowStore->setPeerDeviceHint(QString());
+        return;
+    }
+
+    if (barrier_type() == BarrierType::Client && !hostname().isEmpty()) {
+        m_pWorkflowStore->setPeerDeviceHint(hostname());
+        return;
+    }
+
+    if (barrier_type() == BarrierType::Server) {
+        m_pWorkflowStore->setPeerDeviceHint(tr("remote client"));
+        return;
+    }
+
+    m_pWorkflowStore->setPeerDeviceHint(QString());
 }

@@ -19,7 +19,7 @@
 #define BARRIER_LIB_NET_SECUREUTILS_H
 
 #include "FingerprintData.h"
-#include <openssl/ossl_typ.h>
+#include <openssl/x509.h>
 #include <cstdint>
 #include <string>
 #include <vector>

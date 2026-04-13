@@ -54,15 +54,21 @@
 
 #include <iostream>
 #include <stdio.h>
+#include <algorithm>
 #include <sstream>
 
-#define RETRY_TIME 1.0
+namespace {
+static const double kRetryTimeMin = 1.0;
+static const double kRetryTimeMax = 15.0;
+static const double kRetryBackoffMultiplier = 1.8;
+}
 
 ClientApp::ClientApp(IEventQueue* events, CreateTaskBarReceiverFunc createTaskBarReceiver) :
     App(events, createTaskBarReceiver, new ClientArgs()),
     m_client(NULL),
     m_clientScreen(NULL),
-    m_serverAddress(NULL)
+    m_serverAddress(NULL),
+    m_restartTimeout(kRetryTimeMin)
 {
 }
 
@@ -134,7 +140,8 @@ ClientApp::help()
            << "an IPv6 address is required when also specifying a port number and \n"
            << "optional otherwise. The default port number is " << kDefaultPort << ".\n";
 
-    LOG((CLOG_PRINT "%s", buffer.str().c_str()));
+    std::cout << buffer.str();
+    std::cout.flush();
 }
 
 const char*
@@ -193,31 +200,16 @@ ClientApp::updateStatus(const String& msg)
 void
 ClientApp::resetRestartTimeout()
 {
-    // retry time can nolonger be changed
-    //s_retryTime = 0.0;
+    m_restartTimeout = kRetryTimeMin;
 }
 
 
 double
 ClientApp::nextRestartTimeout()
 {
-    // retry at a constant rate (Issue 52)
-    return RETRY_TIME;
-
-    /*
-    // choose next restart timeout.  we start with rapid retries
-    // then slow down.
-    if (s_retryTime < 1.0) {
-    s_retryTime = 1.0;
-    }
-    else if (s_retryTime < 3.0) {
-    s_retryTime = 3.0;
-    }
-    else {
-    s_retryTime = 5.0;
-    }
-    return s_retryTime;
-    */
+    double retryTime = m_restartTimeout;
+    m_restartTimeout = (std::min)(kRetryTimeMax, m_restartTimeout * kRetryBackoffMultiplier);
+    return retryTime;
 }
 
 

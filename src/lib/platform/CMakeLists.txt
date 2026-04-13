@@ -25,6 +25,9 @@ elseif (UNIX)
     file(GLOB sources "XWindows*.cpp")
     list(APPEND sources "XWindowsClipboardURIListPNGConverter.cpp")
     list(APPEND headers "XWindowsClipboardURIListPNGConverter.h")
+endif()
+
+if (WIN32 OR UNIX)
     add_library(lodepng STATIC "${CMAKE_SOURCE_DIR}/ext/lodepng/lodepng.cpp")
 endif()
 
@@ -41,6 +44,10 @@ endif()
 include_directories(${inc})
 add_library(platform STATIC ${sources})
 target_link_libraries(platform client ${libs})
+
+if (WIN32 OR UNIX)
+    target_link_libraries(platform lodepng)
+endif()
 
 if (UNIX)
     target_link_libraries(platform lodepng io net ipc synlib client ${libs})

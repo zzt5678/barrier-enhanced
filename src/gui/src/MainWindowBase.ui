@@ -17,6 +17,35 @@
      <enum>QLayout::SetFixedSize</enum>
     </property>
     <item>
+     <widget class="QFrame" name="heroCard">
+      <property name="frameShape">
+       <enum>QFrame::StyledPanel</enum>
+      </property>
+      <property name="frameShadow">
+       <enum>QFrame::Raised</enum>
+      </property>
+      <layout class="QVBoxLayout" name="verticalLayout_hero">
+       <item>
+        <widget class="QLabel" name="m_pLabelHeroTitle">
+         <property name="text">
+          <string>Barrier Control Center</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="m_pLabelHeroSubtitle">
+         <property name="text">
+          <string>Manage client or server mode from the tray, tune connection behavior, and switch between work and play without leaving the desktop.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
      <widget class="QGroupBox" name="m_pGroupServer">
       <property name="sizePolicy">
        <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
@@ -205,6 +234,42 @@
      </widget>
     </item>
     <item>
+     <widget class="QGroupBox" name="m_pGroupExperience">
+      <property name="title">
+       <string>Experience</string>
+      </property>
+      <layout class="QVBoxLayout" name="verticalLayout_features">
+       <item>
+        <widget class="QCheckBox" name="m_pCheckBoxEnableDragDrop">
+         <property name="text">
+          <string>Enable file and image drag &amp; drop</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="m_pCheckBoxGameMode">
+         <property name="text">
+          <string>Game mode for server sessions</string>
+         </property>
+         <property name="toolTip">
+          <string>Locks the cursor to the primary screen on startup and prefers lower-latency behavior for gaming.</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="m_pLabelFeatureHint">
+         <property name="text">
+          <string>Game mode is applied when this machine runs as the server. Drag &amp; drop works on supported desktop platforms.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
      <layout class="QHBoxLayout" name="horizontalLayout_3">
       <item>
        <widget class="QLabel" name="m_pLabelFingerprint">
@@ -344,6 +409,13 @@
        </spacer>
       </item>
       <item>
+       <widget class="QPushButton" name="m_pButtonSettings">
+        <property name="text">
+         <string>Se&amp;ttings</string>
+        </property>
+       </widget>
+      </item>
+      <item>
        <widget class="QPushButton" name="m_pButtonReload">
         <property name="enabled">
          <bool>false</bool>
@@ -421,10 +493,10 @@
   </action>
   <action name="m_pActionRestore">
    <property name="text">
-    <string>&amp;Show</string>
+    <string>&amp;Open Control Center</string>
    </property>
    <property name="toolTip">
-    <string>Show</string>
+    <string>Open Control Center</string>
    </property>
    <property name="shortcut">
     <string notr="true"/>

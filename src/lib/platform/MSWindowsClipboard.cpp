@@ -28,6 +28,8 @@
 #include "base/Log.h"
 #include "ext/lodepng/lodepng.h"
 
+static std::string convertBMPToPNG(const std::string& dibData);
+
 //
 // MSWindowsClipboard
 //

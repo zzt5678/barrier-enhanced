@@ -214,6 +214,10 @@ Server::Server(
 		LOG((CLOG_NOTE "Scroll Lock is on, locking cursor to screen"));
 		m_lockedToScreen = true;
 	}
+	if (m_args.m_gameMode) {
+		m_lockedToScreen = true;
+		LOG((CLOG_NOTE "game mode enabled - cursor starts locked to the primary screen"));
+	}
 
 }
 
@@ -1131,6 +1135,15 @@ Server::sendOptions(BaseClientProxy* client) const
 		}
 	}
 
+	if (m_args.m_gameMode) {
+		optionsList.push_back(kOptionRelativeMouseMoves);
+		optionsList.push_back(1);
+		optionsList.push_back(kOptionLocalShortcutMode);
+		optionsList.push_back(1);
+		optionsList.push_back(kOptionLowLatencyMode);
+		optionsList.push_back(1);
+	}
+
 	// send the options
 	client->resetOptions();
 	client->setOptions(optionsList);
@@ -1140,64 +1153,63 @@ void
 Server::processOptions()
 {
 	const Config::ScreenOptions* options = m_config->getOptions("");
-	if (options == NULL) {
-		return;
-	}
 
 	m_switchNeedsShift = false;		// it seems if I don't add these
 	m_switchNeedsControl = false;	// lines, the 'reload config' option
 	m_switchNeedsAlt = false;		// doesn't work correct.
 
 	bool newRelativeMoves = m_relativeMoves;
-	for (Config::ScreenOptions::const_iterator index = options->begin();
-								index != options->end(); ++index) {
-		const OptionID id       = index->first;
-		const OptionValue value = index->second;
-		if (id == kOptionScreenSwitchDelay) {
-			m_switchWaitDelay = 1.0e-3 * static_cast<double>(value);
-			if (m_switchWaitDelay < 0.0) {
-				m_switchWaitDelay = 0.0;
+	if (options != NULL) {
+		for (Config::ScreenOptions::const_iterator index = options->begin();
+									index != options->end(); ++index) {
+			const OptionID id       = index->first;
+			const OptionValue value = index->second;
+			if (id == kOptionScreenSwitchDelay) {
+				m_switchWaitDelay = 1.0e-3 * static_cast<double>(value);
+				if (m_switchWaitDelay < 0.0) {
+					m_switchWaitDelay = 0.0;
+				}
+				stopSwitchWait();
 			}
-			stopSwitchWait();
-		}
-		else if (id == kOptionScreenSwitchTwoTap) {
-			m_switchTwoTapDelay = 1.0e-3 * static_cast<double>(value);
-			if (m_switchTwoTapDelay < 0.0) {
-				m_switchTwoTapDelay = 0.0;
+			else if (id == kOptionScreenSwitchTwoTap) {
+				m_switchTwoTapDelay = 1.0e-3 * static_cast<double>(value);
+				if (m_switchTwoTapDelay < 0.0) {
+					m_switchTwoTapDelay = 0.0;
+				}
+				stopSwitchTwoTap();
 			}
-			stopSwitchTwoTap();
-		}
-		else if (id == kOptionScreenSwitchNeedsControl) {
-			m_switchNeedsControl = (value != 0);
-		}
-		else if (id == kOptionScreenSwitchNeedsShift) {
-			m_switchNeedsShift = (value != 0);
-		}
-		else if (id == kOptionScreenSwitchNeedsAlt) {
-			m_switchNeedsAlt = (value != 0);
-		}
-		else if (id == kOptionRelativeMouseMoves) {
-			newRelativeMoves = (value != 0);
-		}
-		else if (id == kOptionClipboardSharing) {
-			m_enableClipboard = (value != 0);
+			else if (id == kOptionScreenSwitchNeedsControl) {
+				m_switchNeedsControl = (value != 0);
+			}
+			else if (id == kOptionScreenSwitchNeedsShift) {
+				m_switchNeedsShift = (value != 0);
+			}
+			else if (id == kOptionScreenSwitchNeedsAlt) {
+				m_switchNeedsAlt = (value != 0);
+			}
+			else if (id == kOptionRelativeMouseMoves) {
+				newRelativeMoves = (value != 0);
+			}
+			else if (id == kOptionClipboardSharing) {
+				m_enableClipboard = (value != 0);
 
-			if (m_enableClipboard == false) {
-				LOG((CLOG_NOTE "clipboard sharing is disabled"));
+				if (m_enableClipboard == false) {
+					LOG((CLOG_NOTE "clipboard sharing is disabled"));
+				}
 			}
-		}
-		else if (id == kOptionLocalShortcutMode) {
-			m_localShortcutMode = (value != 0);
+			else if (id == kOptionLocalShortcutMode) {
+				m_localShortcutMode = (value != 0);
 
-			if (m_localShortcutMode) {
-				LOG((CLOG_NOTE "local shortcut mode enabled - shortcuts will be handled locally when mouse is on primary screen"));
+				if (m_localShortcutMode) {
+					LOG((CLOG_NOTE "local shortcut mode enabled - shortcuts will be handled locally when mouse is on primary screen"));
+				}
 			}
-		}
-		else if (id == kOptionLowLatencyMode) {
-			m_lowLatencyMode = (value != 0);
+			else if (id == kOptionLowLatencyMode) {
+				m_lowLatencyMode = (value != 0);
 
-			if (m_lowLatencyMode) {
-				LOG((CLOG_NOTE "low latency mode enabled - reduced latency at cost of higher CPU usage"));
+				if (m_lowLatencyMode) {
+					LOG((CLOG_NOTE "low latency mode enabled - reduced latency at cost of higher CPU usage"));
+				}
 			}
 		}
 	}
@@ -1205,6 +1217,13 @@ Server::processOptions()
 		stopRelativeMoves();
 	}
 	m_relativeMoves = newRelativeMoves;
+
+	if (m_args.m_gameMode) {
+		m_relativeMoves = true;
+		m_localShortcutMode = true;
+		m_lowLatencyMode = true;
+		LOG((CLOG_NOTE "game mode enabled - low latency, local shortcuts, and relative mouse moves are forced on"));
+	}
 }
 
 void

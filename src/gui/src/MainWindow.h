@@ -60,6 +60,10 @@ class ZeroconfService;
 class DataDownloader;
 class CommandProcess;
 class SslCertificate;
+class ActionBus;
+class WorkflowStore;
+class WorkflowHubDialog;
+class CommandPaletteDialog;
 
 class MainWindow : public QMainWindow, public Ui::MainWindowBase
 {
@@ -132,6 +136,10 @@ public slots:
         void logError();
         void bonjourInstallFinished();
         void showLogWindow();
+        void showWorkflowHub();
+        void showCommandPalette();
+        void handleWorkflowNotification(const QString& title, const QString& body);
+        void updateWorkflowIndicators();
 
     protected:
         QSettings& settings() { return m_Settings; }
@@ -169,6 +177,9 @@ public slots:
         void proofreadInfo();
         void windowStateChanged();
         void updateSSLFingerprint();
+        void refreshControlState();
+        void showControlCenter();
+        void updateWorkflowPeerHint();
 
     private:
         QSettings& m_Settings;
@@ -198,6 +209,12 @@ public slots:
         SslCertificate* m_pSslCertificate;
         QStringList m_PendingClientNames;
         LogWindow *m_pLogWindow;
+        WorkflowStore* m_pWorkflowStore;
+        ActionBus* m_pActionBus;
+        WorkflowHubDialog* m_pWorkflowHubDialog;
+        CommandPaletteDialog* m_pCommandPaletteDialog;
+        QAction* m_pActionWorkflowHub;
+        QAction* m_pActionCommandPalette;
 
         bool m_fingerprint_expanded = false;
 
@@ -206,6 +223,8 @@ private slots:
     void on_m_pComboServerList_currentIndexChanged(QString );
     void on_m_pButtonReload_clicked();
     void installBonjour();
+    void on_m_pCheckBoxEnableDragDrop_clicked(bool checked);
+    void on_m_pCheckBoxGameMode_clicked(bool checked);
 
 };
 

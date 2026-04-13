@@ -405,7 +405,10 @@ static int cert_verify_fingerprint_callback(X509_STORE_CTX* ctx, void*)
     }
 
     // Check if the fingerprint matches any trusted fingerprint
-    barrier::FingerprintData peer_fingerprint(hash, hash + hash_len);
+    barrier::FingerprintData peer_fingerprint;
+    peer_fingerprint.algorithm =
+        barrier::fingerprint_type_to_string(barrier::FingerprintType::SHA256);
+    peer_fingerprint.data.assign(hash, hash + hash_len);
     for (const auto& fp : db.fingerprints()) {
         if (peer_fingerprint == fp) {
             return 1;  // Trusted

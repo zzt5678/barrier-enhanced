@@ -280,6 +280,9 @@ ArgParser::parseGenericArgs(int argc, const char* const* argv, int& i)
             argsBase().m_enableDragDrop = true;
         }
     }
+    else if (isArg(i, argc, argv, NULL, "--game-mode")) {
+        argsBase().m_gameMode = true;
+    }
     else if (isArg(i, argc, argv, NULL, "--drop-dir")) {
         argsBase().m_dropTarget = argv[++i];
     }
