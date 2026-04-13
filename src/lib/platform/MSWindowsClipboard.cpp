@@ -28,8 +28,164 @@
 #include "base/Log.h"
 #include "ext/lodepng/lodepng.h"
 
+#include <objidl.h>
+#include <gdiplus.h>
+#include <shellapi.h>
+#include <cwctype>
+
+#pragma comment(lib, "gdiplus.lib")
+
 static std::string convertBMPToPNG(const std::string& dibData);
 static std::string convertPNGToDIB(const std::string& pngData);
+static std::string convertHDropToPNG(HANDLE dropHandle);
+
+namespace {
+
+ULONG_PTR ensureGdiplusToken()
+{
+    static ULONG_PTR token = 0;
+    static bool initialized = false;
+
+    if (!initialized) {
+        Gdiplus::GdiplusStartupInput startupInput;
+        if (Gdiplus::GdiplusStartup(&token, &startupInput, NULL) != Gdiplus::Ok) {
+            token = 0;
+        }
+        initialized = true;
+    }
+
+    return token;
+}
+
+std::wstring toLowerCopy(std::wstring value)
+{
+    for (size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<wchar_t>(std::towlower(value[i]));
+    }
+    return value;
+}
+
+std::string utf8FromWide(const std::wstring& value)
+{
+    if (value.empty()) {
+        return {};
+    }
+
+    const int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, NULL, 0, NULL, NULL);
+    if (size <= 1) {
+        return {};
+    }
+
+    std::string result(static_cast<size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, &result[0], size, NULL, NULL);
+    return result;
+}
+
+bool isSupportedImagePath(const std::wstring& path)
+{
+    const std::wstring lower = toLowerCopy(path);
+    return lower.size() >= 4 && (
+        lower.rfind(L".png") == lower.size() - 4 ||
+        lower.rfind(L".jpg") == lower.size() - 4 ||
+        lower.rfind(L".bmp") == lower.size() - 4 ||
+        lower.rfind(L".gif") == lower.size() - 4 ||
+        lower.rfind(L".tif") == lower.size() - 4 ||
+        lower.rfind(L".webp") == lower.size() - 5 ||
+        lower.rfind(L".jpeg") == lower.size() - 5 ||
+        lower.rfind(L".tiff") == lower.size() - 5
+    );
+}
+
+bool dropListContainsSupportedImage(HANDLE dropHandle)
+{
+    if (dropHandle == NULL) {
+        return false;
+    }
+
+    const HDROP drop = static_cast<HDROP>(dropHandle);
+    const UINT fileCount = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+    for (UINT i = 0; i < fileCount; ++i) {
+        const UINT length = DragQueryFileW(drop, i, NULL, 0);
+        if (length == 0) {
+            continue;
+        }
+
+        std::wstring path;
+        path.resize(length);
+        if (DragQueryFileW(drop, i, &path[0], length + 1) == 0) {
+            continue;
+        }
+
+        if (isSupportedImagePath(path)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::string convertImageFileToPNG(const std::wstring& path)
+{
+    if (ensureGdiplusToken() == 0) {
+        LOG((CLOG_WARN "GDI+ initialization failed, cannot convert image file clipboard payload"));
+        return {};
+    }
+
+    Gdiplus::Bitmap source(path.c_str());
+    if (source.GetLastStatus() != Gdiplus::Ok) {
+        LOG((CLOG_WARN "failed to load image file from clipboard path: %s", utf8FromWide(path).c_str()));
+        return {};
+    }
+
+    const UINT width = source.GetWidth();
+    const UINT height = source.GetHeight();
+    if (width == 0 || height == 0) {
+        return {};
+    }
+
+    Gdiplus::Bitmap converted(width, height, PixelFormat32bppARGB);
+    Gdiplus::Graphics graphics(&converted);
+    if (graphics.DrawImage(&source, 0, 0, width, height) != Gdiplus::Ok) {
+        LOG((CLOG_WARN "failed to normalize image file to 32-bit ARGB: %s", utf8FromWide(path).c_str()));
+        return {};
+    }
+
+    Gdiplus::Rect rect(0, 0, width, height);
+    Gdiplus::BitmapData bitmapData;
+    if (converted.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bitmapData) != Gdiplus::Ok) {
+        LOG((CLOG_WARN "failed to lock normalized image pixels: %s", utf8FromWide(path).c_str()));
+        return {};
+    }
+
+    std::vector<unsigned char> rgba;
+    rgba.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+    for (UINT y = 0; y < height; ++y) {
+        const unsigned char* srcRow = static_cast<const unsigned char*>(bitmapData.Scan0) + y * bitmapData.Stride;
+        unsigned char* dstRow = &rgba[static_cast<size_t>(y) * width * 4];
+        for (UINT x = 0; x < width; ++x) {
+            const unsigned char* srcPixel = srcRow + x * 4;
+            unsigned char* dstPixel = dstRow + x * 4;
+            dstPixel[0] = srcPixel[2];
+            dstPixel[1] = srcPixel[1];
+            dstPixel[2] = srcPixel[0];
+            dstPixel[3] = srcPixel[3];
+        }
+    }
+
+    converted.UnlockBits(&bitmapData);
+
+    std::vector<unsigned char> png;
+    unsigned error = lodepng::encode(png, rgba, width, height, LCT_RGBA);
+    if (error != 0) {
+        LOG((CLOG_WARN "failed to encode image file clipboard payload to PNG: %s", lodepng_error_text(error)));
+        return {};
+    }
+
+    LOG((CLOG_INFO "converted clipboard image file to PNG payload: %s", utf8FromWide(path).c_str()));
+    return std::string(reinterpret_cast<const char*>(png.data()), png.size());
+}
+
+} // namespace
 
 //
 // MSWindowsClipboard
@@ -171,6 +327,14 @@ MSWindowsClipboard::getTime() const
 bool
 MSWindowsClipboard::has(EFormat format) const
 {
+    if (format == IClipboard::kText && IsClipboardFormatAvailable(CF_HDROP)) {
+        HANDLE dropData = GetClipboardData(CF_HDROP);
+        if (dropListContainsSupportedImage(dropData)) {
+            LOG((CLOG_DEBUG "suppressing text clipboard format because CF_HDROP contains image files"));
+            return false;
+        }
+    }
+
     // Special handling for PNG format: check for PNG first, then fallback to BMP
     if (format == IClipboard::kPNG) {
         // Check if PNG format is available
@@ -181,6 +345,12 @@ MSWindowsClipboard::has(EFormat format) const
         // Fallback: check if BMP is available (most apps provide BMP instead of PNG)
         if (IsClipboardFormatAvailable(CF_DIB)) {
             return true;
+        }
+        if (IsClipboardFormatAvailable(CF_HDROP)) {
+            HANDLE dropData = GetClipboardData(CF_HDROP);
+            if (dropListContainsSupportedImage(dropData)) {
+                return true;
+            }
         }
         return false;
     }
@@ -237,6 +407,14 @@ std::string MSWindowsClipboard::get(EFormat format) const
 
                 LOG((CLOG_DEBUG "Converting BMP (%u bytes) to PNG", bmpSize));
                 return convertBMPToPNG(dibData);
+            }
+        }
+
+        HANDLE dropData = GetClipboardData(CF_HDROP);
+        if (dropData != NULL) {
+            std::string filePng = convertHDropToPNG(dropData);
+            if (!filePng.empty()) {
+                return filePng;
             }
         }
 
@@ -451,4 +629,35 @@ static std::string convertPNGToDIB(const std::string& pngData)
     }
 
     return dibData;
+}
+
+static std::string convertHDropToPNG(HANDLE dropHandle)
+{
+    const HDROP drop = static_cast<HDROP>(dropHandle);
+    const UINT fileCount = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+    if (fileCount == 0) {
+        return {};
+    }
+
+    for (UINT index = 0; index < fileCount; ++index) {
+        const UINT pathLength = DragQueryFileW(drop, index, NULL, 0);
+        if (pathLength == 0) {
+            continue;
+        }
+
+        std::wstring path(pathLength + 1, L'\0');
+        const UINT copied = DragQueryFileW(drop, index, &path[0], pathLength + 1);
+        path.resize(copied);
+
+        if (!isSupportedImagePath(path)) {
+            continue;
+        }
+
+        std::string png = convertImageFileToPNG(path);
+        if (!png.empty()) {
+            return png;
+        }
+    }
+
+    return {};
 }

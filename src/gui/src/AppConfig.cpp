@@ -134,12 +134,7 @@ void AppConfig::persistLogDir()
 
 const QString AppConfig::logFilenameCmd() const
 {
-    QString filename = m_LogFilename;
-#if defined(Q_OS_WIN)
-    // wrap in quotes in case username contains spaces.
-    filename = QString("\"%1\"").arg(filename);
-#endif
-    return filename;
+    return m_LogFilename;
 }
 
 QString AppConfig::logLevelText() const

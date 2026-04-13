@@ -34,7 +34,82 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <X11/Xatom.h>
+
+namespace {
+
+bool shouldStoreConvertedClipboardData(IClipboard::EFormat format,
+                                       const std::string& converted,
+                                       const std::string& raw)
+{
+    switch (format) {
+    case IClipboard::kPNG:
+    case IClipboard::kBitmap:
+    case IClipboard::kHTML:
+        return !converted.empty();
+
+    case IClipboard::kText:
+    default:
+        return !converted.empty() || raw.empty();
+    }
+}
+
+std::string trimClipboardText(std::string text)
+{
+    size_t start = 0;
+    while (start < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[start])) != 0) {
+        ++start;
+    }
+
+    size_t end = text.size();
+    while (end > start &&
+           std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
+        --end;
+    }
+
+    return text.substr(start, end - start);
+}
+
+bool looksLikeImagePathOrUri(const std::string& text)
+{
+    std::string value = trimClipboardText(text);
+    if (value.empty()) {
+        return false;
+    }
+
+    const char* extensions[] = {
+        ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"
+    };
+
+    std::string lower = value;
+    for (size_t i = 0; i < lower.size(); ++i) {
+        lower[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(lower[i])));
+    }
+
+    for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); ++i) {
+        const std::string extension = extensions[i];
+        if (lower.size() >= extension.size() &&
+            lower.compare(lower.size() - extension.size(), extension.size(), extension) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void suppressImagePathTextFallback(bool* added, std::string* data)
+{
+    if (added[IClipboard::kPNG] && added[IClipboard::kText] &&
+        looksLikeImagePathOrUri(data[IClipboard::kText])) {
+        LOG((CLOG_DEBUG "suppressing text clipboard path because PNG payload is available"));
+        added[IClipboard::kText] = false;
+        data[IClipboard::kText].clear();
+    }
+}
+
+} // namespace
 
 //
 // XWindowsClipboard
@@ -569,12 +644,20 @@ XWindowsClipboard::icccmFillCache()
             continue;
         }
 
-        // add to clipboard and note we've done it
         IClipboard::EFormat format = converter->getFormat();
-        m_data[format]  = converter->toIClipboard(targetData);
+        std::string convertedData = converter->toIClipboard(targetData);
+        if (!shouldStoreConvertedClipboardData(format, convertedData, targetData)) {
+            LOG((CLOG_DEBUG1 "skipping empty conversion for target %s", XWindowsUtil::atomToString(m_display, target).c_str()));
+            continue;
+        }
+
+        // add to clipboard and note we've done it
+        m_data[format]  = convertedData;
         m_added[format] = true;
         LOG((CLOG_DEBUG "added format %d for target %s (%u %s)", format, XWindowsUtil::atomToString(m_display, target).c_str(), targetData.size(), targetData.size() == 1 ? "byte" : "bytes"));
     }
+
+    suppressImagePathTextFallback(m_added, m_data);
 }
 
 bool
@@ -809,12 +892,20 @@ XWindowsClipboard::motifFillCache()
             continue;
         }
 
-        // add to clipboard and note we've done it
         IClipboard::EFormat format = converter->getFormat();
-        m_data[format]  = converter->toIClipboard(targetData);
+        std::string convertedData = converter->toIClipboard(targetData);
+        if (!shouldStoreConvertedClipboardData(format, convertedData, targetData)) {
+            LOG((CLOG_DEBUG1 "skipping empty conversion for target %s", XWindowsUtil::atomToString(m_display, target).c_str()));
+            continue;
+        }
+
+        // add to clipboard and note we've done it
+        m_data[format]  = convertedData;
         m_added[format] = true;
         LOG((CLOG_DEBUG "added format %d for target %s", format, XWindowsUtil::atomToString(m_display, target).c_str()));
     }
+
+    suppressImagePathTextFallback(m_added, m_data);
 }
 
 bool
