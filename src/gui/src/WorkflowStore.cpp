@@ -17,6 +17,7 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QThread>
 #include <QUrl>
 #include <QUuid>
 
@@ -51,6 +52,28 @@ bool writeImageFile(const QString& filePath, const QImage& image)
     return image.save(filePath, "PNG");
 }
 
+QString validatedInboxDir(const QString& configuredPath, const QString& storageRoot)
+{
+    QString candidate = configuredPath.trimmed();
+    if (candidate.isEmpty()) {
+        return QDir(storageRoot).filePath(QStringLiteral("inbox"));
+    }
+
+    candidate = QDir::cleanPath(candidate);
+    const QFileInfo info(candidate);
+    if (!info.isAbsolute() || candidate.contains(QStringLiteral(".."))) {
+        return QDir(storageRoot).filePath(QStringLiteral("inbox"));
+    }
+
+    return candidate;
+}
+
+void assertWorkflowThread(const QObject* object)
+{
+    Q_ASSERT(object != nullptr);
+    Q_ASSERT(object->thread() == QThread::currentThread());
+}
+
 } // namespace
 
 WorkflowStore::WorkflowStore(AppConfig& appConfig, QObject* parent) :
@@ -70,7 +93,7 @@ WorkflowStore::WorkflowStore(AppConfig& appConfig, QObject* parent) :
     m_storageRoot = QDir(m_storageRoot).filePath(QStringLiteral("workflow"));
     m_payloadDir = QDir(m_storageRoot).filePath(QStringLiteral("payload"));
     m_previewDir = QDir(m_storageRoot).filePath(QStringLiteral("preview"));
-    m_inboxDir = appConfig.workflowInboxDir();
+    m_inboxDir = validatedInboxDir(appConfig.workflowInboxDir(), m_storageRoot);
 
     QDir().mkpath(m_storageRoot);
     QDir().mkpath(m_payloadDir);
@@ -85,6 +108,8 @@ WorkflowStore::WorkflowStore(AppConfig& appConfig, QObject* parent) :
 
 void WorkflowStore::attachClipboard(QClipboard* clipboard)
 {
+    assertWorkflowThread(this);
+
     if (m_clipboard == clipboard) {
         return;
     }
@@ -101,11 +126,14 @@ void WorkflowStore::attachClipboard(QClipboard* clipboard)
 
 void WorkflowStore::setPeerDeviceHint(const QString& peerDevice)
 {
+    assertWorkflowThread(this);
     m_peerDeviceHint = peerDevice.trimmed();
 }
 
 void WorkflowStore::setInteractiveSessionOpen(bool open)
 {
+    assertWorkflowThread(this);
+
     if (open) {
         ++m_interactiveSessionDepth;
         markActivity(WorkflowRuntimeMode::Active);
@@ -206,6 +234,8 @@ void WorkflowStore::recordReceipt(const QString& contextId,
                                   const QString& status,
                                   const QString& detail)
 {
+    assertWorkflowThread(this);
+
     TransferReceipt receipt;
     receipt.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     receipt.contextId = contextId;
@@ -224,6 +254,8 @@ void WorkflowStore::recordReceipt(const QString& contextId,
 
 void WorkflowStore::recordLogLine(const QString& line)
 {
+    assertWorkflowThread(this);
+
     static const QRegularExpression droppedFileExpr(
         QStringLiteral("dropped file \"([^\"]+)\" in \"([^\"]+)\""));
     static const QRegularExpression transferFailedExpr(
@@ -265,6 +297,8 @@ void WorkflowStore::recordLogLine(const QString& line)
 
 bool WorkflowStore::addCapturedImageContext(const QImage& image, QString* contextId)
 {
+    assertWorkflowThread(this);
+
     if (image.isNull()) {
         return false;
     }
@@ -291,6 +325,8 @@ bool WorkflowStore::addCapturedImageContext(const QImage& image, QString* contex
 
 void WorkflowStore::handleClipboardChanged()
 {
+    assertWorkflowThread(this);
+
     if (!m_appConfig->getWorkflowEnabled() || m_ignoreClipboardChanges || m_clipboard == nullptr) {
         return;
     }
@@ -300,6 +336,8 @@ void WorkflowStore::handleClipboardChanged()
 
 void WorkflowStore::evaluateRuntimeMode()
 {
+    assertWorkflowThread(this);
+
     const QDateTime now = QDateTime::currentDateTimeUtc();
     const qint64 idleSeconds = m_lastActivity.secsTo(now);
 
