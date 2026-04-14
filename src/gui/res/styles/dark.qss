@@ -41,6 +41,14 @@ QLabel#m_pLabelHeroTitle {
     letter-spacing: 0.3px;
 }
 
+QLabel#m_pLabelWindowBrand {
+    color: #111113;
+    font-size: 24px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    padding: 2px 0 6px 0;
+}
+
 QLabel#m_pLabelHeroSubtitle {
     color: #6e6e73;
     font-size: 10.5pt;
