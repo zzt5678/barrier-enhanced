@@ -31,17 +31,7 @@
     <property name="verticalSpacing">
      <number>16</number>
     </property>
-    <item row="0" column="0" colspan="2">
-     <widget class="QLabel" name="m_pLabelWindowBrand">
-      <property name="text">
-       <string>Weave</string>
-      </property>
-      <property name="alignment">
-       <set>Qt::AlignCenter</set>
-      </property>
-     </widget>
-    </item>
-    <item row="1" column="0">
+    <item row="0" column="0">
      <widget class="QFrame" name="heroCard">
       <property name="frameShape">
        <enum>QFrame::StyledPanel</enum>
@@ -59,7 +49,7 @@
           <set>Qt::AlignCenter</set>
          </property>
          <property name="text">
-          <string>Weave Control Center</string>
+          <string>Control Center</string>
          </property>
         </widget>
        </item>
@@ -79,7 +69,7 @@
       </layout>
      </widget>
     </item>
-    <item row="1" column="1">
+    <item row="0" column="1">
      <widget class="QFrame" name="overviewCard">
       <property name="frameShape">
        <enum>QFrame::StyledPanel</enum>
@@ -164,7 +154,7 @@
       </layout>
      </widget>
     </item>
-    <item row="2" column="0">
+    <item row="1" column="0">
      <widget class="QGroupBox" name="m_pGroupServer">
       <property name="sizePolicy">
        <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
@@ -303,7 +293,7 @@
       </layout>
      </widget>
     </item>
-    <item row="2" column="1">
+    <item row="1" column="1">
      <widget class="QGroupBox" name="m_pGroupClient">
       <property name="sizePolicy">
        <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
@@ -400,7 +390,7 @@
       </layout>
      </widget>
     </item>
-    <item row="3" column="0">
+    <item row="2" column="0">
      <widget class="QGroupBox" name="m_pGroupExperience">
       <property name="title">
        <string>Experience</string>
@@ -439,7 +429,7 @@
       </layout>
      </widget>
     </item>
-    <item row="3" column="1">
+    <item row="2" column="1">
      <widget class="QFrame" name="workflowCard">
       <property name="frameShape">
        <enum>QFrame::StyledPanel</enum>
@@ -487,7 +477,7 @@
       </layout>
      </widget>
     </item>
-    <item row="4" column="0" colspan="2">
+    <item row="3" column="0" colspan="2">
      <widget class="QFrame" name="footerCard">
       <property name="frameShape">
        <enum>QFrame::StyledPanel</enum>

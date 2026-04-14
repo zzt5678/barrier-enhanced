@@ -36,17 +36,9 @@ QFrame#heroCard {
 
 QLabel#m_pLabelHeroTitle {
     color: #111113;
-    font-size: 34px;
+    font-size: 22px;
     font-weight: 700;
-    letter-spacing: 0.3px;
-}
-
-QLabel#m_pLabelWindowBrand {
-    color: #111113;
-    font-size: 24px;
-    font-weight: 700;
-    letter-spacing: 0.4px;
-    padding: 2px 0 6px 0;
+    letter-spacing: 0.2px;
 }
 
 QLabel#m_pLabelHeroSubtitle {

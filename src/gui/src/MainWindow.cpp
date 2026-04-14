@@ -79,19 +79,19 @@ static const QString barrierConfigSaveFilter(barrierConfigFilter);
 static const char* barrierIconFiles[] =
 {
 #if defined(Q_OS_MAC)
-    ":/res/icons/32x32/barrier-disconnected-mask.png",
-    ":/res/icons/32x32/barrier-disconnected-mask.png",
-    ":/res/icons/32x32/barrier-connected-mask.png",
-    ":/res/icons/32x32/barrier-transfering-mask.png"
+    ":/res/icons/32x32/weave-disconnected-mask.png",
+    ":/res/icons/32x32/weave-disconnected-mask.png",
+    ":/res/icons/32x32/weave-connected-mask.png",
+    ":/res/icons/32x32/weave-transfering-mask.png"
 #else
-    ":/res/icons/16x16/barrier-disconnected.png",
-    ":/res/icons/16x16/barrier-disconnected.png",
-    ":/res/icons/16x16/barrier-connected.png",
-    ":/res/icons/16x16/barrier-transfering.png"
+    ":/res/icons/16x16/weave-disconnected.png",
+    ":/res/icons/16x16/weave-disconnected.png",
+    ":/res/icons/16x16/weave-connected.png",
+    ":/res/icons/16x16/weave-transfering.png"
 #endif
 };
 
-static const char* barrierLargeIcon = ":/res/icons/256x256/barrier.ico";
+static const char* barrierLargeIcon = ":/res/icons/256x256/weave.png";
 
 MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_Settings(settings),
