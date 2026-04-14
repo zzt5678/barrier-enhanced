@@ -28,6 +28,8 @@
 #include "base/EventTypes.h"
 #include "mt/CondVar.h"
 
+#include <memory>
+
 class EventQueueTimer;
 namespace barrier { class Screen; }
 class ServerProxy;
@@ -37,6 +39,7 @@ namespace barrier { class IStream; }
 class IEventQueue;
 class Thread;
 class TCPSocket;
+class StreamChunker;
 
 //! Barrier client
 /*!
@@ -89,7 +92,7 @@ public:
     void dragInfoReceived(UInt32 fileNum, std::string data);
 
     //! Create a new thread and use it to send file to Server
-    void                sendFileToServer(const char* filename);
+    void                sendFileToServer(const std::string& filename);
 
     //! Send dragging file information back to server
     void sendDragInfo(UInt32 fileCount, std::string& info, size_t size);
@@ -167,7 +170,7 @@ private:
     void                sendEvent(Event::Type, void*);
     void                sendConnectionFailedEvent(const char* msg);
     void                sendFileChunk(const void* data);
-    void send_file_thread(const char* filename);
+    void                send_file_thread(const std::string& filename, const std::shared_ptr<StreamChunker>& chunker);
     void write_to_drop_dir_thread();
     void                setupConnecting();
     void                setupConnection();
@@ -219,6 +222,7 @@ private:
     DragFileList        m_dragFileList;
     std::string m_dragFileExt;
     Thread*                m_sendFileThread;
+    std::shared_ptr<StreamChunker> m_sendFileChunker;
     Thread*                m_writeToDropDirThread;
     TCPSocket*            m_socket;
     bool                m_useSecureNetwork;

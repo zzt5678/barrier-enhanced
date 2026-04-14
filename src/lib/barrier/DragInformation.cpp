@@ -26,7 +26,8 @@ using namespace std;
 
 DragInformation::DragInformation() :
     m_filename(),
-    m_filesize(0)
+    m_filesize(0),
+    m_entryType(File)
 {
 }
 
@@ -60,7 +61,7 @@ DragInformation::parseDragInfo(DragFileList& dragFileList, UInt32 fileNum, Strin
             di.setFilename(filename);
             dragFileList.push_back(di);
         }
-        startPos = findResult2 + 1;
+        startPos = findResult1 + 1;
 
         //set filesize
         findResult2 = data.find(',', startPos);
@@ -70,7 +71,15 @@ DragInformation::parseDragInfo(DragFileList& dragFileList, UInt32 fileNum, Strin
             size_t size = stringToNum(filesize);
             dragFileList.at(index).setFilesize(size);
         }
-        startPos = findResult1 + 1;
+
+        startPos = findResult2 + 1;
+        size_t findResult3 = data.find(',', startPos);
+        if (findResult3 != String::npos && findResult3 > startPos) {
+            const String typeToken = data.substr(startPos, findResult3 - startPos);
+            dragFileList.at(index).setEntryType(
+                typeToken == "D" ? Directory : File);
+            startPos = findResult3 + 1;
+        }
 
         ++index;
     }
@@ -105,8 +114,12 @@ DragInformation::setupDragInfo(DragFileList& fileList, String& output)
     for (int i = 0; i < size; ++i) {
         output.append(fileList.at(i).getFilename());
         output.append(",");
-        String filesize = getFileSize(fileList.at(i).getFilename());
+        String filesize = fileList.at(i).isDirectory()
+            ? String("0")
+            : getFileSize(fileList.at(i).getFilename());
         output.append(filesize);
+        output.append(",");
+        output.push_back(static_cast<char>(fileList.at(i).getEntryType()));
         output.append(",");
     }
     return size;

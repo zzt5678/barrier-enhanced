@@ -24,13 +24,13 @@
 #include <QStandardPaths>
 
 #if defined(Q_OS_WIN)
-const char AppConfig::m_BarriersName[] = "barriers.exe";
-const char AppConfig::m_BarriercName[] = "barrierc.exe";
+const char AppConfig::m_BarriersName[] = "weaves.exe";
+const char AppConfig::m_BarriercName[] = "weavec.exe";
 const char AppConfig::m_BarrierLogDir[] = "log/";
 #define DEFAULT_PROCESS_MODE Desktop
 #else
-const char AppConfig::m_BarriersName[] = "barriers";
-const char AppConfig::m_BarriercName[] = "barrierc";
+const char AppConfig::m_BarriersName[] = "weaves";
+const char AppConfig::m_BarriercName[] = "weavec";
 const char AppConfig::m_BarrierLogDir[] = "/var/log/";
 #define DEFAULT_PROCESS_MODE Desktop
 #endif
@@ -161,7 +161,7 @@ void AppConfig::loadSettings()
     m_Interface = settings().value("interface").toString();
     m_LogLevel = settings().value("logLevel", 3).toInt(); // level 3: INFO
     m_LogToFile = settings().value("logToFile", false).toBool();
-    m_LogFilename = settings().value("logFilename", barrierLogDir() + "barrier.log").toString();
+    m_LogFilename = settings().value("logFilename", barrierLogDir() + "weave.log").toString();
     m_WizardLastRun = settings().value("wizardLastRun", 0).toInt();
     m_Language = settings().value("language", QLocale::system().name()).toString();
     m_StartedBefore = settings().value("startedBefore", false).toBool();

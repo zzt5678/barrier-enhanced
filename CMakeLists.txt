@@ -16,7 +16,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 cmake_minimum_required (VERSION 3.16)
-project (barrier C CXX)
+project (weave C CXX)
 
 option (BARRIER_BUILD_GUI "Build the GUI" ON)
 option (BARRIER_BUILD_INSTALLER "Build the installer" ON)
@@ -423,12 +423,12 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     set (CMAKE_INSTALL_RPATH "@loader_path/../Libraries;@loader_path/../Frameworks")
     set (BARRIER_BUNDLE_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dist/macos/bundle)
     set (BARRIER_BUNDLE_DIR ${CMAKE_BINARY_DIR}/bundle)
-    set (BARRIER_BUNDLE_APP_DIR ${BARRIER_BUNDLE_DIR}/Barrier.app)
+    set (BARRIER_BUNDLE_APP_DIR ${BARRIER_BUNDLE_DIR}/Weave.app)
     set (BARRIER_BUNDLE_BINARY_DIR ${BARRIER_BUNDLE_APP_DIR}/Contents/MacOS)
 
     configure_files (${BARRIER_BUNDLE_SOURCE_DIR} ${BARRIER_BUNDLE_DIR})
 
-    add_custom_target(Barrier_MacOS ALL
+    add_custom_target(Weave_MacOS ALL
                       bash build_dist.sh
                       DEPENDS barrier barriers barrierc
                       WORKING_DIRECTORY ${BARRIER_BUNDLE_DIR})
@@ -450,12 +450,8 @@ endif()
 #
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     configure_files (${CMAKE_CURRENT_SOURCE_DIR}/dist/rpm ${CMAKE_BINARY_DIR}/rpm)
-    install(FILES res/barrier.svg DESTINATION share/icons/hicolor/scalable/apps)
-    if("${VERSION_MAJOR}" STREQUAL "2")
-        install(FILES res/barrier2.desktop DESTINATION share/applications)
-    else()
-        install(FILES res/barrier.desktop DESTINATION share/applications)
-    endif()
+    install(FILES res/barrier.svg DESTINATION share/icons/hicolor/scalable/apps RENAME weave.svg)
+    install(FILES res/barrier.desktop DESTINATION share/applications RENAME weave.desktop)
 endif()
 
 else()

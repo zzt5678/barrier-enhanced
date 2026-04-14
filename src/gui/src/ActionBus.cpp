@@ -22,7 +22,7 @@ QString sanitizePathSegment(QString text)
 {
     text = text.simplified();
     if (text.isEmpty()) {
-        text = QStringLiteral("barrier-item");
+        text = QStringLiteral("weave-item");
     }
 
     text.replace(QRegularExpression(QStringLiteral("[\\\\/:*?\"<>|]")), QStringLiteral("_"));
@@ -194,7 +194,7 @@ bool ActionBus::execute(const QString& actionId,
 
     if (success) {
         if (actionId == QStringLiteral("show_notification")) {
-            emit notificationRequested(QStringLiteral("Barrier Workflow"), detail);
+            emit notificationRequested(QStringLiteral("Weave Workflow"), detail);
         }
 
         m_store->recordReceipt(createdContextId,
@@ -223,8 +223,8 @@ bool ActionBus::executeQuickCommand(const QString& commandId,
     const QString latestContextId = history.isEmpty() ? QString() : history.first().id;
 
     if (commandId == QStringLiteral("open_workflow_hub")) {
-        emit notificationRequested(QStringLiteral("Barrier Workflow"),
-                                   QStringLiteral("Open the Workflow Hub from the tray or the Barrier menu."));
+        emit notificationRequested(QStringLiteral("Weave Workflow"),
+                                   QStringLiteral("Open the Workflow Hub from the tray or the Weave menu."));
         return true;
     }
 

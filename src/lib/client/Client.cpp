@@ -27,6 +27,7 @@
 #include "barrier/protocol_types.h"
 #include "barrier/XBarrier.h"
 #include "barrier/StreamChunker.h"
+#include "barrier/TransferArchive.h"
 #include "barrier/IPlatformScreen.h"
 #include "mt/Thread.h"
 #include "net/TCPSocket.h"
@@ -40,9 +41,20 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <fstream>
+
+namespace {
+
+bool prepareTransferSource(const char* filename,
+                           barrier::fs::path& sourcePath,
+                           barrier::fs::path& tempPackagePath,
+                           std::string& error);
+
+}
 
 //
 // Client
@@ -247,8 +259,8 @@ Client::enter(SInt32 xAbs, SInt32 yAbs, UInt32, KeyModifierMask mask, bool)
     m_screen->enter(mask);
     m_screen->mouseMove(xAbs, yAbs);
 
-    if (m_sendFileThread != NULL) {
-        StreamChunker::interruptFile();
+    if (m_sendFileChunker) {
+        m_sendFileChunker->interruptFile();
         m_sendFileThread = NULL;
     }
 }
@@ -802,24 +814,41 @@ Client::isReceivedFileSizeValid()
 }
 
 void
-Client::sendFileToServer(const char* filename)
+Client::sendFileToServer(const std::string& filename)
 {
-    if (m_sendFileThread != NULL) {
-        StreamChunker::interruptFile();
+    if (m_sendFileChunker) {
+        m_sendFileChunker->interruptFile();
     }
 
-    m_sendFileThread = new Thread([this, filename]() { send_file_thread(filename); });
+    auto chunker = std::make_shared<StreamChunker>();
+    m_sendFileChunker = chunker;
+    m_sendFileThread = new Thread([this, filename, chunker]() { send_file_thread(filename, chunker); });
 }
 
-void Client::send_file_thread(const char* filename)
+void Client::send_file_thread(const std::string& filename, const std::shared_ptr<StreamChunker>& chunker)
 {
+    barrier::fs::path sourcePath;
+    barrier::fs::path tempPackagePath;
     try {
-        StreamChunker::sendFile(filename, m_events, this, m_stream);
+        std::string error;
+        if (!prepareTransferSource(filename.c_str(), sourcePath, tempPackagePath, error)) {
+            throw std::runtime_error(error);
+        }
+
+        const barrier::fs::path& transferPath =
+            tempPackagePath.empty() ? sourcePath : tempPackagePath;
+        chunker->sendFile(transferPath.u8string().c_str(), m_events, this, m_stream);
     }
     catch (std::runtime_error& error) {
         LOG((CLOG_ERR "failed sending file chunks: %s", error.what()));
     }
 
+    if (!tempPackagePath.empty()) {
+        barrier::fs::remove(tempPackagePath);
+    }
+    if (m_sendFileChunker == chunker) {
+        m_sendFileChunker.reset();
+    }
     m_sendFileThread = NULL;
 }
 
@@ -827,4 +856,52 @@ void
 Client::sendDragInfo(UInt32 fileCount, std::string& info, size_t size)
 {
     m_server->sendDragInfo(fileCount, info.c_str(), size);
+}
+namespace {
+
+bool prepareTransferSource(const char* filename,
+                           barrier::fs::path& sourcePath,
+                           barrier::fs::path& tempPackagePath,
+                           std::string& error)
+{
+    sourcePath.clear();
+    tempPackagePath.clear();
+    error.clear();
+
+    std::vector<barrier::fs::path> sourcePaths;
+    std::istringstream input(filename);
+    std::string entry;
+    while (std::getline(input, entry)) {
+        if (!entry.empty()) {
+            sourcePaths.push_back(barrier::fs::u8path(entry));
+        }
+    }
+    if (sourcePaths.empty()) {
+        sourcePaths.push_back(barrier::fs::u8path(filename));
+    }
+
+    for (const auto& path : sourcePaths) {
+        if (!barrier::fs::exists(path)) {
+            error = "transfer source does not exist";
+            return false;
+        }
+    }
+
+    if (sourcePaths.size() > 1) {
+        return TransferArchive::createSelectionPackageFile(sourcePaths, tempPackagePath, error);
+    }
+
+    sourcePath = sourcePaths.front();
+    if (!barrier::fs::exists(sourcePath)) {
+        error = "transfer source does not exist";
+        return false;
+    }
+
+    if (barrier::fs::is_directory(sourcePath)) {
+        return TransferArchive::createSelectionPackageFile(sourcePaths, tempPackagePath, error);
+    }
+
+    return true;
+}
+
 }

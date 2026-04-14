@@ -42,6 +42,7 @@ endif()
 add_executable(barrierc ${sources})
 target_link_libraries(barrierc
     arch base client common io mt net ipc platform server synlib ${libs} ${OPENSSL_LIBS})
+set_target_properties(barrierc PROPERTIES OUTPUT_NAME weavec)
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     install (TARGETS barrierc DESTINATION ${BARRIER_BUNDLE_BINARY_DIR})

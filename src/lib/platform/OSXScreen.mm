@@ -38,6 +38,7 @@
 #include "base/Log.h"
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
+#include "io/filesystem.h"
 
 #include <math.h>
 #include <mach-o/dyld.h>
@@ -870,6 +871,9 @@ OSXScreen::leave()
 
 				DragInformation di;
 				di.setFilename(fileList);
+				if (barrier::fs::is_directory(barrier::fs::u8path(fileList))) {
+					di.setEntryType(DragInformation::Directory);
+				}
 				DragFileList dragFileList;
 				dragFileList.push_back(di);
 				String info;
@@ -880,7 +884,7 @@ OSXScreen::leave()
 
 				// TODO: what to do with multiple file or even
 				// a folder
-				client->sendFileToServer(fileList.c_str());
+				client->sendFileToServer(fileList);
 			}
 		}
 		m_draggingStarted = false;

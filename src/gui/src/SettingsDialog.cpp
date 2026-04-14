@@ -33,7 +33,14 @@
 #include <QCheckBox>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QPushButton>
 #include <QSpinBox>
+#include <QDesktopServices>
+#include <QUrl>
+
+#if defined(Q_OS_MAC)
+#include <ApplicationServices/ApplicationServices.h>
+#endif
 
 SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     QDialog(parent, Qt::Dialog | Qt::WindowTitleHint | Qt::WindowSystemMenuHint | Qt::WindowCloseButtonHint),
@@ -42,7 +49,10 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     m_pCheckBoxWorkflowEnabled(new QCheckBox(tr("Enable lightweight workflow handoff"), this)),
     m_pCheckBoxWorkflowSuggestions(new QCheckBox(tr("Enable suggestion cards"), this)),
     m_pSpinBoxWorkflowHistoryLimit(new QSpinBox(this)),
-    m_pSpinBoxWorkflowDormantSeconds(new QSpinBox(this))
+    m_pSpinBoxWorkflowDormantSeconds(new QSpinBox(this)),
+    m_pLabelPlatformStatus(new QLabel(this)),
+    m_pLabelPlatformDetail(new QLabel(this)),
+    m_pButtonPlatformAction(new QPushButton(this))
 {
     setupUi(this);
 
@@ -85,6 +95,16 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     verticalLayout_2->addWidget(m_pCheckBoxWorkflowSuggestions);
     verticalLayout_2->addLayout(historyRow);
     verticalLayout_2->addLayout(dormantRow);
+
+    auto* platformGroup = new QGroupBox(tr("Platform Readiness"), this);
+    auto* platformLayout = new QVBoxLayout(platformGroup);
+    m_pLabelPlatformDetail->setWordWrap(true);
+    platformLayout->addWidget(m_pLabelPlatformStatus);
+    platformLayout->addWidget(m_pLabelPlatformDetail);
+    platformLayout->addWidget(m_pButtonPlatformAction, 0, Qt::AlignLeft);
+    verticalLayout->insertWidget(3, platformGroup);
+    connect(m_pButtonPlatformAction, &QPushButton::clicked, this, &SettingsDialog::onPlatformActionClicked);
+    updatePlatformReadiness();
 
 #if defined(Q_OS_WIN)
     m_pComboElevate->setCurrentIndex(static_cast<int>(appConfig().elevateMode()));
@@ -179,4 +199,51 @@ void SettingsDialog::on_m_pComboLanguage_currentIndexChanged(int index)
 {
     QString ietfCode = m_pComboLanguage->itemData(index).toString();
     QBarrierApplication::getInstance()->switchTranslator(ietfCode);
+}
+
+void SettingsDialog::updatePlatformReadiness()
+{
+#if defined(Q_OS_MAC)
+    const bool trusted = AXIsProcessTrusted();
+    m_pLabelPlatformStatus->setText(trusted
+        ? tr("Accessibility access is ready")
+        : tr("Accessibility access is still required"));
+    m_pLabelPlatformDetail->setText(trusted
+        ? tr("Weave can capture and inject input without any extra setup on this Mac.")
+        : tr("Click below and macOS will open the Accessibility authorization prompt for Weave."));
+    m_pButtonPlatformAction->setVisible(true);
+    m_pButtonPlatformAction->setText(tr("Prompt Accessibility Access"));
+#elif defined(Q_OS_WIN)
+    m_pLabelPlatformStatus->setText(tr("Windows permission flow is handled in-app"));
+    m_pLabelPlatformDetail->setText(tr("Keep Elevate set to As Needed so Weave can prompt when UAC or desktop switching requires it."));
+    m_pButtonPlatformAction->setVisible(false);
+#elif defined(WINAPI_XWINDOWS)
+    const bool isWayland = QGuiApplication::platformName() == QStringLiteral("wayland");
+    m_pLabelPlatformStatus->setText(isWayland
+        ? tr("Wayland session detected")
+        : tr("X11 session detected"));
+    m_pLabelPlatformDetail->setText(isWayland
+        ? tr("Wayland still limits input control. Use an X11 session for full Weave support.")
+        : tr("X11 is ready. Weave does not need extra desktop authorization on this session."));
+    m_pButtonPlatformAction->setVisible(isWayland);
+    m_pButtonPlatformAction->setText(tr("Open Compatibility Guide"));
+#else
+    m_pLabelPlatformStatus->setText(tr("No additional readiness checks"));
+    m_pLabelPlatformDetail->setText(tr("This platform does not require a separate permission prompt here."));
+    m_pButtonPlatformAction->setVisible(false);
+#endif
+}
+
+void SettingsDialog::onPlatformActionClicked()
+{
+#if defined(Q_OS_MAC)
+    const void* keys[] = { kAXTrustedCheckOptionPrompt };
+    const void* values[] = { kCFBooleanTrue };
+    CFDictionaryRef options = CFDictionaryCreate(NULL, keys, values, 1, NULL, NULL);
+    AXIsProcessTrustedWithOptions(options);
+    CFRelease(options);
+#elif defined(WINAPI_XWINDOWS)
+    QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/debauchee/barrier/wiki/FAQ")));
+#endif
+    updatePlatformReadiness();
 }

@@ -16,6 +16,7 @@
 #include <QMimeData>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QThread>
 #include <QTimer>
 #include <QUrl>
 #include <QUuid>
@@ -45,10 +46,40 @@ QString joinPathsSignature(const QStringList& paths)
     return normalized.join(QStringLiteral("||"));
 }
 
+QString fallbackInboxDir(const QString& storageRoot)
+{
+    return QDir(storageRoot).filePath(QStringLiteral("inbox"));
+}
+
+QString sanitizeInboxDir(const QString& candidate, const QString& storageRoot)
+{
+    const QString fallback = QDir::cleanPath(fallbackInboxDir(storageRoot));
+    QString normalized = QDir::cleanPath(candidate.trimmed());
+    if (normalized.isEmpty() || !QDir::isAbsolutePath(normalized)) {
+        return fallback;
+    }
+
+    const QString native = QDir::fromNativeSeparators(normalized);
+    const QStringList parts = native.split('/', Qt::SkipEmptyParts);
+    for (const QString& part : parts) {
+        if (part == QStringLiteral("..")) {
+            return fallback;
+        }
+    }
+
+    return normalized;
+}
+
 bool writeImageFile(const QString& filePath, const QImage& image)
 {
     QDir().mkpath(QFileInfo(filePath).absolutePath());
     return image.save(filePath, "PNG");
+}
+
+void assertWorkflowThread(const QObject* object)
+{
+    Q_ASSERT(object != nullptr);
+    Q_ASSERT(object->thread() == QThread::currentThread());
 }
 
 } // namespace
@@ -70,12 +101,15 @@ WorkflowStore::WorkflowStore(AppConfig& appConfig, QObject* parent) :
     m_storageRoot = QDir(m_storageRoot).filePath(QStringLiteral("workflow"));
     m_payloadDir = QDir(m_storageRoot).filePath(QStringLiteral("payload"));
     m_previewDir = QDir(m_storageRoot).filePath(QStringLiteral("preview"));
-    m_inboxDir = appConfig.workflowInboxDir();
+    m_inboxDir = sanitizeInboxDir(appConfig.workflowInboxDir(), m_storageRoot);
 
     QDir().mkpath(m_storageRoot);
     QDir().mkpath(m_payloadDir);
     QDir().mkpath(m_previewDir);
-    QDir().mkpath(m_inboxDir);
+    if (!QDir().mkpath(m_inboxDir)) {
+        m_inboxDir = fallbackInboxDir(m_storageRoot);
+        QDir().mkpath(m_inboxDir);
+    }
 
     auto* timer = new QTimer(this);
     timer->setInterval(5000);
@@ -206,6 +240,8 @@ void WorkflowStore::recordReceipt(const QString& contextId,
                                   const QString& status,
                                   const QString& detail)
 {
+    assertWorkflowThread(this);
+
     TransferReceipt receipt;
     receipt.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     receipt.contextId = contextId;
@@ -217,13 +253,15 @@ void WorkflowStore::recordReceipt(const QString& contextId,
     m_receipts.prepend(receipt);
     pruneReceipts();
     emit receiptsChanged();
-    emit notificationRequested(QStringLiteral("Barrier Workflow"), detail.isEmpty()
+    emit notificationRequested(QStringLiteral("Weave Workflow"), detail.isEmpty()
         ? status
         : QStringLiteral("%1: %2").arg(status, detail));
 }
 
 void WorkflowStore::recordLogLine(const QString& line)
 {
+    assertWorkflowThread(this);
+
     static const QRegularExpression droppedFileExpr(
         QStringLiteral("dropped file \"([^\"]+)\" in \"([^\"]+)\""));
     static const QRegularExpression transferFailedExpr(
@@ -265,6 +303,8 @@ void WorkflowStore::recordLogLine(const QString& line)
 
 bool WorkflowStore::addCapturedImageContext(const QImage& image, QString* contextId)
 {
+    assertWorkflowThread(this);
+
     if (image.isNull()) {
         return false;
     }
@@ -291,6 +331,8 @@ bool WorkflowStore::addCapturedImageContext(const QImage& image, QString* contex
 
 void WorkflowStore::handleClipboardChanged()
 {
+    assertWorkflowThread(this);
+
     if (!m_appConfig->getWorkflowEnabled() || m_ignoreClipboardChanges || m_clipboard == nullptr) {
         return;
     }
@@ -300,6 +342,8 @@ void WorkflowStore::handleClipboardChanged()
 
 void WorkflowStore::evaluateRuntimeMode()
 {
+    assertWorkflowThread(this);
+
     const QDateTime now = QDateTime::currentDateTimeUtc();
     const qint64 idleSeconds = m_lastActivity.secsTo(now);
 
@@ -428,7 +472,7 @@ ContextItem WorkflowStore::buildPathContext(const QStringList& paths, bool hasFo
     item.kind = hasFolders ? ContextKind::Folder : ContextKind::File;
     item.summary = summarizePaths(paths, hasFolders);
     item.byteSize = knownBytes;
-    item.mimeType = QStringLiteral("application/x-barrier-path-manifest");
+    item.mimeType = QStringLiteral("application/x-weave-path-manifest");
     item.sensitivity = SensitivityLevel::Normal;
     item.createdAt = QDateTime::currentDateTimeUtc();
     item.expiresAt = item.createdAt.addDays(14);
@@ -573,7 +617,7 @@ void WorkflowStore::addSuggestionsForItem(const ContextItem& item)
 
     emit suggestionsChanged();
     if (!m_suggestions.isEmpty()) {
-        emit notificationRequested(QStringLiteral("Barrier Suggestions"),
+        emit notificationRequested(QStringLiteral("Weave Suggestions"),
                                    QStringLiteral("New workflow suggestions are ready for %1.").arg(item.summary));
     }
 }

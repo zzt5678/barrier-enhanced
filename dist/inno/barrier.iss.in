@@ -1,14 +1,14 @@
-#define MyAppName "Barrier"
+#define MyAppName "Weave"
 #define MyAppVersion "@BARRIER_VERSION_MAJOR@.@BARRIER_VERSION_MINOR@.@BARRIER_VERSION_PATCH@.@BARRIER_BUILD_NUMBER@"
 #define MyAppTextVersion "@BARRIER_VERSION@"
 #define MyAppPublisher "Debauchee Open Source Group"
 #define MyAppURL "https://github.com/debauchee/barrier/wiki"
 #define MyAppCopyright "Copyright (C) 2018 Debauchee Open Source Group"
-#define MyAppExeName "barrier.exe"
-#define MyAppServiceName "Barrier"
-#define MyAppServiceExe "barrierd.exe"
-#define MyAppServiceDesc "Manages the Barrier background processes."
-#define MyAppListenerDesc "Barrier Listener"
+#define MyAppExeName "weave.exe"
+#define MyAppServiceName "Weave"
+#define MyAppServiceExe "weaved.exe"
+#define MyAppServiceDesc "Manages the Weave background processes."
+#define MyAppListenerDesc "Weave Listener"
 
 [Setup]
 AppId={{41036EA6-3F7A-4803-8AE0-469E5E91EFCC}
@@ -23,7 +23,7 @@ DefaultDirName={pf}\{#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile=@CMAKE_CURRENT_SOURCE_DIR@/res/License.rtf
 OutputDir=@CMAKE_RUNTIME_OUTPUT_DIRECTORY@/../installer-inno/bin
-OutputBaseFilename=BarrierSetup-{#MyAppTextVersion}
+OutputBaseFilename=WeaveSetup-{#MyAppTextVersion}
 SetupIconFile=@CMAKE_CURRENT_SOURCE_DIR@/res/barrier.ico
 VersionInfoProductTextVersion={#MyAppTextVersion}
 VersionInfoProductVersion={#MyAppVersion}
@@ -60,7 +60,7 @@ Filename: {sys}\sc.exe; Parameters: "start {#MyAppServiceName}"; Flags: runhidde
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-Type: filesandordirs; Name: "{commonappdata}\Barrier"
+Type: filesandordirs; Name: "{commonappdata}\Weave"
 
 [UninstallRun]
 Filename: {sys}\taskkill; Parameters: "/im {#MyAppExeName} /f /t"; Flags: runhidden

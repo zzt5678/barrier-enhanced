@@ -28,3 +28,4 @@ endif()
 
 target_link_libraries (barrierd
     arch base common io ipc mt net platform synlib ${libs} ${OPENSSL_LIBS})
+set_target_properties(barrierd PROPERTIES OUTPUT_NAME weaved)

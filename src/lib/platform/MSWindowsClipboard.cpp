@@ -81,6 +81,20 @@ std::string utf8FromWide(const std::wstring& value)
     return result;
 }
 
+std::string pathLabel(const std::wstring& path)
+{
+    if (path.empty()) {
+        return {};
+    }
+
+    const barrier::fs::path fsPath(path);
+    if (!fsPath.filename().empty()) {
+        return fsPath.filename().u8string();
+    }
+
+    return utf8FromWide(path);
+}
+
 bool isSupportedImagePath(const std::wstring& path)
 {
     const std::wstring lower = toLowerCopy(path);
@@ -133,7 +147,7 @@ std::string convertImageFileToPNG(const std::wstring& path)
 
     Gdiplus::Bitmap source(path.c_str());
     if (source.GetLastStatus() != Gdiplus::Ok) {
-        LOG((CLOG_WARN "failed to load image file from clipboard path: %s", utf8FromWide(path).c_str()));
+        LOG((CLOG_WARN "failed to load image file from clipboard path: %s", pathLabel(path).c_str()));
         return {};
     }
 
@@ -146,14 +160,14 @@ std::string convertImageFileToPNG(const std::wstring& path)
     Gdiplus::Bitmap converted(width, height, PixelFormat32bppARGB);
     Gdiplus::Graphics graphics(&converted);
     if (graphics.DrawImage(&source, 0, 0, width, height) != Gdiplus::Ok) {
-        LOG((CLOG_WARN "failed to normalize image file to 32-bit ARGB: %s", utf8FromWide(path).c_str()));
+        LOG((CLOG_WARN "failed to normalize image file to 32-bit ARGB: %s", pathLabel(path).c_str()));
         return {};
     }
 
     Gdiplus::Rect rect(0, 0, width, height);
     Gdiplus::BitmapData bitmapData;
     if (converted.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bitmapData) != Gdiplus::Ok) {
-        LOG((CLOG_WARN "failed to lock normalized image pixels: %s", utf8FromWide(path).c_str()));
+        LOG((CLOG_WARN "failed to lock normalized image pixels: %s", pathLabel(path).c_str()));
         return {};
     }
 
@@ -181,7 +195,7 @@ std::string convertImageFileToPNG(const std::wstring& path)
         return {};
     }
 
-    LOG((CLOG_INFO "converted clipboard image file to PNG payload: %s", utf8FromWide(path).c_str()));
+    LOG((CLOG_INFO "converted clipboard image file to PNG payload: %s", pathLabel(path).c_str()));
     return std::string(reinterpret_cast<const char*>(png.data()), png.size());
 }
 

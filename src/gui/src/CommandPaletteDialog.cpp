@@ -21,7 +21,7 @@ CommandPaletteDialog::CommandPaletteDialog(WorkflowStore& store, ActionBus& acti
     m_filter(new QLineEdit(this)),
     m_commandList(new QListWidget(this))
 {
-    setWindowTitle(tr("Barrier Command Palette"));
+    setWindowTitle(tr("Weave Command Palette"));
     resize(520, 360);
 
     m_filter->setPlaceholderText(tr("Type a command..."));

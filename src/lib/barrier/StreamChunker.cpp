@@ -17,8 +17,6 @@
 
 #include "barrier/StreamChunker.h"
 
-#include "mt/Lock.h"
-#include "mt/Mutex.h"
 #include "barrier/FileChunk.h"
 #include "barrier/ClipboardChunk.h"
 #include "barrier/protocol_types.h"
@@ -141,9 +139,10 @@ void queueClipboardChunks(
 
 }
 
-bool StreamChunker::s_isChunkingFile = false;
-bool StreamChunker::s_interruptFile = false;
-Mutex* StreamChunker::s_interruptMutex = NULL;
+StreamChunker::StreamChunker() :
+    m_interruptFile(false)
+{
+}
 
 void
 StreamChunker::sendFile(const char* filename,
@@ -151,7 +150,7 @@ StreamChunker::sendFile(const char* filename,
                 void* eventTarget,
                 barrier::IStream* stream)
 {
-    s_isChunkingFile = true;
+    m_interruptFile.store(false);
 
     std::fstream file(filename, std::ios::in | std::ios::binary);
 
@@ -177,8 +176,7 @@ StreamChunker::sendFile(const char* filename,
     file.seekg (0, std::ios::beg);
 
     while (true) {
-        if (s_interruptFile) {
-            s_interruptFile = false;
+        if (shouldInterrupt()) {
             LOG((CLOG_DEBUG "file transmission interrupted"));
             break;
         }
@@ -216,8 +214,6 @@ StreamChunker::sendFile(const char* filename,
     events->addEvent(Event(events->forFile().fileChunkSending(), eventTarget, end));
 
     file.close();
-
-    s_isChunkingFile = false;
 }
 
 void
@@ -236,8 +232,12 @@ StreamChunker::sendClipboard(
 void
 StreamChunker::interruptFile()
 {
-    if (s_isChunkingFile) {
-        s_interruptFile = true;
-        LOG((CLOG_INFO "previous dragged file has become invalid"));
-    }
+    m_interruptFile.store(true);
+    LOG((CLOG_INFO "previous dragged file has become invalid"));
+}
+
+bool
+StreamChunker::shouldInterrupt() const
+{
+    return m_interruptFile.load();
 }

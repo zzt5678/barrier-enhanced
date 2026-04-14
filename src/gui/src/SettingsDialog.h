@@ -27,6 +27,8 @@
 class AppConfig;
 class QCheckBox;
 class QSpinBox;
+class QLabel;
+class QPushButton;
 
 class SettingsDialog : public QDialog, public Ui::SettingsDialogBase
 {
@@ -48,11 +50,17 @@ class SettingsDialog : public QDialog, public Ui::SettingsDialogBase
         QCheckBox* m_pCheckBoxWorkflowSuggestions;
         QSpinBox* m_pSpinBoxWorkflowHistoryLimit;
         QSpinBox* m_pSpinBoxWorkflowDormantSeconds;
+        QLabel* m_pLabelPlatformStatus;
+        QLabel* m_pLabelPlatformDetail;
+        QPushButton* m_pButtonPlatformAction;
+
+        void updatePlatformReadiness();
 
     private slots:
         void on_m_pComboLanguage_currentIndexChanged(int index);
         void on_m_pCheckBoxLogToFile_stateChanged(int );
         void on_m_pButtonBrowseLog_clicked();
+        void onPlatformActionClicked();
 };
 
 #endif

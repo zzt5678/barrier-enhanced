@@ -23,7 +23,7 @@
    </size>
   </property>
   <property name="windowTitle">
-   <string>Setup Barrier</string>
+   <string>Setup Weave</string>
   </property>
   <widget class="QWizardPage" name="m_pWelcomePage">
    <property name="title">
@@ -36,7 +36,7 @@
     <item>
      <widget class="QLabel" name="label_3">
       <property name="text">
-       <string>Thanks for installing Barrier!</string>
+       <string>Thanks for installing Weave!</string>
       </property>
       <property name="wordWrap">
        <bool>true</bool>
@@ -111,7 +111,7 @@
        <locale language="English" country="UnitedKingdom"/>
       </property>
       <property name="text">
-       <string>Barrier lets you easily share your mouse and keyboard between multiple computers on your desk, and it's Free and Open Source. Just move your mouse off the edge of one computer's screen on to another. You can even share all of your clipboards. All you need is a network connection. Barrier is cross-platform (works on Windows, Mac OS X and Linux).</string>
+       <string>Weave lets you easily share your mouse and keyboard between multiple computers on your desk, and it's Free and Open Source. Just move your mouse off the edge of one computer's screen on to another. You can even share all of your clipboards. All you need is a network connection. Weave is cross-platform (works on Windows, macOS and Linux).</string>
       </property>
       <property name="wordWrap">
        <bool>true</bool>
@@ -228,6 +228,115 @@ p, li { white-space: pre-wrap; }
        <size>
         <width>0</width>
         <height>0</height>
+       </size>
+      </property>
+     </spacer>
+    </item>
+   </layout>
+  </widget>
+  <widget class="QWizardPage" name="m_pPermissionsPage">
+   <property name="title">
+    <string>Ready to Control</string>
+   </property>
+   <property name="subTitle">
+    <string>Weave will check the platform requirements before you finish setup.</string>
+   </property>
+   <layout class="QVBoxLayout" name="verticalLayout_permissions">
+    <item>
+     <widget class="QFrame" name="m_pPermissionCard">
+      <property name="frameShape">
+       <enum>QFrame::StyledPanel</enum>
+      </property>
+      <property name="frameShadow">
+       <enum>QFrame::Raised</enum>
+      </property>
+      <layout class="QVBoxLayout" name="verticalLayout_permissionCard">
+       <item>
+        <widget class="QLabel" name="m_pPermissionTitle">
+         <property name="text">
+          <string>Platform Status</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="m_pPermissionSummary">
+         <property name="text">
+          <string>Weave is checking whether this machine can capture input and present the desktop correctly.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="m_pPermissionDetails">
+         <property name="text">
+          <string/>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="textInteractionFlags">
+          <set>Qt::TextSelectableByMouse</set>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_permissions">
+         <item>
+          <widget class="QPushButton" name="m_pButtonPermissionAction">
+           <property name="text">
+            <string>Open System Settings</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="m_pButtonPermissionRefresh">
+           <property name="text">
+            <string>Check Again</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="horizontalSpacer_permissions">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="m_pPermissionHint">
+      <property name="text">
+       <string>On macOS, Weave can trigger the Accessibility prompt automatically. On Windows, keep Elevate set to As Needed. On Linux, X11 works best; Wayland remains limited.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <spacer name="verticalSpacer_permissions">
+      <property name="orientation">
+       <enum>Qt::Vertical</enum>
+      </property>
+      <property name="sizeType">
+       <enum>QSizePolicy::MinimumExpanding</enum>
+      </property>
+      <property name="sizeHint" stdset="0">
+       <size>
+        <width>20</width>
+        <height>40</height>
        </size>
       </property>
      </spacer>

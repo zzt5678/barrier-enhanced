@@ -180,6 +180,7 @@ public slots:
         void refreshControlState();
         void showControlCenter();
         void updateWorkflowPeerHint();
+        void updateOverviewCards();
 
     private:
         QSettings& m_Settings;

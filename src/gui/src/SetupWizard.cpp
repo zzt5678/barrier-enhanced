@@ -19,8 +19,17 @@
 #include "MainWindow.h"
 #include "QBarrierApplication.h"
 #include "QUtility.h"
+#include "AppConfig.h"
+#include "DisplayIsValid.h"
 
 #include <QMessageBox>
+#include <QDesktopServices>
+#include <QOperatingSystemVersion>
+#include <QUrl>
+
+#if defined(Q_OS_MAC)
+#include <ApplicationServices/ApplicationServices.h>
+#endif
 
 SetupWizard::SetupWizard(MainWindow& mainWindow, bool startMain) :
     m_MainWindow(mainWindow),
@@ -51,6 +60,7 @@ SetupWizard::SetupWizard(MainWindow& mainWindow, bool startMain) :
 
     m_Locale.fillLanguageComboBox(m_pComboLanguage);
     setIndexFromItemData(m_pComboLanguage, m_MainWindow.appConfig().language());
+    updatePermissionsPage();
 }
 
 SetupWizard::~SetupWizard()
@@ -60,7 +70,7 @@ SetupWizard::~SetupWizard()
 bool SetupWizard::validateCurrentPage()
 {
     QMessageBox message;
-    message.setWindowTitle(tr("Setup Barrier"));
+    message.setWindowTitle(tr("Setup Weave"));
     message.setIcon(QMessageBox::Information);
 
     if (currentPage() == m_pNodePage)
@@ -90,6 +100,7 @@ void SetupWizard::changeEvent(QEvent* event)
                 m_pComboLanguage->blockSignals(true);
                 retranslateUi(this);
                 m_pComboLanguage->blockSignals(false);
+                updatePermissionsPage();
                 break;
             }
 
@@ -145,4 +156,89 @@ void SetupWizard::on_m_pComboLanguage_currentIndexChanged(int index)
 {
     QString ietfCode = m_pComboLanguage->itemData(index).toString();
     QBarrierApplication::getInstance()->switchTranslator(ietfCode);
+}
+
+void SetupWizard::on_m_pButtonPermissionRefresh_clicked()
+{
+    updatePermissionsPage();
+}
+
+void SetupWizard::on_m_pButtonPermissionAction_clicked()
+{
+    triggerPermissionAction();
+    updatePermissionsPage();
+}
+
+void SetupWizard::updatePermissionsPage()
+{
+    m_pPermissionSummary->setText(permissionSummaryText());
+    m_pPermissionDetails->setText(permissionDetailText());
+
+#if defined(Q_OS_MAC)
+    m_pButtonPermissionAction->setVisible(true);
+    m_pButtonPermissionAction->setText(tr("Prompt Accessibility Access"));
+#elif defined(Q_OS_WIN)
+    m_pButtonPermissionAction->setVisible(false);
+#elif defined(WINAPI_XWINDOWS)
+    const bool isWayland = QGuiApplication::platformName() == QStringLiteral("wayland");
+    m_pButtonPermissionAction->setVisible(isWayland);
+    m_pButtonPermissionAction->setText(tr("Open Wayland Guidance"));
+#else
+    m_pButtonPermissionAction->setVisible(false);
+#endif
+}
+
+bool SetupWizard::currentPlatformReady() const
+{
+#if defined(Q_OS_MAC)
+    return AXIsProcessTrusted();
+#elif defined(WINAPI_XWINDOWS)
+    if (QGuiApplication::platformName() == QStringLiteral("wayland")) {
+        return false;
+    }
+    return display_is_valid();
+#else
+    return true;
+#endif
+}
+
+QString SetupWizard::permissionSummaryText() const
+{
+    return currentPlatformReady()
+        ? tr("This device is ready for Weave control.")
+        : tr("Weave still needs one platform permission or compatibility step before full control is available.");
+}
+
+QString SetupWizard::permissionDetailText() const
+{
+#if defined(Q_OS_MAC)
+    if (AXIsProcessTrusted()) {
+        return tr("Accessibility access is already granted. You can finish setup and start sharing immediately.");
+    }
+    return tr("Weave needs Accessibility access to capture and inject input. Click the button below and macOS will open the authorization prompt for you.");
+#elif defined(Q_OS_WIN)
+    return tr("Windows works best with Elevate set to As Needed. Weave will prompt for UAC when the desktop context changes, so no separate permissions page is required.");
+#elif defined(WINAPI_XWINDOWS)
+    if (QGuiApplication::platformName() == QStringLiteral("wayland")) {
+        return tr("This session is running on Wayland. Clipboard and discovery may work, but full input control is limited. Use an X11 session for the smoothest setup.");
+    }
+    return tr("X11 is available and no additional desktop authorization is required. Finish setup and connect your other machine.");
+#else
+    return tr("No additional platform permission checks are required for this operating system.");
+#endif
+}
+
+void SetupWizard::triggerPermissionAction()
+{
+#if defined(Q_OS_MAC)
+    const void* keys[] = { kAXTrustedCheckOptionPrompt };
+    const void* values[] = { kCFBooleanTrue };
+    CFDictionaryRef options = CFDictionaryCreate(NULL, keys, values, 1, NULL, NULL);
+    AXIsProcessTrustedWithOptions(options);
+    CFRelease(options);
+#elif defined(WINAPI_XWINDOWS)
+    if (QGuiApplication::platformName() == QStringLiteral("wayland")) {
+        QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/debauchee/barrier/wiki/FAQ")));
+    }
+#endif
 }

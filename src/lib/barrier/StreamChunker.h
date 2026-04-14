@@ -20,14 +20,17 @@
 #include "barrier/clipboard_types.h"
 #include "base/String.h"
 
+#include <atomic>
+
 class IEventQueue;
-class Mutex;
 namespace barrier { class IStream; }
 
 class StreamChunker {
 public:
-    static void sendFile(const char* filename, IEventQueue* events, void* eventTarget,
-                         barrier::IStream* stream = nullptr);
+    StreamChunker();
+
+    void sendFile(const char* filename, IEventQueue* events, void* eventTarget,
+                  barrier::IStream* stream = nullptr);
     static void            sendClipboard(
                             String& data,
                             size_t size,
@@ -36,10 +39,11 @@ public:
                             IEventQueue* events,
                             void* eventTarget,
                             barrier::IStream* stream = nullptr);
-    static void            interruptFile();
+    void                   interruptFile();
 
 private:
-    static bool            s_isChunkingFile;
-    static bool            s_interruptFile;
-    static Mutex*        s_interruptMutex;
+    bool                   shouldInterrupt() const;
+
+private:
+    std::atomic<bool>      m_interruptFile;
 };

@@ -1,5 +1,5 @@
 #!/bin/sh
-ICNS_BASE=../dist/macos/bundle/Barrier.app/Contents/Resources
+ICNS_BASE=../dist/macos/bundle/Weave.app/Contents/Resources
 if ! which magick >/dev/null 2>&1; then
     echo "Need ImageMagick for this"
     exit 10
@@ -17,6 +17,6 @@ done
 # windows icon
 magick convert work/{16,24,32,48,64,128}.png barrier.png barrier.ico || exit $?
 # macos icon
-png2icns "$ICNS_BASE/Barrier.icns" work/{16,32,256,512,1024}.png || exit $?
+png2icns "$ICNS_BASE/Weave.icns" work/{16,32,256,512,1024}.png || exit $?
 rm -rf work
 echo Done

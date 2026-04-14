@@ -143,6 +143,7 @@ include_directories (./src)
 target_link_libraries(barrier net base io Qt5::Core Qt5::Widgets Qt5::Network ${OPENSSL_LIBS})
 target_compile_definitions (barrier PRIVATE -DBARRIER_VERSION_STAGE="${BARRIER_VERSION_STAGE}")
 target_compile_definitions (barrier PRIVATE -DBARRIER_REVISION="${BARRIER_REVISION}")
+set_target_properties(barrier PROPERTIES OUTPUT_NAME weave)
 
 if (WIN32)
     file(TO_CMAKE_PATH "$ENV{BONJOUR_SDK_HOME}" BONJOUR_SDK_HOME)

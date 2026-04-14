@@ -55,28 +55,67 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     m_saveButton(new QPushButton(tr("Save to Inbox"), this)),
     m_revealButton(new QPushButton(tr("Reveal"), this))
 {
-    setWindowTitle(tr("Barrier Workflow Hub"));
-    resize(720, 520);
+    setWindowTitle(tr("Weave Workflow Hub"));
+    resize(860, 620);
+    setObjectName(QStringLiteral("WorkflowHubDialog"));
 
     m_previewLabel->setAlignment(Qt::AlignCenter);
-    m_previewLabel->setMinimumHeight(96);
+    m_previewLabel->setMinimumHeight(140);
     m_previewLabel->setText(tr("No preview"));
+    m_previewLabel->setObjectName(QStringLiteral("m_pWorkflowPreview"));
 
     m_tabs->addTab(m_historyList, tr("History"));
     m_tabs->addTab(m_suggestionList, tr("Suggestions"));
     m_tabs->addTab(m_receiptList, tr("Receipts"));
+    m_tabs->setObjectName(QStringLiteral("m_pWorkflowTabs"));
+
+    auto* titleLabel = new QLabel(tr("Workflow Hub"), this);
+    titleLabel->setObjectName(QStringLiteral("m_pLabelWorkflowSectionTitle"));
+    auto* subtitleLabel = new QLabel(
+        tr("Review transferred context, suggested follow-up actions, and every receipt Weave records while you move content between devices."),
+        this);
+    subtitleLabel->setObjectName(QStringLiteral("m_pLabelReceiptSummary"));
+    subtitleLabel->setWordWrap(true);
 
     auto* headerLayout = new QVBoxLayout;
+    headerLayout->addWidget(titleLabel);
+    headerLayout->addWidget(subtitleLabel);
     headerLayout->addWidget(m_runtimeLabel);
     headerLayout->addWidget(m_capabilityLabel);
 
     auto* contentLayout = new QHBoxLayout;
-    contentLayout->addWidget(m_tabs, 2);
+    contentLayout->setSpacing(18);
+    auto* leftCard = new QFrame(this);
+    leftCard->setObjectName(QStringLiteral("workflowCard"));
+    leftCard->setFrameShape(QFrame::StyledPanel);
+    leftCard->setFrameShadow(QFrame::Raised);
+    auto* leftLayout = new QVBoxLayout(leftCard);
+    auto* leftTitle = new QLabel(tr("Collected Context"), leftCard);
+    leftTitle->setObjectName(QStringLiteral("m_pLabelWorkflowSectionTitle"));
+    auto* leftSubtitle = new QLabel(tr("Switch between history, suggestions, and receipts without leaving the desktop."), leftCard);
+    leftSubtitle->setObjectName(QStringLiteral("m_pLabelReceiptSummary"));
+    leftSubtitle->setWordWrap(true);
+    leftLayout->addWidget(leftTitle);
+    leftLayout->addWidget(leftSubtitle);
+    leftLayout->addWidget(m_tabs, 1);
+    contentLayout->addWidget(leftCard, 2);
 
+    auto* rightCard = new QFrame(this);
+    rightCard->setObjectName(QStringLiteral("workflowCard"));
+    rightCard->setFrameShape(QFrame::StyledPanel);
+    rightCard->setFrameShadow(QFrame::Raised);
     auto* detailLayout = new QVBoxLayout;
+    auto* detailTitle = new QLabel(tr("Inspector"), rightCard);
+    detailTitle->setObjectName(QStringLiteral("m_pLabelWorkflowSectionTitle"));
+    auto* detailSubtitle = new QLabel(tr("Preview payloads, inspect transfer metadata, and execute the next step from one place."), rightCard);
+    detailSubtitle->setObjectName(QStringLiteral("m_pLabelReceiptSummary"));
+    detailSubtitle->setWordWrap(true);
+    detailLayout->addWidget(detailTitle);
+    detailLayout->addWidget(detailSubtitle);
     detailLayout->addWidget(m_previewLabel);
     detailLayout->addWidget(m_detail, 1);
-    contentLayout->addLayout(detailLayout, 3);
+    rightCard->setLayout(detailLayout);
+    contentLayout->addWidget(rightCard, 3);
 
     auto* actionLayout = new QHBoxLayout;
     auto* screenshotButton = new QPushButton(tr("Capture Screenshot"), this);
@@ -92,6 +131,8 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     actionLayout->addWidget(closeButton);
 
     auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(20, 20, 20, 20);
+    root->setSpacing(18);
     root->addLayout(headerLayout);
     root->addLayout(contentLayout, 1);
     root->addLayout(actionLayout);

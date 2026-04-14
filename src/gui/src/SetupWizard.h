@@ -44,10 +44,18 @@ protected:
     void reject();
 
 private:
+    void updatePermissionsPage();
+    bool currentPlatformReady() const;
+    QString permissionSummaryText() const;
+    QString permissionDetailText() const;
+    void triggerPermissionAction();
+
     MainWindow& m_MainWindow;
     bool m_StartMain;
     BarrierLocale m_Locale;
 
 private slots:
     void on_m_pComboLanguage_currentIndexChanged(int index);
+    void on_m_pButtonPermissionRefresh_clicked();
+    void on_m_pButtonPermissionAction_clicked();
 };

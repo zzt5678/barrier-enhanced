@@ -17,6 +17,7 @@
 file(GLOB_RECURSE headers "*.h")
 file(GLOB_RECURSE sources "*.cpp")
 list(APPEND sources "barrier/PacketStreamFilterTests.cpp")
+list(APPEND sources "barrier/TransferArchiveTests.cpp")
 
 file(GLOB_RECURSE remove_platform "platform/*")
 list(REMOVE_ITEM headers ${remove_platform})

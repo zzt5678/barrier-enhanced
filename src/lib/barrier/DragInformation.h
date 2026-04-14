@@ -26,6 +26,11 @@ typedef std::vector<DragInformation> DragFileList;
 
 class DragInformation {
 public:
+    enum EntryType {
+        File = 'F',
+        Directory = 'D'
+    };
+
     DragInformation();
     ~DragInformation() { }
 
@@ -33,6 +38,9 @@ public:
     void                setFilename(String& name) { m_filename = name; }
     size_t                getFilesize() { return m_filesize; }
     void                setFilesize(size_t size) { m_filesize = size; }
+    EntryType            getEntryType() const { return m_entryType; }
+    void                setEntryType(EntryType type) { m_entryType = type; }
+    bool                isDirectory() const { return m_entryType == Directory; }
 
     static void            parseDragInfo(DragFileList& dragFileList, UInt32 fileNum, String data);
     static String        getDragFileExtension(String filename);
@@ -50,4 +58,5 @@ private:
 private:
     String                m_filename;
     size_t                m_filesize;
+    EntryType            m_entryType;
 };

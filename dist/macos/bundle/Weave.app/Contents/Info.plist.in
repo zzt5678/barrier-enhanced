@@ -4,18 +4,18 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>English</string>
     <key>CFBundleDisplayName</key>
-    <string>Barrier</string>
+    <string>Weave</string>
     <key>CFBundleExecutable</key>
-    <string>barrier</string>
+    <string>weave</string>
     <key>CFBundleIconFile</key>
-    <string>Barrier.icns</string>
+    <string>Weave.icns</string>
     <key>CFBundleIdentifier</key>
-    <string>barrier</string>
+    <string>weave</string>
     <!-- TODO: Fix this in v2.0 //-->
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Barrier</string>
+    <string>Weave</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleSignature</key>

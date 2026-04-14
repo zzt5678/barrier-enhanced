@@ -34,6 +34,8 @@ ServerConfigDialog::ServerConfigDialog(QWidget* parent, ServerConfig& config, co
     m_Message("")
 {
     setupUi(this);
+    setObjectName(QStringLiteral("ServerConfigDialogBase"));
+    resize(1040, 700);
 
     m_pCheckBoxHeartbeat->setChecked(serverConfig().hasHeartbeat());
     m_pSpinBoxHeartbeat->setValue(serverConfig().heartbeat());
@@ -68,6 +70,13 @@ ServerConfigDialog::ServerConfigDialog(QWidget* parent, ServerConfig& config, co
 
     if (serverConfig().numScreens() == 0)
         model().screen(serverConfig().numColumns() / 2, serverConfig().numRows() / 2) = Screen(defaultScreenName);
+
+    label_2->setText(tr("Drag devices into the canvas until moving across the edge feels obvious and calm."));
+    label_3->setText(tr("Double-click a device to refine its settings. Use Automation for hotkeys and actions, or Advanced only when you need to override the default crossing behavior."));
+    m_pLabelServerConfigSummary->setText(tr("Configured screens: %1 · Hotkeys: %2 · Clipboard sharing: %3")
+        .arg(serverConfig().numScreens())
+        .arg(serverConfig().hotkeys().size())
+        .arg(serverConfig().clipboardSharing() ? tr("On") : tr("Off")));
 }
 
 void ServerConfigDialog::showEvent(QShowEvent* event)

@@ -30,6 +30,7 @@
 #include "barrier/XScreen.h"
 #include "barrier/XBarrier.h"
 #include "barrier/StreamChunker.h"
+#include "barrier/TransferArchive.h"
 #include "barrier/KeyState.h"
 #include "barrier/Screen.h"
 #include "barrier/PacketStreamFilter.h"
@@ -45,10 +46,62 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <memory>
 #include <sstream>
 #include <fstream>
 #include <ctime>
 #include <stdexcept>
+
+namespace {
+
+bool prepareTransferSource(const char* filename,
+                           barrier::fs::path& sourcePath,
+                           barrier::fs::path& tempPackagePath,
+                           std::string& error);
+
+float clampUnitFraction(float value)
+{
+    if (value < 0.0f) {
+        return 0.0f;
+    }
+    if (value > 1.0f) {
+        return 1.0f;
+    }
+    return value;
+}
+
+DragFileList parseDraggedPaths(const std::string& pathList)
+{
+    DragFileList dragFileList;
+    std::istringstream input(pathList);
+    std::string path;
+    while (std::getline(input, path)) {
+        if (path.empty()) {
+            continue;
+        }
+        DragInformation di;
+        di.setFilename(path);
+        if (barrier::fs::is_directory(barrier::fs::u8path(path))) {
+            di.setEntryType(DragInformation::Directory);
+        }
+        dragFileList.push_back(di);
+    }
+
+    if (dragFileList.empty() && !pathList.empty()) {
+        DragInformation di;
+        std::string singlePath = pathList;
+        di.setFilename(singlePath);
+        if (barrier::fs::is_directory(barrier::fs::u8path(pathList))) {
+            di.setEntryType(DragInformation::Directory);
+        }
+        dragFileList.push_back(di);
+    }
+
+    return dragFileList;
+}
+
+}
 //
 // Server
 //
@@ -575,11 +628,13 @@ Server::mapToFraction(BaseClientProxy* client,
 	switch (dir) {
 	case kLeft:
 	case kRight:
-		return static_cast<float>(y - sy + 0.5f) / static_cast<float>(sh);
+		return clampUnitFraction(static_cast<float>(y - sy + 0.5f) /
+			static_cast<float>(sh));
 
 	case kTop:
 	case kBottom:
-		return static_cast<float>(x - sx + 0.5f) / static_cast<float>(sw);
+		return clampUnitFraction(static_cast<float>(x - sx + 0.5f) /
+			static_cast<float>(sw));
 
 	case kNoDirection:
 		assert(0 && "bad direction");
@@ -2009,9 +2064,7 @@ void Server::send_drag_info_thread(BaseClientProxy* newScreen)
 	m_dragFileList.clear();
     std::string& dragFileList = m_screen->getDraggingFilename();
 	if (!dragFileList.empty()) {
-		DragInformation di;
-		di.setFilename(dragFileList);
-		m_dragFileList.push_back(di);
+		m_dragFileList = parseDraggedPaths(dragFileList);
 	}
 
 #if defined(__APPLE__)
@@ -2179,8 +2232,8 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 	} while (false);
 
 	if (jump) {
-		if (m_sendFileThread != NULL) {
-			StreamChunker::interruptFile();
+		if (m_sendFileChunker) {
+			m_sendFileChunker->interruptFile();
 			m_sendFileThread = NULL;
 		}
 
@@ -2543,25 +2596,42 @@ Server::isReceivedFileSizeValid()
 }
 
 void
-Server::sendFileToClient(const char* filename)
+Server::sendFileToClient(const std::string& filename)
 {
-	if (m_sendFileThread != NULL) {
-		StreamChunker::interruptFile();
+	if (m_sendFileChunker) {
+		m_sendFileChunker->interruptFile();
 	}
 
-    m_sendFileThread = new Thread([this, filename]() { send_file_thread(filename); });
+    auto chunker = std::make_shared<StreamChunker>();
+    m_sendFileChunker = chunker;
+    m_sendFileThread = new Thread([this, filename, chunker]() { send_file_thread(filename, chunker); });
 }
 
-void Server::send_file_thread(const char* filename)
+void Server::send_file_thread(const std::string& filename, const std::shared_ptr<StreamChunker>& chunker)
 {
+	barrier::fs::path sourcePath;
+	barrier::fs::path tempPackagePath;
 	try {
-		LOG((CLOG_DEBUG "sending file to client, filename=%s", filename));
-		StreamChunker::sendFile(filename, m_events, this, m_active != NULL ? m_active->getStream() : NULL);
+		LOG((CLOG_DEBUG "sending file to client, filename=%s", filename.c_str()));
+		std::string error;
+		if (!prepareTransferSource(filename.c_str(), sourcePath, tempPackagePath, error)) {
+			throw std::runtime_error(error);
+		}
+
+		const barrier::fs::path& transferPath =
+			tempPackagePath.empty() ? sourcePath : tempPackagePath;
+		chunker->sendFile(transferPath.u8string().c_str(), m_events, this, m_active != NULL ? m_active->getStream() : NULL);
 	}
 	catch (std::runtime_error &error) {
 		LOG((CLOG_ERR "failed sending file chunks, error: %s", error.what()));
 	}
 
+	if (!tempPackagePath.empty()) {
+		barrier::fs::remove(tempPackagePath);
+	}
+	if (m_sendFileChunker == chunker) {
+		m_sendFileChunker.reset();
+	}
 	m_sendFileThread = NULL;
 }
 
@@ -2576,4 +2646,52 @@ Server::dragInfoReceived(UInt32 fileNum, std::string content)
 	DragInformation::parseDragInfo(m_fakeDragFileList, fileNum, content);
 
 	m_screen->startDraggingFiles(m_fakeDragFileList);
+}
+namespace {
+
+bool prepareTransferSource(const char* filename,
+                           barrier::fs::path& sourcePath,
+                           barrier::fs::path& tempPackagePath,
+                           std::string& error)
+{
+    sourcePath.clear();
+    tempPackagePath.clear();
+    error.clear();
+
+    std::vector<barrier::fs::path> sourcePaths;
+    std::istringstream input(filename);
+    std::string entry;
+    while (std::getline(input, entry)) {
+        if (!entry.empty()) {
+            sourcePaths.push_back(barrier::fs::u8path(entry));
+        }
+    }
+    if (sourcePaths.empty()) {
+        sourcePaths.push_back(barrier::fs::u8path(filename));
+    }
+
+    for (const auto& path : sourcePaths) {
+        if (!barrier::fs::exists(path)) {
+            error = "transfer source does not exist";
+            return false;
+        }
+    }
+
+    if (sourcePaths.size() > 1) {
+        return TransferArchive::createSelectionPackageFile(sourcePaths, tempPackagePath, error);
+    }
+
+    sourcePath = sourcePaths.front();
+    if (!barrier::fs::exists(sourcePath)) {
+        error = "transfer source does not exist";
+        return false;
+    }
+
+    if (barrier::fs::is_directory(sourcePath)) {
+        return TransferArchive::createSelectionPackageFile(sourcePaths, tempPackagePath, error);
+    }
+
+    return true;
+}
+
 }

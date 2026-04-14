@@ -15,6 +15,35 @@
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
+    <widget class="QFrame" name="m_pSettingsHeaderCard">
+     <property name="frameShape">
+      <enum>QFrame::StyledPanel</enum>
+     </property>
+     <property name="frameShadow">
+      <enum>QFrame::Raised</enum>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_settingsHeader">
+      <item>
+       <widget class="QLabel" name="m_pLabelSettingsTitle">
+        <property name="text">
+         <string>Weave Settings</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="m_pLabelSettingsSummary">
+        <property name="text">
+         <string>Control how this device identifies itself, how Weave reaches peers, and how much latency or automation help you want by default.</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
     <widget class="QGroupBox" name="m_pGroupGeneral">
      <property name="enabled">
       <bool>true</bool>
@@ -26,7 +55,7 @@
       </sizepolicy>
      </property>
      <property name="title">
-      <string>General</string>
+      <string>Identity</string>
      </property>
      <layout class="QFormLayout" name="formLayout">
       <property name="fieldGrowthPolicy">
@@ -90,7 +119,7 @@
       <item row="2" column="1">
        <widget class="QComboBox" name="m_pComboElevate">
         <property name="toolTip">
-         <string>Specify when the Barrier service should run at an elevated privilege level</string>
+         <string>Specify when the Weave service should run at an elevated privilege level</string>
         </property>
         <property name="currentIndex">
          <number>0</number>
@@ -129,7 +158,7 @@
       <item row="5" column="0">
        <widget class="QCheckBox" name="m_pCheckBoxAutoStart">
         <property name="text">
-         <string>Start &amp;Barrier on startup</string>
+         <string>Start &amp;Weave on startup</string>
         </property>
        </widget>
       </item>
@@ -139,7 +168,7 @@
    <item>
     <widget class="QGroupBox" name="m_pGroupNetworking">
      <property name="title">
-      <string>Networking</string>
+      <string>Transport</string>
      </property>
      <layout class="QGridLayout" name="gridLayout_3">
       <item row="1" column="0">
@@ -208,7 +237,7 @@
    <item>
     <widget class="QGroupBox" name="m_pGroupFeatures">
      <property name="title">
-      <string>Features</string>
+      <string>Input &amp; Workflow</string>
      </property>
      <layout class="QVBoxLayout" name="verticalLayout_2">
       <item>
@@ -244,7 +273,7 @@
          <string>Optimize for remote-control apps on clients</string>
         </property>
         <property name="toolTip">
-         <string>Tunes Barrier for cases where a Windows client is itself running a remote-control tool such as Sunlogin.</string>
+         <string>Tunes Weave for cases where a Windows client is itself running a remote-control tool such as Sunlogin.</string>
         </property>
        </widget>
       </item>
@@ -260,7 +289,7 @@
       </sizepolicy>
      </property>
      <property name="title">
-      <string>Logging</string>
+      <string>Diagnostics</string>
      </property>
      <property name="alignment">
       <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>

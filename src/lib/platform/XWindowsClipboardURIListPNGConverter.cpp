@@ -13,9 +13,11 @@
 #include "io/filesystem.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <sstream>
+#include <unistd.h>
 
 namespace {
 
@@ -113,6 +115,90 @@ bool looksLikePng(const std::string& data)
            data[3] == 'G';
 }
 
+std::string stableContentId(const std::string& data)
+{
+    unsigned long long hash = 1469598103934665603ull;
+    for (size_t i = 0; i < data.size(); ++i) {
+        hash ^= static_cast<unsigned char>(data[i]);
+        hash *= 1099511628211ull;
+    }
+
+    std::ostringstream id;
+    id << std::hex << hash;
+    return id.str();
+}
+
+std::string tempDirectory()
+{
+    const char* tmpdir = std::getenv("TMPDIR");
+    if (tmpdir != nullptr && tmpdir[0] != '\0') {
+        return tmpdir;
+    }
+    return "/tmp";
+}
+
+std::string encodeFileUriPath(const std::string& path)
+{
+    static const char hex[] = "0123456789ABCDEF";
+
+    std::string encoded;
+    encoded.reserve(path.size());
+    for (size_t i = 0; i < path.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(path[i]);
+        const bool unreserved =
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~' || c == '/';
+
+        if (unreserved) {
+            encoded.push_back(static_cast<char>(c));
+        }
+        else {
+            encoded.push_back('%');
+            encoded.push_back(hex[c >> 4]);
+            encoded.push_back(hex[c & 0x0f]);
+        }
+    }
+    return encoded;
+}
+
+std::string writePngUriFile(const std::string& png)
+{
+    if (!looksLikePng(png) || png.size() > kMaxUriImageBytes) {
+        return {};
+    }
+
+    const std::string path = tempDirectory() +
+        "/barrier-clipboard-image-" +
+        std::to_string(static_cast<long long>(getpid())) +
+        "-" + stableContentId(png) + ".png";
+
+    try {
+        const barrier::fs::path imagePath = barrier::fs::u8path(path);
+        std::ofstream file;
+        barrier::open_utf8_path(file, imagePath, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) {
+            LOG((CLOG_WARN "failed to create uri-list image file: %s", path.c_str()));
+            return {};
+        }
+
+        file.write(png.data(), static_cast<std::streamsize>(png.size()));
+        file.close();
+        if (!file) {
+            LOG((CLOG_WARN "failed to write uri-list image file: %s", path.c_str()));
+            return {};
+        }
+
+        LOG((CLOG_INFO "published image clipboard payload as uri-list file: %s", path.c_str()));
+        return "file://" + encodeFileUriPath(path) + "\r\n";
+    }
+    catch (const std::exception& e) {
+        LOG((CLOG_WARN "failed to publish uri-list image file %s: %s", path.c_str(), e.what()));
+        return {};
+    }
+}
+
 std::string readPngFile(const std::string& path)
 {
     if (path.empty()) {
@@ -186,9 +272,9 @@ XWindowsClipboardURIListPNGConverter::getDataSize() const
 }
 
 std::string
-XWindowsClipboardURIListPNGConverter::fromIClipboard(const std::string&) const
+XWindowsClipboardURIListPNGConverter::fromIClipboard(const std::string& png) const
 {
-    return {};
+    return writePngUriFile(png);
 }
 
 std::string

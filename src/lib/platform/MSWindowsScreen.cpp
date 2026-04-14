@@ -39,8 +39,10 @@
 #include "base/Log.h"
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
+#include "io/filesystem.h"
 
 #include <string.h>
+#include <sstream>
 #include <Shlobj.h>
 #include <comutil.h>
 #include <algorithm>
@@ -361,16 +363,34 @@ MSWindowsScreen::leave()
 void MSWindowsScreen::send_drag_thread()
 {
     std::string& draggingFilename = getDraggingFilename();
-    size_t size = draggingFilename.size();
 
     if (draggingFilename.empty() == false) {
         ClientApp& app = ClientApp::instance();
         Client* client = app.getClientPtr();
-        UInt32 fileCount = 1;
+        DragFileList dragFileList;
+        std::istringstream input(draggingFilename);
+        std::string path;
+        while (std::getline(input, path)) {
+            if (path.empty()) {
+                continue;
+            }
+            DragInformation di;
+            di.setFilename(path);
+            if (barrier::fs::is_directory(barrier::fs::u8path(path))) {
+                di.setEntryType(DragInformation::Directory);
+            }
+            dragFileList.push_back(di);
+        }
+        if (dragFileList.empty()) {
+            m_draggingStarted = false;
+            return;
+        }
+        String info;
+        UInt32 fileCount = DragInformation::setupDragInfo(dragFileList, info);
         LOG((CLOG_DEBUG "send dragging info to server: %s", draggingFilename.c_str()));
-        client->sendDragInfo(fileCount, draggingFilename, size);
+        client->sendDragInfo(fileCount, info, info.size());
         LOG((CLOG_DEBUG "send dragging file to server"));
-        client->sendFileToServer(draggingFilename.c_str());
+        client->sendFileToServer(draggingFilename);
     }
 
     m_draggingStarted = false;

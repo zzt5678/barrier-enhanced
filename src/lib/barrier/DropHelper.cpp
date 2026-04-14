@@ -16,13 +16,31 @@
  */
 
 #include "barrier/DropHelper.h"
+#include "barrier/TransferArchive.h"
 
 #include "base/Log.h"
 #include "io/filesystem.h"
 
+#include <ctime>
+#include <cstdlib>
 #include <fstream>
+#include <sstream>
+#include <thread>
 
 namespace {
+
+std::string uniqueToken()
+{
+    std::ostringstream stream;
+    stream << std::hex
+           << static_cast<unsigned long long>(std::time(nullptr))
+           << "-"
+           << static_cast<unsigned long long>(
+               std::hash<std::thread::id>{}(std::this_thread::get_id()))
+           << "-"
+           << static_cast<unsigned long long>(std::rand());
+    return stream.str();
+}
 
 barrier::fs::path unique_drop_target_path(const barrier::fs::path& destination,
                                           const String& filename)
@@ -56,6 +74,33 @@ DropHelper::writeToDir(const String& destination, DragFileList& fileList, String
     if (!destination.empty() && fileList.size() > 0) {
         const barrier::fs::path dropDirectory = barrier::fs::u8path(destination);
         barrier::fs::create_directories(dropDirectory);
+
+        if (fileList.size() > 1 || fileList.at(0).isDirectory()) {
+            std::string error;
+            const barrier::fs::path stagingRoot =
+                dropDirectory / barrier::fs::u8path(".barrier-unpack-" + uniqueToken());
+            barrier::fs::create_directories(stagingRoot);
+            if (!TransferArchive::extractPackage(data, stagingRoot, error)) {
+                barrier::fs::remove_all(stagingRoot);
+                LOG((CLOG_ERR "drop directory failed: %s", error.c_str()));
+                return;
+            }
+
+            for (const auto& entry : barrier::fs::directory_iterator(stagingRoot)) {
+                const barrier::fs::path finalTarget =
+                    unique_drop_target_path(dropDirectory, entry.path().filename().u8string());
+                barrier::fs::rename(entry.path(), finalTarget);
+            }
+            barrier::fs::remove_all(stagingRoot);
+
+            LOG((CLOG_INFO "dropped transfer bundle (%zu item(s)) in \"%s\"",
+                 fileList.size(),
+                 destination.c_str()));
+
+            fileList.clear();
+            String().swap(data);
+            return;
+        }
 
         const barrier::fs::path dropTarget =
             unique_drop_target_path(dropDirectory, fileList.at(0).getFilename());

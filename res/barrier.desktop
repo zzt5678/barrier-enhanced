@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Barrier
+Name=Weave
 Comment=Keyboard and mouse sharing solution
-Exec=barrier
-Icon=barrier
+Exec=weave
+Icon=weave
 Terminal=false
 Categories=Utility;RemoteAccess;
 Keywords=keyboard;mouse;sharing;network;share;

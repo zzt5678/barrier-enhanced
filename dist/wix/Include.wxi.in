@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Include>
-    <?define Name="Barrier" ?>
+    <?define Name="Weave" ?>
     <?define Version="@BARRIER_WIX_VERSION@" ?>
     <?define QtVersion="@QT_VERSION@" ?>
     <?define Author="Debauchee Open Source Group" ?>

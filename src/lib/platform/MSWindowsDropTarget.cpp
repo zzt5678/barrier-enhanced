@@ -97,6 +97,12 @@ MSWindowsDropTarget::setDraggingFilename(const std::string& filename)
     m_dragFilename = filename;
 }
 
+void
+MSWindowsDropTarget::setDraggingFileList(const std::string& fileList)
+{
+    m_dragFilename = fileList;
+}
+
 std::string
 MSWindowsDropTarget::getDraggingFilename()
 {
@@ -122,11 +128,16 @@ getDropData(IDataObject* dataObject)
                 const HDROP drop = static_cast<HDROP>(stgMed.hGlobal);
                 const UINT fileCount = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
                 if (fileCount > 0) {
-                    const UINT pathLength = DragQueryFileW(drop, 0, nullptr, 0);
-                    if (pathLength > 0) {
+                    std::string joinedList;
+                    for (UINT fileIndex = 0; fileIndex < fileCount; ++fileIndex) {
+                        const UINT pathLength = DragQueryFileW(drop, fileIndex, nullptr, 0);
+                        if (pathLength == 0) {
+                            continue;
+                        }
+
                         std::wstring wideFilename(pathLength + 1, L'\0');
                         const UINT copied = DragQueryFileW(
-                            drop, 0, &wideFilename[0], pathLength + 1);
+                            drop, fileIndex, &wideFilename[0], pathLength + 1);
                         wideFilename.resize(copied);
 
                         const int utf8Size = WideCharToMultiByte(
@@ -136,8 +147,15 @@ getDropData(IDataObject* dataObject)
                             WideCharToMultiByte(
                                 CP_UTF8, 0, wideFilename.c_str(), -1,
                                 &filename[0], utf8Size, nullptr, nullptr);
-                            MSWindowsDropTarget::instance().setDraggingFilename(filename);
+                            if (!joinedList.empty()) {
+                                joinedList.push_back('\n');
+                            }
+                            joinedList.append(filename);
                         }
+                    }
+
+                    if (!joinedList.empty()) {
+                        MSWindowsDropTarget::instance().setDraggingFileList(joinedList);
                     }
                 }
 

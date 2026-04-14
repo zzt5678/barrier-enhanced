@@ -161,7 +161,7 @@ bool ZeroconfService::registerService(bool server)
             if (server) {
                 QString localIP = getLocalIPAddresses();
                 if (localIP.isEmpty()) {
-                    QMessageBox::warning(m_pMainWindow, tr("Barrier"),
+                    QMessageBox::warning(m_pMainWindow, tr("Weave"),
                         tr("Failed to get local IP address. "
                            "Please manually type in server address "
                            "on your clients"));

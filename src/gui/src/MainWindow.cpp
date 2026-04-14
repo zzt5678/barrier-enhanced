@@ -63,15 +63,15 @@
 
 static const QString allFilesFilter(QObject::tr("All files (*.*)"));
 #if defined(Q_OS_WIN)
-static const char barrierConfigName[] = "barrier.sgc";
-static const QString barrierConfigFilter(QObject::tr("Barrier Configurations (*.sgc)"));
+static const char barrierConfigName[] = "weave.sgc";
+static const QString barrierConfigFilter(QObject::tr("Weave Configurations (*.sgc)"));
 static QString bonjourBaseUrl = "http://binaries.symless.com/bonjour/";
 static const char bonjourFilename32[] = "Bonjour.msi";
 static const char bonjourFilename64[] = "Bonjour64.msi";
 static const char bonjourTargetFilename[] = "Bonjour.msi";
 #else
-static const char barrierConfigName[] = "barrier.conf";
-static const QString barrierConfigFilter(QObject::tr("Barrier Configurations (*.conf)"));
+static const char barrierConfigName[] = "weave.conf";
+static const QString barrierConfigFilter(QObject::tr("Weave Configurations (*.conf)"));
 #endif
 static const QString barrierConfigOpenFilter(barrierConfigFilter + ";;" + allFilesFilter);
 static const QString barrierConfigSaveFilter(barrierConfigFilter);
@@ -89,14 +89,6 @@ static const char* barrierIconFiles[] =
     ":/res/icons/16x16/barrier-connected.png",
     ":/res/icons/16x16/barrier-transfering.png"
 #endif
-};
-
-static const char* barrierIconNames[] =
-{
-    "barrier-disconnected",
-    "barrier-disconnected",
-    "barrier-connected",
-    "barrier-transfering"
 };
 
 static const char* barrierLargeIcon = ":/res/icons/256x256/barrier.ico";
@@ -193,14 +185,14 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
 
     // change default size based on os
 #if defined(Q_OS_MAC)
-    resize(720, 550);
-    setMinimumSize(720, 0);
+    resize(920, 640);
+    setMinimumSize(820, 600);
 #elif defined(Q_OS_LINUX)
-    resize(700, 530);
-    setMinimumSize(700, 0);
+    resize(960, 640);
+    setMinimumSize(860, 600);
 #elif defined(Q_OS_WIN)
-    resize(820, 620);
-    setMinimumSize(760, 540);
+    resize(1000, 700);
+    setMinimumSize(900, 620);
 #endif
 
     m_SuppressAutoConfigWarning = true;
@@ -302,7 +294,7 @@ void MainWindow::createTrayIcon()
 
     m_pTrayIcon = new QSystemTrayIcon(this);
     m_pTrayIcon->setContextMenu(m_pTrayIconMenu);
-    m_pTrayIcon->setToolTip("Barrier");
+    m_pTrayIcon->setToolTip("Weave");
 
     connect(m_pTrayIcon, SIGNAL(activated(QSystemTrayIcon::ActivationReason)),
             this, SLOT(trayActivated(QSystemTrayIcon::ActivationReason)));
@@ -314,7 +306,7 @@ void MainWindow::createTrayIcon()
 
 void MainWindow::retranslateMenuBar()
 {
-    m_pMenuBarrier->setTitle(tr("&Barrier"));
+    m_pMenuBarrier->setTitle(tr("&Weave"));
     m_pMenuHelp->setTitle(tr("&Help"));
 }
 
@@ -359,7 +351,7 @@ void MainWindow::loadSettings()
 void MainWindow::initConnections()
 {
     connect(m_pActionMinimize, SIGNAL(triggered()), this, SLOT(hide()));
-    connect(m_pActionRestore, SIGNAL(triggered()), this, SLOT(showControlCenter()));
+    connect(m_pActionRestore, &QAction::triggered, this, &MainWindow::showControlCenter);
     connect(m_pButtonSettings, SIGNAL(clicked()), this, SLOT(on_m_pActionSettings_triggered()));
     connect(m_pActionStartBarrier, SIGNAL(triggered()), this, SLOT(startBarrier()));
     connect(m_pActionStopBarrier, SIGNAL(triggered()), this, SLOT(stopBarrier()));
@@ -367,6 +359,9 @@ void MainWindow::initConnections()
     connect(m_pActionWorkflowHub, SIGNAL(triggered()), this, SLOT(showWorkflowHub()));
     connect(m_pActionCommandPalette, SIGNAL(triggered()), this, SLOT(showCommandPalette()));
     connect(m_pActionQuit, SIGNAL(triggered()), qApp, SLOT(quit()));
+    connect(m_pButtonWorkflowHub, &QPushButton::clicked, this, &MainWindow::showWorkflowHub);
+    connect(m_pButtonShowLog, &QPushButton::clicked, this, &MainWindow::showLogWindow);
+    connect(m_pListRecentReceipts, &QListWidget::itemActivated, this, &MainWindow::showWorkflowHub);
 }
 
 void MainWindow::saveSettings()
@@ -388,7 +383,9 @@ void MainWindow::saveSettings()
 void MainWindow::setIcon(qBarrierState state)
 {
     if (m_pTrayIcon) {
-        QIcon icon = QIcon::fromTheme(barrierIconNames[state], QIcon(barrierIconFiles[state]));
+        // Use bundled Weave assets directly so the tray never falls back
+        // to a stale system-installed Barrier icon from the theme cache.
+        QIcon icon(QString::fromUtf8(barrierIconFiles[state]));
 #if defined(Q_OS_MAC)
         icon.setIsMask(true);
 #endif
@@ -499,9 +496,9 @@ void MainWindow::checkConnected(const QString& line)
 
         if (!appConfig().startedBefore() && isVisible()) {
                 QMessageBox::information(
-                    this, "Barrier",
-                    tr("Barrier is now connected. You can close the "
-                    "config window and Barrier will remain connected in "
+                    this, "Weave",
+                    tr("Weave is now connected. You can close the "
+                    "config window and Weave will remain connected in "
                     "the background."));
 
             appConfig().setStartedBefore(true);
@@ -694,8 +691,8 @@ bool MainWindow::clientArgs(QStringList& args, QString& app)
     if (!QFile::exists(app))
     {
         show();
-        QMessageBox::warning(this, tr("Barrier client not found"),
-                             tr("The executable for the barrier client does not exist."));
+        QMessageBox::warning(this, tr("Weave client not found"),
+                             tr("The executable for the Weave client does not exist."));
         return false;
     }
 
@@ -717,7 +714,7 @@ bool MainWindow::clientArgs(QStringList& args, QString& app)
         show();
         if (!m_SuppressEmptyServerWarning) {
             QMessageBox::warning(this, tr("Hostname is empty"),
-                             tr("Please fill in a hostname for the barrier client to connect to."));
+                             tr("Please fill in a hostname for the Weave client to connect to."));
         }
         return false;
     }
@@ -737,7 +734,7 @@ QString MainWindow::configFilename()
         m_pTempConfigFile = new QTemporaryFile();
         if (!m_pTempConfigFile->open())
         {
-            QMessageBox::critical(this, tr("Cannot write configuration file"), tr("The temporary configuration file required to start barrier can not be written."));
+            QMessageBox::critical(this, tr("Cannot write configuration file"), tr("The temporary configuration file required to start Weave can not be written."));
             return "";
         }
 
@@ -751,7 +748,7 @@ QString MainWindow::configFilename()
         if (!QFile::exists(m_pLineEditConfigFile->text()))
         {
             if (QMessageBox::warning(this, tr("Configuration filename invalid"),
-                tr("You have not filled in a valid configuration file for the barrier server. "
+                tr("You have not filled in a valid configuration file for the Weave server. "
                         "Do you want to browse for the configuration file now?"), QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes
                     || !on_m_pButtonBrowseConfigFile_clicked())
                 return "";
@@ -786,8 +783,8 @@ bool MainWindow::serverArgs(QStringList& args, QString& app)
 
     if (!QFile::exists(app))
     {
-        QMessageBox::warning(this, tr("Barrier server not found"),
-                             tr("The executable for the barrier server does not exist."));
+        QMessageBox::warning(this, tr("Weave server not found"),
+                             tr("The executable for the Weave server does not exist."));
         return false;
     }
 
@@ -862,7 +859,7 @@ void MainWindow::stopDesktop()
         return;
     }
 
-    appendLogInfo("stopping barrier desktop process");
+    appendLogInfo("stopping Weave desktop process");
 
     if (barrierProcess()->isOpen()) {
         // try to shutdown child gracefully
@@ -941,17 +938,17 @@ void MainWindow::setBarrierState(qBarrierState state)
             m_pLabelPadlock->hide();
         }
 
-        setStatus(tr("Barrier is running."));
+        setStatus(tr("Weave is running."));
 
         break;
     }
     case barrierConnecting:
         m_pLabelPadlock->hide();
-        setStatus(tr("Barrier is starting."));
+        setStatus(tr("Weave is starting."));
         break;
     case barrierDisconnected:
         m_pLabelPadlock->hide();
-        setStatus(tr("Barrier is not running."));
+        setStatus(tr("Weave is not running."));
         break;
     case barrierTransfering:
         break;
@@ -1172,7 +1169,7 @@ void MainWindow::on_m_pGroupServer_toggled(bool on)
 
 bool MainWindow::on_m_pButtonBrowseConfigFile_clicked()
 {
-    QString fileName = QFileDialog::getOpenFileName(this, tr("Browse for a barriers config file"), QString(), barrierConfigOpenFilter);
+    QString fileName = QFileDialog::getOpenFileName(this, tr("Browse for a Weave config file"), QString(), barrierConfigOpenFilter);
 
     if (!fileName.isEmpty())
     {
@@ -1328,7 +1325,7 @@ void MainWindow::downloadBonjour()
     }
     else {
         QMessageBox::critical(
-            this, tr("Barrier"),
+            this, tr("Weave"),
             tr("Failed to detect system architecture."));
         return;
     }
@@ -1342,7 +1339,7 @@ void MainWindow::downloadBonjour()
 
     if (m_DownloadMessageBox == NULL) {
         m_DownloadMessageBox = new QMessageBox(this);
-        m_DownloadMessageBox->setWindowTitle("Barrier");
+        m_DownloadMessageBox->setWindowTitle("Weave");
         m_DownloadMessageBox->setIcon(QMessageBox::Information);
         m_DownloadMessageBox->setText("Installing Bonjour, please wait...");
         m_DownloadMessageBox->setStandardButtons(0);
@@ -1374,7 +1371,7 @@ void MainWindow::installBonjour()
         m_DownloadMessageBox->hide();
 
         QMessageBox::warning(
-            this, "Barrier",
+            this, "Weave",
             tr("Failed to download Bonjour installer to location: %1")
             .arg(tempLocation));
         return;
@@ -1411,7 +1408,7 @@ void MainWindow::promptAutoConfig()
 {
     if (!isBonjourRunning()) {
         int r = QMessageBox::question(
-            this, tr("Barrier"),
+            this, tr("Weave"),
             tr("Do you want to enable auto config and install Bonjour?\n\n"
                "This feature helps you establish the connection."),
             QMessageBox::Yes | QMessageBox::No);
@@ -1441,7 +1438,7 @@ void MainWindow::on_m_pCheckBoxAutoConfig_toggled(bool checked)
     if (!isBonjourRunning() && checked) {
         if (!m_SuppressAutoConfigWarning) {
             int r = QMessageBox::information(
-                this, tr("Barrier"),
+                this, tr("Weave"),
                 tr("Auto config feature requires Bonjour.\n\n"
                    "Do you want to install Bonjour?"),
                 QMessageBox::Yes | QMessageBox::No);
@@ -1486,6 +1483,7 @@ void MainWindow::refreshControlState()
         ? tr("Game mode is available because this machine is acting as the server. Drag & drop stays available for supported desktop targets.")
         : tr("Client mode keeps quick connect and tray control active. Switch this machine to server mode to enable game mode."));
     updateWorkflowPeerHint();
+    updateOverviewCards();
 }
 
 void MainWindow::on_m_pCheckBoxEnableDragDrop_clicked(bool checked)
@@ -1538,14 +1536,40 @@ void MainWindow::handleWorkflowNotification(const QString& title, const QString&
 
 void MainWindow::updateWorkflowIndicators()
 {
-    if (!m_pTrayIcon || !m_pWorkflowStore) {
+    if (!m_pWorkflowStore) {
         return;
     }
 
-    m_pTrayIcon->setToolTip(QStringLiteral("Barrier\nWorkflow %1\n%2 history item(s), %3 suggestion(s)")
-        .arg(m_pWorkflowStore->runtimeModeText())
-        .arg(m_pWorkflowStore->history().size())
-        .arg(m_pWorkflowStore->suggestions().size()));
+    if (m_pTrayIcon) {
+        m_pTrayIcon->setToolTip(QStringLiteral("Weave\nWorkflow %1\n%2 history item(s), %3 suggestion(s)")
+            .arg(m_pWorkflowStore->runtimeModeText())
+            .arg(m_pWorkflowStore->history().size())
+            .arg(m_pWorkflowStore->suggestions().size()));
+    }
+
+    m_pLabelWorkflowRuntimeValue->setText(m_pWorkflowStore->runtimeModeText());
+
+    m_pListRecentReceipts->clear();
+    const QList<TransferReceipt>& receipts = m_pWorkflowStore->receipts();
+    if (receipts.isEmpty()) {
+        m_pLabelReceiptSummary->setText(tr("No recent transfers yet. Incoming files, screenshots, and workflow actions will appear here."));
+    }
+    else {
+        const TransferReceipt& latest = receipts.first();
+        m_pLabelReceiptSummary->setText(tr("%1 transfer receipt(s). Latest: %2")
+            .arg(receipts.size())
+            .arg(latest.status));
+        const int count = qMin(5, receipts.size());
+        for (int i = 0; i < count; ++i) {
+            const TransferReceipt& receipt = receipts.at(i);
+            const QString line = QStringLiteral("%1  %2")
+                .arg(receipt.status, receipt.detail.isEmpty() ? receipt.actionId : receipt.detail);
+            auto* item = new QListWidgetItem(line, m_pListRecentReceipts);
+            item->setToolTip(receipt.createdAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
+        }
+    }
+
+    updateOverviewCards();
 }
 
 void MainWindow::updateWorkflowPeerHint()
@@ -1570,4 +1594,27 @@ void MainWindow::updateWorkflowPeerHint()
     }
 
     m_pWorkflowStore->setPeerDeviceHint(QString());
+}
+
+void MainWindow::updateOverviewCards()
+{
+    const bool serverMode = barrier_type() == BarrierType::Server;
+    m_pLabelModeValue->setText(serverMode ? tr("Server") : tr("Client"));
+
+    QString peerText;
+    if (barrierState() == barrierDisconnected) {
+        peerText = serverMode
+            ? tr("Ready to accept a client")
+            : (hostname().isEmpty() ? tr("No server selected") : hostname());
+    }
+    else {
+        peerText = serverMode
+            ? tr("Connected or awaiting a remote client")
+            : (hostname().isEmpty() ? tr("Connected server") : hostname());
+    }
+    m_pLabelPeerValue->setText(peerText);
+
+    if (!m_pWorkflowStore) {
+        m_pLabelWorkflowRuntimeValue->setText(tr("Unavailable"));
+    }
 }

@@ -33,10 +33,13 @@
 #include "common/stdset.h"
 #include "common/stdvector.h"
 
+#include <memory>
+
 class BaseClientProxy;
 class EventQueueTimer;
 class PrimaryClient;
 class InputFilter;
+class StreamChunker;
 namespace barrier { class Screen; }
 class IEventQueue;
 class Thread;
@@ -143,7 +146,7 @@ public:
     void                disconnect();
 
     //! Create a new thread and use it to send file to client
-    void                sendFileToClient(const char* filename);
+    void                sendFileToClient(const std::string& filename);
 
     //! Received dragging information from client
     void dragInfoReceived(UInt32 fileNum, std::string content);
@@ -359,7 +362,7 @@ private:
     void                forceLeaveClient(BaseClientProxy* client);
 
     // thread function for sending file
-    void send_file_thread(const char* filename);
+    void                send_file_thread(const std::string& filename, const std::shared_ptr<StreamChunker>& chunker);
 
     // thread function for writing file to drop directory
     void write_to_drop_dir_thread();
@@ -473,6 +476,7 @@ private:
     DragFileList        m_dragFileList;
     DragFileList        m_fakeDragFileList;
     Thread*                m_sendFileThread;
+    std::shared_ptr<StreamChunker> m_sendFileChunker;
     Thread*                m_writeToDropDirThread;
     std::string m_dragFileExt;
     bool                m_ignoreFileTransfer;

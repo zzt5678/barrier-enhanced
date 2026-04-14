@@ -13,7 +13,36 @@
   <property name="windowTitle">
    <string>Server Configuration</string>
   </property>
-  <layout class="QVBoxLayout">
+ <layout class="QVBoxLayout">
+   <item>
+    <widget class="QFrame" name="m_pHeaderCard">
+     <property name="frameShape">
+      <enum>QFrame::StyledPanel</enum>
+     </property>
+     <property name="frameShadow">
+      <enum>QFrame::Raised</enum>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_headerCard">
+      <item>
+       <widget class="QLabel" name="m_pLabelServerConfigTitle">
+        <property name="text">
+         <string>Server Layout Studio</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="m_pLabelServerConfigSummary">
+        <property name="text">
+         <string>Shape the crossing experience screen by screen. Keep the canvas clean, align edges precisely, and tune advanced behavior only when the defaults are not enough.</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
    <item>
     <widget class="QTabWidget" name="m_pTabWidget">
      <property name="currentIndex">
@@ -21,7 +50,7 @@
      </property>
      <widget class="QWidget" name="m_pTabScreens">
       <attribute name="title">
-       <string>Screens and links</string>
+       <string>Layout</string>
       </attribute>
       <layout class="QVBoxLayout">
        <item>
@@ -57,7 +86,7 @@
             </sizepolicy>
            </property>
            <property name="text">
-            <string>Configure the layout of your barrier server configuration.</string>
+            <string>Configure the layout of your Weave server configuration.</string>
            </property>
            <property name="alignment">
             <set>Qt::AlignCenter</set>
@@ -154,7 +183,7 @@ Double click on a screen to edit its settings.</string>
      </widget>
      <widget class="QWidget" name="m_pTabHotkeys">
       <attribute name="title">
-       <string>Hotkeys</string>
+       <string>Automation</string>
       </attribute>
       <layout class="QHBoxLayout">
        <item>
@@ -270,14 +299,14 @@ Double click on a screen to edit its settings.</string>
       </layout>
      </widget>
      <widget class="QWidget" name="m_pTabAdvanced">
-      <attribute name="title">
-       <string>Advanced server settings</string>
+     <attribute name="title">
+       <string>Advanced</string>
       </attribute>
       <layout class="QGridLayout">
        <item row="0" column="0">
         <widget class="QGroupBox" name="m_pGroupSwitch">
          <property name="title">
-          <string>&amp;Switch</string>
+          <string>&amp;Crossing Behavior</string>
          </property>
          <layout class="QVBoxLayout">
           <item>
@@ -419,7 +448,7 @@ Double click on a screen to edit its settings.</string>
        <item row="0" column="1">
         <widget class="QGroupBox" name="m_pGroupOptions">
          <property name="title">
-          <string>&amp;Options</string>
+          <string>&amp;Server Defaults</string>
          </property>
          <layout class="QGridLayout">
           <item row="3" column="0">
@@ -548,7 +577,7 @@ Double click on a screen to edit its settings.</string>
        <item row="1" column="0" colspan="2">
         <widget class="QGroupBox" name="m_pGroupSwitchCorners">
          <property name="title">
-          <string>&amp;Dead corners</string>
+          <string>&amp;Dead Corners</string>
          </property>
          <property name="checked">
           <bool>false</bool>

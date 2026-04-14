@@ -41,6 +41,7 @@ public:
     HRESULT __stdcall    Drop(IDataObject* dataObject, DWORD keyState, POINTL point, DWORD* effect);
 
     void                setDraggingFilename(const std::string& filename);
+    void                setDraggingFileList(const std::string& fileList);
     std::string            getDraggingFilename();
     void                clearDraggingFilename();
 
