@@ -220,6 +220,9 @@ private:
     void                deskMouseRelativeMove(SInt32 dx, SInt32 dy) const;
     void                deskEnter(Desk* desk);
     void                deskLeave(Desk* desk, HKL keyLayout);
+    void                updateDeskTimer(double interval);
+    void                beginLowLatencyRelativeMoves();
+    void                endLowLatencyRelativeMoves();
     void desk_thread(Desk* desk);
 
     // desk switch checking and handling
@@ -290,6 +293,11 @@ private:
 
     // options
     bool                m_leaveForegroundOption;
+    bool                m_lowLatencyMode;
+    bool                m_nestedRemoteMode;
+    bool                m_relativeMoveAccelerationDisabled;
+    int                 m_oldMouseAcceleration[4];
+    double              m_deskPollInterval;
 
     IEventQueue*        m_events;
 

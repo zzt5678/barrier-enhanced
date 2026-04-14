@@ -228,6 +228,26 @@
         </property>
        </widget>
       </item>
+      <item>
+       <widget class="QCheckBox" name="m_pCheckBoxLowLatencyMode">
+        <property name="text">
+         <string>Prefer low-latency mouse delivery</string>
+        </property>
+        <property name="toolTip">
+         <string>Reduces mouse buffering and desk polling delay without enabling full game mode.</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="m_pCheckBoxNestedRemoteMode">
+        <property name="text">
+         <string>Optimize for remote-control apps on clients</string>
+        </property>
+        <property name="toolTip">
+         <string>Tunes Barrier for cases where a Windows client is itself running a remote-control tool such as Sunlogin.</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>

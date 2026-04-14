@@ -41,6 +41,8 @@ public:
     bool                m_enableDragDrop;
     String              m_dropTarget;
     bool                m_gameMode;
+    bool                m_lowLatencyMode;
+    bool                m_nestedRemoteMode;
 #if SYSAPI_WIN32
     bool                m_debugServiceWait;
     bool                m_pauseOnExit;

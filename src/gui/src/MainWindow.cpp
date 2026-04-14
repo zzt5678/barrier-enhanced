@@ -804,6 +804,12 @@ bool MainWindow::serverArgs(QStringList& args, QString& app)
     if (appConfig().getGameMode()) {
         args << "--game-mode";
     }
+    if (appConfig().getLowLatencyMode()) {
+        args << "--low-latency-mode";
+    }
+    if (appConfig().getNestedRemoteMode()) {
+        args << "--nested-remote-mode";
+    }
 
     QString configFilename = this->configFilename();
 #if defined(Q_OS_WIN)

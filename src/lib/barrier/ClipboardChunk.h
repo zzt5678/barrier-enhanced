@@ -56,5 +56,5 @@ public:
     static size_t        getExpectedSize() { return s_expectedSize; }
 
 private:
-    static size_t        s_expectedSize;
+    static thread_local size_t s_expectedSize;
 };

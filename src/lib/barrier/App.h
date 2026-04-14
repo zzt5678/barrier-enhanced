@@ -168,6 +168,10 @@ private:
     "      --enable-drag-drop   enable file drag & drop.\n" \
     "      --game-mode          prefer low-latency, lock-friendly behavior for\n" \
     "                           gaming on the primary screen.\n" \
+    "      --low-latency-mode   reduce mouse-input buffering without locking the\n" \
+    "                           cursor to the primary screen.\n" \
+    "      --nested-remote-mode optimize for a remote-control tool running on a\n" \
+    "                           Barrier client (forces lower-latency mouse flow).\n" \
     "      --enable-crypto      enable the crypto (ssl) plugin (default, deprecated).\n" \
     "      --disable-crypto     disable the crypto (ssl) plugin.\n" \
     "      --profile-dir <path> use named profile directory instead.\n" \

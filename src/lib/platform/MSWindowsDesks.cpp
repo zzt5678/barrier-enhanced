@@ -47,6 +47,9 @@
 #if !defined(MOUSEEVENTF_HWHEEL)
 #define MOUSEEVENTF_HWHEEL 0x1000
 #endif
+#if !defined(MOUSEEVENTF_MOVE_NOCOALESCE)
+#define MOUSEEVENTF_MOVE_NOCOALESCE 0x2000
+#endif
 
 // X button stuff
 #if !defined(WM_XBUTTONDOWN)
@@ -91,6 +94,62 @@
 // enable; <unused>
 #define BARRIER_MSG_FAKE_INPUT        BARRIER_HOOK_LAST_MSG + 12
 
+namespace {
+
+LONG normalizeMouseCoordinate(SInt32 value, SInt32 origin, SInt32 length)
+{
+    if (length <= 1) {
+        return 0;
+    }
+
+    const double scaled =
+        (static_cast<double>(value - origin) * 65535.0) /
+        static_cast<double>(length - 1);
+    if (scaled <= 0.0) {
+        return 0;
+    }
+    if (scaled >= 65535.0) {
+        return 65535;
+    }
+    return static_cast<LONG>(scaled + 0.5);
+}
+
+void sendKeyboardInput(UINT virtualKey, UINT scanCode, DWORD flags)
+{
+    INPUT input;
+    ZeroMemory(&input, sizeof(input));
+    input.type = INPUT_KEYBOARD;
+
+    const UINT resolvedScan =
+        (scanCode != 0) ? scanCode : MapVirtualKey(virtualKey, MAPVK_VK_TO_VSC);
+    if (resolvedScan != 0) {
+        input.ki.wVk = 0;
+        input.ki.wScan = static_cast<WORD>(resolvedScan);
+        input.ki.dwFlags = flags | KEYEVENTF_SCANCODE;
+    }
+    else {
+        input.ki.wVk = static_cast<WORD>(virtualKey);
+        input.ki.wScan = 0;
+        input.ki.dwFlags = flags;
+    }
+
+    SendInput(1, &input, sizeof(input));
+}
+
+void sendMouseInput(LONG dx, LONG dy, DWORD flags, DWORD mouseData)
+{
+    INPUT input;
+    ZeroMemory(&input, sizeof(input));
+    input.type = INPUT_MOUSE;
+    input.mi.dx = dx;
+    input.mi.dy = dy;
+    input.mi.dwFlags = flags;
+    input.mi.mouseData = mouseData;
+    SendInput(1, &input, sizeof(input));
+}
+
+}
+
 //
 // MSWindowsDesks
 //
@@ -106,6 +165,7 @@ MSWindowsDesks::MSWindowsDesks(bool isPrimary, bool noHooks,
     m_xCenter(0), m_yCenter(0),
     m_multimon(false),
     m_timer(NULL),
+    m_threadID(0),
     m_screensaver(screensaver),
     m_screensaverNotify(false),
     m_activeDesk(NULL),
@@ -113,6 +173,12 @@ MSWindowsDesks::MSWindowsDesks(bool isPrimary, bool noHooks,
     m_mutex(),
     m_deskReady(&m_mutex, false),
     m_updateKeys(updateKeys),
+    m_leaveForegroundOption(false),
+    m_lowLatencyMode(false),
+    m_nestedRemoteMode(false),
+    m_relativeMoveAccelerationDisabled(false),
+    m_oldMouseAcceleration{0, 0, 0, 0},
+    m_deskPollInterval(0.2),
     m_events(events),
     m_stopOnDeskSwitch(stopOnDeskSwitch)
 {
@@ -141,10 +207,7 @@ MSWindowsDesks::enable()
     // which desk is active and reinstalls the hooks as necessary.
     // we wouldn't need this if windows notified us of a desktop
     // change but as far as i can tell it doesn't.
-    m_timer = m_events->newTimer(0.2, NULL);
-    m_events->adoptHandler(Event::kTimer, m_timer,
-                            new TMethodEventJob<MSWindowsDesks>(
-                                this, &MSWindowsDesks::handleCheckDesk));
+    updateDeskTimer(m_deskPollInterval);
 
     updateKeys();
 }
@@ -158,6 +221,8 @@ MSWindowsDesks::disable()
         m_events->deleteTimer(m_timer);
         m_timer = NULL;
     }
+    m_threadID = 0;
+    endLowLatencyRelativeMoves();
 
     // destroy desks
     removeDesks();
@@ -181,23 +246,94 @@ void
 MSWindowsDesks::resetOptions()
 {
     m_leaveForegroundOption = false;
+    m_lowLatencyMode = false;
+    m_nestedRemoteMode = false;
+    endLowLatencyRelativeMoves();
+    updateDeskTimer(0.2);
 }
 
 void
 MSWindowsDesks::setOptions(const OptionsList& options)
 {
+    bool lowLatencyMode = false;
+    bool nestedRemoteMode = false;
     for (UInt32 i = 0, n = (UInt32)options.size(); i < n; i += 2) {
         if (options[i] == kOptionWin32KeepForeground) {
             m_leaveForegroundOption = (options[i + 1] != 0);
             LOG((CLOG_DEBUG1 "%s the foreground window", m_leaveForegroundOption ? "don\'t grab" : "grab"));
         }
+        else if (options[i] == kOptionLowLatencyMode) {
+            lowLatencyMode = (options[i + 1] != 0);
+        }
+        else if (options[i] == kOptionNestedRemoteMode) {
+            nestedRemoteMode = (options[i + 1] != 0);
+        }
     }
+
+    m_lowLatencyMode = lowLatencyMode;
+    m_nestedRemoteMode = nestedRemoteMode;
+    if (!m_lowLatencyMode && !m_nestedRemoteMode) {
+        endLowLatencyRelativeMoves();
+    }
+    updateDeskTimer((m_lowLatencyMode || m_nestedRemoteMode) ? 0.05 : 0.2);
 }
 
 void
 MSWindowsDesks::updateKeys()
 {
     sendMessage(BARRIER_MSG_SYNC_KEYS, 0, 0);
+}
+
+void
+MSWindowsDesks::updateDeskTimer(double interval)
+{
+    m_deskPollInterval = interval;
+
+    if (m_timer != NULL) {
+        m_events->removeHandler(Event::kTimer, m_timer);
+        m_events->deleteTimer(m_timer);
+        m_timer = NULL;
+    }
+
+    if (m_threadID != 0) {
+        m_timer = m_events->newTimer(m_deskPollInterval, NULL);
+        m_events->adoptHandler(Event::kTimer, m_timer,
+                                new TMethodEventJob<MSWindowsDesks>(
+                                    this, &MSWindowsDesks::handleCheckDesk));
+    }
+}
+
+void
+MSWindowsDesks::beginLowLatencyRelativeMoves()
+{
+    if (m_relativeMoveAccelerationDisabled ||
+        GetSystemMetrics(SM_MOUSEPRESENT) == 0 ||
+        (!m_lowLatencyMode && !m_nestedRemoteMode)) {
+        return;
+    }
+
+    if (!SystemParametersInfo(SPI_GETMOUSE, 0, m_oldMouseAcceleration, 0) ||
+        !SystemParametersInfo(SPI_GETMOUSESPEED, 0, m_oldMouseAcceleration + 3, 0)) {
+        return;
+    }
+
+    int newSpeed[4] = { 0, 0, 0, 1 };
+    if (SystemParametersInfo(SPI_SETMOUSE, 0, newSpeed, 0) &&
+        SystemParametersInfo(SPI_SETMOUSESPEED, 0, newSpeed + 3, 0)) {
+        m_relativeMoveAccelerationDisabled = true;
+    }
+}
+
+void
+MSWindowsDesks::endLowLatencyRelativeMoves()
+{
+    if (!m_relativeMoveAccelerationDisabled) {
+        return;
+    }
+
+    SystemParametersInfo(SPI_SETMOUSE, 0, m_oldMouseAcceleration, 0);
+    SystemParametersInfo(SPI_SETMOUSESPEED, 0, m_oldMouseAcceleration + 3, 0);
+    m_relativeMoveAccelerationDisabled = false;
 }
 
 void
@@ -463,15 +599,28 @@ MSWindowsDesks::secondaryDeskProc(
 void
 MSWindowsDesks::deskMouseMove(SInt32 x, SInt32 y) const
 {
-    // when using absolute positioning with mouse_event(),
-    // the normalized device coordinates range over only
-    // the primary screen.
-    SInt32 w = GetSystemMetrics(SM_CXSCREEN);
-    SInt32 h = GetSystemMetrics(SM_CYSCREEN);
-    mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                            (DWORD)((65535.0f * x) / (w - 1) + 0.5f),
-                            (DWORD)((65535.0f * y) / (h - 1) + 0.5f),
-                            0, 0);
+    SInt32 originX = 0;
+    SInt32 originY = 0;
+    SInt32 width = GetSystemMetrics(SM_CXSCREEN);
+    SInt32 height = GetSystemMetrics(SM_CYSCREEN);
+    DWORD flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+
+    if (m_multimon) {
+        originX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        originY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        flags |= MOUSEEVENTF_VIRTUALDESK;
+    }
+    if (m_lowLatencyMode || m_nestedRemoteMode) {
+        flags |= MOUSEEVENTF_MOVE_NOCOALESCE;
+    }
+
+    sendMouseInput(
+        normalizeMouseCoordinate(x, originX, width),
+        normalizeMouseCoordinate(y, originY, height),
+        flags,
+        0);
 }
 
 void
@@ -488,23 +637,32 @@ MSWindowsDesks::deskMouseRelativeMove(SInt32 dx, SInt32 dy) const
 
     // save mouse speed & acceleration
     int oldSpeed[4];
-    bool accelChanged =
-                SystemParametersInfo(SPI_GETMOUSE,0, oldSpeed, 0) &&
-                SystemParametersInfo(SPI_GETMOUSESPEED, 0, oldSpeed + 3, 0);
+    const bool manageAccelerationPerMove =
+        !m_relativeMoveAccelerationDisabled &&
+        !m_lowLatencyMode &&
+        !m_nestedRemoteMode;
+    bool accelChanged = false;
 
-    // use 1:1 motion
-    if (accelChanged) {
-        int newSpeed[4] = { 0, 0, 0, 1 };
+    if (manageAccelerationPerMove) {
         accelChanged =
-                SystemParametersInfo(SPI_SETMOUSE, 0, newSpeed, 0) ||
-                SystemParametersInfo(SPI_SETMOUSESPEED, 0, newSpeed + 3, 0);
+                    SystemParametersInfo(SPI_GETMOUSE,0, oldSpeed, 0) &&
+                    SystemParametersInfo(SPI_GETMOUSESPEED, 0, oldSpeed + 3, 0);
+
+        if (accelChanged) {
+            int newSpeed[4] = { 0, 0, 0, 1 };
+            accelChanged =
+                    SystemParametersInfo(SPI_SETMOUSE, 0, newSpeed, 0) &&
+                    SystemParametersInfo(SPI_SETMOUSESPEED, 0, newSpeed + 3, 0);
+        }
     }
 
-    // move relative to mouse position
-    mouse_event(MOUSEEVENTF_MOVE, dx, dy, 0, 0);
+    DWORD flags = MOUSEEVENTF_MOVE;
+    if (m_lowLatencyMode || m_nestedRemoteMode) {
+        flags |= MOUSEEVENTF_MOVE_NOCOALESCE;
+    }
+    sendMouseInput(dx, dy, flags, 0);
 
-    // restore mouse speed & acceleration
-    if (accelChanged) {
+    if (manageAccelerationPerMove && accelChanged) {
         SystemParametersInfo(SPI_SETMOUSE, 0, oldSpeed, 0);
         SystemParametersInfo(SPI_SETMOUSESPEED, 0, oldSpeed + 3, 0);
     }
@@ -513,6 +671,8 @@ MSWindowsDesks::deskMouseRelativeMove(SInt32 dx, SInt32 dy) const
 void
 MSWindowsDesks::deskEnter(Desk* desk)
 {
+    endLowLatencyRelativeMoves();
+
     if (!m_isPrimary) {
         ReleaseCapture();
     }
@@ -581,6 +741,8 @@ MSWindowsDesks::deskLeave(Desk* desk, HKL keyLayout)
         ActivateKeyboardLayout(keyLayout, 0);
     }
     else {
+        beginLowLatencyRelativeMoves();
+
         // move hider window under the cursor center, raise, and show it
         SetWindowPos(desk->m_window, HWND_TOP,
                             m_xCenter, m_yCenter, 1, 1,
@@ -665,12 +827,13 @@ void MSWindowsDesks::desk_thread(Desk* desk)
             break;
 
         case BARRIER_MSG_FAKE_KEY:
-            keybd_event(HIBYTE(msg.lParam), LOBYTE(msg.lParam), (DWORD)msg.wParam, 0);
+            sendKeyboardInput(HIBYTE(msg.lParam), LOBYTE(msg.lParam), (DWORD)msg.wParam);
             break;
 
         case BARRIER_MSG_FAKE_BUTTON:
             if (msg.wParam != 0) {
-                mouse_event((DWORD)msg.wParam, 0, 0, (DWORD)msg.lParam, 0);
+                sendMouseInput(0, 0, static_cast<DWORD>(msg.wParam),
+                                static_cast<DWORD>(msg.lParam));
             }
             break;
 
@@ -686,10 +849,12 @@ void MSWindowsDesks::desk_thread(Desk* desk)
 
         case BARRIER_MSG_FAKE_WHEEL:
             if (msg.lParam != 0) {
-                mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)msg.lParam, 0);
+                sendMouseInput(0, 0, MOUSEEVENTF_WHEEL,
+                                static_cast<DWORD>(msg.lParam));
             }
             else if (IsWindowsVistaOrGreater() && msg.wParam != 0) {
-                mouse_event(MOUSEEVENTF_HWHEEL, 0, 0, (DWORD)msg.wParam, 0);
+                sendMouseInput(0, 0, MOUSEEVENTF_HWHEEL,
+                                static_cast<DWORD>(msg.wParam));
             }
             break;
 
@@ -718,9 +883,9 @@ void MSWindowsDesks::desk_thread(Desk* desk)
             break;
 
         case BARRIER_MSG_FAKE_INPUT:
-            keybd_event(BARRIER_HOOK_FAKE_INPUT_VIRTUAL_KEY,
+            sendKeyboardInput(BARRIER_HOOK_FAKE_INPUT_VIRTUAL_KEY,
                                 BARRIER_HOOK_FAKE_INPUT_SCANCODE,
-                                msg.wParam ? 0 : KEYEVENTF_KEYUP, 0);
+                                msg.wParam ? 0 : KEYEVENTF_KEYUP);
             break;
         }
 

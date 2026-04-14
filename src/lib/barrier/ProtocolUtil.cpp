@@ -47,6 +47,31 @@ ProtocolUtil::writef(barrier::IStream* stream, const char* fmt, ...)
     va_end(args);
 }
 
+void
+ProtocolUtil::writefLowPriority(barrier::IStream* stream, const char* fmt, ...)
+{
+    assert(stream != NULL);
+    assert(fmt != NULL);
+    LOG((CLOG_DEBUG2 "writefLowPriority(%s)", fmt));
+
+    va_list args;
+    va_start(args, fmt);
+    UInt32 size = getLength(fmt, args);
+    va_end(args);
+
+    if (size == 0) {
+        return;
+    }
+
+    std::vector<UInt8> buffer(size);
+    va_start(args, fmt);
+    writef_void(buffer.data(), fmt, args);
+    va_end(args);
+
+    stream->writeLowPriority(buffer.data(), size);
+    LOG((CLOG_DEBUG2 "wrote %d bytes (low priority)", size));
+}
+
 bool
 ProtocolUtil::readf(barrier::IStream* stream, const char* fmt, ...)
 {

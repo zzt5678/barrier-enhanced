@@ -283,6 +283,12 @@ ArgParser::parseGenericArgs(int argc, const char* const* argv, int& i)
     else if (isArg(i, argc, argv, NULL, "--game-mode")) {
         argsBase().m_gameMode = true;
     }
+    else if (isArg(i, argc, argv, NULL, "--low-latency-mode")) {
+        argsBase().m_lowLatencyMode = true;
+    }
+    else if (isArg(i, argc, argv, NULL, "--nested-remote-mode")) {
+        argsBase().m_nestedRemoteMode = true;
+    }
     else if (isArg(i, argc, argv, NULL, "--drop-dir")) {
         argsBase().m_dropTarget = argv[++i];
     }

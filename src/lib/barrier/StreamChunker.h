@@ -22,17 +22,20 @@
 
 class IEventQueue;
 class Mutex;
+namespace barrier { class IStream; }
 
 class StreamChunker {
 public:
-    static void sendFile(const char* filename, IEventQueue* events, void* eventTarget);
+    static void sendFile(const char* filename, IEventQueue* events, void* eventTarget,
+                         barrier::IStream* stream = nullptr);
     static void            sendClipboard(
                             String& data,
                             size_t size,
                             ClipboardID id,
                             UInt32 sequence,
                             IEventQueue* events,
-                            void* eventTarget);
+                            void* eventTarget,
+                            barrier::IStream* stream = nullptr);
     static void            interruptFile();
 
 private:

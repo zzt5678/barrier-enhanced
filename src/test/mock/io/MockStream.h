@@ -31,6 +31,7 @@ public:
     MOCK_METHOD0(close, void());
     MOCK_METHOD2(read, UInt32(void*, UInt32));
     MOCK_METHOD2(write, void(const void*, UInt32));
+    MOCK_METHOD2(writeLowPriority, void(const void*, UInt32));
     MOCK_METHOD0(flush, void());
     MOCK_METHOD0(shutdownInput, void());
     MOCK_METHOD0(shutdownOutput, void());
@@ -41,4 +42,5 @@ public:
     MOCK_CONST_METHOD0(getEventTarget, void*());
     MOCK_CONST_METHOD0(isReady, bool());
     MOCK_CONST_METHOD0(getSize, UInt32());
+    MOCK_CONST_METHOD0(getBufferedOutputSize, UInt32());
 };

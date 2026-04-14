@@ -23,7 +23,9 @@
 #include "base/Log.h"
 #include <cstring>
 
-size_t ClipboardChunk::s_expectedSize = 0;
+static const size_t kClipboardReceiveReserveLimit = 16 * 1024 * 1024;
+
+thread_local size_t ClipboardChunk::s_expectedSize = 0;
 
 ClipboardChunk::ClipboardChunk(size_t size) :
     Chunk(size)
@@ -100,6 +102,9 @@ ClipboardChunk::assemble(barrier::IStream* stream,
         s_expectedSize = barrier::string::stringToSizeType(data);
         LOG((CLOG_DEBUG "start receiving clipboard data"));
         dataCached.clear();
+        if (s_expectedSize <= kClipboardReceiveReserveLimit) {
+            dataCached.reserve(s_expectedSize);
+        }
         return kStart;
     }
     else if (mark == kDataChunk) {
@@ -150,5 +155,5 @@ ClipboardChunk::send(barrier::IStream* stream, void* data)
         break;
     }
 
-    ProtocolUtil::writef(stream, kMsgDClipboard, id, sequence, mark, &dataChunk);
+    ProtocolUtil::writefLowPriority(stream, kMsgDClipboard, id, sequence, mark, &dataChunk);
 }

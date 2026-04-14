@@ -58,7 +58,7 @@ ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard* clipboard)
         size_t size = data.size();
         LOG((CLOG_DEBUG "sending clipboard %d to \"%s\"", id, getName().c_str()));
 
-        StreamChunker::sendClipboard(data, size, id, 0, m_events, this);
+        StreamChunker::sendClipboard(data, size, id, 0, m_events, this, getStream());
     }
 }
 

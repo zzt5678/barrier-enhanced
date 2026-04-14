@@ -29,6 +29,8 @@
 #include "base/Log.h"
 #include "base/Stopwatch.h"
 #include "base/String.h"
+#include "arch/Arch.h"
+#include "io/IStream.h"
 
 #include <fstream>
 #include <stdexcept>
@@ -52,6 +54,91 @@ size_t getChunkSize(size_t totalSize)
     return 32 * 1024;
 }
 
+size_t getClipboardChunkSize(size_t totalSize)
+{
+    if (totalSize >= 16 * 1024 * 1024) {
+        return 32 * 1024;
+    }
+    if (totalSize >= 1 * 1024 * 1024) {
+        return 16 * 1024;
+    }
+    return 8 * 1024;
+}
+
+void cooperativeYield(size_t& bytesSinceYield, size_t threshold)
+{
+    if (bytesSinceYield >= threshold) {
+        bytesSinceYield = 0;
+        ARCH->sleep(0.0);
+    }
+}
+
+void waitForBufferedOutputBudget(barrier::IStream* stream,
+                                 UInt32 maxBufferedBytes,
+                                 double sleepSeconds)
+{
+    if (stream == nullptr) {
+        return;
+    }
+
+    UInt32 waitCount = 0;
+    while (stream->getBufferedOutputSize() > maxBufferedBytes) {
+        ++waitCount;
+        ARCH->sleep(sleepSeconds);
+    }
+
+    if (waitCount > 0) {
+        LOG((CLOG_DEBUG2 "bulk output throttled: waits=%u maxBufferedBudget=%u slept=%.3fs",
+            waitCount, maxBufferedBytes, waitCount * sleepSeconds));
+    }
+}
+
+void queueClipboardChunks(
+                String data,
+                size_t size,
+                ClipboardID id,
+                UInt32 sequence,
+                IEventQueue* events,
+                void* eventTarget,
+                barrier::IStream* stream)
+{
+    String dataSize = barrier::string::sizeTypeToString(size);
+    ClipboardChunk* sizeMessage = ClipboardChunk::start(id, sequence, dataSize);
+
+    events->addEvent(Event(events->forClipboard().clipboardSending(), eventTarget, sizeMessage));
+
+    size_t sentLength = 0;
+    size_t bytesSinceYield = 0;
+    const size_t chunkSize = getClipboardChunkSize(size);
+
+    while (true) {
+        events->addEvent(Event(events->forFile().keepAlive(), eventTarget));
+        waitForBufferedOutputBudget(stream, 128 * 1024, 0.001);
+
+        size_t bytesToSend = chunkSize;
+        if (sentLength + bytesToSend > size) {
+            bytesToSend = size - sentLength;
+        }
+
+        String chunk(data.data() + sentLength, bytesToSend);
+        ClipboardChunk* dataChunk = ClipboardChunk::data(id, sequence, chunk);
+
+        events->addEvent(Event(events->forClipboard().clipboardSending(), eventTarget, dataChunk));
+
+        sentLength += bytesToSend;
+        bytesSinceYield += bytesToSend;
+        cooperativeYield(bytesSinceYield, 64 * 1024);
+        if (sentLength == size) {
+            break;
+        }
+    }
+
+    ClipboardChunk* end = ClipboardChunk::end(id, sequence);
+    events->addEvent(Event(events->forClipboard().clipboardSending(), eventTarget, end));
+
+    LOG((CLOG_DEBUG "sent clipboard size=%d", sentLength));
+}
+
 }
 
 bool StreamChunker::s_isChunkingFile = false;
@@ -61,7 +148,8 @@ Mutex* StreamChunker::s_interruptMutex = NULL;
 void
 StreamChunker::sendFile(const char* filename,
                 IEventQueue* events,
-                void* eventTarget)
+                void* eventTarget,
+                barrier::IStream* stream)
 {
     s_isChunkingFile = true;
 
@@ -83,6 +171,7 @@ StreamChunker::sendFile(const char* filename,
 
     // send chunk messages with a fixed chunk size
     size_t sentLength = 0;
+    size_t bytesSinceYield = 0;
     const size_t chunkSize = getChunkSize(size);
     std::vector<char> chunkBuffer(chunkSize);
     file.seekg (0, std::ios::beg);
@@ -95,6 +184,7 @@ StreamChunker::sendFile(const char* filename,
         }
 
         events->addEvent(Event(events->forFile().keepAlive(), eventTarget));
+        waitForBufferedOutputBudget(stream, 512 * 1024, 0.001);
 
         // make sure we don't read too much from the mock data.
         size_t bytesToRead = chunkSize;
@@ -112,6 +202,8 @@ StreamChunker::sendFile(const char* filename,
         events->addEvent(Event(events->forFile().fileChunkSending(), eventTarget, fileChunk));
 
         sentLength += bytesToRead;
+        bytesSinceYield += bytesToRead;
+        cooperativeYield(bytesSinceYield, 256 * 1024);
 
         if (sentLength == size) {
             break;
@@ -135,44 +227,10 @@ StreamChunker::sendClipboard(
                 ClipboardID id,
                 UInt32 sequence,
                 IEventQueue* events,
-                void* eventTarget)
+                void* eventTarget,
+                barrier::IStream* stream)
 {
-    // send first message (data size)
-    String dataSize = barrier::string::sizeTypeToString(size);
-    ClipboardChunk* sizeMessage = ClipboardChunk::start(id, sequence, dataSize);
-
-    events->addEvent(Event(events->forClipboard().clipboardSending(), eventTarget, sizeMessage));
-
-    // send clipboard chunk with a fixed size
-    size_t sentLength = 0;
-    const size_t chunkSize = 32 * 1024;
-
-    while (true) {
-        events->addEvent(Event(events->forFile().keepAlive(), eventTarget));
-
-        // make sure we don't read too much from the mock data.
-        size_t bytesToSend = chunkSize;
-        if (sentLength + bytesToSend > size) {
-            bytesToSend = size - sentLength;
-        }
-
-        String chunk(data.substr(sentLength, bytesToSend).c_str(), bytesToSend);
-        ClipboardChunk* dataChunk = ClipboardChunk::data(id, sequence, chunk);
-
-        events->addEvent(Event(events->forClipboard().clipboardSending(), eventTarget, dataChunk));
-
-        sentLength += bytesToSend;
-        if (sentLength == size) {
-            break;
-        }
-    }
-
-    // send last message
-    ClipboardChunk* end = ClipboardChunk::end(id, sequence);
-
-    events->addEvent(Event(events->forClipboard().clipboardSending(), eventTarget, end));
-
-    LOG((CLOG_DEBUG "sent clipboard size=%d", sentLength));
+    queueClipboardChunks(data, size, id, sequence, events, eventTarget, stream);
 }
 
 void

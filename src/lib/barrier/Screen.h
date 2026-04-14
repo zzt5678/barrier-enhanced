@@ -139,6 +139,7 @@ public:
     */
     void                keyUp(KeyID id, KeyModifierMask, KeyButton);
     void                fakeAllKeysUp();
+    void                refreshKeyState();
 
     //! Notify of mouse press
     /*!

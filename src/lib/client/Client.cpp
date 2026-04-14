@@ -244,8 +244,8 @@ void
 Client::enter(SInt32 xAbs, SInt32 yAbs, UInt32, KeyModifierMask mask, bool)
 {
     m_active = true;
-    m_screen->mouseMove(xAbs, yAbs);
     m_screen->enter(mask);
+    m_screen->mouseMove(xAbs, yAbs);
 
     if (m_sendFileThread != NULL) {
         StreamChunker::interruptFile();
@@ -814,7 +814,7 @@ Client::sendFileToServer(const char* filename)
 void Client::send_file_thread(const char* filename)
 {
     try {
-        StreamChunker::sendFile(filename, m_events, this);
+        StreamChunker::sendFile(filename, m_events, this, m_stream);
     }
     catch (std::runtime_error& error) {
         LOG((CLOG_ERR "failed sending file chunks: %s", error.what()));

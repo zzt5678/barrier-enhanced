@@ -744,6 +744,9 @@ Config::readSectionOptions(ConfigReadContext& s)
 		else if (name == "clipboardSharing") {
 			addOption("", kOptionClipboardSharing, s.parseBoolean(value));
 		}
+		else if (name == "nestedRemoteMode") {
+			addOption("", kOptionNestedRemoteMode, s.parseBoolean(value));
+		}
 
 		else {
 			handled = false;
@@ -906,6 +909,10 @@ Config::readSectionScreens(ConfigReadContext& s)
 			}
 			else if (name == "lowLatencyMode") {
 				addOption(screen, kOptionLowLatencyMode,
+					s.parseBoolean(value));
+			}
+			else if (name == "nestedRemoteMode") {
+				addOption(screen, kOptionNestedRemoteMode,
 					s.parseBoolean(value));
 			}
 			else {
@@ -1374,6 +1381,9 @@ Config::getOptionName(OptionID id)
 	if (id == kOptionLowLatencyMode) {
 		return "lowLatencyMode";
 	}
+	if (id == kOptionNestedRemoteMode) {
+		return "nestedRemoteMode";
+	}
 	return NULL;
 }
 
@@ -1392,7 +1402,8 @@ std::string Config::getOptionValue(OptionID id, OptionValue value)
 		id == kOptionScreenPreserveFocus ||
 		id == kOptionClipboardSharing ||
 		id == kOptionLocalShortcutMode ||
-		id == kOptionLowLatencyMode) {
+		id == kOptionLowLatencyMode ||
+		id == kOptionNestedRemoteMode) {
 		return (value != 0) ? "true" : "false";
 	}
 	if (id == kOptionModifierMapForShift ||

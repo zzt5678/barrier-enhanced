@@ -207,6 +207,38 @@ TEST(GenericArgsParsingTests, parseGenericArgs_noHookCmd_noHookTrue)
     EXPECT_EQ(1, i);
 }
 
+TEST(GenericArgsParsingTests, parseGenericArgs_lowLatencyModeCmd_enableLowLatencyMode)
+{
+    int i = 1;
+    const int argc = 2;
+    const char* kLowLatencyModeCmd[argc] = { "stub", "--low-latency-mode" };
+
+    ArgParser argParser(NULL);
+    ArgsBase argsBase;
+    argParser.setArgsBase(argsBase);
+
+    argParser.parseGenericArgs(argc, kLowLatencyModeCmd, i);
+
+    EXPECT_TRUE(argsBase.m_lowLatencyMode);
+    EXPECT_EQ(1, i);
+}
+
+TEST(GenericArgsParsingTests, parseGenericArgs_nestedRemoteModeCmd_enableNestedRemoteMode)
+{
+    int i = 1;
+    const int argc = 2;
+    const char* kNestedRemoteModeCmd[argc] = { "stub", "--nested-remote-mode" };
+
+    ArgParser argParser(NULL);
+    ArgsBase argsBase;
+    argParser.setArgsBase(argsBase);
+
+    argParser.parseGenericArgs(argc, kNestedRemoteModeCmd, i);
+
+    EXPECT_TRUE(argsBase.m_nestedRemoteMode);
+    EXPECT_EQ(1, i);
+}
+
 TEST(GenericArgsParsingTests, parseGenericArgs_helpCmd_showHelp)
 {
     g_helpShowed = false;

@@ -222,6 +222,12 @@ Screen::fakeAllKeysUp()
 }
 
 void
+Screen::refreshKeyState()
+{
+    m_screen->updateKeyState();
+}
+
+void
 Screen::mouseDown(ButtonID button)
 {
     m_screen->fakeMouseButton(button, true);

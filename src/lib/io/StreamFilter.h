@@ -42,12 +42,14 @@ public:
     virtual void        close();
     virtual UInt32        read(void* buffer, UInt32 n);
     virtual void        write(const void* buffer, UInt32 n);
+    virtual void        writeLowPriority(const void* buffer, UInt32 n);
     virtual void        flush();
     virtual void        shutdownInput();
     virtual void        shutdownOutput();
     virtual void*        getEventTarget() const;
     virtual bool        isReady() const;
     virtual UInt32        getSize() const;
+    virtual UInt32        getBufferedOutputSize() const;
 
     //! Get the stream
     /*!

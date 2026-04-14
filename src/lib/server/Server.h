@@ -305,6 +305,7 @@ private:
     void                handleScreensaverActivatedEvent(const Event&, void*);
     void                handleScreensaverDeactivatedEvent(const Event&, void*);
     void                handleSwitchWaitTimeout(const Event&, void*);
+    void                handlePrimaryKeyStateSync(const Event&, void*);
     void                handleClientDisconnected(const Event&, void*);
     void                handleClientCloseTimeout(const Event&, void*);
     void                handleSwitchToScreenEvent(const Event&, void*);
@@ -435,6 +436,7 @@ private:
     // state for delayed screen switching
     double                m_switchWaitDelay;
     EventQueueTimer*    m_switchWaitTimer;
+    EventQueueTimer*    m_primaryKeyStateTimer;
     SInt32                m_switchWaitX, m_switchWaitY;
 
     // state for double-tap screen switching
@@ -483,6 +485,7 @@ private:
     // low latency mode - when enabled, reduces latency at cost of higher CPU usage
     // by disabling Nagle algorithm, larger buffers, and faster timeouts
     bool                m_lowLatencyMode;
+    bool                m_nestedRemoteMode;
 
     Thread*                m_sendDragInfoThread;
     bool                m_waitDragInfoThread;

@@ -50,6 +50,7 @@ public:
     void                onInfoChanged();
     bool                onGrabClipboard(ClipboardID);
     void                onClipboardChanged(ClipboardID, const IClipboard*);
+    barrier::IStream*   getStream() const { return m_stream; }
 
     //@}
 
@@ -71,6 +72,7 @@ protected:
 private:
     // if compressing mouse motion then send the last motion now
     void                flushCompressedMouse();
+    bool                shouldCompressMouseMoves() const;
 
     void                sendInfo(const ClientInfo&);
 
@@ -121,6 +123,8 @@ private:
     SInt32                m_dxMouse, m_dyMouse;
 
     bool                m_ignoreMouse;
+    bool                m_lowLatencyMode;
+    bool                m_nestedRemoteMode;
 
     KeyModifierID        m_modifierTranslationTable[kKeyModifierIDLast];
 

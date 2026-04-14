@@ -103,6 +103,7 @@ public:
     */
     virtual KeyModifierMask
                         getToggleMask() const;
+    bool                isClipboardDirty(ClipboardID id) const;
 
     //! Get screen lock state
     /*!
@@ -115,6 +116,7 @@ public:
     // FIXME -- these probably belong on IScreen
     virtual void        enable();
     virtual void        disable();
+    void                refreshKeyState();
 
     // IScreen overrides
     virtual void*        getEventTarget() const;

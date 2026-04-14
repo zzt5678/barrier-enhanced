@@ -65,6 +65,13 @@ public:
     */
     virtual void        write(const void* buffer, UInt32 n) = 0;
 
+    //! Write to stream with low priority
+    /*!
+    Writes bulk data that may be deferred behind latency-sensitive
+    keyboard, mouse, and control traffic.
+    */
+    virtual void        writeLowPriority(const void* buffer, UInt32 n) = 0;
+
     //! Flush the stream
     /*!
     Waits until all buffered data has been written to the stream.
@@ -113,6 +120,13 @@ public:
     return zero.
     */
     virtual UInt32        getSize() const = 0;
+
+    //! Get bytes buffered for output
+    /*!
+    Returns a conservative estimate of the bytes currently buffered for
+    output but not yet written to the underlying transport.
+    */
+    virtual UInt32        getBufferedOutputSize() const = 0;
 
     //@}
 };

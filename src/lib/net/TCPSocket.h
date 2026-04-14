@@ -24,6 +24,7 @@
 #include "mt/CondVar.h"
 #include "mt/Mutex.h"
 #include "arch/IArchNetwork.h"
+#include "base/Stopwatch.h"
 #include <memory>
 
 class Mutex;
@@ -49,12 +50,14 @@ public:
     // IStream overrides
     virtual UInt32        read(void* buffer, UInt32 n);
     virtual void        write(const void* buffer, UInt32 n);
+    virtual void        writeLowPriority(const void* buffer, UInt32 n);
     virtual void        flush();
     virtual void        shutdownInput();
     virtual void        shutdownOutput();
     virtual bool        isReady() const;
     virtual bool        isFatal() const;
     virtual UInt32        getSize() const;
+    virtual UInt32        getBufferedOutputSize() const;
 
     // IDataSocket overrides
     virtual void        connect(const NetworkAddress&);
@@ -84,16 +87,21 @@ protected:
     Mutex&                getMutex() { return m_mutex; }
 
     void                sendEvent(Event::Type);
-    void                discardWrittenData(int bytesWrote);
+    void                discardWrittenData(StreamBuffer& outputBuffer, int bytesWrote);
+    void                writeToBuffer(StreamBuffer& outputBuffer, const void* buffer, UInt32 n);
 
 private:
     void                init();
+    bool                hasBufferedOutputNoLock() const;
+    bool                hasHighPriorityOutputNoLock() const;
 
     void                sendConnectionFailedEvent(const char*);
     void                onConnected();
     void                onInputShutdown();
     void                onOutputShutdown();
     void                onDisconnected();
+    void                noteQueuedBytes(bool lowPriority, UInt32 n);
+    void                logOutputWindowStatsIfNeeded();
 
     MultiplexerJobStatus serviceConnecting(ISocketMultiplexerJob*, bool, bool, bool);
     MultiplexerJobStatus serviceConnected(ISocketMultiplexerJob*, bool, bool, bool);
@@ -105,10 +113,18 @@ protected:
     IEventQueue*        m_events;
     StreamBuffer        m_inputBuffer;
     StreamBuffer        m_outputBuffer;
+    StreamBuffer        m_lowPriorityOutputBuffer;
 
 private:
     Mutex                m_mutex;
     ArchSocket            m_socket;
     CondVar<bool>        m_flushed;
     SocketMultiplexer*    m_socketMultiplexer;
+    Stopwatch            m_outputStatsWindow;
+    UInt32               m_windowHighPriorityWrites;
+    UInt32               m_windowLowPriorityWrites;
+    UInt32               m_windowHighPriorityBytes;
+    UInt32               m_windowLowPriorityBytes;
+    UInt32               m_windowMaxHighPriorityBuffered;
+    UInt32               m_windowMaxLowPriorityBuffered;
 };

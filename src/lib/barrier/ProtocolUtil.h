@@ -53,6 +53,10 @@ public:
     static void            writef(barrier::IStream*,
                             const char* fmt, ...);
 
+    //! Write formatted data with low priority
+    static void            writefLowPriority(barrier::IStream*,
+                            const char* fmt, ...);
+
     //! Read formatted data
     /*!
     Read formatted binary data from a buffer.  This performs the

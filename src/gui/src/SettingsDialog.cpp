@@ -60,6 +60,8 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     m_pCheckBoxMinimizeToTray->setChecked(appConfig().getMinimizeToTray());
     m_pCheckBoxEnableDragDrop->setChecked(appConfig().getEnableDragDrop());
     m_pCheckBoxGameMode->setChecked(appConfig().getGameMode());
+    m_pCheckBoxLowLatencyMode->setChecked(appConfig().getLowLatencyMode());
+    m_pCheckBoxNestedRemoteMode->setChecked(appConfig().getNestedRemoteMode());
     m_pCheckBoxWorkflowEnabled->setChecked(appConfig().getWorkflowEnabled());
     m_pCheckBoxWorkflowSuggestions->setChecked(appConfig().getSuggestionsEnabled());
     m_pSpinBoxWorkflowHistoryLimit->setRange(10, 500);
@@ -110,6 +112,8 @@ void SettingsDialog::accept()
     m_appConfig.setMinimizeToTray(m_pCheckBoxMinimizeToTray->isChecked());
     m_appConfig.setEnableDragDrop(m_pCheckBoxEnableDragDrop->isChecked());
     m_appConfig.setGameMode(m_pCheckBoxGameMode->isChecked());
+    m_appConfig.setLowLatencyMode(m_pCheckBoxLowLatencyMode->isChecked());
+    m_appConfig.setNestedRemoteMode(m_pCheckBoxNestedRemoteMode->isChecked());
     m_appConfig.setWorkflowEnabled(m_pCheckBoxWorkflowEnabled->isChecked());
     m_appConfig.setSuggestionsEnabled(m_pCheckBoxWorkflowSuggestions->isChecked());
     m_appConfig.setWorkflowHistoryLimit(m_pSpinBoxWorkflowHistoryLimit->value());

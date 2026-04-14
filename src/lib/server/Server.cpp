@@ -74,6 +74,7 @@ Server::Server(
 	m_switchScreen(NULL),
 	m_switchWaitDelay(0.0),
 	m_switchWaitTimer(NULL),
+	m_primaryKeyStateTimer(NULL),
 	m_switchTwoTapDelay(0.0),
 	m_switchTwoTapEngaged(false),
 	m_switchTwoTapArmed(false),
@@ -92,6 +93,7 @@ Server::Server(
 	m_enableClipboard(true),
 	m_localShortcutMode(false),
 	m_lowLatencyMode(false),
+	m_nestedRemoteMode(false),
 	m_sendDragInfoThread(NULL),
 	m_waitDragInfoThread(true),
 	m_args(args)
@@ -119,6 +121,10 @@ Server::Server(
 	m_events->adoptHandler(Event::kTimer, this,
 							new TMethodEventJob<Server>(this,
 								&Server::handleSwitchWaitTimeout));
+	m_primaryKeyStateTimer = m_events->newTimer(2.0, NULL);
+	m_events->adoptHandler(Event::kTimer, m_primaryKeyStateTimer,
+							new TMethodEventJob<Server>(this,
+								&Server::handlePrimaryKeyStateSync));
 	m_events->adoptHandler(m_events->forIKeyState().keyDown(),
 							m_inputFilter,
 							new TMethodEventJob<Server>(this,
@@ -252,6 +258,11 @@ Server::~Server()
 							m_inputFilter);
 	m_events->removeHandler(m_events->forIPrimaryScreen().fakeInputEnd(),
 							m_inputFilter);
+	if (m_primaryKeyStateTimer != NULL) {
+		m_events->removeHandler(Event::kTimer, m_primaryKeyStateTimer);
+		m_events->deleteTimer(m_primaryKeyStateTimer);
+		m_primaryKeyStateTimer = NULL;
+	}
 	m_events->removeHandler(Event::kTimer, this);
 	stopSwitch();
 
@@ -484,10 +495,9 @@ Server::switchScreen(BaseClientProxy* dst,
 	// since that's a waste of time we skip that and just warp the
 	// mouse.
 	if (m_active != dst) {
-		// When leaving a screen, fake releasing all keys to prevent
-		// "stuck" modifier keys (e.g., Alt, Ctrl held on one screen
-		// and released on another)
-		if (m_localShortcutMode) {
+		// When leaving the primary screen, release any locally
+		// synthesized keys so modifier state cannot leak across screens.
+		if (m_active == m_primaryClient) {
 			m_screen->fakeAllKeysUp();
 		}
 
@@ -503,7 +513,8 @@ Server::switchScreen(BaseClientProxy* dst,
 		if (m_active == m_primaryClient && m_enableClipboard) {
 			for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
 				ClipboardInfo& clipboard = m_clipboards[id];
-				if (clipboard.m_clipboardOwner == getName(m_primaryClient)) {
+				if (clipboard.m_clipboardOwner == getName(m_primaryClient) &&
+					m_primaryClient->isClipboardDirty(id)) {
 					onClipboardChanged(m_primaryClient,
 						id, clipboard.m_clipboardSeqNum);
 				}
@@ -520,6 +531,9 @@ Server::switchScreen(BaseClientProxy* dst,
 		m_active->enter(x, y, m_seqNum,
 								m_primaryClient->getToggleMask(),
 								forScreensaver);
+		if (m_active == m_primaryClient) {
+			m_primaryClient->refreshKeyState();
+		}
 
 		if (m_enableClipboard) {
 			// send the clipboard data to new active screen
@@ -584,11 +598,23 @@ Server::mapToPixel(BaseClientProxy* client,
 	case kLeft:
 	case kRight:
 		y = static_cast<SInt32>(f * sh) + sy;
+		if (y < sy) {
+			y = sy;
+		}
+		else if (y >= sy + sh) {
+			y = sy + sh - 1;
+		}
 		break;
 
 	case kTop:
 	case kBottom:
 		x = static_cast<SInt32>(f * sw) + sx;
+		if (x < sx) {
+			x = sx;
+		}
+		else if (x >= sx + sw) {
+			x = sx + sw - 1;
+		}
 		break;
 
 	case kNoDirection:
@@ -1143,6 +1169,16 @@ Server::sendOptions(BaseClientProxy* client) const
 		optionsList.push_back(kOptionLowLatencyMode);
 		optionsList.push_back(1);
 	}
+	if (m_args.m_lowLatencyMode || m_args.m_nestedRemoteMode) {
+		optionsList.push_back(kOptionLowLatencyMode);
+		optionsList.push_back(1);
+	}
+	if (m_args.m_nestedRemoteMode) {
+		optionsList.push_back(kOptionRelativeMouseMoves);
+		optionsList.push_back(1);
+		optionsList.push_back(kOptionNestedRemoteMode);
+		optionsList.push_back(1);
+	}
 
 	// send the options
 	client->resetOptions();
@@ -1157,6 +1193,10 @@ Server::processOptions()
 	m_switchNeedsShift = false;		// it seems if I don't add these
 	m_switchNeedsControl = false;	// lines, the 'reload config' option
 	m_switchNeedsAlt = false;		// doesn't work correct.
+	m_enableClipboard = true;
+	m_localShortcutMode = false;
+	m_lowLatencyMode = false;
+	m_nestedRemoteMode = false;
 
 	bool newRelativeMoves = m_relativeMoves;
 	if (options != NULL) {
@@ -1211,6 +1251,13 @@ Server::processOptions()
 					LOG((CLOG_NOTE "low latency mode enabled - reduced latency at cost of higher CPU usage"));
 				}
 			}
+			else if (id == kOptionNestedRemoteMode) {
+				m_nestedRemoteMode = (value != 0);
+
+				if (m_nestedRemoteMode) {
+					LOG((CLOG_NOTE "nested remote mode enabled - favoring relative mouse delivery and remote-control compatibility"));
+				}
+			}
 		}
 	}
 	if (m_relativeMoves && !newRelativeMoves) {
@@ -1223,6 +1270,16 @@ Server::processOptions()
 		m_localShortcutMode = true;
 		m_lowLatencyMode = true;
 		LOG((CLOG_NOTE "game mode enabled - low latency, local shortcuts, and relative mouse moves are forced on"));
+	}
+	if (m_args.m_lowLatencyMode) {
+		m_lowLatencyMode = true;
+		LOG((CLOG_NOTE "low latency mode enabled from command line"));
+	}
+	if (m_args.m_nestedRemoteMode) {
+		m_nestedRemoteMode = true;
+		m_relativeMoves = true;
+		m_lowLatencyMode = true;
+		LOG((CLOG_NOTE "nested remote mode enabled - relative mouse moves and low latency are forced on"));
 	}
 }
 
@@ -1410,6 +1467,14 @@ Server::handleSwitchWaitTimeout(const Event&, void*)
 
 	// switch screen
 	switchScreen(m_switchScreen, m_switchWaitX, m_switchWaitY, false);
+}
+
+void
+Server::handlePrimaryKeyStateSync(const Event&, void*)
+{
+	if (m_active == m_primaryClient) {
+		m_primaryClient->refreshKeyState();
+	}
 }
 
 void
@@ -2491,7 +2556,7 @@ void Server::send_file_thread(const char* filename)
 {
 	try {
 		LOG((CLOG_DEBUG "sending file to client, filename=%s", filename));
-		StreamChunker::sendFile(filename, m_events, this);
+		StreamChunker::sendFile(filename, m_events, this, m_active != NULL ? m_active->getStream() : NULL);
 	}
 	catch (std::runtime_error &error) {
 		LOG((CLOG_ERR "failed sending file chunks, error: %s", error.what()));

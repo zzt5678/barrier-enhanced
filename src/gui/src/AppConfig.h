@@ -106,6 +106,10 @@ class AppConfig: public QObject
         bool getEnableDragDrop() const;
         void setGameMode(bool b);
         bool getGameMode() const;
+        void setLowLatencyMode(bool b);
+        bool getLowLatencyMode() const;
+        void setNestedRemoteMode(bool b);
+        bool getNestedRemoteMode() const;
         void setWorkflowEnabled(bool b);
         bool getWorkflowEnabled() const;
         void setSuggestionsEnabled(bool b);
@@ -154,6 +158,8 @@ protected:
         bool m_MinimizeToTray;
         bool m_EnableDragDrop;
         bool m_GameMode;
+        bool m_LowLatencyMode;
+        bool m_NestedRemoteMode;
         bool m_WorkflowEnabled;
         bool m_SuggestionsEnabled;
         int m_WorkflowHistoryLimit;

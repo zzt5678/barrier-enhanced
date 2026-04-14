@@ -41,7 +41,14 @@ TCPSocket::TCPSocket(IEventQueue* events, SocketMultiplexer* socketMultiplexer, 
     m_events(events),
     m_mutex(),
     m_flushed(&m_mutex, true),
-    m_socketMultiplexer(socketMultiplexer)
+    m_socketMultiplexer(socketMultiplexer),
+    m_outputStatsWindow(true),
+    m_windowHighPriorityWrites(0),
+    m_windowLowPriorityWrites(0),
+    m_windowHighPriorityBytes(0),
+    m_windowLowPriorityBytes(0),
+    m_windowMaxHighPriorityBuffered(0),
+    m_windowMaxLowPriorityBuffered(0)
 {
     try {
         m_socket = ARCH->newSocket(family, IArchNetwork::kSTREAM);
@@ -61,7 +68,14 @@ TCPSocket::TCPSocket(IEventQueue* events, SocketMultiplexer* socketMultiplexer, 
     m_mutex(),
     m_socket(socket),
     m_flushed(&m_mutex, true),
-    m_socketMultiplexer(socketMultiplexer)
+    m_socketMultiplexer(socketMultiplexer),
+    m_outputStatsWindow(true),
+    m_windowHighPriorityWrites(0),
+    m_windowLowPriorityWrites(0),
+    m_windowHighPriorityBytes(0),
+    m_windowLowPriorityBytes(0),
+    m_windowMaxHighPriorityBuffered(0),
+    m_windowMaxLowPriorityBuffered(0)
 {
     assert(m_socket != NULL);
 
@@ -159,6 +173,18 @@ TCPSocket::read(void* buffer, UInt32 n)
 void
 TCPSocket::write(const void* buffer, UInt32 n)
 {
+    writeToBuffer(m_outputBuffer, buffer, n);
+}
+
+void
+TCPSocket::writeLowPriority(const void* buffer, UInt32 n)
+{
+    writeToBuffer(m_lowPriorityOutputBuffer, buffer, n);
+}
+
+void
+TCPSocket::writeToBuffer(StreamBuffer& outputBuffer, const void* buffer, UInt32 n)
+{
     bool wasEmpty;
     {
         Lock lock(&m_mutex);
@@ -175,8 +201,9 @@ TCPSocket::write(const void* buffer, UInt32 n)
         }
 
         // copy data to the output buffer
-        wasEmpty = (m_outputBuffer.getSize() == 0);
-        m_outputBuffer.write(buffer, n);
+        wasEmpty = !hasBufferedOutputNoLock();
+        outputBuffer.write(buffer, n);
+        noteQueuedBytes(&outputBuffer == &m_lowPriorityOutputBuffer, n);
 
         // there's data to write
         m_flushed = false;
@@ -271,6 +298,13 @@ TCPSocket::getSize() const
 {
     Lock lock(&m_mutex);
     return m_inputBuffer.getSize();
+}
+
+UInt32
+TCPSocket::getBufferedOutputSize() const
+{
+    Lock lock(&m_mutex);
+    return m_outputBuffer.getSize() + m_lowPriorityOutputBuffer.getSize();
 }
 
 void
@@ -380,12 +414,23 @@ TCPSocket::doWrite()
     UInt32 bufferSize = 0;
     int bytesWrote = 0;
 
-    bufferSize = m_outputBuffer.getSize();
-    const void* buffer = m_outputBuffer.peek(bufferSize);
+    StreamBuffer* outputBuffer = nullptr;
+    if (m_outputBuffer.getSize() > 0) {
+        outputBuffer = &m_outputBuffer;
+    }
+    else if (m_lowPriorityOutputBuffer.getSize() > 0) {
+        outputBuffer = &m_lowPriorityOutputBuffer;
+    }
+    else {
+        return kRetry;
+    }
+
+    bufferSize = outputBuffer->getSize();
+    const void* buffer = outputBuffer->peek(bufferSize);
     bytesWrote = (UInt32)ARCH->writeSocket(m_socket, buffer, bufferSize);
 
     if (bytesWrote > 0) {
-        discardWrittenData(bytesWrote);
+        discardWrittenData(*outputBuffer, bytesWrote);
         return kNew;
     }
 
@@ -434,7 +479,7 @@ std::unique_ptr<ISocketMultiplexerJob> TCPSocket::newJob()
                     m_socket, m_readable, m_writable);
     }
     else {
-        auto writable = m_writable && (m_outputBuffer.getSize() > 0);
+        auto writable = m_writable && hasBufferedOutputNoLock();
         if (!(m_readable || writable)) {
             return {};
         }
@@ -460,10 +505,11 @@ TCPSocket::sendEvent(Event::Type type)
 }
 
 void
-TCPSocket::discardWrittenData(int bytesWrote)
+TCPSocket::discardWrittenData(StreamBuffer& outputBuffer, int bytesWrote)
 {
-    m_outputBuffer.pop(bytesWrote);
-    if (m_outputBuffer.getSize() == 0) {
+    outputBuffer.pop(bytesWrote);
+    if (!hasBufferedOutputNoLock()) {
+        logOutputWindowStatsIfNeeded();
         sendEvent(m_events->forIStream().outputFlushed());
         m_flushed = true;
         m_flushed.broadcast();
@@ -489,11 +535,25 @@ void
 TCPSocket::onOutputShutdown()
 {
     m_outputBuffer.pop(m_outputBuffer.getSize());
+    m_lowPriorityOutputBuffer.pop(m_lowPriorityOutputBuffer.getSize());
     m_writable = false;
 
     // we're now flushed
     m_flushed = true;
     m_flushed.broadcast();
+}
+
+bool
+TCPSocket::hasBufferedOutputNoLock() const
+{
+    return hasHighPriorityOutputNoLock() ||
+           (m_lowPriorityOutputBuffer.getSize() > 0);
+}
+
+bool
+TCPSocket::hasHighPriorityOutputNoLock() const
+{
+    return (m_outputBuffer.getSize() > 0);
 }
 
 void
@@ -503,6 +563,67 @@ TCPSocket::onDisconnected()
     onInputShutdown();
     onOutputShutdown();
     m_connected = false;
+}
+
+void
+TCPSocket::noteQueuedBytes(bool lowPriority, UInt32 n)
+{
+    if (lowPriority) {
+        ++m_windowLowPriorityWrites;
+        m_windowLowPriorityBytes += n;
+        const UInt32 buffered = m_lowPriorityOutputBuffer.getSize();
+        if (buffered > m_windowMaxLowPriorityBuffered) {
+            m_windowMaxLowPriorityBuffered = buffered;
+            if (buffered >= 256 * 1024) {
+                LOG((CLOG_DEBUG1 "low-priority output backlog=%u bytes", buffered));
+            }
+        }
+    }
+    else {
+        ++m_windowHighPriorityWrites;
+        m_windowHighPriorityBytes += n;
+        const UInt32 buffered = m_outputBuffer.getSize();
+        if (buffered > m_windowMaxHighPriorityBuffered) {
+            m_windowMaxHighPriorityBuffered = buffered;
+        }
+    }
+}
+
+void
+TCPSocket::logOutputWindowStatsIfNeeded()
+{
+    const bool hadLowPriorityTraffic =
+        (m_windowLowPriorityWrites > 0 || m_windowLowPriorityBytes > 0);
+    const bool hadMeaningfulHighPriorityTraffic =
+        (m_windowHighPriorityWrites > 32 || m_windowHighPriorityBytes > 16 * 1024);
+    if (!(hadLowPriorityTraffic || hadMeaningfulHighPriorityTraffic)) {
+        m_outputStatsWindow.reset();
+        m_windowHighPriorityWrites = 0;
+        m_windowLowPriorityWrites = 0;
+        m_windowHighPriorityBytes = 0;
+        m_windowLowPriorityBytes = 0;
+        m_windowMaxHighPriorityBuffered = 0;
+        m_windowMaxLowPriorityBuffered = 0;
+        return;
+    }
+
+    LOG((CLOG_DEBUG1
+        "socket output window: high writes=%u bytes=%u maxBuffered=%u, low writes=%u bytes=%u maxBuffered=%u, window=%.3fs",
+        m_windowHighPriorityWrites,
+        m_windowHighPriorityBytes,
+        m_windowMaxHighPriorityBuffered,
+        m_windowLowPriorityWrites,
+        m_windowLowPriorityBytes,
+        m_windowMaxLowPriorityBuffered,
+        m_outputStatsWindow.getTime()));
+
+    m_outputStatsWindow.reset();
+    m_windowHighPriorityWrites = 0;
+    m_windowLowPriorityWrites = 0;
+    m_windowHighPriorityBytes = 0;
+    m_windowLowPriorityBytes = 0;
+    m_windowMaxHighPriorityBuffered = 0;
+    m_windowMaxLowPriorityBuffered = 0;
 }
 
 MultiplexerJobStatus TCPSocket::serviceConnecting(ISocketMultiplexerJob* job, bool, bool write, bool error)

@@ -156,5 +156,5 @@ FileChunk::send(barrier::IStream* stream, UInt8 mark, char* data, size_t dataSiz
         break;
     }
 
-    ProtocolUtil::writef(stream, kMsgDFileTransfer, mark, &chunk);
+    ProtocolUtil::writefLowPriority(stream, kMsgDFileTransfer, mark, &chunk);
 }

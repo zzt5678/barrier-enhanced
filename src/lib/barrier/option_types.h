@@ -70,6 +70,7 @@ static const OptionID    kOptionWin32KeepForeground        = OPTION_CODE("_KFW")
 static const OptionID    kOptionClipboardSharing            = OPTION_CODE("CLPS");
 static const OptionID    kOptionLocalShortcutMode           = OPTION_CODE("LCSM");
 static const OptionID    kOptionLowLatencyMode              = OPTION_CODE("LLAT");
+static const OptionID    kOptionNestedRemoteMode            = OPTION_CODE("NRMT");
 static const OptionID    kOptionDaemonMode                  = OPTION_CODE("DMON");
 //@}
 

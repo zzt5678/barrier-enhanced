@@ -65,6 +65,8 @@ AppConfig::AppConfig(QSettings* settings) :
     m_MinimizeToTray(false),
     m_EnableDragDrop(true),
     m_GameMode(false),
+    m_LowLatencyMode(false),
+    m_NestedRemoteMode(false),
     m_WorkflowEnabled(true),
     m_SuggestionsEnabled(true),
     m_WorkflowHistoryLimit(100),
@@ -179,6 +181,8 @@ void AppConfig::loadSettings()
     m_MinimizeToTray = settings().value("minimizeToTray", false).toBool();
     m_EnableDragDrop = settings().value("enableDragDrop", true).toBool();
     m_GameMode = settings().value("gameMode", false).toBool();
+    m_LowLatencyMode = settings().value("lowLatencyMode", false).toBool();
+    m_NestedRemoteMode = settings().value("nestedRemoteMode", false).toBool();
     m_WorkflowEnabled = settings().value("workflowEnabled", true).toBool();
     m_SuggestionsEnabled = settings().value("workflowSuggestionsEnabled", true).toBool();
     m_WorkflowHistoryLimit = settings().value("workflowHistoryLimit", 100).toInt();
@@ -209,6 +213,8 @@ void AppConfig::saveSettings()
     settings().setValue("minimizeToTray", m_MinimizeToTray);
     settings().setValue("enableDragDrop", m_EnableDragDrop);
     settings().setValue("gameMode", m_GameMode);
+    settings().setValue("lowLatencyMode", m_LowLatencyMode);
+    settings().setValue("nestedRemoteMode", m_NestedRemoteMode);
     settings().setValue("workflowEnabled", m_WorkflowEnabled);
     settings().setValue("workflowSuggestionsEnabled", m_SuggestionsEnabled);
     settings().setValue("workflowHistoryLimit", m_WorkflowHistoryLimit);
@@ -277,6 +283,14 @@ bool AppConfig::getEnableDragDrop() const { return m_EnableDragDrop; }
 void AppConfig::setGameMode(bool b) { m_GameMode = b; }
 
 bool AppConfig::getGameMode() const { return m_GameMode; }
+
+void AppConfig::setLowLatencyMode(bool b) { m_LowLatencyMode = b; }
+
+bool AppConfig::getLowLatencyMode() const { return m_LowLatencyMode; }
+
+void AppConfig::setNestedRemoteMode(bool b) { m_NestedRemoteMode = b; }
+
+bool AppConfig::getNestedRemoteMode() const { return m_NestedRemoteMode; }
 
 void AppConfig::setWorkflowEnabled(bool b) { m_WorkflowEnabled = b; }
 

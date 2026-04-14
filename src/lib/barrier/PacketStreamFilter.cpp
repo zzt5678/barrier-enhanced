@@ -22,6 +22,7 @@
 #include "mt/Lock.h"
 #include "base/TMethodEventJob.h"
 
+#include <array>
 #include <cstring>
 #include <memory>
 
@@ -93,16 +94,54 @@ PacketStreamFilter::read(void* buffer, UInt32 n)
 void
 PacketStreamFilter::write(const void* buffer, UInt32 count)
 {
+    static const UInt32 kSingleWritePacketThreshold = 1024;
+
     // write the length of the payload
     UInt8 length[4];
     length[0] = (UInt8)((count >> 24) & 0xff);
     length[1] = (UInt8)((count >> 16) & 0xff);
     length[2] = (UInt8)((count >>  8) & 0xff);
     length[3] = (UInt8)( count        & 0xff);
+
+    if (count <= kSingleWritePacketThreshold) {
+        std::array<UInt8, kSingleWritePacketThreshold + 4> packet;
+        std::memcpy(packet.data(), length, sizeof(length));
+        if (count > 0) {
+            std::memcpy(packet.data() + sizeof(length), buffer, count);
+        }
+        getStream()->write(packet.data(), count + sizeof(length));
+        return;
+    }
+
     getStream()->write(length, sizeof(length));
 
     // write the payload
     getStream()->write(buffer, count);
+}
+
+void
+PacketStreamFilter::writeLowPriority(const void* buffer, UInt32 count)
+{
+    static const UInt32 kSingleWritePacketThreshold = 1024;
+
+    UInt8 length[4];
+    length[0] = (UInt8)((count >> 24) & 0xff);
+    length[1] = (UInt8)((count >> 16) & 0xff);
+    length[2] = (UInt8)((count >>  8) & 0xff);
+    length[3] = (UInt8)( count        & 0xff);
+
+    if (count <= kSingleWritePacketThreshold) {
+        std::array<UInt8, kSingleWritePacketThreshold + 4> packet;
+        std::memcpy(packet.data(), length, sizeof(length));
+        if (count > 0) {
+            std::memcpy(packet.data() + sizeof(length), buffer, count);
+        }
+        getStream()->writeLowPriority(packet.data(), count + sizeof(length));
+        return;
+    }
+
+    getStream()->writeLowPriority(length, sizeof(length));
+    getStream()->writeLowPriority(buffer, count);
 }
 
 void
@@ -126,6 +165,12 @@ PacketStreamFilter::getSize() const
 {
     Lock lock(&m_mutex);
     return isReadyNoLock() ? m_size : 0;
+}
+
+UInt32
+PacketStreamFilter::getBufferedOutputSize() const
+{
+    return getStream()->getBufferedOutputSize();
 }
 
 bool

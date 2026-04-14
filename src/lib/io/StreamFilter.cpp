@@ -63,6 +63,12 @@ StreamFilter::write(const void* buffer, UInt32 n)
 }
 
 void
+StreamFilter::writeLowPriority(const void* buffer, UInt32 n)
+{
+    getStream()->writeLowPriority(buffer, n);
+}
+
+void
 StreamFilter::flush()
 {
     getStream()->flush();
@@ -96,6 +102,12 @@ UInt32
 StreamFilter::getSize() const
 {
     return getStream()->getSize();
+}
+
+UInt32
+StreamFilter::getBufferedOutputSize() const
+{
+    return getStream()->getBufferedOutputSize();
 }
 
 barrier::IStream*

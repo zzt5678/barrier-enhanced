@@ -50,6 +50,8 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_dxMouse(0),
     m_dyMouse(0),
     m_ignoreMouse(false),
+    m_lowLatencyMode(false),
+    m_nestedRemoteMode(false),
     m_keepAliveAlarm(0.0),
     m_keepAliveAlarmTimer(NULL),
     m_parser(&ServerProxy::parseHandshakeMessage),
@@ -375,7 +377,7 @@ ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard* clipboard)
     std::string data = IClipboard::marshall(clipboard);
     LOG((CLOG_DEBUG "sending clipboard %d seqnum=%d", id, m_seqNum));
 
-    StreamChunker::sendClipboard(data, data.size(), id, m_seqNum, m_events, this);
+    StreamChunker::sendClipboard(data, data.size(), id, m_seqNum, m_events, this, m_stream);
 }
 
 void
@@ -391,6 +393,12 @@ ServerProxy::flushCompressedMouse()
         m_dxMouse = 0;
         m_dyMouse = 0;
     }
+}
+
+bool
+ServerProxy::shouldCompressMouseMoves() const
+{
+    return !m_lowLatencyMode && !m_nestedRemoteMode;
 }
 
 void
@@ -713,7 +721,8 @@ ServerProxy::mouseMove()
     ignore = m_ignoreMouse;
 
     // compress mouse motion events if more input follows
-    if (!ignore && !m_compressMouse && m_stream->isReady()) {
+    if (!ignore && shouldCompressMouseMoves() &&
+        !m_compressMouse && m_stream->isReady()) {
         m_compressMouse = true;
     }
 
@@ -746,7 +755,8 @@ ServerProxy::mouseRelativeMove()
     ignore = m_ignoreMouse;
 
     // compress mouse motion events if more input follows
-    if (!ignore && !m_compressMouseRelative && m_stream->isReady()) {
+    if (!ignore && shouldCompressMouseMoves() &&
+        !m_compressMouseRelative && m_stream->isReady()) {
         m_compressMouseRelative = true;
     }
 
@@ -807,6 +817,9 @@ ServerProxy::resetOptions()
     for (KeyModifierID id = 0; id < kKeyModifierIDLast; ++id) {
         m_modifierTranslationTable[id] = id;
     }
+
+    m_lowLatencyMode = false;
+    m_nestedRemoteMode = false;
 }
 
 void
@@ -845,12 +858,25 @@ ServerProxy::setOptions()
             // update keep alive
             setKeepAliveRate(1.0e-3 * static_cast<double>(options[i + 1]));
         }
+        else if (options[i] == kOptionLowLatencyMode) {
+            m_lowLatencyMode = (options[i + 1] != 0);
+        }
+        else if (options[i] == kOptionNestedRemoteMode) {
+            m_nestedRemoteMode = (options[i + 1] != 0);
+        }
 
         if (id != kKeyModifierIDNull) {
             m_modifierTranslationTable[id] =
                 static_cast<KeyModifierID>(options[i + 1]);
             LOG((CLOG_DEBUG1 "modifier %d mapped to %d", id, m_modifierTranslationTable[id]));
         }
+    }
+
+    if (m_lowLatencyMode) {
+        LOG((CLOG_NOTE "server requested low latency mode - mouse motion compression disabled"));
+    }
+    if (m_nestedRemoteMode) {
+        LOG((CLOG_NOTE "server requested nested remote mode - favoring immediate mouse delivery"));
     }
 }
 

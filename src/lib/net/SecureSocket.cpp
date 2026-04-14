@@ -225,16 +225,29 @@ SecureSocket::doWrite()
     if (!isSecureReady())
         return kRetry;
 
+    StreamBuffer* outputBuffer = nullptr;
     if (do_write_retry_) {
         bufferSize = do_write_retry_size_;
     } else {
-        bufferSize = m_outputBuffer.getSize();
+        if (m_outputBuffer.getSize() > 0) {
+            outputBuffer = &m_outputBuffer;
+            do_write_retry_low_priority_ = false;
+        }
+        else if (m_lowPriorityOutputBuffer.getSize() > 0) {
+            outputBuffer = &m_lowPriorityOutputBuffer;
+            do_write_retry_low_priority_ = true;
+        }
+        else {
+            return kRetry;
+        }
+
+        bufferSize = outputBuffer->getSize();
         if (bufferSize > do_write_retry_buffer_size_) {
             do_write_retry_buffer_.reset(new char[bufferSize]);
             do_write_retry_buffer_size_ = bufferSize;
         }
         if (bufferSize > 0) {
-            std::memcpy(do_write_retry_buffer_.get(), m_outputBuffer.peek(bufferSize), bufferSize);
+            std::memcpy(do_write_retry_buffer_.get(), outputBuffer->peek(bufferSize), bufferSize);
         }
     }
 
@@ -254,7 +267,9 @@ SecureSocket::doWrite()
     }
 
     if (bytesWrote > 0) {
-        discardWrittenData(bytesWrote);
+        StreamBuffer& writtenBuffer =
+            do_write_retry_low_priority_ ? m_lowPriorityOutputBuffer : m_outputBuffer;
+        discardWrittenData(writtenBuffer, bytesWrote);
         return kNew;
     }
 

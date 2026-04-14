@@ -95,6 +95,12 @@ PrimaryClient::getToggleMask() const
 }
 
 bool
+PrimaryClient::isClipboardDirty(ClipboardID id) const
+{
+    return m_clipboardDirty[id];
+}
+
+bool
 PrimaryClient::isLockedToScreen() const
 {
     return m_screen->isLockedToScreen();
@@ -135,6 +141,12 @@ void
 PrimaryClient::disable()
 {
     m_screen->disable();
+}
+
+void
+PrimaryClient::refreshKeyState()
+{
+    m_screen->refreshKeyState();
 }
 
 void
