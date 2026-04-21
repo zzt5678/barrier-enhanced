@@ -17,6 +17,7 @@
  */
 
 #include <iostream>
+#include <algorithm>
 
 #include "MainWindow.h"
 
@@ -51,6 +52,7 @@
 #include <QDesktopServices>
 #include <QDesktopWidget>
 #include <QClipboard>
+#include <QRegularExpression>
 
 #if defined(Q_OS_MAC)
 #include <ApplicationServices/ApplicationServices.h>
@@ -93,6 +95,12 @@ static const char* barrierIconFiles[] =
 
 static const char* barrierLargeIcon = ":/res/icons/256x256/weave.png";
 
+namespace {
+constexpr int kRestartBaseDelayMs = 1000;
+constexpr int kRestartMaxDelayMs = 15000;
+constexpr int kRestartStabilityWindowMs = 30000;
+}
+
 MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_Settings(settings),
     m_AppConfig(&appConfig),
@@ -121,7 +129,9 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_pWorkflowHubDialog(NULL),
     m_pCommandPaletteDialog(NULL),
     m_pActionWorkflowHub(NULL),
-    m_pActionCommandPalette(NULL)
+    m_pActionCommandPalette(NULL),
+    m_RestartTimer(this),
+    m_UnexpectedExitCount(0)
 {
     // explicitly unset DeleteOnClose so the window can be show and hidden
     // repeatedly until Barrier is finished
@@ -217,6 +227,9 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
             toolbutton_show_fingerprint->setArrowType(Qt::ArrowType::DownArrow);
         }
     });
+
+    m_RestartTimer.setSingleShot(true);
+    connect(&m_RestartTimer, &QTimer::timeout, this, &MainWindow::startBarrier);
 
     resize(sizeHint().expandedTo(minimumSize()));
     updateWorkflowPeerHint();
@@ -428,13 +441,8 @@ void MainWindow::logOutput()
 {
     if (m_pBarrier)
     {
-        QString text(m_pBarrier->readAllStandardOutput());
-        for (QString line : text.split(QRegExp("\r|\n|\r\n"))) {
-            if (!line.isEmpty())
-            {
-                appendLogRaw(line);
-            }
-        }
+        consumeLogChunk(QString::fromLocal8Bit(m_pBarrier->readAllStandardOutput()),
+                        &m_PendingStdOutLog, false);
     }
 }
 
@@ -442,7 +450,8 @@ void MainWindow::logError()
 {
     if (m_pBarrier)
     {
-        appendLogRaw(m_pBarrier->readAllStandardError());
+        consumeLogChunk(QString::fromLocal8Bit(m_pBarrier->readAllStandardError()),
+                        &m_PendingStdErrLog, false);
     }
 }
 
@@ -466,12 +475,8 @@ void MainWindow::appendLogError(const QString& text)
 
 void MainWindow::appendLogRaw(const QString& text)
 {
-    for (QString line : text.split(QRegExp("\r|\n|\r\n"))) {
-        if (!line.isEmpty()) {
-            m_pLogWindow->appendRaw(line);
-            updateFromLogLine(line);
-        }
-    }
+    QString buffer;
+    consumeLogChunk(text, &buffer, true);
 }
 
 void MainWindow::updateFromLogLine(const QString &line)
@@ -484,6 +489,50 @@ void MainWindow::updateFromLogLine(const QString &line)
     }
 }
 
+void MainWindow::processLogLine(const QString& line)
+{
+    if (line.isEmpty()) {
+        return;
+    }
+
+    m_pLogWindow->appendRaw(line);
+    updateFromLogLine(line);
+}
+
+void MainWindow::consumeLogChunk(const QString& text, QString* pendingBuffer, bool flushPartialLine)
+{
+    if (pendingBuffer == nullptr || text.isEmpty()) {
+        if (flushPartialLine && pendingBuffer != nullptr && !pendingBuffer->isEmpty()) {
+            processLogLine(*pendingBuffer);
+            pendingBuffer->clear();
+        }
+        return;
+    }
+
+    pendingBuffer->append(text);
+    pendingBuffer->replace("\r\n", "\n");
+    pendingBuffer->replace('\r', '\n');
+
+    int newlineIndex = pendingBuffer->indexOf('\n');
+    while (newlineIndex != -1) {
+        const QString line = pendingBuffer->left(newlineIndex);
+        pendingBuffer->remove(0, newlineIndex + 1);
+        processLogLine(line);
+        newlineIndex = pendingBuffer->indexOf('\n');
+    }
+
+    if (flushPartialLine && !pendingBuffer->isEmpty()) {
+        processLogLine(*pendingBuffer);
+        pendingBuffer->clear();
+    }
+}
+
+void MainWindow::flushPendingProcessLogs()
+{
+    consumeLogChunk(QString(), &m_PendingStdOutLog, true);
+    consumeLogChunk(QString(), &m_PendingStdErrLog, true);
+}
+
 void MainWindow::checkConnected(const QString& line)
 {
     // TODO: implement ipc connection state messages to replace this hack.
@@ -493,6 +542,7 @@ void MainWindow::checkConnected(const QString& line)
     {
         setBarrierState(barrierConnected);
         updateWorkflowPeerHint();
+        resetRestartBackoff();
 
         if (!appConfig().startedBefore() && isVisible()) {
                 QMessageBox::information(
@@ -509,19 +559,26 @@ void MainWindow::checkConnected(const QString& line)
 
 void MainWindow::checkFingerprint(const QString& line)
 {
-    QRegExp fingerprintRegex(".*peer fingerprint \\(SHA1\\): ([A-F0-9:]+) \\(SHA256\\): ([A-F0-9:]+)");
-    if (!fingerprintRegex.exactMatch(line)) {
+    static const QRegularExpression kFingerprintRegex(
+        QStringLiteral(".*peer fingerprint \\(SHA1\\): ([A-F0-9:]+) \\(SHA256\\): ([A-F0-9:]+)"));
+
+    if (!line.contains(QStringLiteral("peer fingerprint"))) {
+        return;
+    }
+
+    const QRegularExpressionMatch match = kFingerprintRegex.match(line);
+    if (!match.hasMatch()) {
         return;
     }
 
     barrier::FingerprintData fingerprint_sha1 = {
         barrier::fingerprint_type_to_string(barrier::FingerprintType::SHA1),
-        barrier::string::from_hex(fingerprintRegex.cap(1).toStdString())
+        barrier::string::from_hex(match.captured(1).toStdString())
     };
 
     barrier::FingerprintData fingerprint_sha256 = {
         barrier::fingerprint_type_to_string(barrier::FingerprintType::SHA256),
-        barrier::string::from_hex(fingerprintRegex.cap(2).toStdString())
+        barrier::string::from_hex(match.captured(2).toStdString())
     };
 
     bool is_client = barrier_type() == BarrierType::Client;
@@ -584,9 +641,24 @@ void MainWindow::startBarrier()
     bool desktopMode = appConfig().processMode() == Desktop;
     bool serviceMode = appConfig().processMode() == Service;
 
+    m_RestartTimer.stop();
+
+    if (desktopMode && barrierProcess() != nullptr) {
+        if (barrierProcess()->state() == QProcess::Starting ||
+            barrierProcess()->state() == QProcess::Running) {
+            appendLogDebug("start requested while process is already active");
+            return;
+        }
+
+        delete barrierProcess();
+        setBarrierProcess(NULL);
+    }
+
     appendLogDebug("starting process");
     m_ExpectedRunningState = kStarted;
     setBarrierState(barrierConnecting);
+    m_PendingStdOutLog.clear();
+    m_PendingStdErrLog.clear();
 
     QString app;
     QStringList args;
@@ -673,8 +745,15 @@ void MainWindow::startBarrier()
         {
             show();
             QMessageBox::warning(this, tr("Program can not be started"), QString(tr("The executable<br><br>%1<br><br>could not be successfully started, although it does exist. Please check if you have sufficient permissions to run this program.").arg(app)));
+            m_ExpectedRunningState = kStopped;
+            resetRestartBackoff();
+            delete barrierProcess();
+            setBarrierProcess(NULL);
+            setBarrierState(barrierDisconnected);
             return;
         }
+
+        m_ProcessLifetime.restart();
     }
 
     if (serviceMode)
@@ -823,6 +902,7 @@ void MainWindow::stopBarrier()
     appendLogDebug("stopping process");
 
     m_ExpectedRunningState = kStopped;
+    resetRestartBackoff();
 
     if (appConfig().processMode() == Service)
     {
@@ -855,35 +935,41 @@ void MainWindow::stopService()
 void MainWindow::stopDesktop()
 {
     QMutexLocker locker(&m_StopDesktopMutex);
-    if (!barrierProcess()) {
+    QProcess* process = barrierProcess();
+    if (process == nullptr) {
         return;
     }
 
     appendLogInfo("stopping Weave desktop process");
 
-    if (barrierProcess()->isOpen()) {
+    if (process->isOpen()) {
         // try to shutdown child gracefully
-        barrierProcess()->write(&ShutdownCh, 1);
-        barrierProcess()->waitForFinished(1500);
-        if (barrierProcess()->state() != QProcess::NotRunning) {
+        process->write(&ShutdownCh, 1);
+        process->waitForFinished(1500);
+        if (process->state() != QProcess::NotRunning) {
             appendLogInfo("desktop process did not stop gracefully; terminating it");
-            barrierProcess()->terminate();
-            barrierProcess()->waitForFinished(2000);
+            process->terminate();
+            process->waitForFinished(2000);
         }
-        if (barrierProcess()->state() != QProcess::NotRunning) {
+        if (process->state() != QProcess::NotRunning) {
             appendLogInfo("desktop process did not terminate; killing it");
-            barrierProcess()->kill();
-            barrierProcess()->waitForFinished(2000);
+            process->kill();
+            process->waitForFinished(2000);
         }
-        barrierProcess()->close();
     }
 
-    delete barrierProcess();
-    setBarrierProcess(NULL);
+    flushPendingProcessLogs();
+    process->close();
+    delete process;
+    if (process == barrierProcess()) {
+        setBarrierProcess(NULL);
+    }
 }
 
 void MainWindow::barrierFinished(int exitCode, QProcess::ExitStatus)
 {
+    flushPendingProcessLogs();
+
     if (exitCode == 0) {
         appendLogInfo(QString("process exited normally"));
     }
@@ -891,11 +977,23 @@ void MainWindow::barrierFinished(int exitCode, QProcess::ExitStatus)
         appendLogError(QString("process exited with error code: %1").arg(exitCode));
     }
 
+    QProcess* finishedProcess = qobject_cast<QProcess*>(sender());
+    if (finishedProcess != nullptr) {
+        finishedProcess->deleteLater();
+        if (finishedProcess == barrierProcess()) {
+            setBarrierProcess(NULL);
+        }
+    }
+
+    if (m_ProcessLifetime.isValid() && m_ProcessLifetime.elapsed() >= kRestartStabilityWindowMs) {
+        resetRestartBackoff();
+    }
+
     if (m_ExpectedRunningState == kStarted) {
-        QTimer::singleShot(1000, this, SLOT(startBarrier()));
-        appendLogInfo(QString("detected process not running, auto restarting"));
+        scheduleAutoRestart();
     }
     else {
+        resetRestartBackoff();
         setBarrierState(barrierDisconnected);
     }
 }
@@ -920,13 +1018,11 @@ void MainWindow::setBarrierState(qBarrierState state)
         m_pButtonReload->setEnabled(false);
     }
 
-    bool connected = false;
-    if (state == barrierConnected || state == barrierTransfering) {
-        connected = true;
-    }
+    const bool activeOrStarting =
+        state == barrierConnected || state == barrierConnecting || state == barrierTransfering;
 
-    m_pActionStartBarrier->setEnabled(!connected);
-    m_pActionStopBarrier->setEnabled(connected);
+    m_pActionStartBarrier->setEnabled(!activeOrStarting);
+    m_pActionStopBarrier->setEnabled(activeOrStarting);
 
     switch (state)
     {
@@ -959,6 +1055,26 @@ void MainWindow::setBarrierState(qBarrierState state)
     m_BarrierState = state;
     updateWorkflowPeerHint();
     updateWorkflowIndicators();
+}
+
+void MainWindow::resetRestartBackoff()
+{
+    m_RestartTimer.stop();
+    m_UnexpectedExitCount = 0;
+}
+
+void MainWindow::scheduleAutoRestart()
+{
+    ++m_UnexpectedExitCount;
+    const int exponent = std::min(m_UnexpectedExitCount - 1, 4);
+    const int delayMs = std::min(kRestartBaseDelayMs << exponent, kRestartMaxDelayMs);
+    const int delaySeconds = (delayMs + 999) / 1000;
+
+    appendLogInfo(QString("detected process not running, auto restarting in %1 second(s)")
+                  .arg(delaySeconds));
+    setStatus(tr("Weave stopped unexpectedly. Retrying in %1 second(s).")
+              .arg(delaySeconds));
+    m_RestartTimer.start(delayMs);
 }
 
 void MainWindow::setVisible(bool visible)

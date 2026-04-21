@@ -129,6 +129,10 @@ namespace {
             case Action::lockCursorToScreen:
                 action.setLockCursorMode(test_action.lock_cursor_mode);
                 break;
+            case Action::mouseDown:
+            case Action::mouseUp:
+            case Action::mousebutton:
+                break;
         }
         return action;
     }

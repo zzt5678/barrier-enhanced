@@ -146,7 +146,7 @@ QLabel#m_pLabelSettingsTitle {
     color: #111113;
 }
 
-QLineEdit, QTextEdit, QSpinBox, QComboBox {
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
     background: #ffffff;
     color: #1d1d1f;
     border: 1px solid #d2d2d7;
@@ -155,7 +155,7 @@ QLineEdit, QTextEdit, QSpinBox, QComboBox {
     min-height: 18px;
 }
 
-QLineEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus {
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QComboBox:focus {
     border: 1px solid #0071e3;
 }
 

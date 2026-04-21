@@ -27,6 +27,8 @@
 #include <QSettings>
 #include <QProcess>
 #include <QThread>
+#include <QElapsedTimer>
+#include <QTimer>
 
 #include "ui_MainWindowBase.h"
 
@@ -44,7 +46,6 @@ class QMenu;
 class QLineEdit;
 class QGroupBox;
 class QPushButton;
-class QTextEdit;
 class QComboBox;
 class QTabWidget;
 class QCheckBox;
@@ -157,6 +158,9 @@ public slots:
         bool serverArgs(QStringList& args, QString& app);
         void setStatus(const QString& status);
         void updateFromLogLine(const QString& line);
+        void processLogLine(const QString& line);
+        void consumeLogChunk(const QString& text, QString* pendingBuffer, bool flushPartialLine);
+        void flushPendingProcessLogs();
         QString getIPAddresses();
         void stopService();
         void stopDesktop();
@@ -174,6 +178,8 @@ public slots:
         void checkConnected(const QString& line);
         void checkFingerprint(const QString& line);
         void restartBarrier();
+        void resetRestartBackoff();
+        void scheduleAutoRestart();
         void proofreadInfo();
         void windowStateChanged();
         void updateSSLFingerprint();
@@ -216,6 +222,11 @@ public slots:
         CommandPaletteDialog* m_pCommandPaletteDialog;
         QAction* m_pActionWorkflowHub;
         QAction* m_pActionCommandPalette;
+        QString m_PendingStdOutLog;
+        QString m_PendingStdErrLog;
+        QTimer m_RestartTimer;
+        QElapsedTimer m_ProcessLifetime;
+        int m_UnexpectedExitCount;
 
         bool m_fingerprint_expanded = false;
 

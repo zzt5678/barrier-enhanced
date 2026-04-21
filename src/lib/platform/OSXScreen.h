@@ -99,7 +99,7 @@ public:
     virtual void        fakeDraggingFiles(DragFileList fileList) override;
     virtual std::string& getDraggingFilename() override;
 
-    const std::string& getDropTarget() const { return m_dropTarget; }
+    const std::string& getDropTarget() const override { return m_dropTarget; }
     void                waitForCarbonLoop() const;
 
 protected:

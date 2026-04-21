@@ -20,6 +20,8 @@
 #define LOGWINDOW__H
 
 #include <QDialog>
+#include <QStringList>
+#include <QTimer>
 
 #include "ui_LogWindowBase.h"
 
@@ -38,9 +40,13 @@ class LogWindow : public QDialog, public Ui::LogWindowBase
         void appendError(const QString& text);
 
     private slots:
+        void flushPendingLines();
         void on_m_pButtonHide_clicked();
         void on_m_pButtonClearLog_clicked();
 
+    private:
+        QStringList m_pendingLines;
+        QTimer m_flushTimer;
 };
 
 #endif // LOGWINDOW__H

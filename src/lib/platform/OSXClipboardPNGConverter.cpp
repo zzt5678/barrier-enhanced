@@ -50,7 +50,7 @@ OSXClipboardPNGConverter::fromIClipboard(const std::string& pngData) const
         return {};
     }
 
-    if (pngData[0] != 0x89 || pngData[1] != 'P' ||
+    if (static_cast<unsigned char>(pngData[0]) != 0x89 || pngData[1] != 'P' ||
         pngData[2] != 'N' || pngData[3] != 'G') {
         return {};
     }

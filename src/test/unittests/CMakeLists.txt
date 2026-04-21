@@ -69,4 +69,4 @@ endif()
 add_executable(unittests ${sources})
 target_link_libraries(unittests
     arch base client server common io net platform server synlib mt ipc ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES} ${libs} ${OPENSSL_LIBS})
-add_test(unittests unittests)
+add_test(NAME unittests COMMAND $<TARGET_FILE:unittests>)

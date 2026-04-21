@@ -20,6 +20,7 @@
 
 #include <QObject>
 #include <QAbstractSocket>
+#include <QTimer>
 
 #include "ElevateMode.h"
 
@@ -60,4 +61,5 @@ private:
     IpcReader* m_Reader;
     bool m_ReaderStarted;
     bool m_Enabled;
+    QTimer m_RetryTimer;
 };

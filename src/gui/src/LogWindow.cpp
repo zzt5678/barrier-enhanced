@@ -18,6 +18,13 @@
 #include "LogWindow.h"
 
 #include <QDateTime>
+#include <QScrollBar>
+#include <QTextDocument>
+
+namespace {
+constexpr int kFlushIntervalMs = 16;
+constexpr int kMaxLogBlocks = 5000;
+}
 
 static QString getTimeStamp()
 {
@@ -26,18 +33,23 @@ static QString getTimeStamp()
 }
 
 LogWindow::LogWindow(QWidget *parent) :
-    QDialog(parent)
+    QDialog(parent),
+    m_flushTimer(this)
 {
     // explicitly unset DeleteOnClose so the log window can be show and hidden
     // repeatedly until Barrier is finished
     setAttribute(Qt::WA_DeleteOnClose, false);
     setupUi(this);
+
+    m_flushTimer.setSingleShot(true);
+    connect(&m_flushTimer, &QTimer::timeout, this, &LogWindow::flushPendingLines);
+    m_pLogOutput->document()->setMaximumBlockCount(kMaxLogBlocks);
 }
 
 void LogWindow::startNewInstance()
 {
     // put a space between last log output and new instance.
-    if (!m_pLogOutput->toPlainText().isEmpty())
+    if (!m_pendingLines.isEmpty() || !m_pLogOutput->document()->isEmpty())
         appendRaw("");
 }
 
@@ -58,7 +70,28 @@ void LogWindow::appendError(const QString& text)
 
 void LogWindow::appendRaw(const QString& text)
 {
-    m_pLogOutput->append(text);
+    m_pendingLines.append(text);
+    if (!m_flushTimer.isActive()) {
+        m_flushTimer.start(kFlushIntervalMs);
+    }
+}
+
+void LogWindow::flushPendingLines()
+{
+    if (m_pendingLines.isEmpty()) {
+        return;
+    }
+
+    const bool stickToBottom =
+        m_pLogOutput->verticalScrollBar()->value() >= m_pLogOutput->verticalScrollBar()->maximum();
+    const QString output = m_pendingLines.join('\n');
+    m_pendingLines.clear();
+
+    m_pLogOutput->appendPlainText(output);
+
+    if (stickToBottom) {
+        m_pLogOutput->verticalScrollBar()->setValue(m_pLogOutput->verticalScrollBar()->maximum());
+    }
 }
 
 void LogWindow::on_m_pButtonHide_clicked()
@@ -68,5 +101,7 @@ void LogWindow::on_m_pButtonHide_clicked()
 
 void LogWindow::on_m_pButtonClearLog_clicked()
 {
+    m_flushTimer.stop();
+    m_pendingLines.clear();
     m_pLogOutput->clear();
 }

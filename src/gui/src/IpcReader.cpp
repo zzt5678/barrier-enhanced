@@ -22,8 +22,12 @@
 #include "IpcReader.h"
 #include <QTcpSocket>
 #include "Ipc.h"
+#include <QDebug>
 #include <QMutex>
 #include <QByteArray>
+#include <algorithm>
+#include <cstring>
+#include <limits>
 
 #ifdef BARRIER_IPC_VERBOSE
 #include <iostream>
@@ -31,6 +35,43 @@
 #else // not defined BARRIER_IPC_VERBOSE
 #define IPC_LOG(x)
 #endif
+
+namespace {
+constexpr int kMessageCodeSize = 4;
+constexpr int kMessageLengthSize = 4;
+constexpr int kMaxLogLineBytes = 1024 * 1024;
+
+QByteArray logMessageHeader()
+{
+    return QByteArray(kIpcMsgLogLine, kMessageCodeSize);
+}
+
+void discardUntilNextHeader(QByteArray& buffer, int searchStart)
+{
+    const QByteArray header = logMessageHeader();
+    const int nextHeader = buffer.indexOf(header, searchStart);
+    if (nextHeader >= 0) {
+        buffer.remove(0, nextHeader);
+        return;
+    }
+
+    int keepBytes = 0;
+    const int maxSuffix = std::min(buffer.size(), header.size() - 1);
+    for (int size = maxSuffix; size > 0; --size) {
+        if (buffer.right(size) == header.left(size)) {
+            keepBytes = size;
+            break;
+        }
+    }
+
+    if (keepBytes > 0) {
+        buffer = buffer.right(keepBytes);
+    }
+    else {
+        buffer.clear();
+    }
+}
+}
 
 IpcReader::IpcReader(QTcpSocket* socket) :
 m_Socket(socket)
@@ -49,6 +90,8 @@ void IpcReader::start()
 void IpcReader::stop()
 {
     disconnect(m_Socket, SIGNAL(readyRead()), this, SLOT(read()));
+    QMutexLocker locker(&m_Mutex);
+    m_Buffer.clear();
 }
 
 void IpcReader::read()
@@ -56,65 +99,50 @@ void IpcReader::read()
     QMutexLocker locker(&m_Mutex);
     IPC_LOG(std::cout << "ready read" << std::endl);
 
-    while (m_Socket->bytesAvailable()) {
-        IPC_LOG(std::cout << "bytes available" << std::endl);
+    const QByteArray newData = m_Socket->readAll();
+    if (newData.isEmpty()) {
+        return;
+    }
 
-        char codeBuf[5];
-        readStream(codeBuf, 4);
-        codeBuf[4] = 0;
-        IPC_LOG(std::cout << "ipc read: " << codeBuf << std::endl);
+    m_Buffer.append(newData);
 
-        if (memcmp(codeBuf, kIpcMsgLogLine, 4) == 0) {
-            IPC_LOG(std::cout << "reading log line" << std::endl);
-
-            char lenBuf[4];
-            readStream(lenBuf, 4);
-            int len = bytesToInt(lenBuf, 4);
-
-            char* data = new char[len];
-            readStream(data, len);
-            QString line = QString::fromUtf8(data, len);
-            delete[] data;
-
-            readLogLine(line);
-        }
-        else {
-            IPC_LOG(std::cerr << "aborting, message invalid" << std::endl);
+    while (true) {
+        if (m_Buffer.size() < kMessageCodeSize) {
             return;
         }
+
+        const char* bufferData = m_Buffer.constData();
+        IPC_LOG(std::cout << "ipc read: "
+                          << QByteArray(bufferData, kMessageCodeSize).constData()
+                          << std::endl);
+
+        if (memcmp(bufferData, kIpcMsgLogLine, kMessageCodeSize) != 0) {
+            qWarning() << "Invalid IPC message header, resynchronizing buffered data";
+            discardUntilNextHeader(m_Buffer, 1);
+            continue;
+        }
+
+        if (m_Buffer.size() < kMessageCodeSize + kMessageLengthSize) {
+            return;
+        }
+
+        const int len = bytesToInt(bufferData + kMessageCodeSize, kMessageLengthSize);
+        if (len < 0 || len > kMaxLogLineBytes) {
+            qWarning() << "Invalid IPC payload length" << len << ", resynchronizing buffered data";
+            discardUntilNextHeader(m_Buffer, kMessageCodeSize);
+            continue;
+        }
+
+        const int totalMessageSize = kMessageCodeSize + kMessageLengthSize + len;
+        if (m_Buffer.size() < totalMessageSize) {
+            return;
+        }
+
+        IPC_LOG(std::cout << "reading log line" << std::endl);
+        const QByteArray lineData = m_Buffer.mid(kMessageCodeSize + kMessageLengthSize, len);
+        m_Buffer.remove(0, totalMessageSize);
+        readLogLine(QString::fromUtf8(lineData.constData(), lineData.size()));
     }
-
-    IPC_LOG(std::cout << "read done" << std::endl);
-}
-
-bool IpcReader::readStream(char* buffer, int length)
-{
-    IPC_LOG(std::cout << "reading stream" << std::endl);
-
-    int read = 0;
-    while (read < length) {
-        int ask = length - read;
-        if (m_Socket->bytesAvailable() < ask) {
-            IPC_LOG(std::cout << "buffer too short, waiting" << std::endl);
-            m_Socket->waitForReadyRead(-1);
-        }
-
-        int got = m_Socket->read(buffer, ask);
-        read += got;
-
-        IPC_LOG(std::cout << "> ask=" << ask << " got=" << got
-            << " read=" << read << std::endl);
-
-        if (got == -1) {
-            IPC_LOG(std::cout << "socket ended, aborting" << std::endl);
-            return false;
-        }
-        else if (length - read > 0) {
-            IPC_LOG(std::cout << "more remains, seek to " << got << std::endl);
-            buffer += got;
-        }
-    }
-    return true;
 }
 
 int IpcReader::bytesToInt(const char *buffer, int size)
@@ -128,11 +156,15 @@ int IpcReader::bytesToInt(const char *buffer, int size)
               (unsigned char)buffer[1];
     }
     else if (size == 4) {
-        return
-            (((unsigned char)buffer[0]) << 24) +
-            (((unsigned char)buffer[1]) << 16) +
-            (((unsigned char)buffer[2]) << 8) +
-              (unsigned char)buffer[3];
+        const unsigned int value =
+            (static_cast<unsigned int>(static_cast<unsigned char>(buffer[0])) << 24) +
+            (static_cast<unsigned int>(static_cast<unsigned char>(buffer[1])) << 16) +
+            (static_cast<unsigned int>(static_cast<unsigned char>(buffer[2])) << 8) +
+             static_cast<unsigned int>(static_cast<unsigned char>(buffer[3]));
+        if (value > static_cast<unsigned int>(std::numeric_limits<int>::max())) {
+            return -1;
+        }
+        return static_cast<int>(value);
     }
     else {
         return 0;

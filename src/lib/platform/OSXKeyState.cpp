@@ -488,7 +488,7 @@ static io_connect_t getEventDriver(void)
 
     if (!sEventDrvrRef) {
         // Get master device port
-        kr = IOMasterPort(bootstrap_port, &masterPort);
+        kr = IOMainPort(bootstrap_port, &masterPort);
         assert(KERN_SUCCESS == kr);
 
         kr = IOServiceGetMatchingServices(masterPort,

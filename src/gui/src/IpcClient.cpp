@@ -24,17 +24,24 @@
 #include "IpcReader.h"
 #include "Ipc.h"
 #include <QDataStream>
+#include <cstring>
 
 IpcClient::IpcClient() :
 m_ReaderStarted(false),
-m_Enabled(false)
+m_Enabled(false),
+m_RetryTimer(this)
 {
     m_Socket = new QTcpSocket(this);
     connect(m_Socket, SIGNAL(connected()), this, SLOT(connected()));
     connect(m_Socket, SIGNAL(error(QAbstractSocket::SocketError)), this, SLOT(error(QAbstractSocket::SocketError)));
 
     m_Reader = new IpcReader(m_Socket);
+    m_Reader->setParent(this);
     connect(m_Reader, SIGNAL(readLogLine(const QString&)), this, SLOT(handleReadLogLine(const QString&)));
+
+    m_RetryTimer.setSingleShot(true);
+    m_RetryTimer.setInterval(1000);
+    connect(&m_RetryTimer, &QTimer::timeout, this, &IpcClient::retryConnect);
 }
 
 IpcClient::~IpcClient()
@@ -43,6 +50,7 @@ IpcClient::~IpcClient()
 
 void IpcClient::connected()
 {
+    m_RetryTimer.stop();
     sendHello();
     infoMessage("connection established");
 }
@@ -50,6 +58,11 @@ void IpcClient::connected()
 void IpcClient::connectToHost()
 {
     m_Enabled = true;
+
+    if (m_Socket->state() == QAbstractSocket::ConnectedState ||
+        m_Socket->state() == QAbstractSocket::ConnectingState) {
+        return;
+    }
 
     infoMessage("connecting to service...");
     m_Socket->connectToHost(QHostAddress(QHostAddress::LocalHost), IPC_PORT);
@@ -62,8 +75,11 @@ void IpcClient::connectToHost()
 
 void IpcClient::disconnectFromHost()
 {
+    m_Enabled = false;
+    m_RetryTimer.stop();
     infoMessage("service disconnect");
     m_Reader->stop();
+    m_ReaderStarted = false;
     m_Socket->close();
 }
 
@@ -78,7 +94,9 @@ void IpcClient::error(QAbstractSocket::SocketError error)
 
     errorMessage(QString("ipc connection error, %1").arg(text));
 
-    QTimer::singleShot(1000, this, SLOT(retryConnect()));
+    if (m_Enabled && !m_RetryTimer.isActive()) {
+        m_RetryTimer.start();
+    }
 }
 
 void IpcClient::retryConnect()
