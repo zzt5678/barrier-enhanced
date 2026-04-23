@@ -167,6 +167,7 @@ public:
 
 private:
     void                sendClipboard(ClipboardID);
+    bool                sendClipboardFileSelection(ClipboardID, const Clipboard&);
     void                sendEvent(Event::Type, void*);
     void                sendConnectionFailedEvent(const char* msg);
     void                sendFileChunk(const void* data);

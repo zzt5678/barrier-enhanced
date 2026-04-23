@@ -261,13 +261,6 @@ ArgParser::parseGenericArgs(int argc, const char* const* argv, int& i)
     else if (isArg(i, argc, argv, NULL, "--enable-drag-drop")) {
         bool useDragDrop = true;
 
-#ifdef WINAPI_XWINDOWS
-
-        useDragDrop = false;
-        LOG((CLOG_INFO "ignoring --enable-drag-drop, not supported on linux."));
-
-#endif
-
 #ifdef WINAPI_MSWINDOWS
 
         if (!IsWindowsVistaOrGreater()) {

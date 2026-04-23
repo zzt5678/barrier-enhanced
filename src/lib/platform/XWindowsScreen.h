@@ -81,6 +81,9 @@ public:
     virtual void        setOptions(const OptionsList& options) override;
     virtual void        setSequenceNumber(UInt32) override;
     virtual bool        isPrimary() const override;
+    virtual void        fakeDraggingFiles(DragFileList fileList) override;
+    virtual const String& getDropTarget() const override;
+    virtual void        setDropTarget(const String& target) override;
 
 protected:
     // IPlatformScreen overrides
@@ -223,6 +226,7 @@ private:
     // clipboards
     XWindowsClipboard*    m_clipboard[kClipboardEnd];
     UInt32                m_sequenceNumber;
+    mutable String        m_dropTargetPath;
 
     // screen saver stuff
     XWindowsScreenSaver*    m_screensaver;

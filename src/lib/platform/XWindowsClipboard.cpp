@@ -24,6 +24,7 @@
 #include "platform/XWindowsClipboardHTMLConverter.h"
 #include "platform/XWindowsClipboardBMPConverter.h"
 #include "platform/XWindowsClipboardPNGConverter.h"
+#include "platform/XWindowsClipboardURIListFileConverter.h"
 #include "platform/XWindowsClipboardURIListPNGConverter.h"
 #include "platform/XWindowsUtil.h"
 #include "mt/Thread.h"
@@ -163,6 +164,9 @@ XWindowsClipboard::XWindowsClipboard(IXWindowsImpl* impl, Display* display,
                                 "text/html"));
     m_converters.push_back(new XWindowsClipboardHTMLConverter(m_display,
                                 "application/x-moz-nativehtml"));
+    m_converters.push_back(new XWindowsClipboardURIListFileConverter(
+                                m_display, "x-special/gnome-copied-files", true));
+    m_converters.push_back(new XWindowsClipboardURIListFileConverter(m_display));
     m_converters.push_back(new XWindowsClipboardBMPConverter(m_display));
     m_converters.push_back(new XWindowsClipboardPNGConverter(m_display));
     m_converters.push_back(new XWindowsClipboardURIListPNGConverter(m_display));

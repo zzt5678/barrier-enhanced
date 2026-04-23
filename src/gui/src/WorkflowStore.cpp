@@ -60,7 +60,7 @@ QString sanitizeInboxDir(const QString& candidate, const QString& storageRoot)
     }
 
     const QString native = QDir::fromNativeSeparators(normalized);
-    const QStringList parts = native.split('/', Qt::SkipEmptyParts);
+    const QStringList parts = native.split('/', QString::SkipEmptyParts);
     for (const QString& part : parts) {
         if (part == QStringLiteral("..")) {
             return fallback;

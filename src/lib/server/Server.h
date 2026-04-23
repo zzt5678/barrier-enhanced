@@ -322,6 +322,8 @@ private:
     void                handleFileRecieveCompletedEvent(const Event&, void*);
 
     // event processing
+    bool                sendClipboardFileSelection(BaseClientProxy* sender,
+                            ClipboardID id, const Clipboard& clipboard);
     void                onClipboardChanged(BaseClientProxy* sender,
                             ClipboardID id, UInt32 seqNum);
     void                onScreensaver(bool activated);

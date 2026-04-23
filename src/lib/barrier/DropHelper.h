@@ -20,8 +20,10 @@
 #include "barrier/DragInformation.h"
 #include "base/String.h"
 
+#include <vector>
+
 class DropHelper {
 public:
-    static void            writeToDir(const String& destination,
+    static std::vector<String> writeToDir(const String& destination,
                             DragFileList& fileList, String& data);
 };

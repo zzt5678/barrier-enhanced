@@ -36,6 +36,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int xi_opcode;
 
@@ -82,6 +84,7 @@ XWindowsScreen::XWindowsScreen(
 	m_ic(NULL),
 	m_lastKeycode(0),
 	m_sequenceNumber(0),
+    m_dropTargetPath(),
 	m_screensaver(NULL),
 	m_screensaverNotify(false),
 	m_xtestIsXineramaUnaware(true),
@@ -383,6 +386,44 @@ void
 XWindowsScreen::checkClipboards()
 {
 	// do nothing, we're always up to date
+}
+
+void
+XWindowsScreen::fakeDraggingFiles(DragFileList)
+{
+    // File-copy transfers use the shared inbox on X11. Native fake drag
+    // synthesis is intentionally not required for copy/paste file support.
+    m_fakeDraggingStarted = false;
+}
+
+const String&
+XWindowsScreen::getDropTarget() const
+{
+    if (m_dropTargetPath.empty()) {
+        const char* home = std::getenv("HOME");
+        if (home != NULL && home[0] != '\0') {
+            const std::string downloads = std::string(home) + "/Downloads";
+            struct stat info;
+            if (stat(downloads.c_str(), &info) == 0 && S_ISDIR(info.st_mode)) {
+                m_dropTargetPath = downloads + "/Weave Inbox";
+            }
+            else {
+                m_dropTargetPath = std::string(home) + "/Weave Inbox";
+            }
+        }
+        else {
+            m_dropTargetPath = "/tmp/Weave Inbox";
+        }
+        LOG((CLOG_INFO "using X11 drop target: %s", m_dropTargetPath.c_str()));
+    }
+
+    return m_dropTargetPath;
+}
+
+void
+XWindowsScreen::setDropTarget(const String& target)
+{
+    m_dropTargetPath = target;
 }
 
 void

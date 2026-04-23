@@ -31,13 +31,17 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #include <shellapi.h>
+#include <ShlObj.h>
 #include <cwctype>
+#include <sstream>
 
 #pragma comment(lib, "gdiplus.lib")
 
 static std::string convertBMPToPNG(const std::string& dibData);
 static std::string convertPNGToDIB(const std::string& pngData);
 static std::string convertHDropToPNG(HANDLE dropHandle);
+static std::string convertHDropToPathList(HANDLE dropHandle);
+static HANDLE createHDropFromInboxText(const std::string& text);
 
 namespace {
 
@@ -87,9 +91,9 @@ std::string pathLabel(const std::wstring& path)
         return {};
     }
 
-    const barrier::fs::path fsPath(path);
-    if (!fsPath.filename().empty()) {
-        return fsPath.filename().u8string();
+    const size_t separator = path.find_last_of(L"\\/");
+    if (separator != std::wstring::npos && separator + 1 < path.size()) {
+        return utf8FromWide(path.substr(separator + 1));
     }
 
     return utf8FromWide(path);
@@ -304,6 +308,14 @@ MSWindowsClipboard::add(EFormat format, const std::string& data)
             }
         }
     }
+
+    if (format == IClipboard::kText) {
+        HANDLE dropHandle = createHDropFromInboxText(data);
+        if (dropHandle != NULL) {
+            LOG((CLOG_INFO "also publishing received file path as CF_HDROP"));
+            m_facade->write(dropHandle, CF_HDROP);
+        }
+    }
 }
 
 bool
@@ -343,9 +355,9 @@ MSWindowsClipboard::has(EFormat format) const
 {
     if (format == IClipboard::kText && IsClipboardFormatAvailable(CF_HDROP)) {
         HANDLE dropData = GetClipboardData(CF_HDROP);
-        if (dropListContainsSupportedImage(dropData)) {
-            LOG((CLOG_DEBUG "suppressing text clipboard format because CF_HDROP contains image files"));
-            return false;
+        if (dropData != NULL) {
+            LOG((CLOG_DEBUG "publishing CF_HDROP clipboard as path-list text metadata"));
+            return true;
         }
     }
 
@@ -384,6 +396,13 @@ MSWindowsClipboard::has(EFormat format) const
 
 std::string MSWindowsClipboard::get(EFormat format) const
 {
+    if (format == IClipboard::kText && IsClipboardFormatAvailable(CF_HDROP)) {
+        HANDLE dropData = GetClipboardData(CF_HDROP);
+        std::string pathList = convertHDropToPathList(dropData);
+        if (!pathList.empty()) {
+            return pathList;
+        }
+    }
     // Special handling for PNG format: try PNG first, then fallback to BMP→PNG conversion
     if (format == IClipboard::kPNG) {
         // Find PNG converter
@@ -674,4 +693,147 @@ static std::string convertHDropToPNG(HANDLE dropHandle)
     }
 
     return {};
+}
+
+static std::string convertHDropToPathList(HANDLE dropHandle)
+{
+    if (dropHandle == NULL) {
+        return {};
+    }
+
+    const HDROP drop = static_cast<HDROP>(dropHandle);
+    const UINT fileCount = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+    std::string pathList;
+    for (UINT index = 0; index < fileCount; ++index) {
+        const UINT pathLength = DragQueryFileW(drop, index, NULL, 0);
+        if (pathLength == 0) {
+            continue;
+        }
+
+        std::wstring path(pathLength + 1, L'\0');
+        const UINT copied = DragQueryFileW(drop, index, &path[0], pathLength + 1);
+        path.resize(copied);
+
+        if (!pathList.empty()) {
+            pathList.push_back('\n');
+        }
+        pathList += utf8FromWide(path);
+    }
+
+    return pathList;
+}
+
+static std::wstring wideFromUtf8(const std::string& value)
+{
+    if (value.empty()) {
+        return {};
+    }
+
+    const int size = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, NULL, 0);
+    if (size <= 1) {
+        return {};
+    }
+
+    std::wstring result(static_cast<size_t>(size - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, &result[0], size);
+    return result;
+}
+
+static std::string trimTextLine(std::string value)
+{
+    while (!value.empty() && (value.back() == '\r' || value.back() == '\n' ||
+                              value.back() == ' ' || value.back() == '\t')) {
+        value.pop_back();
+    }
+
+    size_t start = 0;
+    while (start < value.size() &&
+           (value[start] == ' ' || value[start] == '\t' ||
+            value[start] == '\r' || value[start] == '\n')) {
+        ++start;
+    }
+
+    return value.substr(start);
+}
+
+static bool pathExistsForHDrop(const std::wstring& path)
+{
+    if (path.empty()) {
+        return false;
+    }
+
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool pathLooksLikeReceivedInboxItem(const std::wstring& path)
+{
+    wchar_t localAppData[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
+        std::wstring prefix(localAppData);
+        prefix += L"\\Barrier\\workflow\\inbox\\";
+        const std::wstring lowerPath = toLowerCopy(path);
+        const std::wstring lowerPrefix = toLowerCopy(prefix);
+        if (lowerPath.compare(0, lowerPrefix.size(), lowerPrefix) == 0) {
+            return true;
+        }
+    }
+
+    const std::wstring lowerPath = toLowerCopy(path);
+    return lowerPath.find(L"\\workflow\\inbox\\") != std::wstring::npos ||
+        lowerPath.find(L"\\weave inbox\\") != std::wstring::npos;
+}
+
+static HANDLE createHDropFromInboxText(const std::string& text)
+{
+    std::vector<std::wstring> paths;
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+        line = trimTextLine(line);
+        if (line.empty()) {
+            continue;
+        }
+
+        std::wstring path = wideFromUtf8(line);
+        if (pathExistsForHDrop(path) && pathLooksLikeReceivedInboxItem(path)) {
+            paths.push_back(path);
+        }
+    }
+
+    if (paths.empty()) {
+        return NULL;
+    }
+
+    size_t pathChars = 1;
+    for (const auto& path : paths) {
+        pathChars += path.size() + 1;
+    }
+
+    const size_t bytes = sizeof(DROPFILES) + pathChars * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GHND | GMEM_SHARE, bytes);
+    if (memory == NULL) {
+        return NULL;
+    }
+
+    DROPFILES* dropFiles = static_cast<DROPFILES*>(GlobalLock(memory));
+    if (dropFiles == NULL) {
+        GlobalFree(memory);
+        return NULL;
+    }
+
+    dropFiles->pFiles = sizeof(DROPFILES);
+    dropFiles->fWide = TRUE;
+
+    wchar_t* cursor = reinterpret_cast<wchar_t*>(
+        reinterpret_cast<unsigned char*>(dropFiles) + sizeof(DROPFILES));
+    for (const auto& path : paths) {
+        std::memcpy(cursor, path.c_str(), path.size() * sizeof(wchar_t));
+        cursor += path.size();
+        *cursor++ = L'\0';
+    }
+    *cursor = L'\0';
+
+    GlobalUnlock(memory);
+    return memory;
 }

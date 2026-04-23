@@ -544,13 +544,14 @@ void MainWindow::checkConnected(const QString& line)
         updateWorkflowPeerHint();
         resetRestartBackoff();
 
-        if (!appConfig().startedBefore() && isVisible()) {
-                QMessageBox::information(
-                    this, "Weave",
-                    tr("Weave is now connected. You can close the "
-                    "config window and Weave will remain connected in "
-                    "the background."));
-
+        if (!appConfig().startedBefore()) {
+            if (m_pTrayIcon && m_pTrayIcon->isVisible()) {
+                m_pTrayIcon->showMessage(
+                    tr("Weave"),
+                    tr("Weave is connected and will keep running in the background."),
+                    QSystemTrayIcon::Information,
+                    2500);
+            }
             appConfig().setStartedBefore(true);
             appConfig().saveSettings();
         }
@@ -693,13 +694,14 @@ void MainWindow::startBarrier()
 #endif
     }
 
-#ifndef Q_OS_LINUX
-
     if (appConfig().getEnableDragDrop()) {
         args << "--enable-drag-drop";
+        const QString dropDir = QDir::toNativeSeparators(appConfig().workflowInboxDir());
+        if (!dropDir.isEmpty()) {
+            QDir().mkpath(dropDir);
+            args << "--drop-dir" << dropDir;
+        }
     }
-
-#endif
 
     if (!m_AppConfig->getCryptoEnabled()) {
         args << "--disable-crypto";
@@ -790,8 +792,8 @@ bool MainWindow::clientArgs(QStringList& args, QString& app)
             return true;
         }
     } else if (m_pLineEditHostname->text().isEmpty()) {
-        show();
         if (!m_SuppressEmptyServerWarning) {
+            showControlCenter();
             QMessageBox::warning(this, tr("Hostname is empty"),
                              tr("Please fill in a hostname for the Weave client to connect to."));
         }

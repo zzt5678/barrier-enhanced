@@ -34,6 +34,7 @@
 #include "barrier/KeyState.h"
 #include "barrier/Screen.h"
 #include "barrier/PacketStreamFilter.h"
+#include "barrier/IClipboard.h"
 #include "net/TCPSocket.h"
 #include "net/IDataSocket.h"
 #include "net/IListenSocket.h"
@@ -52,6 +53,7 @@
 #include <fstream>
 #include <ctime>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -99,6 +101,50 @@ DragFileList parseDraggedPaths(const std::string& pathList)
     }
 
     return dragFileList;
+}
+
+std::string trimClipboardLine(std::string value)
+{
+    while (!value.empty() && (value.back() == '\r' || value.back() == '\n' ||
+                              value.back() == ' ' || value.back() == '\t')) {
+        value.pop_back();
+    }
+
+    size_t start = 0;
+    while (start < value.size() &&
+           (value[start] == ' ' || value[start] == '\t' ||
+            value[start] == '\r' || value[start] == '\n')) {
+        ++start;
+    }
+
+    return value.substr(start);
+}
+
+std::vector<barrier::fs::path> clipboardFilePaths(const Clipboard& clipboard)
+{
+    std::vector<barrier::fs::path> paths;
+    if (!clipboard.open(0)) {
+        return paths;
+    }
+
+    if (clipboard.has(IClipboard::kText)) {
+        std::istringstream lines(clipboard.get(IClipboard::kText));
+        std::string line;
+        while (std::getline(lines, line)) {
+            line = trimClipboardLine(line);
+            if (line.empty()) {
+                continue;
+            }
+
+            barrier::fs::path path = barrier::fs::u8path(line);
+            if (barrier::fs::exists(path)) {
+                paths.push_back(path);
+            }
+        }
+    }
+
+    clipboard.close();
+    return paths;
 }
 
 }
@@ -1722,6 +1768,11 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 
 	// got new data
 	LOG((CLOG_INFO "screen \"%s\" updated clipboard %d", clipboard.m_clipboardOwner.c_str(), id));
+	if (sendClipboardFileSelection(sender, id, clipboard.m_clipboard)) {
+		clipboard.m_clipboardData = data;
+		return;
+	}
+
 	clipboard.m_clipboardData = data;
 
 	// tell all clients except the sender that the clipboard is dirty
@@ -1733,6 +1784,48 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 
 	// send the new clipboard to the active screen
 	m_active->setClipboard(id, &clipboard.m_clipboard);
+}
+
+bool
+Server::sendClipboardFileSelection(BaseClientProxy* sender,
+				ClipboardID id, const Clipboard& clipboard)
+{
+	if (id != kClipboardClipboard || !m_args.m_enableDragDrop ||
+		sender == NULL || sender != m_primaryClient || m_active == sender) {
+		return false;
+	}
+
+	const std::vector<barrier::fs::path> paths = clipboardFilePaths(clipboard);
+	if (paths.empty()) {
+		return false;
+	}
+
+	m_dragFileList.clear();
+	std::string transferPaths;
+	for (const auto& path : paths) {
+		if (!transferPaths.empty()) {
+			transferPaths.push_back('\n');
+		}
+		transferPaths += path.u8string();
+
+		DragInformation info;
+		info.setFilename(path.u8string());
+		if (barrier::fs::is_directory(path)) {
+			info.setEntryType(DragInformation::Directory);
+		}
+		m_dragFileList.push_back(info);
+	}
+
+	if (m_dragFileList.empty()) {
+		return false;
+	}
+
+	LOG((CLOG_INFO "clipboard file selection detected, sending %zu item(s) to \"%s\"",
+		m_dragFileList.size(), getName(m_active).c_str()));
+	sendDragInfo(m_active);
+	sendFileToClient(transferPaths);
+	m_dragFileList.clear();
+	return true;
 }
 
 void
@@ -2310,8 +2403,27 @@ void Server::write_to_drop_dir_thread()
 		ARCH->sleep(.1f);
 	}
 
-	DropHelper::writeToDir(m_screen->getDropTarget(), m_fakeDragFileList,
+	std::vector<String> droppedPaths = DropHelper::writeToDir(m_screen->getDropTarget(), m_fakeDragFileList,
 					m_receivedFileData);
+
+	if (!droppedPaths.empty()) {
+		std::string clipboardPaths;
+		for (const auto& path : droppedPaths) {
+			if (!clipboardPaths.empty()) {
+				clipboardPaths.push_back('\n');
+			}
+			clipboardPaths += path;
+		}
+
+		Clipboard clipboard;
+		if (clipboard.open(0)) {
+			clipboard.empty();
+			clipboard.add(IClipboard::kText, clipboardPaths);
+			clipboard.close();
+			m_primaryClient->setClipboard(kClipboardClipboard, &clipboard);
+			m_clipboards[kClipboardClipboard].m_clipboardData = clipboard.marshall();
+		}
+	}
 }
 
 bool

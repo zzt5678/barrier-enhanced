@@ -109,7 +109,7 @@ QList<qint64> findProcessIdsByName(const QString& processName)
 
     const QString output = QString::fromLocal8Bit(tasklist.readAllStandardOutput());
     const QStringList lines = output.split(QRegularExpression(QStringLiteral("[\r\n]+")),
-                                           Qt::SkipEmptyParts);
+                                           QString::SkipEmptyParts);
     for (const QString& line : lines) {
         if (line.startsWith(QStringLiteral("INFO:"), Qt::CaseInsensitive)) {
             continue;
@@ -179,7 +179,7 @@ QList<qint64> findProcessIdsByName(const QString& processName)
 
     const QString output = QString::fromLocal8Bit(pgrep.readAllStandardOutput());
     const QStringList lines = output.split(QRegularExpression(QStringLiteral("[\r\n]+")),
-                                           Qt::SkipEmptyParts);
+                                           QString::SkipEmptyParts);
     for (const QString& line : lines) {
         bool ok = false;
         const qint64 pid = line.trimmed().toLongLong(&ok);

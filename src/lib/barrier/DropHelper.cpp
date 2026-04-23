@@ -66,10 +66,11 @@ barrier::fs::path unique_drop_target_path(const barrier::fs::path& destination,
 
 }
 
-void
+std::vector<String>
 DropHelper::writeToDir(const String& destination, DragFileList& fileList, String& data)
 {
     LOG((CLOG_DEBUG "dropping file, files=%i target=%s", fileList.size(), destination.c_str()));
+    std::vector<String> droppedPaths;
 
     if (!destination.empty() && fileList.size() > 0) {
         const barrier::fs::path dropDirectory = barrier::fs::u8path(destination);
@@ -83,13 +84,14 @@ DropHelper::writeToDir(const String& destination, DragFileList& fileList, String
             if (!TransferArchive::extractPackage(data, stagingRoot, error)) {
                 barrier::fs::remove_all(stagingRoot);
                 LOG((CLOG_ERR "drop directory failed: %s", error.c_str()));
-                return;
+                return droppedPaths;
             }
 
             for (const auto& entry : barrier::fs::directory_iterator(stagingRoot)) {
                 const barrier::fs::path finalTarget =
                     unique_drop_target_path(dropDirectory, entry.path().filename().u8string());
                 barrier::fs::rename(entry.path(), finalTarget);
+                droppedPaths.push_back(finalTarget.u8string());
             }
             barrier::fs::remove_all(stagingRoot);
 
@@ -99,7 +101,7 @@ DropHelper::writeToDir(const String& destination, DragFileList& fileList, String
 
             fileList.clear();
             String().swap(data);
-            return;
+            return droppedPaths;
         }
 
         const barrier::fs::path dropTarget =
@@ -111,7 +113,7 @@ DropHelper::writeToDir(const String& destination, DragFileList& fileList, String
         barrier::open_utf8_path(file, tempTarget, std::ios::out | std::ios::binary | std::ios::trunc);
         if (!file.is_open()) {
             LOG((CLOG_ERR "drop file failed: can not open %s", tempTarget.u8string().c_str()));
-            return;
+            return droppedPaths;
         }
 
         file.write(data.c_str(), data.size());
@@ -121,10 +123,11 @@ DropHelper::writeToDir(const String& destination, DragFileList& fileList, String
         if (file.fail()) {
             LOG((CLOG_ERR "drop file failed while writing %s", tempTarget.u8string().c_str()));
             barrier::fs::remove(tempTarget);
-            return;
+            return droppedPaths;
         }
 
         barrier::fs::rename(tempTarget, dropTarget);
+        droppedPaths.push_back(dropTarget.u8string());
 
         LOG((CLOG_INFO "dropped file \"%s\" in \"%s\"",
              dropTarget.filename().u8string().c_str(),
@@ -136,4 +139,5 @@ DropHelper::writeToDir(const String& destination, DragFileList& fileList, String
     else {
         LOG((CLOG_ERR "drop file failed: drop target is empty"));
     }
+    return droppedPaths;
 }
