@@ -48,6 +48,7 @@ class SettingsDialog : public QDialog, public Ui::SettingsDialogBase
         BarrierLocale m_Locale;
         QCheckBox* m_pCheckBoxWorkflowEnabled;
         QCheckBox* m_pCheckBoxWorkflowSuggestions;
+        QCheckBox* m_pCheckBoxShowTrayNotifications;
         QSpinBox* m_pSpinBoxWorkflowHistoryLimit;
         QSpinBox* m_pSpinBoxWorkflowDormantSeconds;
         QLabel* m_pLabelPlatformStatus;

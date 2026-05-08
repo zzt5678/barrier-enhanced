@@ -63,6 +63,7 @@ AppConfig::AppConfig(QSettings* settings) :
     m_AutoHide(false),
     m_AutoStart(false),
     m_MinimizeToTray(false),
+    m_ShowTrayNotifications(false),
     m_EnableDragDrop(true),
     m_GameMode(false),
     m_LowLatencyMode(false),
@@ -179,6 +180,7 @@ void AppConfig::loadSettings()
     m_AutoHide = settings().value("autoHide", false).toBool();
     m_AutoStart = settings().value("autoStart", false).toBool();
     m_MinimizeToTray = settings().value("minimizeToTray", false).toBool();
+    m_ShowTrayNotifications = settings().value("showTrayNotifications", false).toBool();
     m_EnableDragDrop = settings().value("enableDragDrop", true).toBool();
     m_GameMode = settings().value("gameMode", false).toBool();
     m_LowLatencyMode = settings().value("lowLatencyMode", false).toBool();
@@ -211,6 +213,7 @@ void AppConfig::saveSettings()
     settings().setValue("autoHide", m_AutoHide);
     settings().setValue("autoStart", m_AutoStart);
     settings().setValue("minimizeToTray", m_MinimizeToTray);
+    settings().setValue("showTrayNotifications", m_ShowTrayNotifications);
     settings().setValue("enableDragDrop", m_EnableDragDrop);
     settings().setValue("gameMode", m_GameMode);
     settings().setValue("lowLatencyMode", m_LowLatencyMode);
@@ -275,6 +278,10 @@ bool AppConfig::getAutoStart() { return m_AutoStart; }
 void AppConfig::setMinimizeToTray(bool b) { m_MinimizeToTray = b; }
 
 bool AppConfig::getMinimizeToTray() { return m_MinimizeToTray; }
+
+void AppConfig::setShowTrayNotifications(bool b) { m_ShowTrayNotifications = b; }
+
+bool AppConfig::getShowTrayNotifications() const { return m_ShowTrayNotifications; }
 
 void AppConfig::setEnableDragDrop(bool b) { m_EnableDragDrop = b; }
 

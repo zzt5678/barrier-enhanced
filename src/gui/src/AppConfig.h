@@ -102,6 +102,8 @@ class AppConfig: public QObject
 
         void setMinimizeToTray(bool b);
         bool getMinimizeToTray();
+        void setShowTrayNotifications(bool b);
+        bool getShowTrayNotifications() const;
         void setEnableDragDrop(bool b);
         bool getEnableDragDrop() const;
         void setGameMode(bool b);
@@ -156,6 +158,7 @@ protected:
         bool m_AutoHide;
         bool m_AutoStart;
         bool m_MinimizeToTray;
+        bool m_ShowTrayNotifications;
         bool m_EnableDragDrop;
         bool m_GameMode;
         bool m_LowLatencyMode;

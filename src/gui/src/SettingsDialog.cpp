@@ -48,6 +48,7 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     m_appConfig(config),
     m_pCheckBoxWorkflowEnabled(new QCheckBox(tr("Enable lightweight workflow handoff"), this)),
     m_pCheckBoxWorkflowSuggestions(new QCheckBox(tr("Enable suggestion cards"), this)),
+    m_pCheckBoxShowTrayNotifications(new QCheckBox(tr("Show desktop notifications"), this)),
     m_pSpinBoxWorkflowHistoryLimit(new QSpinBox(this)),
     m_pSpinBoxWorkflowDormantSeconds(new QSpinBox(this)),
     m_pLabelPlatformStatus(new QLabel(this)),
@@ -74,6 +75,9 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     m_pCheckBoxNestedRemoteMode->setChecked(appConfig().getNestedRemoteMode());
     m_pCheckBoxWorkflowEnabled->setChecked(appConfig().getWorkflowEnabled());
     m_pCheckBoxWorkflowSuggestions->setChecked(appConfig().getSuggestionsEnabled());
+    m_pCheckBoxShowTrayNotifications->setChecked(appConfig().getShowTrayNotifications());
+    m_pCheckBoxShowTrayNotifications->setToolTip(
+        tr("Show non-critical tray popups for connection, transfer receipts, and workflow events. Disabled by default."));
     m_pSpinBoxWorkflowHistoryLimit->setRange(10, 500);
     m_pSpinBoxWorkflowHistoryLimit->setValue(appConfig().getWorkflowHistoryLimit());
     m_pSpinBoxWorkflowDormantSeconds->setRange(10, 600);
@@ -93,6 +97,7 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
 
     verticalLayout_2->addWidget(m_pCheckBoxWorkflowEnabled);
     verticalLayout_2->addWidget(m_pCheckBoxWorkflowSuggestions);
+    verticalLayout_2->addWidget(m_pCheckBoxShowTrayNotifications);
     verticalLayout_2->addLayout(historyRow);
     verticalLayout_2->addLayout(dormantRow);
 
@@ -136,6 +141,7 @@ void SettingsDialog::accept()
     m_appConfig.setNestedRemoteMode(m_pCheckBoxNestedRemoteMode->isChecked());
     m_appConfig.setWorkflowEnabled(m_pCheckBoxWorkflowEnabled->isChecked());
     m_appConfig.setSuggestionsEnabled(m_pCheckBoxWorkflowSuggestions->isChecked());
+    m_appConfig.setShowTrayNotifications(m_pCheckBoxShowTrayNotifications->isChecked());
     m_appConfig.setWorkflowHistoryLimit(m_pSpinBoxWorkflowHistoryLimit->value());
     m_appConfig.setWorkflowDormantSeconds(m_pSpinBoxWorkflowDormantSeconds->value());
     m_appConfig.saveSettings();

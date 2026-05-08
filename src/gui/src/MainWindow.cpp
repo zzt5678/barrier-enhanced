@@ -621,11 +621,13 @@ void MainWindow::checkConnected(const QString& line)
 
         if (!appConfig().startedBefore()) {
             if (m_pTrayIcon && m_pTrayIcon->isVisible()) {
-                m_pTrayIcon->showMessage(
-                    tr("Weave"),
-                    tr("Weave is connected and will keep running in the background."),
-                    QSystemTrayIcon::Information,
-                    2500);
+                if (appConfig().getShowTrayNotifications()) {
+                    m_pTrayIcon->showMessage(
+                        tr("Weave"),
+                        tr("Weave is connected and will keep running in the background."),
+                        QSystemTrayIcon::Information,
+                        2500);
+                }
             }
             appConfig().setStartedBefore(true);
             appConfig().saveSettings();
@@ -1716,7 +1718,7 @@ void MainWindow::showCommandPalette()
 
 void MainWindow::handleWorkflowNotification(const QString& title, const QString& body)
 {
-    if (m_pTrayIcon && m_pTrayIcon->isVisible()) {
+    if (appConfig().getShowTrayNotifications() && m_pTrayIcon && m_pTrayIcon->isVisible()) {
         m_pTrayIcon->showMessage(title, body, QSystemTrayIcon::Information, 3500);
     }
 }
