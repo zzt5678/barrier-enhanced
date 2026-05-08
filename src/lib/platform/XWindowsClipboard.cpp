@@ -291,18 +291,26 @@ XWindowsClipboard::addSimpleRequest(Window requestor,
         type = getTimestampData(data, &format);
     }
     else {
-        IXWindowsClipboardConverter* converter = getConverter(target);
-        if (converter != NULL) {
+        for (ConverterList::const_iterator index = m_converters.begin();
+                                    index != m_converters.end(); ++index) {
+            IXWindowsClipboardConverter* converter = *index;
+            if (converter->getAtom() != target) {
+                continue;
+            }
+
             IClipboard::EFormat clipboardFormat = converter->getFormat();
-            if (m_added[clipboardFormat]) {
-                try {
-                    data   = converter->fromIClipboard(m_data[clipboardFormat]);
-                    format = converter->getDataSize();
-                    type   = converter->getAtom();
-                }
-                catch (...) {
-                    // ignore -- cannot convert
-                }
+            if (!m_added[clipboardFormat]) {
+                continue;
+            }
+
+            try {
+                data   = converter->fromIClipboard(m_data[clipboardFormat]);
+                format = converter->getDataSize();
+                type   = converter->getAtom();
+                break;
+            }
+            catch (...) {
+                // ignore -- another converter for this target may work
             }
         }
     }
