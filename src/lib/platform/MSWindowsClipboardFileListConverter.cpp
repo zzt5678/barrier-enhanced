@@ -140,10 +140,11 @@ MSWindowsClipboardFileListConverter::toIClipboard(HANDLE data) const
         }
 
         std::wstring widePath;
-        widePath.resize(length);
+        widePath.resize(static_cast<size_t>(length) + 1);
         if (DragQueryFileW(drop, i, &widePath[0], length + 1) == 0) {
             continue;
         }
+        widePath.resize(length);
 
         payload.paths.push_back(barrier::fs::u8path(utf8FromWide(widePath)));
     }

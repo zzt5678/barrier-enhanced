@@ -132,3 +132,75 @@ TEST(TransferArchiveTests, createAndExtractSelectionPackage_roundTripsMultipleRo
     barrier::fs::remove_all(root);
     barrier::fs::remove(packagePath);
 }
+
+TEST(TransferArchiveTests, createAndExtractSelectionPackage_roundTripsMultipleDirectoriesAndEmptyDirs)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-multidir-" + uniqueToken());
+    const barrier::fs::path docs = root / "docs folder";
+    const barrier::fs::path photos = root / "photos";
+    barrier::fs::create_directories(docs / "empty child");
+    barrier::fs::create_directories(photos / "nested");
+
+    {
+        std::ofstream file;
+        barrier::open_utf8_path(file, docs / "read me.txt", std::ios::out | std::ios::binary | std::ios::trunc);
+        file << "docs";
+    }
+    {
+        std::ofstream file;
+        barrier::open_utf8_path(file, photos / "nested" / "image.txt", std::ios::out | std::ios::binary | std::ios::trunc);
+        file << "photo";
+    }
+
+    barrier::fs::path packagePath;
+    std::string error;
+    ASSERT_TRUE(TransferArchive::createSelectionPackageFile({docs, photos}, packagePath, error)) << error;
+
+    const std::string packageData = readFileUtf8(packagePath);
+    const barrier::fs::path destinationRoot = root / "destination";
+    ASSERT_TRUE(TransferArchive::extractPackage(packageData, destinationRoot, error)) << error;
+
+    EXPECT_TRUE(barrier::fs::is_directory(destinationRoot / "docs folder"));
+    EXPECT_TRUE(barrier::fs::is_directory(destinationRoot / "docs folder" / "empty child"));
+    EXPECT_EQ("docs", readFileUtf8(destinationRoot / "docs folder" / "read me.txt"));
+    EXPECT_EQ("photo", readFileUtf8(destinationRoot / "photos" / "nested" / "image.txt"));
+
+    barrier::fs::remove_all(root);
+    barrier::fs::remove(packagePath);
+}
+
+TEST(TransferArchiveTests, createAndExtractSelectionPackage_renamesDuplicateRootNames)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-duplicates-" + uniqueToken());
+    const barrier::fs::path left = root / "left" / "bundle";
+    const barrier::fs::path right = root / "right" / "bundle";
+    barrier::fs::create_directories(left);
+    barrier::fs::create_directories(right);
+
+    {
+        std::ofstream file;
+        barrier::open_utf8_path(file, left / "left.txt", std::ios::out | std::ios::binary | std::ios::trunc);
+        file << "left";
+    }
+    {
+        std::ofstream file;
+        barrier::open_utf8_path(file, right / "right.txt", std::ios::out | std::ios::binary | std::ios::trunc);
+        file << "right";
+    }
+
+    barrier::fs::path packagePath;
+    std::string error;
+    ASSERT_TRUE(TransferArchive::createSelectionPackageFile({left, right}, packagePath, error)) << error;
+
+    const std::string packageData = readFileUtf8(packagePath);
+    const barrier::fs::path destinationRoot = root / "destination";
+    ASSERT_TRUE(TransferArchive::extractPackage(packageData, destinationRoot, error)) << error;
+
+    EXPECT_EQ("left", readFileUtf8(destinationRoot / "bundle" / "left.txt"));
+    EXPECT_EQ("right", readFileUtf8(destinationRoot / "bundle (1)" / "right.txt"));
+
+    barrier::fs::remove_all(root);
+    barrier::fs::remove(packagePath);
+}
