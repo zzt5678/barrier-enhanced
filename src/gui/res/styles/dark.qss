@@ -29,30 +29,28 @@ QMenu::item:selected {
 
 QFrame#heroCard {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #fafafa, stop:1 #f0f1f5);
-    border-radius: 24px;
+    border-radius: 8px;
     border: 1px solid #d6d7dc;
-    padding: 16px;
+    padding: 8px;
 }
 
 QLabel#m_pLabelHeroTitle {
     color: #111113;
-    font-size: 22px;
+    font-size: 16px;
     font-weight: 700;
-    letter-spacing: 0.2px;
 }
 
 QLabel#m_pLabelHeroSubtitle {
     color: #6e6e73;
-    font-size: 10.5pt;
-    line-height: 1.5;
+    font-size: 9.5pt;
 }
 
 QGroupBox {
     background: #fbfbfd;
     border: 1px solid #dfdfe4;
-    border-radius: 22px;
-    margin-top: 12px;
-    padding: 18px 16px 16px 16px;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding: 10px 10px 10px 10px;
     font-weight: 600;
 }
 
@@ -119,13 +117,13 @@ QFrame#m_pHeaderCard,
 QFrame#m_pSettingsHeaderCard {
     background: #fbfbfd;
     border: 1px solid #dfdfe4;
-    border-radius: 22px;
+    border-radius: 8px;
 }
 
 QFrame#overviewCard,
 QFrame#workflowCard,
 QFrame#footerCard {
-    padding: 14px;
+    padding: 8px;
 }
 
 QLabel#m_pLabelServerConfigTitle {
@@ -150,9 +148,9 @@ QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
     background: #ffffff;
     color: #1d1d1f;
     border: 1px solid #d2d2d7;
-    border-radius: 12px;
-    padding: 7px 12px;
-    min-height: 18px;
+    border-radius: 6px;
+    padding: 5px 9px;
+    min-height: 16px;
 }
 
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QComboBox:focus {
@@ -163,9 +161,9 @@ QPushButton {
     background: #1d1d1f;
     color: white;
     border: none;
-    border-radius: 14px;
-    padding: 9px 16px;
-    min-width: 90px;
+    border-radius: 8px;
+    padding: 7px 12px;
+    min-width: 74px;
     font-weight: 600;
 }
 
@@ -234,10 +232,10 @@ QListWidget {
 
 QListWidget::item {
     border: 1px solid #e5e5ea;
-    border-radius: 14px;
+    border-radius: 6px;
     background: #ffffff;
-    margin: 4px 0;
-    padding: 8px 12px;
+    margin: 3px 0;
+    padding: 6px 8px;
     color: #1d1d1f;
 }
 
@@ -251,7 +249,7 @@ QWizardPage {
 
 QTabWidget::pane {
     border: 1px solid #dfdfe4;
-    border-radius: 18px;
+    border-radius: 8px;
     background: #fbfbfd;
     top: -1px;
 }
@@ -259,9 +257,9 @@ QTabWidget::pane {
 QTabBar::tab {
     background: transparent;
     color: #6e6e73;
-    padding: 10px 14px;
+    padding: 7px 10px;
     margin-right: 6px;
-    border-radius: 12px;
+    border-radius: 6px;
 }
 
 QTabBar::tab:selected {
@@ -291,14 +289,14 @@ QWizard QRadioButton {
 QDialog#WorkflowHubDialog QTextBrowser {
     background: #ffffff;
     border: 1px solid #e5e5ea;
-    border-radius: 16px;
-    padding: 12px;
+    border-radius: 8px;
+    padding: 8px;
 }
 
 QLabel#m_pWorkflowPreview {
     background: #ffffff;
     border: 1px solid #e5e5ea;
-    border-radius: 18px;
+    border-radius: 8px;
     color: #6e6e73;
 }
 

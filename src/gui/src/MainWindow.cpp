@@ -53,6 +53,8 @@
 #include <QDesktopWidget>
 #include <QClipboard>
 #include <QRegularExpression>
+#include <QBoxLayout>
+#include <QScrollArea>
 
 #if defined(Q_OS_MAC)
 #include <ApplicationServices/ApplicationServices.h>
@@ -99,6 +101,21 @@ namespace {
 constexpr int kRestartBaseDelayMs = 1000;
 constexpr int kRestartMaxDelayMs = 15000;
 constexpr int kRestartStabilityWindowMs = 30000;
+
+void refreshDashboardScrollArea(QWidget* root)
+{
+    if (root == nullptr) {
+        return;
+    }
+
+    auto* scrollArea = root->findChild<QScrollArea*>(QStringLiteral("m_pMainScrollArea"));
+    if (scrollArea == nullptr || scrollArea->widget() == nullptr) {
+        return;
+    }
+
+    QWidget* dashboard = scrollArea->widget();
+    dashboard->resize(dashboard->width(), dashboard->sizeHint().height());
+}
 }
 
 MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
@@ -142,6 +159,57 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
 
     setupUi(this);
     setWindowIcon(QIcon(barrierLargeIcon));
+
+    gridLayout_dashboard->removeWidget(heroCard);
+    gridLayout_dashboard->removeWidget(overviewCard);
+    gridLayout_dashboard->removeWidget(m_pGroupServer);
+    gridLayout_dashboard->removeWidget(m_pGroupClient);
+    gridLayout_dashboard->removeWidget(m_pGroupExperience);
+    gridLayout_dashboard->removeWidget(workflowCard);
+    gridLayout_dashboard->removeWidget(footerCard);
+    int dashboardRow = 0;
+    gridLayout_dashboard->addWidget(overviewCard, dashboardRow++, 0, 1, 1);
+    gridLayout_dashboard->addWidget(footerCard, dashboardRow++, 0, 1, 1);
+    gridLayout_dashboard->addWidget(m_pGroupClient, dashboardRow++, 0, 1, 1);
+    gridLayout_dashboard->addWidget(m_pGroupServer, dashboardRow++, 0, 1, 1);
+    gridLayout_dashboard->addWidget(m_pGroupExperience, dashboardRow++, 0, 1, 1);
+    gridLayout_dashboard->addWidget(workflowCard, dashboardRow++, 0, 1, 1);
+    heroCard->hide();
+    gridLayout_dashboard->setColumnStretch(0, 1);
+    gridLayout_dashboard->setColumnStretch(1, 0);
+
+    gridLayout_overview->removeWidget(m_pLabelWorkflowRuntimeCaption);
+    gridLayout_overview->removeWidget(m_pLabelWorkflowRuntimeValue);
+    gridLayout_overview->addWidget(m_pLabelWorkflowRuntimeCaption, 2, 0, 1, 1);
+    gridLayout_overview->addWidget(m_pLabelWorkflowRuntimeValue, 3, 0, 1, 2);
+    gridLayout_overview->setHorizontalSpacing(10);
+    gridLayout_overview->setColumnStretch(0, 1);
+    gridLayout_overview->setColumnStretch(1, 1);
+    gridLayout_overview->setColumnStretch(2, 0);
+    m_pLabelPeerValue->setWordWrap(true);
+    m_pLabelWorkflowRuntimeValue->setWordWrap(true);
+    m_pButtonWorkflowHub->setText(tr("Workflow Hub"));
+    m_pButtonShowLog->setText(tr("Live Log"));
+    horizontalLayout_overviewActions->setDirection(QBoxLayout::TopToBottom);
+    horizontalLayout_overviewActions->setSpacing(8);
+
+    QWidget* dashboard = takeCentralWidget();
+    QScrollArea* scrollArea = new QScrollArea(this);
+    scrollArea->setObjectName(QStringLiteral("m_pMainScrollArea"));
+    scrollArea->setWidgetResizable(false);
+    scrollArea->setSizeAdjustPolicy(QAbstractScrollArea::AdjustIgnored);
+    scrollArea->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
+    scrollArea->setMinimumSize(QSize(0, 0));
+    scrollArea->setFrameShape(QFrame::NoFrame);
+    scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    dashboard->setObjectName(QStringLiteral("dashboardContent"));
+    dashboard->setMinimumSize(QSize(0, 0));
+    dashboard->setFixedWidth(560);
+    dashboard->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    dashboard->adjustSize();
+    scrollArea->setWidget(dashboard);
+    setCentralWidget(scrollArea);
 
     // Apply modern dark theme from QSS resource file
     QFile styleFile(":/res/styles/dark.qss");
@@ -195,14 +263,14 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
 
     // change default size based on os
 #if defined(Q_OS_MAC)
-    resize(920, 640);
-    setMinimumSize(820, 600);
+    resize(640, 560);
+    setMinimumSize(560, 420);
 #elif defined(Q_OS_LINUX)
-    resize(960, 640);
-    setMinimumSize(860, 600);
+    resize(640, 560);
+    setMinimumSize(560, 420);
 #elif defined(Q_OS_WIN)
-    resize(1000, 700);
-    setMinimumSize(900, 620);
+    resize(640, 560);
+    setMinimumSize(560, 420);
 #endif
 
     m_SuppressAutoConfigWarning = true;
@@ -231,9 +299,13 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_RestartTimer.setSingleShot(true);
     connect(&m_RestartTimer, &QTimer::timeout, this, &MainWindow::startBarrier);
 
-    resize(sizeHint().expandedTo(minimumSize()));
+    const QRect availableGeometry = QApplication::desktop()->availableGeometry(this);
+    resize(size().boundedTo(QSize(
+        qMax(availableGeometry.width() - 80, minimumWidth()),
+        qMax(availableGeometry.height() - 80, minimumHeight()))));
     updateWorkflowPeerHint();
     updateWorkflowIndicators();
+    refreshDashboardScrollArea(this);
 }
 
 MainWindow::~MainWindow()
@@ -265,7 +337,7 @@ void MainWindow::open()
     if (appConfig().getAutoHide()) {
         hide();
     } else {
-        showNormal();
+        showControlCenter();
     }
 
     if (!appConfig().autoConfigPrompted()) {
@@ -424,15 +496,18 @@ void MainWindow::trayActivated(QSystemTrayIcon::ActivationReason reason)
 void MainWindow::showControlCenter()
 {
     setWindowState(windowState() & ~Qt::WindowMinimized);
-    setMinimumSize(QSize(760, 540));
-    if (width() < minimumWidth() || height() < minimumHeight()) {
-        resize(qMax(width(), minimumWidth()), qMax(height(), minimumHeight()));
-    }
+    showNormal();
+    refreshDashboardScrollArea(this);
 
     const QRect availableGeometry = QApplication::desktop()->availableGeometry(this);
+    const QSize preferredSize(640, 560);
+    const QSize maxSize(
+        qMax(availableGeometry.width() - 80, minimumWidth()),
+        qMax(availableGeometry.height() - 80, minimumHeight()));
+    const QSize targetSize = preferredSize.boundedTo(maxSize).expandedTo(minimumSize());
+    resize(targetSize);
     move(availableGeometry.center() - rect().center());
 
-    showNormal();
     raise();
     activateWindow();
 }
@@ -905,6 +980,8 @@ void MainWindow::stopBarrier()
 
     m_ExpectedRunningState = kStopped;
     resetRestartBackoff();
+    setBarrierState(barrierDisconnected);
+    qApp->processEvents(QEventLoop::ExcludeUserInputEvents);
 
     if (appConfig().processMode() == Service)
     {
@@ -914,8 +991,6 @@ void MainWindow::stopBarrier()
     {
         stopDesktop();
     }
-
-    setBarrierState(barrierDisconnected);
 
     // HACK: deleting the object deletes the physical file, which is
     // bad, since it could be in use by the Windows service!
@@ -1175,12 +1250,6 @@ void MainWindow::changeEvent(QEvent* event)
 
 bool MainWindow::event(QEvent* event)
 {
-    if (event->type() == QEvent::LayoutRequest) {
-        const QSize preferredSize = sizeHint().expandedTo(minimumSize());
-        if (width() < preferredSize.width() || height() < preferredSize.height()) {
-            resize(qMax(width(), preferredSize.width()), qMax(height(), preferredSize.height()));
-        }
-    }
     return QMainWindow::event(event);
 }
 
@@ -1688,6 +1757,7 @@ void MainWindow::updateWorkflowIndicators()
     }
 
     updateOverviewCards();
+    refreshDashboardScrollArea(this);
 }
 
 void MainWindow::updateWorkflowPeerHint()
