@@ -629,7 +629,8 @@ Server::switchScreen(BaseClientProxy* dst,
 		if (m_active == m_primaryClient && m_enableClipboard) {
 			for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
 				ClipboardInfo& clipboard = m_clipboards[id];
-				if (clipboard.m_clipboardOwner == getName(m_primaryClient)) {
+				if (clipboard.m_clipboardOwner == getName(m_primaryClient) &&
+					clipboard.m_pendingPrimaryFetch) {
 					onClipboardChanged(m_primaryClient,
 						id, clipboard.m_clipboardSeqNum);
 				}
@@ -1472,6 +1473,7 @@ Server::handleClipboardGrabbed(const Event& event, void* vclient)
 	LOG((CLOG_INFO "screen \"%s\" grabbed clipboard %d from \"%s\"", getName(grabber).c_str(), info->m_id, clipboard.m_clipboardOwner.c_str()));
 	clipboard.m_clipboardOwner  = getName(grabber);
 	clipboard.m_clipboardSeqNum = info->m_sequenceNumber;
+	clipboard.m_pendingPrimaryFetch = (grabber == m_primaryClient);
 
 	// clear the clipboard data (since it's not known at this point)
 	if (clipboard.m_clipboard.open(0)) {
@@ -1855,6 +1857,9 @@ Server::onClipboardChanged(BaseClientProxy* sender,
     std::string data = clipboard.m_clipboard.marshall();
 	if (data == clipboard.m_clipboardData) {
 		LOG((CLOG_DEBUG "ignored screen \"%s\" update of clipboard %d (unchanged)", clipboard.m_clipboardOwner.c_str(), id));
+		if (sender == m_primaryClient) {
+			clipboard.m_pendingPrimaryFetch = false;
+		}
 		return;
 	}
 
@@ -1866,6 +1871,9 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 	}
 
 	clipboard.m_clipboardData = data;
+	if (sender == m_primaryClient) {
+		clipboard.m_pendingPrimaryFetch = false;
+	}
 
 	// tell all clients except the sender that the clipboard is dirty
 	for (ClientList::const_iterator index = m_clients.begin();
@@ -2841,7 +2849,8 @@ Server::ClipboardInfo::ClipboardInfo() :
 	m_clipboard(),
 	m_clipboardData(),
 	m_clipboardOwner(),
-	m_clipboardSeqNum(0)
+	m_clipboardSeqNum(0),
+	m_pendingPrimaryFetch(false)
 {
 	// do nothing
 }

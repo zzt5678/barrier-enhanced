@@ -1461,7 +1461,6 @@ XWindowsClipboard::CICCCMGetClipboard::readClipboard(Display* display,
     std::vector<XEvent> events;
     Stopwatch timeout(false);    // timer not stopped, not triggered
     static const double s_timeout = 0.25;    // FIXME -- is this too short?
-    bool noWait = false;
     while (!m_done && !m_failed) {
         // fail if timeout has expired
         if (timeout.getTime() >= s_timeout) {
@@ -1470,8 +1469,8 @@ XWindowsClipboard::CICCCMGetClipboard::readClipboard(Display* display,
         }
 
         // process events if any otherwise sleep
-        if (noWait || XPending(display) > 0) {
-            while (!m_done && !m_failed && (noWait || XPending(display) > 0)) {
+        if (XPending(display) > 0) {
+            while (!m_done && !m_failed && XPending(display) > 0) {
                 XNextEvent(display, &xevent);
                 if (!processEvent(display, &xevent)) {
                     // not processed so save it
@@ -1480,12 +1479,6 @@ XWindowsClipboard::CICCCMGetClipboard::readClipboard(Display* display,
                 else {
                     // reset timer since we've made some progress
                     timeout.reset();
-
-                    // don't sleep anymore, just block waiting for events.
-                    // we're assuming here that the clipboard owner will
-                    // complete the protocol correctly.  if we continue to
-                    // sleep we'll get very bad performance.
-                    noWait = true;
                 }
             }
         }

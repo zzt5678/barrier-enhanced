@@ -403,6 +403,7 @@ private:
         std::string m_clipboardData;
         std::string m_clipboardOwner;
         UInt32            m_clipboardSeqNum;
+        bool              m_pendingPrimaryFetch;
     };
 
     // the primary screen client
