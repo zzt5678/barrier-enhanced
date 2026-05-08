@@ -212,6 +212,13 @@ bool appendFile(std::ofstream& output,
 } // namespace
 
 bool
+TransferArchive::isPackageData(const std::string& data)
+{
+    return data.size() >= kArchiveMagic.size() &&
+           std::equal(kArchiveMagic.begin(), kArchiveMagic.end(), data.begin());
+}
+
+bool
 TransferArchive::createSelectionPackageFile(const std::vector<barrier::fs::path>& sourcePaths,
                                             barrier::fs::path& packagePath,
                                             std::string& error)

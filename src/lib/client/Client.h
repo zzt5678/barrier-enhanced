@@ -22,6 +22,7 @@
 
 #include "barrier/Clipboard.h"
 #include "barrier/DragInformation.h"
+#include "base/Event.h"
 #include "barrier/INode.h"
 #include "barrier/ClientArgs.h"
 #include "net/NetworkAddress.h"
@@ -29,6 +30,7 @@
 #include "mt/CondVar.h"
 
 #include <memory>
+#include <vector>
 
 class EventQueueTimer;
 namespace barrier { class Screen; }
@@ -47,6 +49,12 @@ This class implements the top-level client algorithms for barrier.
 */
 class Client : public IClient, public INode {
 public:
+    class FileClipboardReadyInfo : public EventData {
+    public:
+        std::string m_sessionId;
+        std::vector<std::string> m_paths;
+    };
+
     class FailInfo {
     public:
         FailInfo(const char* what) : m_retry(false), m_what(what) { }
@@ -172,7 +180,10 @@ private:
     void                sendConnectionFailedEvent(const char* msg);
     void                sendFileChunk(const void* data);
     void                send_file_thread(const std::string& filename, const std::shared_ptr<StreamChunker>& chunker);
+    void                send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourcePaths,
+                                                   const std::shared_ptr<StreamChunker>& chunker);
     void write_to_drop_dir_thread();
+    void                handleFileClipboardReady(const Event&, void*);
     void                setupConnecting();
     void                setupConnection();
     void                setupScreen();
@@ -196,7 +207,10 @@ private:
     void                handleFileRecieveCompleted(const Event&, void*);
     void                handleStopRetry(const Event&, void*);
     void                onFileRecieveCompleted();
+    void                publishMaterializedFileClipboard(const std::vector<std::string>& paths,
+                                                         const std::string& sessionId);
     void                sendClipboardThread(void*);
+    void                sendClipboardSelectionToServer(const std::vector<barrier::fs::path>& sourcePaths);
 
 public:
     bool                m_mock;
@@ -229,4 +243,7 @@ private:
     bool                m_useSecureNetwork;
     ClientArgs            m_args;
     bool                m_enableClipboard;
+    std::string         m_remoteFileClipboardSession;
+    std::string         m_readyFileClipboardSession;
+    std::vector<std::string> m_readyFileClipboardPaths;
 };

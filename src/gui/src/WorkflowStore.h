@@ -42,7 +42,8 @@ public:
     void recordReceipt(const QString& contextId,
                        const QString& actionId,
                        const QString& status,
-                       const QString& detail);
+                       const QString& detail,
+                       bool notify = true);
     void recordLogLine(const QString& line);
     bool addCapturedImageContext(const QImage& image, QString* contextId = nullptr);
 

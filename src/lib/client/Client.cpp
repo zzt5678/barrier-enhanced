@@ -24,12 +24,14 @@
 #include "barrier/DropHelper.h"
 #include "barrier/PacketStreamFilter.h"
 #include "barrier/ProtocolUtil.h"
+#include "barrier/RemoteFileClipboard.h"
 #include "barrier/protocol_types.h"
 #include "barrier/XBarrier.h"
 #include "barrier/StreamChunker.h"
 #include "barrier/TransferArchive.h"
 #include "barrier/IPlatformScreen.h"
 #include "barrier/IClipboard.h"
+#include "common/DataDirectories.h"
 #include "mt/Thread.h"
 #include "net/TCPSocket.h"
 #include "net/IDataSocket.h"
@@ -100,6 +102,16 @@ std::vector<barrier::fs::path> clipboardFilePaths(const Clipboard& clipboard)
     return paths;
 }
 
+std::vector<barrier::fs::path> utf8PathsToFsPaths(const std::vector<std::string>& paths)
+{
+    std::vector<barrier::fs::path> result;
+    result.reserve(paths.size());
+    for (size_t i = 0; i < paths.size(); ++i) {
+        result.push_back(barrier::fs::u8path(paths[i]));
+    }
+    return result;
+}
+
 }
 
 //
@@ -143,16 +155,18 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
                             new TMethodEventJob<Client>(this,
                                 &Client::handleResume));
 
-    if (m_args.m_enableDragDrop) {
-        m_events->adoptHandler(m_events->forFile().fileChunkSending(),
-                                this,
-                                new TMethodEventJob<Client>(this,
-                                    &Client::handleFileChunkSending));
-        m_events->adoptHandler(m_events->forFile().fileRecieveCompleted(),
-                                this,
-                                new TMethodEventJob<Client>(this,
-                                    &Client::handleFileRecieveCompleted));
-    }
+    m_events->adoptHandler(m_events->forFile().fileChunkSending(),
+                            this,
+                            new TMethodEventJob<Client>(this,
+                                &Client::handleFileChunkSending));
+    m_events->adoptHandler(m_events->forFile().fileRecieveCompleted(),
+                            this,
+                            new TMethodEventJob<Client>(this,
+                                &Client::handleFileRecieveCompleted));
+    m_events->adoptHandler(m_events->forFile().fileClipboardReady(),
+                            this,
+                            new TMethodEventJob<Client>(this,
+                                &Client::handleFileClipboardReady));
 }
 
 Client::~Client()
@@ -319,11 +333,13 @@ Client::leave()
     m_screen->leave();
 
     if (m_enableClipboard) {
-        // send clipboards that we own and that have changed
+        // Re-read clipboards on leave instead of relying only on the
+        // earlier ownership flag. On Windows the clipboard-viewer
+        // notification can be missed and checkClipboards() only detects
+        // the new owner during Screen::leave(), so gating on
+        // m_ownClipboard here can drop a just-copied clipboard update.
         for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-            if (m_ownClipboard[id]) {
-                sendClipboard(id);
-            }
+            sendClipboard(id);
         }
     }
 
@@ -334,6 +350,20 @@ void
 Client::setClipboard(ClipboardID id, const IClipboard* clipboard)
 {
     m_screen->setClipboard(id, clipboard);
+
+    if (id == kClipboardClipboard && clipboard != NULL) {
+        RemoteFileClipboard::Data remoteFileClipboard;
+        if (RemoteFileClipboard::readFromClipboard(*clipboard, remoteFileClipboard) &&
+            remoteFileClipboard.mode == RemoteFileClipboard::Mode::SourcePaths) {
+            m_remoteFileClipboardSession = remoteFileClipboard.sessionId;
+        }
+        else {
+            m_remoteFileClipboardSession.clear();
+            m_readyFileClipboardSession.clear();
+            m_readyFileClipboardPaths.clear();
+        }
+    }
+
     m_ownClipboard[id]  = false;
     m_sentClipboard[id] = false;
 }
@@ -456,6 +486,29 @@ Client::sendClipboard(ClipboardID id)
     }
     m_screen->getClipboard(id, &clipboard);
 
+    bool hasFileList = false;
+    if (id == kClipboardClipboard) {
+        if (clipboard.open(0)) {
+            hasFileList = clipboard.has(IClipboard::kFileList);
+            clipboard.close();
+        }
+
+        if (hasFileList) {
+            if (RemoteFileClipboard::stripImageFileTransferMetadata(clipboard)) {
+                LOG((CLOG_INFO "stripped image file-transfer metadata before sending clipboard to server"));
+            }
+
+            RemoteFileClipboard::Data remoteFileClipboard;
+            if (RemoteFileClipboard::normalizeClipboard(clipboard, &remoteFileClipboard) &&
+                remoteFileClipboard.mode == RemoteFileClipboard::Mode::SourcePaths) {
+                LOG((CLOG_INFO "remote clipboard source prepared: session=%s items=%lu",
+                     remoteFileClipboard.sessionId.c_str(),
+                     static_cast<unsigned long>(remoteFileClipboard.paths.size())));
+                sendClipboardSelectionToServer(remoteFileClipboard.paths);
+            }
+        }
+    }
+
     // check time
     if (m_timeClipboard[id] == 0 ||
         clipboard.getTime() != m_timeClipboard[id]) {
@@ -467,7 +520,7 @@ Client::sendClipboard(ClipboardID id)
 
         // save and send data if different or not yet sent
         if (!m_sentClipboard[id] || data != m_dataClipboard[id]) {
-            if (sendClipboardFileSelection(id, clipboard)) {
+            if (!hasFileList && sendClipboardFileSelection(id, clipboard)) {
                 m_sentClipboard[id] = true;
                 m_dataClipboard[id] = data;
                 return;
@@ -486,6 +539,16 @@ Client::sendClipboardFileSelection(ClipboardID id, const Clipboard& clipboard)
         return false;
     }
 
+    if (clipboard.open(0)) {
+        const bool hasImagePayload = clipboard.has(IClipboard::kPNG) ||
+                                     clipboard.has(IClipboard::kBitmap);
+        clipboard.close();
+        if (hasImagePayload) {
+            LOG((CLOG_DEBUG "skipping clipboard file-transfer path because image payload is present"));
+            return false;
+        }
+    }
+
     const std::vector<barrier::fs::path> paths = clipboardFilePaths(clipboard);
     if (paths.empty()) {
         return false;
@@ -500,7 +563,8 @@ Client::sendClipboardFileSelection(ClipboardID id, const Clipboard& clipboard)
         transferPaths += path.u8string();
 
         DragInformation info;
-        info.setFilename(path.u8string());
+        std::string pathString = path.u8string();
+        info.setFilename(pathString);
         if (barrier::fs::is_directory(path)) {
             info.setEntryType(DragInformation::Directory);
         }
@@ -867,6 +931,24 @@ Client::onFileRecieveCompleted()
 }
 
 void
+Client::handleFileClipboardReady(const Event& event, void*)
+{
+    FileClipboardReadyInfo* info =
+        static_cast<FileClipboardReadyInfo*>(event.getDataObject());
+    if (info == NULL) {
+        return;
+    }
+
+    m_readyFileClipboardSession = info->m_sessionId;
+    m_readyFileClipboardPaths = info->m_paths;
+    if (!m_remoteFileClipboardSession.empty() &&
+        m_remoteFileClipboardSession == m_readyFileClipboardSession) {
+        publishMaterializedFileClipboard(m_readyFileClipboardPaths,
+                                         m_readyFileClipboardSession);
+    }
+}
+
+void
 Client::handleStopRetry(const Event&, void*)
 {
     m_args.m_restartable = false;
@@ -876,8 +958,33 @@ void Client::write_to_drop_dir_thread()
 {
     LOG((CLOG_DEBUG "starting write to drop dir thread"));
 
-    while (m_screen->isFakeDraggingStarted()) {
-        ARCH->sleep(.1f);
+    if (!m_remoteFileClipboardSession.empty() &&
+        TransferArchive::isPackageData(m_receivedFileData)) {
+        LOG((CLOG_INFO "remote clipboard package received: session=%s", m_remoteFileClipboardSession.c_str()));
+        const barrier::fs::path spoolDir =
+            barrier::DataDirectories::profile() / "clipboard-cache" / "client";
+        std::vector<barrier::fs::path> roots;
+        std::string error;
+        if (RemoteFileClipboard::extractPackage(m_receivedFileData, spoolDir, roots, error)) {
+            LOG((CLOG_INFO "remote clipboard package materialized: session=%s items=%lu",
+                 m_remoteFileClipboardSession.c_str(),
+                 static_cast<unsigned long>(roots.size())));
+            FileClipboardReadyInfo* info = new FileClipboardReadyInfo();
+            info->m_sessionId = m_remoteFileClipboardSession;
+            for (size_t i = 0; i < roots.size(); ++i) {
+                info->m_paths.push_back(roots[i].u8string());
+            }
+
+            Event ready(m_events->forFile().fileClipboardReady(), this);
+            ready.setDataObject(info);
+            m_events->addEvent(ready);
+        }
+        else {
+            LOG((CLOG_ERR "failed to materialize remote clipboard package: %s", error.c_str()));
+        }
+
+        String().swap(m_receivedFileData);
+        return;
     }
 
     std::vector<String> droppedPaths = DropHelper::writeToDir(m_screen->getDropTarget(), m_dragFileList,
@@ -893,7 +1000,17 @@ void Client::write_to_drop_dir_thread()
         }
 
         Clipboard clipboard;
-        if (clipboard.open(0)) {
+        const std::string sessionId = RemoteFileClipboard::createSessionId();
+        if (RemoteFileClipboard::buildMaterializedClipboard(
+                utf8PathsToFsPaths(droppedPaths), sessionId, clipboard)) {
+            setClipboard(kClipboardClipboard, &clipboard);
+            m_sentClipboard[kClipboardClipboard] = true;
+            m_dataClipboard[kClipboardClipboard] = clipboard.marshall();
+            LOG((CLOG_INFO "dropped file(s) published as file clipboard: session=%s items=%lu",
+                 sessionId.c_str(),
+                 static_cast<unsigned long>(droppedPaths.size())));
+        }
+        else if (clipboard.open(0)) {
             clipboard.empty();
             clipboard.add(IClipboard::kText, clipboardPaths);
             clipboard.close();
@@ -902,6 +1019,74 @@ void Client::write_to_drop_dir_thread()
             m_dataClipboard[kClipboardClipboard] = clipboard.marshall();
         }
     }
+}
+
+void
+Client::publishMaterializedFileClipboard(const std::vector<std::string>& paths,
+                                         const std::string& sessionId)
+{
+    Clipboard clipboard;
+    if (!RemoteFileClipboard::buildMaterializedClipboard(
+            utf8PathsToFsPaths(paths), sessionId, clipboard)) {
+        LOG((CLOG_ERR "failed to publish remote clipboard locally: session=%s", sessionId.c_str()));
+        return;
+    }
+
+    m_screen->setClipboard(kClipboardClipboard, &clipboard);
+    LOG((CLOG_INFO "remote clipboard published locally: session=%s items=%lu",
+         sessionId.c_str(),
+         static_cast<unsigned long>(paths.size())));
+    m_remoteFileClipboardSession.clear();
+}
+
+void
+Client::sendClipboardSelectionToServer(const std::vector<barrier::fs::path>& sourcePaths)
+{
+    if (sourcePaths.empty()) {
+        return;
+    }
+
+    if (m_sendFileChunker) {
+        m_sendFileChunker->interruptFile();
+    }
+
+    auto chunker = std::make_shared<StreamChunker>();
+    m_sendFileChunker = chunker;
+    LOG((CLOG_INFO "remote clipboard prefetch started: direction=client-to-server items=%lu",
+         static_cast<unsigned long>(sourcePaths.size())));
+    m_sendFileThread = new Thread([this, sourcePaths, chunker]() {
+        send_clipboard_file_thread(sourcePaths, chunker);
+    });
+}
+
+void
+Client::send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourcePaths,
+                                   const std::shared_ptr<StreamChunker>& chunker)
+{
+    barrier::fs::path packagePath;
+    try {
+        RemoteFileClipboard::Data payload;
+        payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+        payload.paths = sourcePaths;
+
+        std::string error;
+        if (!RemoteFileClipboard::createPackage(payload, packagePath, error)) {
+            throw std::runtime_error(error);
+        }
+
+        chunker->sendFile(packagePath.u8string().c_str(), m_events, this, m_stream);
+    }
+    catch (std::runtime_error& error) {
+        LOG((CLOG_ERR "failed sending remote clipboard file package: %s", error.what()));
+    }
+
+    if (!packagePath.empty()) {
+        barrier::fs::remove(packagePath);
+    }
+    if (m_sendFileChunker == chunker) {
+        m_sendFileChunker.reset();
+    }
+    m_sendFileThread = NULL;
 }
 
 void

@@ -60,6 +60,7 @@ public:
         kHTML,            //!< HTML format, HTML fragment, UTF-8, newline is LF
         kBitmap,          //!< Bitmap format, BMP 24/32bpp, BI_RGB
         kPNG,             //!< PNG format, PNG compressed image
+        kFileList,        //!< File selection payload for cross-device paste
         kNumFormats       //!< The number of clipboard formats
     };
 

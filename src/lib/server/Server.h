@@ -34,6 +34,7 @@
 #include "common/stdvector.h"
 
 #include <memory>
+#include <vector>
 
 class BaseClientProxy;
 class EventQueueTimer;
@@ -51,6 +52,12 @@ This class implements the top-level server algorithms for barrier.
 */
 class Server : public INode {
 public:
+    class FileClipboardReadyInfo : public EventData {
+    public:
+        std::string m_sessionId;
+        std::vector<std::string> m_paths;
+    };
+
     //! Lock cursor to screen data
     class LockCursorToScreenInfo {
     public:
@@ -320,6 +327,7 @@ private:
     void                handleFakeInputEndEvent(const Event&, void*);
     void                handleFileChunkSendingEvent(const Event&, void*);
     void                handleFileRecieveCompletedEvent(const Event&, void*);
+    void                handleFileClipboardReadyEvent(const Event&, void*);
 
     // event processing
     bool                sendClipboardFileSelection(BaseClientProxy* sender,
@@ -339,6 +347,10 @@ private:
     void                onMouseWheel(SInt32 xDelta, SInt32 yDelta);
     void                onFileChunkSending(const void* data);
     void                onFileRecieveCompleted();
+    void                publishMaterializedFileClipboard(const std::vector<std::string>& paths,
+                                                         const std::string& sessionId);
+    void                sendClipboardSelectionToClient(BaseClientProxy* target,
+                                                       const std::vector<barrier::fs::path>& sourcePaths);
 
     // add client to list and attach event handlers for client
     bool                addClient(BaseClientProxy*);
@@ -365,6 +377,9 @@ private:
 
     // thread function for sending file
     void                send_file_thread(const std::string& filename, const std::shared_ptr<StreamChunker>& chunker);
+    void                send_clipboard_file_thread(BaseClientProxy* target,
+                                                   const std::vector<barrier::fs::path>& sourcePaths,
+                                                   const std::shared_ptr<StreamChunker>& chunker);
 
     // thread function for writing file to drop directory
     void write_to_drop_dir_thread();
@@ -480,6 +495,9 @@ private:
     Thread*                m_sendFileThread;
     std::shared_ptr<StreamChunker> m_sendFileChunker;
     Thread*                m_writeToDropDirThread;
+    std::string         m_remoteFileClipboardSession;
+    std::string         m_readyFileClipboardSession;
+    std::vector<std::string> m_readyFileClipboardPaths;
     std::string m_dragFileExt;
     bool                m_ignoreFileTransfer;
     bool                m_enableClipboard;

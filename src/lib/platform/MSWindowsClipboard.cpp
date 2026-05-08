@@ -21,9 +21,11 @@
 #include "platform/MSWindowsClipboardTextConverter.h"
 #include "platform/MSWindowsClipboardUTF16Converter.h"
 #include "platform/MSWindowsClipboardBitmapConverter.h"
+#include "platform/MSWindowsClipboardFileListConverter.h"
 #include "platform/MSWindowsClipboardPNGConverter.h"
 #include "platform/MSWindowsClipboardHTMLConverter.h"
 #include "platform/MSWindowsClipboardFacade.h"
+#include "barrier/RemoteFileClipboard.h"
 #include "arch/win32/ArchMiscWindows.h"
 #include "base/Log.h"
 #include "ext/lodepng/lodepng.h"
@@ -44,6 +46,50 @@ static std::string convertHDropToPathList(HANDLE dropHandle);
 static HANDLE createHDropFromInboxText(const std::string& text);
 
 namespace {
+
+UINT preferredDropEffectFormat()
+{
+    static UINT format = RegisterClipboardFormat(TEXT("Preferred DropEffect"));
+    return format;
+}
+
+DWORD readDropEffect(HANDLE handle)
+{
+    if (handle == NULL) {
+        return DROPEFFECT_COPY;
+    }
+
+    const SIZE_T size = GlobalSize(handle);
+    if (size < sizeof(DWORD)) {
+        return DROPEFFECT_COPY;
+    }
+
+    const DWORD* effect = static_cast<const DWORD*>(GlobalLock(handle));
+    if (effect == NULL) {
+        return DROPEFFECT_COPY;
+    }
+    const DWORD value = *effect;
+    GlobalUnlock(handle);
+    return value;
+}
+
+HANDLE createDropEffectHandle(DWORD effect)
+{
+    HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_DDESHARE, sizeof(DWORD));
+    if (handle == NULL) {
+        return NULL;
+    }
+
+    DWORD* buffer = static_cast<DWORD*>(GlobalLock(handle));
+    if (buffer == NULL) {
+        GlobalFree(handle);
+        return NULL;
+    }
+
+    *buffer = effect;
+    GlobalUnlock(handle);
+    return handle;
+}
 
 ULONG_PTR ensureGdiplusToken()
 {
@@ -221,6 +267,7 @@ MSWindowsClipboard::MSWindowsClipboard(HWND window) :
     m_converters.push_back(new MSWindowsClipboardUTF16Converter);
     m_converters.push_back(new MSWindowsClipboardBitmapConverter);
     m_converters.push_back(new MSWindowsClipboardPNGConverter);
+    m_converters.push_back(new MSWindowsClipboardFileListConverter);
     m_converters.push_back(new MSWindowsClipboardHTMLConverter);
 }
 
@@ -281,6 +328,29 @@ void
 MSWindowsClipboard::add(EFormat format, const std::string& data)
 {
     LOG((CLOG_DEBUG "add %d bytes to clipboard format: %d", data.size(), format));
+
+    if (format == IClipboard::kFileList) {
+        RemoteFileClipboard::Data payload;
+        if (RemoteFileClipboard::parse(data, payload) &&
+            payload.mode == RemoteFileClipboard::Mode::MaterializedPaths) {
+            for (ConverterList::const_iterator index = m_converters.begin();
+                                        index != m_converters.end(); ++index) {
+                IMSWindowsClipboardConverter* converter = *index;
+                if (converter->getFormat() == format) {
+                    HANDLE win32Data = converter->fromIClipboard(data);
+                    if (win32Data != NULL) {
+                        m_facade->write(win32Data, converter->getWin32Format());
+                    }
+                }
+            }
+
+            HANDLE effect = createDropEffectHandle(payload.cut ? DROPEFFECT_MOVE : DROPEFFECT_COPY);
+            if (effect != NULL) {
+                m_facade->write(effect, preferredDropEffectFormat());
+            }
+        }
+        return;
+    }
 
     // convert data to win32 form
     for (ConverterList::const_iterator index = m_converters.begin();
@@ -353,6 +423,10 @@ MSWindowsClipboard::getTime() const
 bool
 MSWindowsClipboard::has(EFormat format) const
 {
+    if (format == IClipboard::kFileList) {
+        return IsClipboardFormatAvailable(CF_HDROP) != 0;
+    }
+
     if (format == IClipboard::kText && IsClipboardFormatAvailable(CF_HDROP)) {
         HANDLE dropData = GetClipboardData(CF_HDROP);
         if (dropData != NULL) {
@@ -396,6 +470,41 @@ MSWindowsClipboard::has(EFormat format) const
 
 std::string MSWindowsClipboard::get(EFormat format) const
 {
+    if (format == IClipboard::kFileList) {
+        IMSWindowsClipboardConverter* converter = NULL;
+        for (ConverterList::const_iterator index = m_converters.begin();
+            index != m_converters.end(); ++index) {
+            if ((*index)->getFormat() == IClipboard::kFileList) {
+                converter = *index;
+                break;
+            }
+        }
+
+        if (converter == NULL) {
+            return {};
+        }
+
+        HANDLE dropData = GetClipboardData(CF_HDROP);
+        if (dropData == NULL) {
+            return {};
+        }
+
+        std::string payload = converter->toIClipboard(dropData);
+        if (payload.empty()) {
+            return {};
+        }
+
+        RemoteFileClipboard::Data parsed;
+        if (!RemoteFileClipboard::parse(payload, parsed)) {
+            return {};
+        }
+
+        HANDLE effectData = GetClipboardData(preferredDropEffectFormat());
+        const DWORD effect = readDropEffect(effectData);
+        parsed.cut = (effect & DROPEFFECT_MOVE) != 0;
+        return RemoteFileClipboard::serialize(parsed);
+    }
+
     if (format == IClipboard::kText && IsClipboardFormatAvailable(CF_HDROP)) {
         HANDLE dropData = GetClipboardData(CF_HDROP);
         std::string pathList = convertHDropToPathList(dropData);

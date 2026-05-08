@@ -238,7 +238,8 @@ const SuggestionCard* WorkflowStore::suggestionById(const QString& suggestionId)
 void WorkflowStore::recordReceipt(const QString& contextId,
                                   const QString& actionId,
                                   const QString& status,
-                                  const QString& detail)
+                                  const QString& detail,
+                                  bool notify)
 {
     assertWorkflowThread(this);
 
@@ -253,9 +254,11 @@ void WorkflowStore::recordReceipt(const QString& contextId,
     m_receipts.prepend(receipt);
     pruneReceipts();
     emit receiptsChanged();
-    emit notificationRequested(QStringLiteral("Weave Workflow"), detail.isEmpty()
-        ? status
-        : QStringLiteral("%1: %2").arg(status, detail));
+    if (notify) {
+        emit notificationRequested(QStringLiteral("Weave Workflow"), detail.isEmpty()
+            ? status
+            : QStringLiteral("%1: %2").arg(status, detail));
+    }
 }
 
 void WorkflowStore::recordLogLine(const QString& line)
@@ -266,6 +269,20 @@ void WorkflowStore::recordLogLine(const QString& line)
         QStringLiteral("dropped file \"([^\"]+)\" in \"([^\"]+)\""));
     static const QRegularExpression transferFailedExpr(
         QStringLiteral("drop file failed: (.+)$"));
+    static const QRegularExpression remotePreparedExpr(
+        QStringLiteral("remote clipboard source prepared: session=([^ ]+) items=(\\d+)"));
+    static const QRegularExpression remotePrefetchExpr(
+        QStringLiteral("remote clipboard prefetch started: direction=([^ ]+) items=(\\d+)(?: target=(.+))?"));
+    static const QRegularExpression remoteReceivedExpr(
+        QStringLiteral("remote clipboard package received: session=([^ ]+)"));
+    static const QRegularExpression remoteMaterializedExpr(
+        QStringLiteral("remote clipboard package materialized: session=([^ ]+) items=(\\d+)"));
+    static const QRegularExpression remotePublishedExpr(
+        QStringLiteral("remote clipboard published locally: session=([^ ]+) items=(\\d+)"));
+    static const QRegularExpression remotePublishFailedExpr(
+        QStringLiteral("failed to publish remote clipboard locally: session=([^ ]+)"));
+    static const QRegularExpression remoteMaterializeFailedExpr(
+        QStringLiteral("failed to materialize remote clipboard package: (.+)$"));
 
     const QRegularExpressionMatch droppedMatch = droppedFileExpr.match(line);
     if (droppedMatch.hasMatch()) {
@@ -289,7 +306,78 @@ void WorkflowStore::recordLogLine(const QString& line)
         recordReceipt(QString(),
                       QStringLiteral("save_to_inbox"),
                       QStringLiteral("Failed"),
-                      failedMatch.captured(1));
+                      failedMatch.captured(1),
+                      false);
+        return;
+    }
+
+    const QRegularExpressionMatch preparedMatch = remotePreparedExpr.match(line);
+    if (preparedMatch.hasMatch()) {
+        recordReceipt(QString(),
+                      QStringLiteral("remote_clipboard"),
+                      QStringLiteral("Prepared"),
+                      QStringLiteral("Remote clipboard prepared for %1 item(s).").arg(preparedMatch.captured(2)));
+        return;
+    }
+
+    const QRegularExpressionMatch prefetchMatch = remotePrefetchExpr.match(line);
+    if (prefetchMatch.hasMatch()) {
+        QString detail = QStringLiteral("Remote clipboard prefetch started for %1 item(s).")
+            .arg(prefetchMatch.captured(2));
+        if (!prefetchMatch.captured(3).isEmpty()) {
+            detail += QStringLiteral(" Target: %1").arg(prefetchMatch.captured(3));
+        }
+        recordReceipt(QString(),
+                      QStringLiteral("remote_clipboard"),
+                      QStringLiteral("Prefetching"),
+                      detail);
+        return;
+    }
+
+    const QRegularExpressionMatch receivedMatch = remoteReceivedExpr.match(line);
+    if (receivedMatch.hasMatch()) {
+        recordReceipt(QString(),
+                      QStringLiteral("remote_clipboard"),
+                      QStringLiteral("Received"),
+                      QStringLiteral("Remote clipboard package received."));
+        return;
+    }
+
+    const QRegularExpressionMatch materializedMatch = remoteMaterializedExpr.match(line);
+    if (materializedMatch.hasMatch()) {
+        recordReceipt(QString(),
+                      QStringLiteral("remote_clipboard"),
+                      QStringLiteral("Materialized"),
+                      QStringLiteral("Remote clipboard ready with %1 item(s).").arg(materializedMatch.captured(2)));
+        return;
+    }
+
+    const QRegularExpressionMatch publishedMatch = remotePublishedExpr.match(line);
+    if (publishedMatch.hasMatch()) {
+        recordReceipt(QString(),
+                      QStringLiteral("remote_clipboard"),
+                      QStringLiteral("Ready"),
+                      QStringLiteral("Remote clipboard published locally with %1 item(s).").arg(publishedMatch.captured(2)));
+        return;
+    }
+
+    const QRegularExpressionMatch publishFailedMatch = remotePublishFailedExpr.match(line);
+    if (publishFailedMatch.hasMatch()) {
+        recordReceipt(QString(),
+                      QStringLiteral("remote_clipboard"),
+                      QStringLiteral("Failed"),
+                      QStringLiteral("Remote clipboard could not be published locally."),
+                      false);
+        return;
+    }
+
+    const QRegularExpressionMatch materializeFailedMatch = remoteMaterializeFailedExpr.match(line);
+    if (materializeFailedMatch.hasMatch()) {
+        recordReceipt(QString(),
+                      QStringLiteral("remote_clipboard"),
+                      QStringLiteral("Failed"),
+                      materializeFailedMatch.captured(1),
+                      false);
         return;
     }
 
@@ -616,10 +704,6 @@ void WorkflowStore::addSuggestionsForItem(const ContextItem& item)
     }
 
     emit suggestionsChanged();
-    if (!m_suggestions.isEmpty()) {
-        emit notificationRequested(QStringLiteral("Weave Suggestions"),
-                                   QStringLiteral("New workflow suggestions are ready for %1.").arg(item.summary));
-    }
 }
 
 void WorkflowStore::pruneHistory()

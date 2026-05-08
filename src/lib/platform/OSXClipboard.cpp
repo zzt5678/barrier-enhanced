@@ -19,6 +19,7 @@
 #include "platform/OSXClipboard.h"
 
 #include "barrier/Clipboard.h"
+#include "barrier/RemoteFileClipboard.h"
 #include "platform/OSXClipboardUTF16Converter.h"
 #include "platform/OSXClipboardTextConverter.h"
 #include "platform/OSXClipboardBMPConverter.h"
@@ -26,6 +27,129 @@
 #include "platform/OSXClipboardHTMLConverter.h"
 #include "base/Log.h"
 #include "arch/XArch.h"
+
+#include <climits>
+#include <cstring>
+
+namespace {
+
+CFStringRef kFileUrlFlavor()
+{
+    return CFSTR("public.file-url");
+}
+
+std::string utf8FromCFString(CFStringRef value)
+{
+    if (value == NULL) {
+        return std::string();
+    }
+
+    const CFIndex length = CFStringGetLength(value);
+    const CFIndex size = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1;
+    std::string output(static_cast<size_t>(size), '\0');
+    if (!CFStringGetCString(value, &output[0], size, kCFStringEncodingUTF8)) {
+        return std::string();
+    }
+    output.resize(strlen(output.c_str()));
+    return output;
+}
+
+std::vector<barrier::fs::path> readFileUrls(PasteboardRef pboard)
+{
+    std::vector<barrier::fs::path> paths;
+    ItemCount itemCount = 0;
+    if (PasteboardGetItemCount(pboard, &itemCount) != noErr) {
+        return paths;
+    }
+
+    for (ItemCount i = 1; i <= itemCount; ++i) {
+        PasteboardItemID item;
+        if (PasteboardGetItemIdentifier(pboard, i, &item) != noErr) {
+            continue;
+        }
+
+        PasteboardFlavorFlags flags;
+        if (PasteboardGetItemFlavorFlags(pboard, item, kFileUrlFlavor(), &flags) != noErr) {
+            continue;
+        }
+
+        CFDataRef buffer = NULL;
+        if (PasteboardCopyItemFlavorData(pboard, item, kFileUrlFlavor(), &buffer) != noErr || buffer == NULL) {
+            if (buffer != NULL) {
+                CFRelease(buffer);
+            }
+            continue;
+        }
+
+        const std::string urlBytes(
+            reinterpret_cast<const char*>(CFDataGetBytePtr(buffer)),
+            static_cast<size_t>(CFDataGetLength(buffer)));
+        CFRelease(buffer);
+
+        CFURLRef url = CFURLCreateWithBytes(
+            kCFAllocatorDefault,
+            reinterpret_cast<const UInt8*>(urlBytes.data()),
+            urlBytes.size(),
+            kCFStringEncodingUTF8,
+            NULL);
+        if (url == NULL) {
+            continue;
+        }
+
+        UInt8 pathBuffer[PATH_MAX];
+        if (CFURLGetFileSystemRepresentation(url, true, pathBuffer, sizeof(pathBuffer))) {
+            paths.push_back(barrier::fs::u8path(reinterpret_cast<const char*>(pathBuffer)));
+        }
+        CFRelease(url);
+    }
+
+    return paths;
+}
+
+bool writeFileUrls(PasteboardRef pboard, const std::vector<barrier::fs::path>& paths)
+{
+    for (size_t i = 0; i < paths.size(); ++i) {
+        const std::string utf8Path = paths[i].u8string();
+        CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+            kCFAllocatorDefault,
+            reinterpret_cast<const UInt8*>(utf8Path.data()),
+            utf8Path.size(),
+            false);
+        if (url == NULL) {
+            return false;
+        }
+
+        CFStringRef urlString = CFURLGetString(url);
+        const std::string utf8Url = utf8FromCFString(urlString);
+        CFRelease(url);
+        if (utf8Url.empty()) {
+            return false;
+        }
+
+        CFDataRef dataRef = CFDataCreate(
+            kCFAllocatorDefault,
+            reinterpret_cast<const UInt8*>(utf8Url.data()),
+            utf8Url.size());
+        if (dataRef == NULL) {
+            return false;
+        }
+
+        const OSStatus status = PasteboardPutItemFlavor(
+            pboard,
+            static_cast<PasteboardItemID>(i + 1),
+            kFileUrlFlavor(),
+            dataRef,
+            kPasteboardFlavorNoFlags);
+        CFRelease(dataRef);
+        if (status != noErr) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+} // namespace
 
 //
 // OSXClipboard
@@ -99,6 +223,15 @@ void OSXClipboard::add(EFormat format, const std::string& data)
     if (m_pboard == NULL)
         return;
 
+    if (format == IClipboard::kFileList) {
+        RemoteFileClipboard::Data payload;
+        if (RemoteFileClipboard::parse(data, payload) &&
+            payload.mode == RemoteFileClipboard::Mode::MaterializedPaths) {
+            writeFileUrls(m_pboard, payload.paths);
+        }
+        return;
+    }
+
     LOG((CLOG_DEBUG "add %d bytes to clipboard format: %d", data.size(), format));
     if (format == IClipboard::kText) {
         LOG((CLOG_DEBUG " format of data to be added to clipboard was kText"));
@@ -168,6 +301,10 @@ OSXClipboard::has(EFormat format) const
     if (m_pboard == NULL)
         return false;
 
+    if (format == IClipboard::kFileList) {
+        return !readFileUrls(m_pboard).empty();
+    }
+
     PasteboardItemID item;
     PasteboardGetItemIdentifier(m_pboard, (CFIndex) 1, &item);
 
@@ -197,6 +334,13 @@ std::string OSXClipboard::get(EFormat format) const
 
     if (m_pboard == NULL)
         return result;
+
+    if (format == IClipboard::kFileList) {
+        RemoteFileClipboard::Data payload;
+        payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+        payload.paths = readFileUrls(m_pboard);
+        return payload.paths.empty() ? std::string() : RemoteFileClipboard::serialize(payload);
+    }
 
     PasteboardGetItemIdentifier(m_pboard, (CFIndex) 1, &item);
 

@@ -23,9 +23,11 @@
 #include "platform/XWindowsClipboardUTF8Converter.h"
 #include "platform/XWindowsClipboardHTMLConverter.h"
 #include "platform/XWindowsClipboardBMPConverter.h"
+#include "platform/XWindowsClipboardFileListConverter.h"
 #include "platform/XWindowsClipboardPNGConverter.h"
 #include "platform/XWindowsClipboardURIListFileConverter.h"
 #include "platform/XWindowsClipboardURIListPNGConverter.h"
+#include "barrier/RemoteFileClipboard.h"
 #include "platform/XWindowsUtil.h"
 #include "mt/Thread.h"
 #include "arch/Arch.h"
@@ -110,6 +112,24 @@ void suppressImagePathTextFallback(bool* added, std::string* data)
     }
 }
 
+void suppressImageFileListFallback(bool* added, std::string* data)
+{
+    if (!added[IClipboard::kPNG] || !added[IClipboard::kFileList]) {
+        return;
+    }
+
+    RemoteFileClipboard::Data payload;
+    if (!RemoteFileClipboard::parse(data[IClipboard::kFileList], payload)) {
+        return;
+    }
+
+    if (RemoteFileClipboard::allPathsLookLikeImages(payload)) {
+        LOG((CLOG_DEBUG "suppressing file-list clipboard payload because PNG payload is available"));
+        added[IClipboard::kFileList] = false;
+        data[IClipboard::kFileList].clear();
+    }
+}
+
 } // namespace
 
 //
@@ -170,6 +190,10 @@ XWindowsClipboard::XWindowsClipboard(IXWindowsImpl* impl, Display* display,
     m_converters.push_back(new XWindowsClipboardBMPConverter(m_display));
     m_converters.push_back(new XWindowsClipboardPNGConverter(m_display));
     m_converters.push_back(new XWindowsClipboardURIListPNGConverter(m_display));
+    m_converters.push_back(new XWindowsClipboardFileListConverter(m_display,
+                                "x-special/gnome-copied-files", true));
+    m_converters.push_back(new XWindowsClipboardFileListConverter(m_display,
+                                "text/uri-list", false));
     m_converters.push_back(new XWindowsClipboardUTF8Converter(m_display,
                                 "text/plain;charset=UTF-8"));
     m_converters.push_back(new XWindowsClipboardUTF8Converter(m_display,
@@ -662,6 +686,7 @@ XWindowsClipboard::icccmFillCache()
     }
 
     suppressImagePathTextFallback(m_added, m_data);
+    suppressImageFileListFallback(m_added, m_data);
 }
 
 bool
@@ -910,6 +935,7 @@ XWindowsClipboard::motifFillCache()
     }
 
     suppressImagePathTextFallback(m_added, m_data);
+    suppressImageFileListFallback(m_added, m_data);
 }
 
 bool

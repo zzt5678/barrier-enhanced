@@ -329,7 +329,7 @@ TEST(GenericArgsParsingTests, parseGenericArgs_dragDropCmdOnNonLinux_enableDragD
 #endif
 
 #ifdef  WINAPI_XWINDOWS
-TEST(GenericArgsParsingTests, parseGenericArgs_dragDropCmdOnLinux_enableDragDropFalse)
+TEST(GenericArgsParsingTests, parseGenericArgs_dragDropCmdOnLinux_enableDragDropTrue)
 {
     int i = 1;
     const int argc = 2;
@@ -341,7 +341,7 @@ TEST(GenericArgsParsingTests, parseGenericArgs_dragDropCmdOnLinux_enableDragDrop
 
     argParser.parseGenericArgs(argc, kDragDropCmd, i);
 
-    EXPECT_FALSE(argsBase.m_enableDragDrop);
+    EXPECT_TRUE(argsBase.m_enableDragDrop);
     EXPECT_EQ(1, i);
 }
 #endif

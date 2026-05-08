@@ -7,6 +7,7 @@
 
 class TransferArchive {
 public:
+    static bool isPackageData(const std::string& data);
     static bool createSelectionPackageFile(const std::vector<barrier::fs::path>& sourcePaths,
                                            barrier::fs::path& packagePath,
                                            std::string& error);
