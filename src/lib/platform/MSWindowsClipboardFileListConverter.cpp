@@ -5,6 +5,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <shellapi.h>
+#include <ShlObj_core.h>
 
 #include <vector>
 
