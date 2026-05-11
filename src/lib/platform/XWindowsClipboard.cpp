@@ -102,6 +102,12 @@ bool looksLikeImagePathOrUri(const std::string& text)
     return false;
 }
 
+bool isTextUriListTarget(Display* display, Atom atom)
+{
+    return atom == XInternAtom(display, "x-special/gnome-copied-files", False) ||
+           atom == XInternAtom(display, "text/uri-list", False);
+}
+
 void suppressImagePathTextFallback(bool* added, std::string* data)
 {
     if (added[IClipboard::kPNG] && added[IClipboard::kText] &&
@@ -1380,6 +1386,11 @@ Atom XWindowsClipboard::getTargetsData(std::string& data, int* format) const
 
         // skip formats we don't have
         if (m_added[converter->getFormat()]) {
+            if (converter->getFormat() == IClipboard::kText &&
+                isTextUriListTarget(m_display, converter->getAtom()) &&
+                converter->fromIClipboard(m_data[IClipboard::kText]).empty()) {
+                continue;
+            }
             XWindowsUtil::appendAtomData(data, converter->getAtom());
         }
     }
