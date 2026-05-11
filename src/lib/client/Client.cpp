@@ -484,7 +484,10 @@ Client::sendClipboard(ClipboardID id)
     if (clipboard.open(m_timeClipboard[id])) {
         clipboard.close();
     }
-    m_screen->getClipboard(id, &clipboard);
+    if (!m_screen->getClipboard(id, &clipboard)) {
+        LOG((CLOG_WARN "clipboard %d could not be read; deferring send to avoid publishing empty data", id));
+        return;
+    }
 
     bool hasFileList = false;
     if (id == kClipboardClipboard) {

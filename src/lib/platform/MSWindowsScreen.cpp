@@ -513,8 +513,22 @@ bool
 MSWindowsScreen::getClipboard(ClipboardID, IClipboard* dst) const
 {
     MSWindowsClipboard src(m_window);
-    Clipboard::copy(dst, &src);
-    return true;
+    constexpr int kClipboardReadAttempts = 8;
+    constexpr double kClipboardReadRetrySeconds = 0.025;
+
+    for (int attempt = 0; attempt < kClipboardReadAttempts; ++attempt) {
+        if (Clipboard::copy(dst, &src)) {
+            if (attempt > 0) {
+                LOG((CLOG_DEBUG "clipboard read succeeded after %d retry attempt(s)", attempt));
+            }
+            return true;
+        }
+
+        ARCH->sleep(kClipboardReadRetrySeconds);
+    }
+
+    LOG((CLOG_WARN "failed to read clipboard after %d attempts", kClipboardReadAttempts));
+    return false;
 }
 
 void
