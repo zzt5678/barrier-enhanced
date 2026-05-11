@@ -430,6 +430,11 @@ void XWindowsClipboard::add(EFormat format, const std::string& data)
     assert(m_open);
     assert(m_owner);
 
+    if (format == IClipboard::kFileList && data.empty()) {
+        LOG((CLOG_DEBUG "skipping empty file-list clipboard payload for clipboard %d", m_id));
+        return;
+    }
+
     LOG((CLOG_DEBUG "add %d bytes to clipboard %d format: %d", data.size(), m_id, format));
 
     m_data[format]  = data;
