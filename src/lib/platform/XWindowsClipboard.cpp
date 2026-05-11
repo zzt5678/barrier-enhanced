@@ -179,11 +179,10 @@ XWindowsClipboard::XWindowsClipboard(IXWindowsImpl* impl, Display* display,
         break;
     }
 
-    // add converters, most desired first
-    m_converters.push_back(new XWindowsClipboardHTMLConverter(m_display,
-                                "text/html"));
-    m_converters.push_back(new XWindowsClipboardHTMLConverter(m_display,
-                                "application/x-moz-nativehtml"));
+    // Add converters in the order requestors should prefer. Rich web
+    // editors such as Chrome contenteditable fields commonly pick the
+    // first usable text target from TARGETS; prefer plain text over
+    // remote HTML fragments so malformed CF_HTML does not block paste.
     m_converters.push_back(new XWindowsClipboardURIListFileConverter(
                                 m_display, "x-special/gnome-copied-files", true));
     m_converters.push_back(new XWindowsClipboardURIListFileConverter(m_display));
@@ -208,6 +207,10 @@ XWindowsClipboard::XWindowsClipboard(IXWindowsImpl* impl, Display* display,
                                 "text/plain"));
     m_converters.push_back(new XWindowsClipboardTextConverter(m_display,
                                 "STRING"));
+    m_converters.push_back(new XWindowsClipboardHTMLConverter(m_display,
+                                "text/html"));
+    m_converters.push_back(new XWindowsClipboardHTMLConverter(m_display,
+                                "application/x-moz-nativehtml"));
 
     // we have no data
     clearCache();
