@@ -560,6 +560,31 @@ MSWindowsScreen::reconfigure(UInt32 activeSides)
 void
 MSWindowsScreen::warpCursor(SInt32 x, SInt32 y)
 {
+    const SInt32 minX = m_x;
+    const SInt32 minY = m_y;
+    const SInt32 maxX = m_x + m_w - 1;
+    const SInt32 maxY = m_y + m_h - 1;
+    const SInt32 originalX = x;
+    const SInt32 originalY = y;
+    if (x < minX && x + m_w >= minX && x + m_w <= maxX) {
+        x += m_w;
+    }
+    else if (x > maxX && x - m_w >= minX && x - m_w <= maxX) {
+        x -= m_w;
+    }
+    if (y < minY && y + m_h >= minY && y + m_h <= maxY) {
+        y += m_h;
+    }
+    else if (y > maxY && y - m_h >= minY && y - m_h <= maxY) {
+        y -= m_h;
+    }
+    x = (x < minX) ? minX : ((x > maxX) ? maxX : x);
+    y = (y < minY) ? minY : ((y > maxY) ? maxY : y);
+    if (x != originalX || y != originalY) {
+        LOG((CLOG_WARN "normalized out-of-bounds cursor warp from %+d,%+d to %+d,%+d within %+d,%+d %dx%d",
+             originalX, originalY, x, y, m_x, m_y, m_w, m_h));
+    }
+
     // warp mouse
     warpCursorNoFlush(x, y);
 
@@ -766,6 +791,31 @@ MSWindowsScreen::fakeMouseButton(ButtonID id, bool press)
 void
 MSWindowsScreen::fakeMouseMove(SInt32 x, SInt32 y)
 {
+    const SInt32 minX = m_x;
+    const SInt32 minY = m_y;
+    const SInt32 maxX = m_x + m_w - 1;
+    const SInt32 maxY = m_y + m_h - 1;
+    const SInt32 originalX = x;
+    const SInt32 originalY = y;
+    if (x < minX && x + m_w >= minX && x + m_w <= maxX) {
+        x += m_w;
+    }
+    else if (x > maxX && x - m_w >= minX && x - m_w <= maxX) {
+        x -= m_w;
+    }
+    if (y < minY && y + m_h >= minY && y + m_h <= maxY) {
+        y += m_h;
+    }
+    else if (y > maxY && y - m_h >= minY && y - m_h <= maxY) {
+        y -= m_h;
+    }
+    x = (x < minX) ? minX : ((x > maxX) ? maxX : x);
+    y = (y < minY) ? minY : ((y > maxY) ? maxY : y);
+    if (x != originalX || y != originalY) {
+        LOG((CLOG_WARN "normalized out-of-bounds remote mouse move from %+d,%+d to %+d,%+d within %+d,%+d %dx%d",
+             originalX, originalY, x, y, m_x, m_y, m_w, m_h));
+    }
+
     m_desks->fakeMouseMove(x, y);
     if (m_buttons[kButtonLeft]) {
         m_draggingStarted = true;
