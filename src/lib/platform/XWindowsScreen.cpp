@@ -41,6 +41,49 @@
 
 static int xi_opcode;
 
+namespace {
+
+bool
+normalizeToScreenShape(const char* operation,
+	SInt32 sx, SInt32 sy, SInt32 sw, SInt32 sh,
+	SInt32& x, SInt32& y)
+{
+	if (sw <= 0 || sh <= 0) {
+		LOG((CLOG_WARN "ignoring %s for invalid screen shape %+d,%+d %dx%d",
+			operation, sx, sy, sw, sh));
+		return false;
+	}
+
+	const SInt32 minX = sx;
+	const SInt32 minY = sy;
+	const SInt32 maxX = sx + sw - 1;
+	const SInt32 maxY = sy + sh - 1;
+	const SInt32 originalX = x;
+	const SInt32 originalY = y;
+
+	if (x < minX) {
+		x = minX;
+	}
+	else if (x > maxX) {
+		x = maxX;
+	}
+	if (y < minY) {
+		y = minY;
+	}
+	else if (y > maxY) {
+		y = maxY;
+	}
+
+	if (x != originalX || y != originalY) {
+		LOG((CLOG_WARN "normalized out-of-bounds %s from %+d,%+d to %+d,%+d within %+d,%+d %dx%d",
+			operation, originalX, originalY, x, y, sx, sy, sw, sh));
+	}
+
+	return true;
+}
+
+}
+
 //
 // XWindowsScreen
 //
@@ -551,6 +594,10 @@ XWindowsScreen::reconfigure(UInt32)
 void
 XWindowsScreen::warpCursor(SInt32 x, SInt32 y)
 {
+	if (!normalizeToScreenShape("cursor warp", m_x, m_y, m_w, m_h, x, y)) {
+		return;
+	}
+
 	// warp mouse
 	warpCursorNoFlush(x, y);
 
@@ -851,6 +898,10 @@ XWindowsScreen::fakeMouseButton(ButtonID button, bool press)
 void
 XWindowsScreen::fakeMouseMove(SInt32 x, SInt32 y)
 {
+	if (!normalizeToScreenShape("remote mouse move", m_x, m_y, m_w, m_h, x, y)) {
+		return;
+	}
+
 	if (m_xinerama && m_xtestIsXineramaUnaware) {
         m_impl->XWarpPointer(m_display, None, m_root, 0, 0, 0, 0, x, y);
 	}
@@ -969,10 +1020,14 @@ XWindowsScreen::openDisplay(const char* displayName)
 #if HAVE_X11_EXTENSIONS_XRANDR_H
 	// query for XRandR extension
 	int dummyError;
-    m_xrandr = m_impl->XRRQueryExtension(display, &m_xrandrEventBase, &dummyError);
+	m_xrandr = m_impl->XRRQueryExtension(display, &m_xrandrEventBase, &dummyError);
 	if (m_xrandr) {
-		// enable XRRScreenChangeNotifyEvent
-        m_impl->XRRSelectInput(display, DefaultRootWindow(display), RRScreenChangeNotifyMask | RRCrtcChangeNotifyMask);
+		// Enable screen, CRTC, and output notifications. Monitor unplug/replug
+		// can arrive as an output change without a separate CRTC event.
+		m_impl->XRRSelectInput(display, DefaultRootWindow(display),
+			RRScreenChangeNotifyMask | RRCrtcChangeNotifyMask |
+			RROutputChangeNotifyMask | RRProviderChangeNotifyMask |
+			RRResourceChangeNotifyMask);
 	}
 #endif
 
@@ -1434,10 +1489,16 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 
 #if HAVE_X11_EXTENSIONS_XRANDR_H
 		if (m_xrandr) {
-			if (xevent->type == m_xrandrEventBase + RRScreenChangeNotify ||
-			    (xevent->type == m_xrandrEventBase + RRNotify &&
-			     reinterpret_cast<XRRNotifyEvent *>(xevent)->subtype == RRNotify_CrtcChange)) {
-				LOG((CLOG_INFO "XRRScreenChangeNotifyEvent or RRNotify_CrtcChange received"));
+			bool topologyChanged = (xevent->type == m_xrandrEventBase + RRScreenChangeNotify);
+			if (!topologyChanged && xevent->type == m_xrandrEventBase + RRNotify) {
+				const int subtype = reinterpret_cast<XRRNotifyEvent *>(xevent)->subtype;
+				topologyChanged = (subtype == RRNotify_CrtcChange ||
+					subtype == RRNotify_OutputChange ||
+					subtype == RRNotify_ProviderChange ||
+					subtype == RRNotify_ResourceChange);
+			}
+			if (topologyChanged) {
+				LOG((CLOG_INFO "XRandR screen topology change received"));
 
 				// we're required to call back into XLib so XLib can update its internal state
 				XRRUpdateConfiguration(xevent);
@@ -1451,6 +1512,17 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 				if (m_isPrimary) {
                     m_impl->XMoveWindow(m_display, m_window, m_x, m_y);
                     m_impl->XResizeWindow(m_display, m_window, m_w, m_h);
+					if (!m_isOnScreen) {
+						LOG((CLOG_DEBUG "reparking hidden cursor at %d,%d after screen shape change",
+							m_xCenter, m_yCenter));
+						warpCursor(m_xCenter, m_yCenter);
+					}
+				}
+				else if (!m_isOnScreen) {
+					LOG((CLOG_DEBUG "reparking secondary hidden cursor at %d,%d after screen shape change",
+						m_xCenter, m_yCenter));
+					m_impl->XMoveWindow(m_display, m_window, m_xCenter, m_yCenter);
+					fakeMouseMove(m_xCenter, m_yCenter);
 				}
 
 				sendEvent(m_events->forIScreen().shapeChanged());

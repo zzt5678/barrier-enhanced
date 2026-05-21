@@ -85,6 +85,34 @@ float clampUnitFraction(float value)
     return value;
 }
 
+bool clampToClientShape(BaseClientProxy* client, SInt32& x, SInt32& y)
+{
+    SInt32 sx, sy, sw, sh;
+    client->getShape(sx, sy, sw, sh);
+
+    if (sw <= 0 || sh <= 0) {
+        LOG((CLOG_WARN "ignoring invalid screen shape for \"%s\": %d,%d %dx%d",
+            client->getName().c_str(), sx, sy, sw, sh));
+        return false;
+    }
+
+    if (x < sx) {
+        x = sx;
+    }
+    else if (x >= sx + sw) {
+        x = sx + sw - 1;
+    }
+
+    if (y < sy) {
+        y = sy;
+    }
+    else if (y >= sy + sh) {
+        y = sy + sh - 1;
+    }
+
+    return true;
+}
+
 DragFileList parseDraggedPaths(const std::string& pathList)
 {
     DragFileList dragFileList;
@@ -1426,12 +1454,25 @@ Server::handleShapeChanged(const Event&, void* vclient)
 	// update jump coordinate
 	SInt32 x, y;
 	client->getCursorPos(x, y);
+	if (!clampToClientShape(client, x, y)) {
+		return;
+	}
 	client->setJumpCursorPos(x, y);
 
 	// update the mouse coordinates
 	if (client == m_active) {
 		m_x = x;
 		m_y = y;
+		m_xDelta  = 0;
+		m_yDelta  = 0;
+		m_xDelta2 = 0;
+		m_yDelta2 = 0;
+		stopSwitch();
+		if (client != m_primaryClient) {
+			LOG((CLOG_DEBUG "reanchoring active screen \"%s\" at %d,%d after shape change",
+				getName(client).c_str(), m_x, m_y));
+			client->mouseMove(m_x, m_y);
+		}
 	}
 
 	// handle resolution change to primary screen
@@ -2408,7 +2449,7 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 					break;
 
 				case kBottom:
-					clearWait = (m_y <= ay + ah - 1 + zoneSize);
+					clearWait = (m_y <= ay + ah - 1 - zoneSize);
 					break;
 
 				default:
@@ -2676,7 +2717,9 @@ Server::addClient(BaseClientProxy* client)
 	// initialize client data
 	SInt32 x, y;
 	client->getCursorPos(x, y);
-	client->setJumpCursorPos(x, y);
+	if (client == m_primaryClient || clampToClientShape(client, x, y)) {
+		client->setJumpCursorPos(x, y);
+	}
 
 	// tell primary client about the active sides
 	m_primaryClient->reconfigure(getActivePrimarySides());
