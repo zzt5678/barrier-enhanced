@@ -1250,6 +1250,17 @@ void MainWindow::changeEvent(QEvent* event)
     QMainWindow::changeEvent(event);
 }
 
+void MainWindow::closeEvent(QCloseEvent* event)
+{
+    if (m_pTrayIcon != NULL && m_pTrayIcon->isVisible()) {
+        event->ignore();
+        hide();
+        return;
+    }
+
+    QMainWindow::closeEvent(event);
+}
+
 bool MainWindow::event(QEvent* event)
 {
     return QMainWindow::event(event);

@@ -581,7 +581,7 @@ MSWindowsScreen::warpCursor(SInt32 x, SInt32 y)
     x = (x < minX) ? minX : ((x > maxX) ? maxX : x);
     y = (y < minY) ? minY : ((y > maxY) ? maxY : y);
     if (x != originalX || y != originalY) {
-        LOG((CLOG_WARN "normalized out-of-bounds cursor warp from %+d,%+d to %+d,%+d within %+d,%+d %dx%d",
+        LOG((CLOG_DEBUG "normalized out-of-bounds cursor warp from %+d,%+d to %+d,%+d within %+d,%+d %dx%d",
              originalX, originalY, x, y, m_x, m_y, m_w, m_h));
     }
 
@@ -811,10 +811,6 @@ MSWindowsScreen::fakeMouseMove(SInt32 x, SInt32 y)
     }
     x = (x < minX) ? minX : ((x > maxX) ? maxX : x);
     y = (y < minY) ? minY : ((y > maxY) ? maxY : y);
-    if (x != originalX || y != originalY) {
-        LOG((CLOG_WARN "normalized out-of-bounds remote mouse move from %+d,%+d to %+d,%+d within %+d,%+d %dx%d",
-             originalX, originalY, x, y, m_x, m_y, m_w, m_h));
-    }
 
     m_desks->fakeMouseMove(x, y);
     if (m_buttons[kButtonLeft]) {
