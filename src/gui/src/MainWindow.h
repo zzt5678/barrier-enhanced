@@ -164,6 +164,7 @@ public slots:
         QString getIPAddresses();
         void stopService();
         void stopDesktop();
+        void terminateDuplicateDesktopProcesses(const QString& app);
         void closeEvent(QCloseEvent* event);
         void changeEvent(QEvent* event);
         bool event(QEvent* event);

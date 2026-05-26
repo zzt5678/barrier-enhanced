@@ -63,6 +63,7 @@
 #if defined(Q_OS_WIN)
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <TlHelp32.h>
 #endif
 
 static const QString allFilesFilter(QObject::tr("All files (*.*)"));
@@ -721,6 +722,13 @@ void MainWindow::startBarrier()
 
     m_RestartTimer.stop();
 
+    const QString expectedApp = appPath(barrier_type() == BarrierType::Client
+        ? appConfig().barriercName()
+        : appConfig().barriersName());
+    if (desktopMode) {
+        terminateDuplicateDesktopProcesses(expectedApp);
+    }
+
     if (desktopMode && barrierProcess() != nullptr) {
         if (barrierProcess()->state() == QProcess::Starting ||
             barrierProcess()->state() == QProcess::Running) {
@@ -833,6 +841,9 @@ void MainWindow::startBarrier()
         }
 
         m_ProcessLifetime.restart();
+        QTimer::singleShot(2000, this, [this, expectedApp]() {
+            terminateDuplicateDesktopProcesses(expectedApp);
+        });
     }
 
     if (serviceMode)
@@ -1218,6 +1229,61 @@ QString MainWindow::getScreenName()
     else {
         return appConfig().screenName();
     }
+}
+
+void MainWindow::terminateDuplicateDesktopProcesses(const QString& app)
+{
+#if defined(Q_OS_WIN)
+    const QString targetPath = QDir::toNativeSeparators(QFileInfo(app).absoluteFilePath()).toLower();
+    const QString targetName = QFileInfo(app).fileName();
+    const DWORD currentProcessId = GetCurrentProcessId();
+    const qint64 managedProcessId = barrierProcess() != nullptr ? barrierProcess()->processId() : 0;
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    PROCESSENTRY32W entry;
+    ZeroMemory(&entry, sizeof(entry));
+    entry.dwSize = sizeof(entry);
+    if (!Process32FirstW(snapshot, &entry)) {
+        CloseHandle(snapshot);
+        return;
+    }
+
+    do {
+        const DWORD processId = entry.th32ProcessID;
+        if (processId == currentProcessId || static_cast<qint64>(processId) == managedProcessId) {
+            continue;
+        }
+
+        const QString processName = QString::fromWCharArray(entry.szExeFile);
+        if (processName.compare(targetName, Qt::CaseInsensitive) != 0) {
+            continue;
+        }
+
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, processId);
+        if (process == NULL) {
+            continue;
+        }
+
+        wchar_t imagePath[MAX_PATH * 4];
+        DWORD imagePathSize = sizeof(imagePath) / sizeof(imagePath[0]);
+        const bool pathMatches = QueryFullProcessImageNameW(process, 0, imagePath, &imagePathSize) &&
+            QDir::toNativeSeparators(QString::fromWCharArray(imagePath)).toLower() == targetPath;
+        if (pathMatches) {
+            appendLogInfo(QString("stopping duplicate desktop process %1 (%2)").arg(targetName).arg(processId));
+            TerminateProcess(process, 0);
+        }
+
+        CloseHandle(process);
+    } while (Process32NextW(snapshot, &entry));
+
+    CloseHandle(snapshot);
+#else
+    Q_UNUSED(app);
+#endif
 }
 
 void MainWindow::changeEvent(QEvent* event)
