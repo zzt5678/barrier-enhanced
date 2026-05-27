@@ -345,10 +345,11 @@ void MainWindow::open()
         promptAutoConfig();
     }
 
-    // only start if user has previously started. this stops the gui from
-    // auto hiding before the user has configured barrier (which of course
-    // confuses first time users, who think barrier has crashed).
-    if (appConfig().startedBefore() && appConfig().getAutoStart()) {
+    // A login shortcut starts the UI shell only. If this device is already
+    // configured as a client, keep the actual desktop client alive as well.
+    const bool configuredClient =
+        barrier_type() == BarrierType::Client && !hostname().trimmed().isEmpty();
+    if ((appConfig().startedBefore() && appConfig().getAutoStart()) || configuredClient) {
         m_SuppressEmptyServerWarning = true;
         startBarrier();
         m_SuppressEmptyServerWarning = false;
