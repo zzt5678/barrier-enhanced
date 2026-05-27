@@ -113,6 +113,13 @@ bool clampToClientShape(BaseClientProxy* client, SInt32& x, SInt32& y)
     return true;
 }
 
+bool isReturnToPrimaryHotKey(KeyID id, KeyModifierMask mask)
+{
+    const KeyModifierMask required =
+        KeyModifierShift | KeyModifierControl | KeyModifierAlt;
+    return id == kKeyPause && (mask & required) == required;
+}
+
 DragFileList parseDraggedPaths(const std::string& pathList)
 {
     DragFileList dragFileList;
@@ -490,6 +497,19 @@ Server::adoptClient(BaseClientProxy* client)
 	}
 
 	// add client to client list
+	ClientList::const_iterator existing = m_clients.find(getName(client));
+	if (existing != m_clients.end()) {
+		LOG((CLOG_WARN "a client with name \"%s\" is already connected", getName(client).c_str()));
+		if (existing->second == m_active || existing->second == m_switchScreen ||
+			existing->second == m_activeSaver) {
+			LOG((CLOG_WARN "returning to primary before rejecting duplicate active client \"%s\"",
+				getName(client).c_str()));
+			forceLeaveClient(existing->second);
+		}
+		closeClient(client, kMsgEBusy);
+		return;
+	}
+
 	if (!addClient(client)) {
 		// can only have one screen with a given name at any given time
 		LOG((CLOG_WARN "a client with name \"%s\" is already connected", getName(client).c_str()));
@@ -1481,7 +1501,9 @@ Server::handleShapeChanged(const Event&, void* vclient)
 			onMouseMovePrimary(m_x, m_y);
 		}
 		else {
-			onMouseMoveSecondary(0, 0);
+			LOG((CLOG_WARN "returning to primary after primary screen shape changed while \"%s\" was active",
+				getName(m_active).c_str()));
+			forceLeaveClient(m_active);
 		}
 	}
 }
@@ -2041,6 +2063,12 @@ Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button,
 {
 	LOG((CLOG_DEBUG1 "onKeyDown id=%d mask=0x%04x button=0x%04x", id, mask, button));
 	assert(m_active != NULL);
+
+	if (m_active != m_primaryClient && isReturnToPrimaryHotKey(id, mask)) {
+		LOG((CLOG_WARN "emergency return to primary from \"%s\"", getName(m_active).c_str()));
+		forceLeaveClient(m_active);
+		return;
+	}
 
 	// relay
 	if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
