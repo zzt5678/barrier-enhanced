@@ -32,16 +32,9 @@
 #include <QLockFile>
 #include <QDir>
 #include <QFileInfo>
-#include <QProcess>
 
 #if defined(Q_OS_MAC)
 #include <Carbon/Carbon.h>
-#endif
-
-#if !defined(Q_OS_WIN)
-#include <signal.h>
-#include <unistd.h>
-#include <errno.h>
 #endif
 
 #ifdef Q_OS_DARWIN
@@ -65,171 +58,9 @@ bool checkMacAssistiveDevices();
 
 namespace {
 
-QStringList managedProcessNames()
-{
-#if defined(Q_OS_WIN)
-    return {
-        QStringLiteral("weave.exe"),
-        QStringLiteral("weavec.exe"),
-        QStringLiteral("weaves.exe"),
-        QStringLiteral("weaved.exe"),
-        QStringLiteral("barrier.exe"),
-        QStringLiteral("barrierc.exe"),
-        QStringLiteral("barriers.exe"),
-        QStringLiteral("barrierd.exe")
-    };
-#else
-    return {
-        QStringLiteral("weave"),
-        QStringLiteral("weavec"),
-        QStringLiteral("weaves"),
-        QStringLiteral("weaved"),
-        QStringLiteral("barrier"),
-        QStringLiteral("barrierc"),
-        QStringLiteral("barriers"),
-        QStringLiteral("barrierd")
-    };
-#endif
-}
-
-#if defined(Q_OS_WIN)
-QList<qint64> findProcessIdsByName(const QString& processName)
-{
-    QList<qint64> pids;
-    QProcess tasklist;
-    tasklist.start(QStringLiteral("tasklist"),
-                   {QStringLiteral("/FI"),
-                    QStringLiteral("IMAGENAME eq %1").arg(processName),
-                    QStringLiteral("/FO"),
-                    QStringLiteral("CSV"),
-                    QStringLiteral("/NH")});
-    if (!tasklist.waitForFinished(2000)) {
-        return pids;
-    }
-
-    const QString output = QString::fromLocal8Bit(tasklist.readAllStandardOutput());
-    const QStringList lines = output.split(QRegularExpression(QStringLiteral("[\r\n]+")),
-                                           QString::SkipEmptyParts);
-    for (const QString& line : lines) {
-        if (line.startsWith(QStringLiteral("INFO:"), Qt::CaseInsensitive)) {
-            continue;
-        }
-        QString trimmed = line.trimmed();
-        if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-            trimmed = trimmed.mid(1, trimmed.size() - 2);
-        }
-        const QStringList columns = trimmed.split(QStringLiteral("\",\""));
-        if (columns.size() < 2) {
-            continue;
-        }
-        bool ok = false;
-        const qint64 pid = columns.at(1).toLongLong(&ok);
-        if (ok) {
-            pids.append(pid);
-        }
-    }
-    return pids;
-}
-
-bool processExists(qint64 pid)
-{
-    QProcess tasklist;
-    tasklist.start(QStringLiteral("tasklist"),
-                   {QStringLiteral("/FI"),
-                    QStringLiteral("PID eq %1").arg(pid),
-                    QStringLiteral("/FO"),
-                    QStringLiteral("CSV"),
-                    QStringLiteral("/NH")});
-    if (!tasklist.waitForFinished(2000)) {
-        return false;
-    }
-    const QString output = QString::fromLocal8Bit(tasklist.readAllStandardOutput());
-    return output.contains(QStringLiteral(",\"%1\",").arg(pid));
-}
-
-void terminateProcess(qint64 pid)
-{
-    if (pid <= 0 || pid == static_cast<qint64>(QCoreApplication::applicationPid())) {
-        return;
-    }
-
-    QProcess::execute(QStringLiteral("taskkill"),
-                      {QStringLiteral("/PID"), QString::number(pid), QStringLiteral("/T")});
-    for (int i = 0; i < 10 && processExists(pid); ++i) {
-        QThreadImpl::msleep(100);
-    }
-    if (processExists(pid)) {
-        QProcess::execute(QStringLiteral("taskkill"),
-                          {QStringLiteral("/PID"), QString::number(pid), QStringLiteral("/T"), QStringLiteral("/F")});
-    }
-}
-#else
-QList<qint64> findProcessIdsByName(const QString& processName)
-{
-    QList<qint64> pids;
-    QProcess pgrep;
-    pgrep.start(QStringLiteral("pgrep"),
-                {QStringLiteral("-u"),
-                 QString::number(::getuid()),
-                 QStringLiteral("-x"),
-                 processName});
-    if (!pgrep.waitForFinished(2000)) {
-        return pids;
-    }
-
-    const QString output = QString::fromLocal8Bit(pgrep.readAllStandardOutput());
-    const QStringList lines = output.split(QRegularExpression(QStringLiteral("[\r\n]+")),
-                                           QString::SkipEmptyParts);
-    for (const QString& line : lines) {
-        bool ok = false;
-        const qint64 pid = line.trimmed().toLongLong(&ok);
-        if (ok) {
-            pids.append(pid);
-        }
-    }
-    return pids;
-}
-
-bool processExists(qint64 pid)
-{
-    if (pid <= 0) {
-        return false;
-    }
-    return (::kill(static_cast<pid_t>(pid), 0) == 0) || (errno == EPERM);
-}
-
-void terminateProcess(qint64 pid)
-{
-    if (pid <= 0 || pid == static_cast<qint64>(QCoreApplication::applicationPid())) {
-        return;
-    }
-
-    ::kill(static_cast<pid_t>(pid), SIGTERM);
-    for (int i = 0; i < 15 && processExists(pid); ++i) {
-        QThreadImpl::msleep(100);
-    }
-    if (processExists(pid)) {
-        ::kill(static_cast<pid_t>(pid), SIGKILL);
-    }
-}
-#endif
-
-void cleanupPreviousProcesses()
-{
-    for (const QString& processName : managedProcessNames()) {
-        const QList<qint64> pids = findProcessIdsByName(processName);
-        for (qint64 pid : pids) {
-            terminateProcess(pid);
-        }
-    }
-}
-
 void cleanupStartupArtifacts()
 {
     const QDir tempDir = QDir::temp();
-    QFile::remove(tempDir.absoluteFilePath(QStringLiteral("barrier-gui.lock")));
-    QFile::remove(tempDir.absoluteFilePath(QStringLiteral("weave-gui.lock")));
-
     const QStringList tempPatterns = {
         QStringLiteral("Barrier.*"),
         QStringLiteral("Weave.*")
@@ -269,13 +100,10 @@ int main(int argc, char* argv[])
 
 	QBarrierApplication app(argc, argv);
 
-    cleanupPreviousProcesses();
-    cleanupStartupArtifacts();
-
 	// Single instance lock - prevent multiple barrier GUI instances
 	// This fixes the tray icon duplication issue when restarting barrier
 	QLockFile lockFile(QDir::temp().absoluteFilePath("weave-gui.lock"));
-	lockFile.setStaleLockTime(0);  // Remove stale lock on startup
+	lockFile.setStaleLockTime(30000);
     bool locked = false;
     for (int attempt = 0; attempt < 20 && !locked; ++attempt) {
         locked = lockFile.tryLock(100);
@@ -289,6 +117,8 @@ int main(int argc, char* argv[])
 			"If you need to restart, please quit the existing instance first.");
 		return 1;
 	}
+
+    cleanupStartupArtifacts();
 
 #if defined(Q_OS_MAC)
 	if (app.applicationDirPath().startsWith("/Volumes/")) {

@@ -182,6 +182,7 @@ public slots:
         void restartBarrier();
         void resetRestartBackoff();
         void scheduleAutoRestart();
+        void quitApplication();
         void proofreadInfo();
         void windowStateChanged();
         void updateSSLFingerprint();
@@ -229,6 +230,7 @@ public slots:
         QTimer m_RestartTimer;
         QElapsedTimer m_ProcessLifetime;
         int m_UnexpectedExitCount;
+        bool m_AllowApplicationQuit;
 
         bool m_fingerprint_expanded = false;
 

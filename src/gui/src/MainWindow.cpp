@@ -149,7 +149,8 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_pActionWorkflowHub(NULL),
     m_pActionCommandPalette(NULL),
     m_RestartTimer(this),
-    m_UnexpectedExitCount(0)
+    m_UnexpectedExitCount(0),
+    m_AllowApplicationQuit(false)
 {
     // explicitly unset DeleteOnClose so the window can be show and hidden
     // repeatedly until Barrier is finished
@@ -445,7 +446,7 @@ void MainWindow::initConnections()
     connect(m_pActionShowLog, SIGNAL(triggered()), this, SLOT(showLogWindow()));
     connect(m_pActionWorkflowHub, SIGNAL(triggered()), this, SLOT(showWorkflowHub()));
     connect(m_pActionCommandPalette, SIGNAL(triggered()), this, SLOT(showCommandPalette()));
-    connect(m_pActionQuit, SIGNAL(triggered()), qApp, SLOT(quit()));
+    connect(m_pActionQuit, &QAction::triggered, this, &MainWindow::quitApplication);
     connect(m_pButtonWorkflowHub, &QPushButton::clicked, this, &MainWindow::showWorkflowHub);
     connect(m_pButtonShowLog, &QPushButton::clicked, this, &MainWindow::showLogWindow);
     connect(m_pListRecentReceipts, &QListWidget::itemActivated, this, &MainWindow::showWorkflowHub);
@@ -1168,6 +1169,12 @@ void MainWindow::scheduleAutoRestart()
     m_RestartTimer.start(delayMs);
 }
 
+void MainWindow::quitApplication()
+{
+    m_AllowApplicationQuit = true;
+    qApp->quit();
+}
+
 void MainWindow::setVisible(bool visible)
 {
     QMainWindow::setVisible(visible);
@@ -1319,7 +1326,13 @@ void MainWindow::changeEvent(QEvent* event)
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
-    if (m_pTrayIcon != NULL && m_pTrayIcon->isVisible()) {
+    const bool runningOrStarting =
+        barrierState() == barrierConnected || barrierState() == barrierConnecting ||
+        barrierState() == barrierTransfering;
+
+    if (!m_AllowApplicationQuit &&
+        ((m_pTrayIcon != NULL && m_pTrayIcon->isVisible()) ||
+         (barrier_type() == BarrierType::Client && runningOrStarting))) {
         event->ignore();
         hide();
         return;
