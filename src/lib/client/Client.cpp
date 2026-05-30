@@ -53,6 +53,9 @@
 
 namespace {
 
+const UInt32 kClipboardReadRetryLimit = 20;
+const double kClipboardReadRetrySeconds = 0.25;
+
 bool prepareTransferSource(const char* filename,
                            barrier::fs::path& sourcePath,
                            barrier::fs::path& tempPackagePath,
@@ -129,6 +132,7 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
     m_screen(screen),
     m_stream(NULL),
     m_timer(NULL),
+    m_clipboardRetryTimer(NULL),
     m_server(NULL),
     m_ready(false),
     m_active(false),
@@ -144,6 +148,14 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
 {
     assert(m_socketFactory != NULL);
     assert(m_screen        != NULL);
+
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        m_ownClipboard[id] = false;
+        m_sentClipboard[id] = false;
+        m_clipboardRetryPending[id] = false;
+        m_clipboardRetryCount[id] = 0;
+        m_timeClipboard[id] = 0;
+    }
 
     // register suspend/resume event handlers
     m_events->adoptHandler(m_events->forIScreen().suspend(),
@@ -485,9 +497,12 @@ Client::sendClipboard(ClipboardID id)
         clipboard.close();
     }
     if (!m_screen->getClipboard(id, &clipboard)) {
-        LOG((CLOG_WARN "clipboard %d could not be read; deferring send to avoid publishing empty data", id));
+        LOG((CLOG_WARN "clipboard %d could not be read; scheduling retry to avoid publishing empty data", id));
+        scheduleClipboardRetry(id);
         return;
     }
+    m_clipboardRetryPending[id] = false;
+    m_clipboardRetryCount[id] = 0;
 
     bool hasFileList = false;
     if (id == kClipboardClipboard) {
@@ -729,6 +744,11 @@ Client::cleanupConnection()
 void
 Client::cleanupScreen()
 {
+    cleanupClipboardRetryTimer();
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        m_clipboardRetryPending[id] = false;
+        m_clipboardRetryCount[id] = 0;
+    }
     if (m_server != NULL) {
         if (m_ready) {
             m_screen->disable();
@@ -740,6 +760,55 @@ Client::cleanupScreen()
                             getEventTarget());
         delete m_server;
         m_server = NULL;
+    }
+}
+
+void
+Client::cleanupClipboardRetryTimer()
+{
+    if (m_clipboardRetryTimer != NULL) {
+        m_events->removeHandler(Event::kTimer, m_clipboardRetryTimer);
+        m_events->deleteTimer(m_clipboardRetryTimer);
+        m_clipboardRetryTimer = NULL;
+    }
+}
+
+bool
+Client::hasPendingClipboardRetry() const
+{
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        if (m_clipboardRetryPending[id]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void
+Client::scheduleClipboardRetry(ClipboardID id)
+{
+    if (id >= kClipboardEnd) {
+        return;
+    }
+
+    if (m_clipboardRetryCount[id] >= kClipboardReadRetryLimit) {
+        LOG((CLOG_WARN "clipboard %d could not be read after %u deferred retry attempt(s); keeping previous data",
+            id, kClipboardReadRetryLimit));
+        m_clipboardRetryPending[id] = false;
+        m_clipboardRetryCount[id] = 0;
+        if (!hasPendingClipboardRetry()) {
+            cleanupClipboardRetryTimer();
+        }
+        return;
+    }
+
+    m_clipboardRetryPending[id] = true;
+    if (m_clipboardRetryTimer == NULL) {
+        m_clipboardRetryTimer =
+            m_events->newOneShotTimer(kClipboardReadRetrySeconds, NULL);
+        m_events->adoptHandler(Event::kTimer, m_clipboardRetryTimer,
+                            new TMethodEventJob<Client>(this,
+                                &Client::handleClipboardRetry));
     }
 }
 
@@ -771,8 +840,11 @@ Client::handleConnected(const Event&, void*)
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         m_ownClipboard[id]  = false;
         m_sentClipboard[id] = false;
+        m_clipboardRetryPending[id] = false;
+        m_clipboardRetryCount[id] = 0;
         m_timeClipboard[id] = 0;
     }
+    cleanupClipboardRetryTimer();
 }
 
 void
@@ -844,11 +916,38 @@ Client::handleClipboardGrabbed(const Event& event, void*)
     m_ownClipboard[info->m_id]  = true;
     m_sentClipboard[info->m_id] = false;
     m_timeClipboard[info->m_id] = 0;
+    m_clipboardRetryPending[info->m_id] = false;
+    m_clipboardRetryCount[info->m_id] = 0;
 
     // if we're not the active screen then send the clipboard now,
     // otherwise we'll wait until we leave.
     if (!m_active) {
         sendClipboard(info->m_id);
+    }
+}
+
+void
+Client::handleClipboardRetry(const Event&, void*)
+{
+    cleanupClipboardRetryTimer();
+
+    if (!m_enableClipboard || m_server == NULL) {
+        for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+            m_clipboardRetryPending[id] = false;
+            m_clipboardRetryCount[id] = 0;
+        }
+        return;
+    }
+
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        if (!m_clipboardRetryPending[id]) {
+            continue;
+        }
+
+        ++m_clipboardRetryCount[id];
+        LOG((CLOG_DEBUG "retrying deferred clipboard %d read, attempt %u",
+            id, m_clipboardRetryCount[id]));
+        sendClipboard(id);
     }
 }
 

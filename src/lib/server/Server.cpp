@@ -60,6 +60,8 @@
 namespace {
 
 const SInt32 kMinUsableScreenDimension = 64;
+const int kClipboardReadAttempts = 8;
+const double kClipboardReadRetrySeconds = 0.025;
 
 bool prepareTransferSource(const char* filename,
                            barrier::fs::path& sourcePath,
@@ -125,6 +127,25 @@ bool hasValidClientShape(BaseClientProxy* client)
         return false;
     }
     return true;
+}
+
+bool readClipboardWithRetry(BaseClientProxy* sender, ClipboardID id, Clipboard& clipboard)
+{
+    for (int attempt = 0; attempt < kClipboardReadAttempts; ++attempt) {
+        if (sender->getClipboard(id, &clipboard)) {
+            if (attempt > 0) {
+                LOG((CLOG_DEBUG "clipboard %d read from \"%s\" succeeded after %d retry attempt(s)",
+                    id, sender->getName().c_str(), attempt));
+            }
+            return true;
+        }
+
+        ARCH->sleep(kClipboardReadRetrySeconds);
+    }
+
+    LOG((CLOG_WARN "clipboard %d could not be read from \"%s\" after %d attempts; preserving previous data",
+        id, sender->getName().c_str(), kClipboardReadAttempts));
+    return false;
 }
 
 bool isReturnToPrimaryHotKey(KeyID id, KeyModifierMask mask)
@@ -712,17 +733,8 @@ Server::switchScreen(BaseClientProxy* dst,
 		m_xDelta2 = 0;
 		m_yDelta2 = 0;
 
-		// update the primary client's clipboards if we're leaving the
-		// primary screen.
 		if (m_active == m_primaryClient && m_enableClipboard) {
-			for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-				ClipboardInfo& clipboard = m_clipboards[id];
-				if (clipboard.m_clipboardOwner == getName(m_primaryClient) &&
-					clipboard.m_pendingPrimaryFetch) {
-					onClipboardChanged(m_primaryClient,
-						id, clipboard.m_clipboardSeqNum);
-				}
-			}
+			fetchPendingPrimaryClipboards();
 		}
 
 		// cut over
@@ -739,23 +751,7 @@ Server::switchScreen(BaseClientProxy* dst,
 			m_primaryClient->refreshKeyState();
 		}
 
-		if (m_enableClipboard) {
-			// send the clipboard data to new active screen
-			for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-				m_active->setClipboard(id, &m_clipboards[id].m_clipboard);
-
-				if (id == kClipboardClipboard &&
-					m_active != m_primaryClient &&
-					m_clipboards[id].m_clipboardOwner == getName(m_primaryClient)) {
-					RemoteFileClipboard::Data remoteFileClipboard;
-					if (RemoteFileClipboard::readFromClipboard(
-							m_clipboards[id].m_clipboard, remoteFileClipboard) &&
-						remoteFileClipboard.mode == RemoteFileClipboard::Mode::SourcePaths) {
-						sendClipboardSelectionToClient(m_active, remoteFileClipboard.paths);
-					}
-				}
-			}
-		}
+		replayClipboardsToActive();
 
 		Server::SwitchToScreenInfo* info =
 			Server::SwitchToScreenInfo::alloc(m_active->getName());
@@ -821,6 +817,46 @@ Server::recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y)
 	noSwitch(m_x, m_y);
 	m_primaryLeaveFailedRecently = true;
 	m_primaryLeaveFailureTimer.reset();
+}
+
+void
+Server::fetchPendingPrimaryClipboards()
+{
+    if (!m_enableClipboard) {
+        return;
+    }
+
+    const std::string primaryName = getName(m_primaryClient);
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        ClipboardInfo& clipboard = m_clipboards[id];
+        if (clipboard.m_clipboardOwner == primaryName &&
+            clipboard.m_pendingPrimaryFetch) {
+            onClipboardChanged(m_primaryClient, id, clipboard.m_clipboardSeqNum);
+        }
+    }
+}
+
+void
+Server::replayClipboardsToActive()
+{
+    if (!m_enableClipboard || m_active == NULL) {
+        return;
+    }
+
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        m_active->setClipboard(id, &m_clipboards[id].m_clipboard);
+
+        if (id == kClipboardClipboard &&
+            m_active != m_primaryClient &&
+            m_clipboards[id].m_clipboardOwner == getName(m_primaryClient)) {
+            RemoteFileClipboard::Data remoteFileClipboard;
+            if (RemoteFileClipboard::readFromClipboard(
+                    m_clipboards[id].m_clipboard, remoteFileClipboard) &&
+                remoteFileClipboard.mode == RemoteFileClipboard::Mode::SourcePaths) {
+                sendClipboardSelectionToClient(m_active, remoteFileClipboard.paths);
+            }
+        }
+    }
 }
 
 void
@@ -2027,7 +2063,9 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 	assert(sender == m_clients.find(clipboard.m_clipboardOwner)->second);
 
 	// get data
-	sender->getClipboard(id, &clipboard.m_clipboard);
+	if (!readClipboardWithRetry(sender, id, clipboard.m_clipboard)) {
+		return;
+	}
 
 	bool hasFileList = false;
 	if (id == kClipboardClipboard) {
@@ -3060,6 +3098,7 @@ Server::forceLeaveClient(BaseClientProxy* client)
 			m_yDelta = 0;
 			m_xDelta2 = 0;
 			m_yDelta2 = 0;
+			replayClipboardsToActive();
 			m_primaryLeaveFailedRecently = true;
 			m_primaryLeaveFailureTimer.reset();
 		}
@@ -3078,6 +3117,7 @@ Server::forceLeaveClient(BaseClientProxy* client)
 									m_primaryClient->getToggleMask(), false);
 				m_primaryClient->refreshKeyState();
 			}
+			replayClipboardsToActive();
 
 			Server::SwitchToScreenInfo* info =
 				Server::SwitchToScreenInfo::alloc(m_active->getName());

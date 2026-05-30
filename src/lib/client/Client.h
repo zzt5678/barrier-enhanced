@@ -200,12 +200,16 @@ private:
     void                handleDisconnected(const Event&, void*);
     void                handleShapeChanged(const Event&, void*);
     void                handleClipboardGrabbed(const Event&, void*);
+    void                handleClipboardRetry(const Event&, void*);
     void                handleHello(const Event&, void*);
     void                handleSuspend(const Event& event, void*);
     void                handleResume(const Event& event, void*);
     void                handleFileChunkSending(const Event&, void*);
     void                handleFileRecieveCompleted(const Event&, void*);
     void                handleStopRetry(const Event&, void*);
+    void                cleanupClipboardRetryTimer();
+    void                scheduleClipboardRetry(ClipboardID id);
+    bool                hasPendingClipboardRetry() const;
     void                onFileRecieveCompleted();
     void                publishMaterializedFileClipboard(const std::vector<std::string>& paths,
                                                          const std::string& sessionId);
@@ -222,6 +226,7 @@ private:
     barrier::Screen*    m_screen;
     barrier::IStream*    m_stream;
     EventQueueTimer*    m_timer;
+    EventQueueTimer*    m_clipboardRetryTimer;
     ServerProxy*        m_server;
     bool                m_ready;
     bool                m_active;
@@ -229,6 +234,8 @@ private:
     bool                m_connectOnResume;
     bool                m_ownClipboard[kClipboardEnd];
     bool                m_sentClipboard[kClipboardEnd];
+    bool                m_clipboardRetryPending[kClipboardEnd];
+    UInt32              m_clipboardRetryCount[kClipboardEnd];
     IClipboard::Time    m_timeClipboard[kClipboardEnd];
     std::string m_dataClipboard[kClipboardEnd];
     IEventQueue*        m_events;

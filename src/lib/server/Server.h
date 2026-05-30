@@ -335,6 +335,8 @@ private:
     void                recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y);
     bool                sendClipboardFileSelection(BaseClientProxy* sender,
                             ClipboardID id, const Clipboard& clipboard);
+    void                fetchPendingPrimaryClipboards();
+    void                replayClipboardsToActive();
     void                onClipboardChanged(BaseClientProxy* sender,
                             ClipboardID id, UInt32 seqNum);
     void                onScreensaver(bool activated);
