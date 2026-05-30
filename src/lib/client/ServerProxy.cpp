@@ -50,6 +50,7 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_dxMouse(0),
     m_dyMouse(0),
     m_ignoreMouse(false),
+    m_infoAckTimer(true),
     m_lowLatencyMode(false),
     m_nestedRemoteMode(false),
     m_keepAliveAlarm(0.0),
@@ -358,9 +359,21 @@ ServerProxy::onInfoChanged()
     // ignore mouse motion until we receive acknowledgment of our info
     // change message.
     m_ignoreMouse = true;
+    m_infoAckTimer.start();
+    m_infoAckTimer.reset();
 
     // send info update
     queryInfo();
+}
+
+void
+ServerProxy::clearStaleInfoAckGate()
+{
+    if (m_ignoreMouse && m_infoAckTimer.getTime() > 2.0) {
+        LOG((CLOG_WARN "clearing stale mouse gate after missing info acknowledgment"));
+        m_ignoreMouse = false;
+        queryInfo();
+    }
 }
 
 bool
@@ -547,6 +560,7 @@ ServerProxy::enter()
     m_dxMouse               = 0;
     m_dyMouse               = 0;
     m_seqNum                = seqNum;
+    m_ignoreMouse           = false;
 
     // forward
     m_client->enter(x, y, seqNum, static_cast<KeyModifierMask>(mask), false);
@@ -718,6 +732,7 @@ ServerProxy::mouseMove()
     ProtocolUtil::readf(m_stream, kMsgDMouseMove + 4, &x, &y);
 
     // note if we should ignore the move
+    clearStaleInfoAckGate();
     ignore = m_ignoreMouse;
 
     // compress mouse motion events if more input follows
@@ -752,6 +767,7 @@ ServerProxy::mouseRelativeMove()
     ProtocolUtil::readf(m_stream, kMsgDMouseRelMove + 4, &dx, &dy);
 
     // note if we should ignore the move
+    clearStaleInfoAckGate();
     ignore = m_ignoreMouse;
 
     // compress mouse motion events if more input follows

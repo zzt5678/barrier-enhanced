@@ -108,6 +108,7 @@ MSWindowsScreen::MSWindowsScreen(
     m_mark(0),
     m_markReceived(0),
     m_fixTimer(NULL),
+    m_pendingShapeRefresh(false),
     m_keyLayout(NULL),
     m_screensaver(NULL),
     m_screensaverNotify(false),
@@ -791,6 +792,22 @@ MSWindowsScreen::fakeMouseButton(ButtonID id, bool press)
 void
 MSWindowsScreen::fakeMouseMove(SInt32 x, SInt32 y)
 {
+    if (m_pendingShapeRefresh) {
+        LOG((CLOG_DEBUG "refreshing pending Windows screen shape before mouse move"));
+        onDisplayChange();
+    }
+
+    if (m_w < 64 || m_h < 64) {
+        LOG((CLOG_WARN "refreshing invalid Windows screen shape before mouse move: %+d,%+d %dx%d",
+            m_x, m_y, m_w, m_h));
+        updateScreenShape();
+        if (m_w < 64 || m_h < 64) {
+            LOG((CLOG_WARN "ignoring mouse move for invalid Windows screen shape: %+d,%+d %dx%d",
+                m_x, m_y, m_w, m_h));
+            return;
+        }
+    }
+
     const SInt32 minX = m_x;
     const SInt32 minY = m_y;
     const SInt32 maxX = m_x + m_w - 1;
@@ -1136,6 +1153,7 @@ MSWindowsScreen::onEvent(HWND, UINT msg,
         case PBT_APMRESUMEAUTOMATIC:
         case PBT_APMRESUMECRITICAL:
         case PBT_APMRESUMESUSPEND:
+            onDisplayChange();
             m_events->addEvent(Event(m_events->forIScreen().resume(),
                             getEventTarget(), NULL,
                             Event::kDeliverImmediately));
@@ -1522,7 +1540,9 @@ MSWindowsScreen::onDisplayChange()
     SInt32 xOld = m_x, yOld = m_y, wOld = m_w, hOld = m_h;
 
     // update shape
-    updateScreenShape();
+    if (!updateScreenShape()) {
+        return true;
+    }
 
     // do nothing if resolution hasn't changed
     if (xOld != m_x || yOld != m_y || wOld != m_w || hOld != m_h) {
@@ -1641,28 +1661,47 @@ MSWindowsScreen::ignore() const
     return (m_mark != m_markReceived);
 }
 
-void
+bool
 MSWindowsScreen::updateScreenShape()
 {
     // get shape and center
-    m_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    m_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    m_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    m_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    m_xCenter = GetSystemMetrics(SM_CXSCREEN) >> 1;
-    m_yCenter = GetSystemMetrics(SM_CYSCREEN) >> 1;
+    const SInt32 w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const SInt32 h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    const SInt32 x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const SInt32 y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const SInt32 primaryW = GetSystemMetrics(SM_CXSCREEN);
+    const SInt32 primaryH = GetSystemMetrics(SM_CYSCREEN);
+    if (w < 64 || h < 64 || primaryW < 64 || primaryH < 64) {
+        LOG((CLOG_WARN "ignoring transient Windows screen shape: %+d,%+d %dx%d primary=%dx%d",
+            x, y, w, h, primaryW, primaryH));
+        m_pendingShapeRefresh = true;
+        return false;
+    }
+
+    m_pendingShapeRefresh = false;
+    m_w = w;
+    m_h = h;
+    m_x = x;
+    m_y = y;
+    m_xCenter = primaryW >> 1;
+    m_yCenter = primaryH >> 1;
 
     // check for multiple monitors
-    m_multimon = (m_w != GetSystemMetrics(SM_CXSCREEN) ||
-                  m_h != GetSystemMetrics(SM_CYSCREEN));
+    m_multimon = (m_w != primaryW || m_h != primaryH);
 
     // tell the desks
     m_desks->setShape(m_x, m_y, m_w, m_h, m_xCenter, m_yCenter, m_multimon);
+    return true;
 }
 
 void
 MSWindowsScreen::handleFixes(const Event&, void*)
 {
+    if (m_pendingShapeRefresh) {
+        LOG((CLOG_DEBUG "retrying pending Windows screen shape refresh"));
+        onDisplayChange();
+    }
+
     // fix clipboard chain
     fixClipboardViewer();
 

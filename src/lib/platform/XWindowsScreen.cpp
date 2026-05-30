@@ -299,20 +299,7 @@ XWindowsScreen::enter()
         m_impl->XSetInputFocus(m_display, m_lastFocus, m_lastFocusRevert, CurrentTime);
 	}
 
-	#if HAVE_X11_EXTENSIONS_DPMS_H
-	// Force the DPMS to turn screen back on since we don't
-	// actually cause physical hardware input to trigger it
-	int dummy;
-	CARD16 powerlevel;
-	BOOL enabled;
-    if (m_impl->DPMSQueryExtension(m_display, &dummy, &dummy) &&
-        m_impl->DPMSCapable(m_display) &&
-        m_impl->DPMSInfo(m_display, &powerlevel, &enabled))
-	{
-		if (enabled && powerlevel != DPMSModeOn)
-            m_impl->DPMSForceLevel(m_display, DPMSModeOn);
-	}
-	#endif
+	wakeDisplayFromPowerSave();
 
 	// unmap the hider/grab window.  this also ungrabs the mouse and
 	// keyboard if they're grabbed.
@@ -344,6 +331,8 @@ XWindowsScreen::enter()
 bool
 XWindowsScreen::leave()
 {
+	wakeDisplayFromPowerSave();
+
 	if (!m_isPrimary) {
 		// restore the previous keyboard auto-repeat state.  if the user
 		// changed the auto-repeat configuration while on the client then
@@ -396,6 +385,27 @@ XWindowsScreen::leave()
 	m_isOnScreen = false;
 
 	return true;
+}
+
+void
+XWindowsScreen::wakeDisplayFromPowerSave()
+{
+#if HAVE_X11_EXTENSIONS_DPMS_H
+	// Synthetic input does not reliably wake DPMS before we try to grab or warp.
+	int dummy;
+	CARD16 powerlevel;
+	BOOL enabled;
+	if (m_impl->DPMSQueryExtension(m_display, &dummy, &dummy) &&
+		m_impl->DPMSCapable(m_display) &&
+		m_impl->DPMSInfo(m_display, &powerlevel, &enabled)) {
+		if (enabled && powerlevel != DPMSModeOn) {
+			LOG((CLOG_INFO "waking X11 display from DPMS mode before input transition"));
+			m_impl->DPMSForceLevel(m_display, DPMSModeOn);
+			m_impl->XSync(m_display, False);
+			ARCH->sleep(0.05);
+		}
+	}
+#endif
 }
 
 bool
@@ -1338,21 +1348,30 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 			}
 			else if (cookie->evtype == XI_RawMotion) {
 				// Get current pointer's position
-				Window root, child;
-				XMotionEvent xmotion;
+				XMotionEvent xmotion = {};
 				xmotion.type = MotionNotify;
 				xmotion.send_event = False; // Raw motion
 				xmotion.display = m_display;
 				xmotion.window = m_window;
 				/* xmotion's time, state and is_hint are not used */
 				unsigned int msk;
-                    xmotion.same_screen = m_impl->XQueryPointer(
+				xmotion.same_screen = m_impl->XQueryPointer(
 						m_display, m_root, &xmotion.root, &xmotion.subwindow,
 						&xmotion.x_root,
 						&xmotion.y_root,
 						&xmotion.x,
 						&xmotion.y,
 						&msk);
+				if (!xmotion.same_screen) {
+					LOG((CLOG_WARN "ignoring XI2 raw motion because XQueryPointer failed"));
+					m_impl->XFreeEventData(m_display, cookie);
+					return;
+				}
+				if (!normalizeToScreenShape("XI2 raw motion",
+						m_x, m_y, m_w, m_h, xmotion.x_root, xmotion.y_root)) {
+					m_impl->XFreeEventData(m_display, cookie);
+					return;
+				}
 					onMouseMove(xmotion);
                     m_impl->XFreeEventData(m_display, cookie);
 					return;
@@ -1686,6 +1705,10 @@ void
 XWindowsScreen::onMouseMove(const XMotionEvent& xmotion)
 {
 	LOG((CLOG_DEBUG2 "event: MotionNotify %d,%d", xmotion.x_root, xmotion.y_root));
+	if (!xmotion.same_screen) {
+		LOG((CLOG_WARN "ignoring motion event outside the current X11 screen"));
+		return;
+	}
 
 	// compute motion delta (relative to the last known
 	// mouse position)

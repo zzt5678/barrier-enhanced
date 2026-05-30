@@ -330,6 +330,9 @@ private:
     void                handleFileClipboardReadyEvent(const Event&, void*);
 
     // event processing
+    bool                canLeavePrimaryNow(const char* reason);
+    void                recoverToPrimaryFromActive(const char* reason);
+    void                recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y);
     bool                sendClipboardFileSelection(BaseClientProxy* sender,
                             ClipboardID id, const Clipboard& clipboard);
     void                onClipboardChanged(BaseClientProxy* sender,
@@ -511,6 +514,8 @@ private:
     // by disabling Nagle algorithm, larger buffers, and faster timeouts
     bool                m_lowLatencyMode;
     bool                m_nestedRemoteMode;
+    bool                m_primaryLeaveFailedRecently;
+    Stopwatch           m_primaryLeaveFailureTimer;
 
     Thread*                m_sendDragInfoThread;
     bool                m_waitDragInfoThread;

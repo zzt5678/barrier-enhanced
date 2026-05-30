@@ -128,6 +128,7 @@ private:
     Window                openWindow() const;
     void                openIM();
 
+    void                wakeDisplayFromPowerSave();
     bool                grabMouseAndKeyboard();
     void                onKeyPress(XKeyEvent&);
     void                onKeyRelease(XKeyEvent&, bool isRepeat);

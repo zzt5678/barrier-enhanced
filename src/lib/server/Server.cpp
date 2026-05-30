@@ -59,6 +59,8 @@
 
 namespace {
 
+const SInt32 kMinUsableScreenDimension = 64;
+
 bool prepareTransferSource(const char* filename,
                            barrier::fs::path& sourcePath,
                            barrier::fs::path& tempPackagePath,
@@ -90,8 +92,8 @@ bool clampToClientShape(BaseClientProxy* client, SInt32& x, SInt32& y)
     SInt32 sx, sy, sw, sh;
     client->getShape(sx, sy, sw, sh);
 
-    if (sw <= 0 || sh <= 0) {
-        LOG((CLOG_WARN "ignoring invalid screen shape for \"%s\": %d,%d %dx%d",
+    if (sw < kMinUsableScreenDimension || sh < kMinUsableScreenDimension) {
+        LOG((CLOG_WARN "ignoring unusable screen shape for \"%s\": %d,%d %dx%d",
             client->getName().c_str(), sx, sy, sw, sh));
         return false;
     }
@@ -110,6 +112,18 @@ bool clampToClientShape(BaseClientProxy* client, SInt32& x, SInt32& y)
         y = sy + sh - 1;
     }
 
+    return true;
+}
+
+bool hasValidClientShape(BaseClientProxy* client)
+{
+    SInt32 sx, sy, sw, sh;
+    client->getShape(sx, sy, sw, sh);
+    if (sw < kMinUsableScreenDimension || sh < kMinUsableScreenDimension) {
+        LOG((CLOG_WARN "unusable screen shape for \"%s\": %d,%d %dx%d",
+            client->getName().c_str(), sx, sy, sw, sh));
+        return false;
+    }
     return true;
 }
 
@@ -243,6 +257,8 @@ Server::Server(
 	m_localShortcutMode(false),
 	m_lowLatencyMode(false),
 	m_nestedRemoteMode(false),
+	m_primaryLeaveFailedRecently(false),
+	m_primaryLeaveFailureTimer(true),
 	m_sendDragInfoThread(NULL),
 	m_waitDragInfoThread(true),
 	m_args(args)
@@ -633,6 +649,18 @@ Server::switchScreen(BaseClientProxy* dst,
 {
 	assert(dst != NULL);
 
+	if (!clampToClientShape(dst, x, y)) {
+		LOG((CLOG_WARN "refusing to switch to \"%s\" with unusable destination shape",
+			getName(dst).c_str()));
+		stopSwitch();
+		return;
+	}
+
+	if (m_active == m_primaryClient && dst != m_primaryClient &&
+		!canLeavePrimaryNow("screen switch")) {
+		return;
+	}
+
 #ifndef NDEBUG
 	{
 		SInt32 dx, dy, dw, dh;
@@ -647,30 +675,42 @@ Server::switchScreen(BaseClientProxy* dst,
 	// stop waiting to switch
 	stopSwitch();
 
-	// record new position
-	m_x       = x;
-	m_y       = y;
-	m_xDelta  = 0;
-	m_yDelta  = 0;
-	m_xDelta2 = 0;
-	m_yDelta2 = 0;
-
 	// wrapping means leaving the active screen and entering it again.
 	// since that's a waste of time we skip that and just warp the
 	// mouse.
 	if (m_active != dst) {
-		// When leaving the primary screen, release any locally
-		// synthesized keys so modifier state cannot leak across screens.
-		if (m_active == m_primaryClient) {
-			m_screen->fakeAllKeysUp();
-		}
+		BaseClientProxy* oldActive = m_active;
+		const SInt32 oldX = m_x;
+		const SInt32 oldY = m_y;
 
 		// leave active screen
 		if (!m_active->leave()) {
 			// cannot leave screen
 			LOG((CLOG_WARN "can't leave screen"));
+			m_x = oldX;
+			m_y = oldY;
+			m_xDelta = 0;
+			m_yDelta = 0;
+			m_xDelta2 = 0;
+			m_yDelta2 = 0;
+			if (oldActive == m_primaryClient) {
+				recoverPrimaryAfterSwitchFailure(oldX, oldY);
+			}
 			return;
 		}
+
+		m_primaryLeaveFailedRecently = false;
+		if (oldActive == m_primaryClient) {
+			m_screen->fakeAllKeysUp();
+		}
+
+		// record new position
+		m_x       = x;
+		m_y       = y;
+		m_xDelta  = 0;
+		m_yDelta  = 0;
+		m_xDelta2 = 0;
+		m_yDelta2 = 0;
 
 		// update the primary client's clipboards if we're leaving the
 		// primary screen.
@@ -722,8 +762,91 @@ Server::switchScreen(BaseClientProxy* dst,
 		m_events->addEvent(Event(m_events->forServer().screenSwitched(), this, info));
 	}
 	else {
+		m_x       = x;
+		m_y       = y;
+		m_xDelta  = 0;
+		m_yDelta  = 0;
+		m_xDelta2 = 0;
+		m_yDelta2 = 0;
 		m_active->mouseMove(x, y);
 	}
+}
+
+bool
+Server::canLeavePrimaryNow(const char* reason)
+{
+	if (m_active != m_primaryClient || !m_primaryLeaveFailedRecently) {
+		return true;
+	}
+
+	if (m_primaryLeaveFailureTimer.getTime() < 2.0) {
+		LOG((CLOG_WARN "suppressing %s while primary input recovery settles", reason));
+		stopSwitch();
+		return false;
+	}
+
+	m_primaryLeaveFailedRecently = false;
+	return true;
+}
+
+void
+Server::recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y)
+{
+	SInt32 ax, ay, aw, ah;
+	m_primaryClient->getShape(ax, ay, aw, ah);
+	if (aw < kMinUsableScreenDimension || ah < kMinUsableScreenDimension) {
+		LOG((CLOG_WARN "cannot reanchor primary after failed leave; unusable primary shape %d,%d %dx%d",
+			ax, ay, aw, ah));
+		m_primaryLeaveFailedRecently = true;
+		m_primaryLeaveFailureTimer.reset();
+		return;
+	}
+
+	const SInt32 zone = getJumpZoneSize(m_primaryClient);
+	const SInt32 margin = std::max<SInt32>(zone + 8, 16);
+	SInt32 safeX = x;
+	SInt32 safeY = y;
+	if (safeX < ax + margin || safeX >= ax + aw - margin) {
+		safeX = ax + aw / 2;
+	}
+	if (safeY < ay + margin || safeY >= ay + ah - margin) {
+		safeY = ay + ah / 2;
+	}
+
+	LOG((CLOG_WARN "reanchoring primary at %d,%d after failed leave", safeX, safeY));
+	m_x = safeX;
+	m_y = safeY;
+	m_primaryClient->mouseMove(m_x, m_y);
+	m_primaryClient->refreshKeyState();
+	noSwitch(m_x, m_y);
+	m_primaryLeaveFailedRecently = true;
+	m_primaryLeaveFailureTimer.reset();
+}
+
+void
+Server::recoverToPrimaryFromActive(const char* reason)
+{
+	if (m_active == m_primaryClient) {
+		return;
+	}
+
+	LOG((CLOG_WARN "recovering to primary after %s while \"%s\" was active",
+		reason, getName(m_active).c_str()));
+	stopSwitch();
+
+	SInt32 x, y;
+	m_primaryClient->getCursorCenter(x, y);
+	if (clampToClientShape(m_primaryClient, x, y)) {
+		switchScreen(m_primaryClient, x, y, false);
+	}
+	else {
+		LOG((CLOG_WARN "primary shape is not valid; notifying active client to leave before local fallback"));
+		m_active->leave();
+		forceLeaveClient(m_active);
+	}
+
+	m_primaryLeaveFailedRecently = true;
+	m_primaryLeaveFailureTimer.reset();
 }
 
 void
@@ -842,6 +965,11 @@ Server::getNeighbor(BaseClientProxy* src,
 		// ready then we can stop.
 		ClientList::const_iterator index = m_clients.find(dstName);
 		if (index != m_clients.end()) {
+			if (!hasValidClientShape(index->second)) {
+				LOG((CLOG_WARN "ignoring neighbor \"%s\" with unusable screen shape",
+					dstName.c_str()));
+				return NULL;
+			}
 			LOG((CLOG_DEBUG2 "\"%s\" is on %s of \"%s\" at %f", dstName.c_str(), Config::dirName(dir), srcName.c_str(), t));
 			mapToPixel(index->second, dir, tTmp, x, y);
 			return index->second;
@@ -1017,6 +1145,10 @@ Server::isSwitchOkay(BaseClientProxy* newScreen,
 				SInt32 xActive, SInt32 yActive)
 {
 	LOG((CLOG_DEBUG1 "try to leave \"%s\" on %s", getName(m_active).c_str(), Config::dirName(dir)));
+
+	if (!canLeavePrimaryNow("edge switch")) {
+		return false;
+	}
 
 	// is there a neighbor?
 	if (newScreen == NULL) {
@@ -1471,9 +1603,25 @@ Server::handleShapeChanged(const Event&, void* vclient)
 
 	LOG((CLOG_DEBUG "screen \"%s\" shape changed", getName(client).c_str()));
 
+	if (!hasValidClientShape(client)) {
+		if (client == m_primaryClient && m_active != m_primaryClient) {
+			recoverToPrimaryFromActive("invalid primary screen shape");
+		}
+		else if (client == m_active && client != m_primaryClient) {
+			recoverToPrimaryFromActive("invalid active client screen shape");
+		}
+		return;
+	}
+
 	// update jump coordinate
 	SInt32 x, y;
-	client->getCursorPos(x, y);
+	if (client == m_active) {
+		x = m_x;
+		y = m_y;
+	}
+	else {
+		client->getCursorPos(x, y);
+	}
 	if (!clampToClientShape(client, x, y)) {
 		return;
 	}
@@ -1503,7 +1651,7 @@ Server::handleShapeChanged(const Event&, void* vclient)
 		else {
 			LOG((CLOG_WARN "returning to primary after primary screen shape changed while \"%s\" was active",
 				getName(m_active).c_str()));
-			forceLeaveClient(m_active);
+			recoverToPrimaryFromActive("primary screen shape changed");
 		}
 	}
 }
@@ -1657,6 +1805,12 @@ Server::handleScreensaverDeactivatedEvent(const Event&, void*)
 void
 Server::handleSwitchWaitTimeout(const Event&, void*)
 {
+	if (m_switchScreen == NULL || m_clientSet.count(m_switchScreen) == 0) {
+		LOG((CLOG_WARN "canceling delayed switch to unavailable screen"));
+		stopSwitch();
+		return;
+	}
+
 	// ignore if mouse is locked to screen
 	if (isLockedToScreen()) {
 		LOG((CLOG_DEBUG1 "locked to screen"));
@@ -2251,6 +2405,12 @@ Server::onMouseMovePrimary(SInt32 x, SInt32 y)
 	// get screen shape
 	SInt32 ax, ay, aw, ah;
 	m_active->getShape(ax, ay, aw, ah);
+	if (aw < kMinUsableScreenDimension || ah < kMinUsableScreenDimension) {
+		LOG((CLOG_WARN "primary screen has unusable shape during local motion: %d,%d %dx%d",
+			ax, ay, aw, ah));
+		noSwitch(m_x, m_y);
+		return false;
+	}
 	SInt32 zoneSize = getJumpZoneSize(m_active);
 
 	// clamp position to screen
@@ -2419,6 +2579,12 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 	// get screen shape
 	SInt32 ax, ay, aw, ah;
 	m_active->getShape(ax, ay, aw, ah);
+	if (aw < kMinUsableScreenDimension || ah < kMinUsableScreenDimension) {
+		LOG((CLOG_WARN "active screen \"%s\" has unusable shape during secondary motion: %d,%d %dx%d",
+			getName(m_active).c_str(), ax, ay, aw, ah));
+		recoverToPrimaryFromActive("invalid active client shape during motion");
+		return;
+	}
 
 	// find direction of neighbor and get the neighbor
 	bool jump = true;
@@ -2870,34 +3036,53 @@ Server::removeOldClient(BaseClientProxy* client)
 void
 Server::forceLeaveClient(BaseClientProxy* client)
 {
+	if (m_switchScreen == client) {
+		stopSwitch();
+	}
+
 	BaseClientProxy* active =
 		(m_activeSaver != NULL) ? m_activeSaver : m_active;
 	if (active == client) {
 		// record new position (center of primary screen)
 		m_primaryClient->getCursorCenter(m_x, m_y);
+		const bool primaryUsable = clampToClientShape(m_primaryClient, m_x, m_y);
 
 		// stop waiting to switch to this client
 		if (active == m_switchScreen) {
 			stopSwitch();
 		}
 
-		// don't notify active screen since it has probably already
-		// disconnected.
-		LOG((CLOG_INFO "jump from \"%s\" to \"%s\" at %d,%d", getName(active).c_str(), getName(m_primaryClient).c_str(), m_x, m_y));
-
-		// cut over
-		m_active = m_primaryClient;
-
-		// enter new screen (unless we already have because of the
-		// screen saver)
-		if (m_activeSaver == NULL) {
-			m_primaryClient->enter(m_x, m_y, m_seqNum,
-								m_primaryClient->getToggleMask(), false);
+		if (!primaryUsable) {
+			LOG((CLOG_WARN "holding local input on primary after \"%s\" left; primary shape is not usable yet",
+				getName(active).c_str()));
+			m_active = m_primaryClient;
+			m_xDelta = 0;
+			m_yDelta = 0;
+			m_xDelta2 = 0;
+			m_yDelta2 = 0;
+			m_primaryLeaveFailedRecently = true;
+			m_primaryLeaveFailureTimer.reset();
 		}
+		else {
+			// don't notify active screen since it has probably already
+			// disconnected.
+			LOG((CLOG_INFO "jump from \"%s\" to \"%s\" at %d,%d", getName(active).c_str(), getName(m_primaryClient).c_str(), m_x, m_y));
 
-		Server::SwitchToScreenInfo* info =
-			Server::SwitchToScreenInfo::alloc(m_active->getName());
-		m_events->addEvent(Event(m_events->forServer().screenSwitched(), this, info));
+			// cut over
+			m_active = m_primaryClient;
+
+			// enter new screen (unless we already have because of the
+			// screen saver)
+			if (m_activeSaver == NULL) {
+				m_primaryClient->enter(m_x, m_y, m_seqNum,
+									m_primaryClient->getToggleMask(), false);
+				m_primaryClient->refreshKeyState();
+			}
+
+			Server::SwitchToScreenInfo* info =
+				Server::SwitchToScreenInfo::alloc(m_active->getName());
+			m_events->addEvent(Event(m_events->forServer().screenSwitched(), this, info));
+		}
 	}
 
 	// if this screen had the cursor when the screen saver activated

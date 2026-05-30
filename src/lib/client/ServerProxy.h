@@ -73,6 +73,7 @@ private:
     // if compressing mouse motion then send the last motion now
     void                flushCompressedMouse();
     bool                shouldCompressMouseMoves() const;
+    void                clearStaleInfoAckGate();
 
     void                sendInfo(const ClientInfo&);
 
@@ -123,6 +124,7 @@ private:
     SInt32                m_dxMouse, m_dyMouse;
 
     bool                m_ignoreMouse;
+    Stopwatch           m_infoAckTimer;
     bool                m_lowLatencyMode;
     bool                m_nestedRemoteMode;
 

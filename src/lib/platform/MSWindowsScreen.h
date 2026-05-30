@@ -181,7 +181,7 @@ private: // HACK
     bool                ignore() const;
 
     // update screen size cache
-    void                updateScreenShape();
+    bool                updateScreenShape();
 
     // fix timer callback
     void                handleFixes(const Event&, void*);
@@ -279,6 +279,7 @@ private:
 
     // timer for periodically checking stuff that requires polling
     EventQueueTimer*    m_fixTimer;
+    bool                m_pendingShapeRefresh;
 
     // the keyboard layout to use when off primary screen
     HKL                    m_keyLayout;
