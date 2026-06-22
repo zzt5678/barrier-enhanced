@@ -38,5 +38,7 @@ enum qIpcClientType {
 
 extern const char*        kIpcMsgHello;
 extern const char*        kIpcMsgLogLine;
+// Command argument 2 is the Windows elevation mode: 0 as-needed, 1 always,
+// 2 never.
 extern const char*        kIpcMsgCommand;
 extern const char*        kIpcMsgShutdown;

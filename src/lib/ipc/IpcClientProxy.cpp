@@ -33,7 +33,10 @@
 IpcClientProxy::IpcClientProxy(barrier::IStream& stream, IEventQueue* events) :
     m_stream(stream),
     m_clientType(kIpcClientUnknown),
+    m_processId(0),
     m_disconnecting(false),
+    m_deleting(false),
+    m_sendRefCount(0),
     m_events(events)
 {
     m_events->adoptHandler(
@@ -68,12 +71,45 @@ IpcClientProxy::~IpcClientProxy()
     m_events->removeHandler(
         m_events->forIStream().outputShutdown(), m_stream.getEventTarget());
 
+    waitForSendRefs();
+
     // don't delete the stream while it's being used.
     {
         std::lock_guard<std::mutex> lock_read(m_readMutex);
         std::lock_guard<std::mutex> lock_write(m_writeMutex);
         delete &m_stream;
     }
+}
+
+bool
+IpcClientProxy::tryAddSendRef()
+{
+    std::lock_guard<std::mutex> lock(m_sendRefMutex);
+    if (m_deleting || m_disconnecting) {
+        return false;
+    }
+
+    ++m_sendRefCount;
+    return true;
+}
+
+void
+IpcClientProxy::releaseSendRef()
+{
+    std::lock_guard<std::mutex> lock(m_sendRefMutex);
+    assert(m_sendRefCount > 0);
+    --m_sendRefCount;
+    if (m_sendRefCount == 0) {
+        m_sendRefCond.notify_all();
+    }
+}
+
+void
+IpcClientProxy::waitForSendRefs()
+{
+    std::unique_lock<std::mutex> lock(m_sendRefMutex);
+    m_deleting = true;
+    m_sendRefCond.wait(lock, [this]() { return m_sendRefCount == 0; });
 }
 
 void
@@ -110,11 +146,21 @@ IpcClientProxy::handleData(const Event&, void*)
             m = parseHello();
         }
         else if (memcmp(code, kIpcMsgCommand, 4) == 0) {
+            if (m_clientType != kIpcClientGui) {
+                LOG((CLOG_WARN "rejecting ipc command from non-gui client type=%d", m_clientType));
+                disconnect();
+                return;
+            }
             m = parseCommand();
         }
         else {
             LOG((CLOG_ERR "invalid ipc message"));
             disconnect();
+            return;
+        }
+
+        if (m == nullptr) {
+            return;
         }
 
         // don't delete with this event; the data is passed to a new event.
@@ -160,12 +206,22 @@ IpcHelloMessage*
 IpcClientProxy::parseHello()
 {
     UInt8 type;
-    ProtocolUtil::readf(&m_stream, kIpcMsgHello + 4, &type);
+    UInt32 processId = 0;
+    ProtocolUtil::readf(&m_stream, kIpcMsgHello + 4, &type, &processId);
+
+    if (type != kIpcClientGui && type != kIpcClientNode) {
+        LOG((CLOG_WARN "rejecting invalid ipc client type=%d", type));
+        m_clientType = kIpcClientUnknown;
+        m_processId = 0;
+        disconnect();
+        return nullptr;
+    }
 
     m_clientType = static_cast<EIpcClientType>(type);
+    m_processId = processId;
 
     // must be deleted by event handler.
-    return new IpcHelloMessage(m_clientType);
+    return new IpcHelloMessage(m_clientType, m_processId);
 }
 
 IpcCommandMessage*
@@ -176,14 +232,18 @@ IpcClientProxy::parseCommand()
     ProtocolUtil::readf(&m_stream, kIpcMsgCommand + 4, &command, &elevate);
 
     // must be deleted by event handler.
-    return new IpcCommandMessage(command, elevate != 0);
+    return new IpcCommandMessage(command, elevate);
 }
 
 void
 IpcClientProxy::disconnect()
 {
+    bool expected = false;
+    if (!m_disconnecting.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
     LOG((CLOG_DEBUG "ipc disconnect, closing stream"));
-    m_disconnecting = true;
     m_stream.close();
     m_events->addEvent(Event(m_events->forIpcClientProxy().disconnected(), this));
 }

@@ -93,16 +93,36 @@ EventQueue::EventQueue() :
     ARCH->setSignalHandler(Arch::kINTERRUPT, &interrupt, this);
     ARCH->setSignalHandler(Arch::kTERMINATE, &interrupt, this);
     m_buffer = new SimpleEventQueueBuffer;
+    m_fileKeepAliveType = Event::kUnknown;
 }
 
 EventQueue::~EventQueue()
 {
+    ARCH->setSignalHandler(Arch::kINTERRUPT, NULL, NULL);
+    ARCH->setSignalHandler(Arch::kTERMINATE, NULL, NULL);
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        for (EventTable::iterator i = m_events.begin(); i != m_events.end(); ++i) {
+            Event::deleteData(i->second);
+        }
+        m_events.clear();
+        m_oldEventIDs.clear();
+
+    }
+
+    {
+        Lock lock(m_readyMutex);
+        while (!m_pending.empty()) {
+            Event::deleteData(m_pending.front());
+            m_pending.pop();
+        }
+    }
+
     delete m_buffer;
     delete m_readyCondVar;
     delete m_readyMutex;
-
-    ARCH->setSignalHandler(Arch::kINTERRUPT, NULL, NULL);
-    ARCH->setSignalHandler(Arch::kTERMINATE, NULL, NULL);
 }
 
 void
@@ -111,16 +131,18 @@ EventQueue::loop()
     m_buffer->init();
     {
         Lock lock(m_readyMutex);
+
+        while (!m_pending.empty()) {
+            LOG((CLOG_DEBUG "add pending events to buffer"));
+            Event event = m_pending.front();
+            m_pending.pop();
+            addEventToBuffer(event);
+        }
+
         *m_readyCondVar = true;
         m_readyCondVar->signal();
     }
     LOG((CLOG_DEBUG "event queue is ready"));
-    while (!m_pending.empty()) {
-        LOG((CLOG_DEBUG "add pending events to buffer"));
-        Event& event = m_pending.front();
-        addEventToBuffer(event);
-        m_pending.pop();
-    }
 
     Event event;
     getEvent(event);
@@ -191,6 +213,7 @@ EventQueue::adoptBuffer(IEventQueueBuffer* buffer)
     }
     m_events.clear();
     m_oldEventIDs.clear();
+    m_pendingFileKeepAliveTargets.clear();
 
     // use new buffer
     m_buffer = buffer;
@@ -303,10 +326,14 @@ EventQueue::addEvent(const Event& event)
         dispatchEvent(event);
         Event::deleteData(event);
     }
-    else if (!(*m_readyCondVar)) {
-        m_pending.push(event);
-    }
     else {
+        {
+            Lock lock(m_readyMutex);
+            if (!(*m_readyCondVar)) {
+                m_pending.push(event);
+                return;
+            }
+        }
         addEventToBuffer(event);
     }
 }
@@ -314,7 +341,19 @@ EventQueue::addEvent(const Event& event)
 void
 EventQueue::addEventToBuffer(const Event& event)
 {
+    const Event::Type fileKeepAliveType = getFileKeepAliveTypeForCoalescing(event);
     std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (fileKeepAliveType != Event::kUnknown && event.getType() == fileKeepAliveType) {
+        m_fileKeepAliveType = fileKeepAliveType;
+        void* target = event.getTarget();
+        if (m_pendingFileKeepAliveTargets.find(target) != m_pendingFileKeepAliveTargets.end()) {
+            LOG((CLOG_DEBUG2 "coalescing duplicate file keepalive event"));
+            Event::deleteData(event);
+            return;
+        }
+        m_pendingFileKeepAliveTargets.insert(target);
+    }
 
     // store the event's data locally
     UInt32 eventID = saveEvent(event);
@@ -483,11 +522,41 @@ EventQueue::removeEvent(UInt32 eventID)
     // get data
     Event event = index->second;
     m_events.erase(index);
+    clearCoalescedEvent(event);
 
     // save old id for reuse
     m_oldEventIDs.push_back(eventID);
 
     return event;
+}
+
+Event::Type
+EventQueue::getFileKeepAliveTypeForCoalescing(const Event& event)
+{
+    if (m_typesForFile == NULL ||
+        event.getData() != NULL ||
+        event.getDataObject() != NULL) {
+        return Event::kUnknown;
+    }
+
+    const Event::Type keepAliveType = m_typesForFile->keepAlive();
+    return event.getType() == keepAliveType ? keepAliveType : Event::kUnknown;
+}
+
+void
+EventQueue::clearCoalescedEvent(const Event& event)
+{
+    if (m_fileKeepAliveType != Event::kUnknown &&
+        event.getType() == m_fileKeepAliveType) {
+        m_pendingFileKeepAliveTargets.erase(event.getTarget());
+    }
+}
+
+size_t
+EventQueue::getQueuedEventCount() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_events.size();
 }
 
 bool

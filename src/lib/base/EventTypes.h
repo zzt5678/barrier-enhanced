@@ -747,6 +747,7 @@ public:
         m_fileChunkSending(Event::kUnknown),
         m_fileRecieveCompleted(Event::kUnknown),
         m_fileClipboardReady(Event::kUnknown),
+        m_dropDirWriteFinished(Event::kUnknown),
         m_keepAlive(Event::kUnknown) { }
 
     //! @name accessors
@@ -761,6 +762,9 @@ public:
     //! A remote clipboard file package was materialized locally
     Event::Type        fileClipboardReady();
 
+    //! A drop-dir writer thread finished and queued transfers can continue
+    Event::Type        dropDirWriteFinished();
+
     //! Send a keep alive
     Event::Type        keepAlive();
 
@@ -770,5 +774,6 @@ private:
     Event::Type        m_fileChunkSending;
     Event::Type        m_fileRecieveCompleted;
     Event::Type        m_fileClipboardReady;
+    Event::Type        m_dropDirWriteFinished;
     Event::Type        m_keepAlive;
 };

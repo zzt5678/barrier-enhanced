@@ -28,6 +28,8 @@
 #include "base/Event.h"
 #include "base/Log.h"
 
+#include <vector>
+
 //
 // IpcServer
 //
@@ -71,19 +73,21 @@ IpcServer::~IpcServer()
     }
 
     if (m_socket != nullptr) {
+        m_events->removeHandler(m_events->forIListenSocket().connecting(), m_socket);
         delete m_socket;
     }
 
+    ClientList clients;
     {
         std::lock_guard<std::mutex> lock(m_clientsMutex);
-        ClientList::iterator it;
-        for (it = m_clients.begin(); it != m_clients.end(); it++) {
-            deleteClient(*it);
-        }
-        m_clients.clear();
+        clients.swap(m_clients);
     }
 
-    m_events->removeHandler(m_events->forIListenSocket().connecting(), m_socket);
+    ClientList::iterator it;
+    for (it = clients.begin(); it != clients.end(); it++) {
+        deleteClient(*it);
+    }
+
 }
 
 void
@@ -128,11 +132,16 @@ IpcServer::handleClientDisconnected(const Event& e, void*)
 {
     IpcClientProxy* proxy = static_cast<IpcClientProxy*>(e.getTarget());
 
-    std::lock_guard<std::mutex> lock(m_clientsMutex);
-    m_clients.remove(proxy);
+    int connected = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        m_clients.remove(proxy);
+        connected = static_cast<int>(m_clients.size());
+    }
+
     deleteClient(proxy);
 
-    LOG((CLOG_DEBUG "ipc client proxy removed, connected=%d", m_clients.size()));
+    LOG((CLOG_DEBUG "ipc client proxy removed, connected=%d", connected));
 }
 
 void
@@ -176,13 +185,70 @@ IpcServer::hasClients(EIpcClientType clientType) const
 void
 IpcServer::send(const IpcMessage& message, EIpcClientType filterType)
 {
-    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    std::vector<IpcClientProxy*> recipients;
 
-    ClientList::iterator it;
-    for (it = m_clients.begin(); it != m_clients.end(); it++) {
-        IpcClientProxy* proxy = *it;
-        if (proxy->m_clientType == filterType) {
-            proxy->send(message);
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+
+        ClientList::iterator it;
+        for (it = m_clients.begin(); it != m_clients.end(); it++) {
+            IpcClientProxy* proxy = *it;
+            if (proxy->m_clientType == filterType && proxy->tryAddSendRef()) {
+                recipients.push_back(proxy);
+            }
         }
     }
+
+    std::vector<IpcClientProxy*>::iterator it;
+    for (it = recipients.begin(); it != recipients.end(); it++) {
+        IpcClientProxy* proxy = *it;
+        try {
+            proxy->send(message);
+        }
+        catch (...) {
+            proxy->releaseSendRef();
+            throw;
+        }
+        proxy->releaseSendRef();
+    }
+}
+
+bool
+IpcServer::sendToProcess(const IpcMessage& message, EIpcClientType filterType,
+                         UInt32 processId)
+{
+    if (processId == 0) {
+        return false;
+    }
+
+    std::vector<IpcClientProxy*> recipients;
+
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+
+        ClientList::iterator it;
+        for (it = m_clients.begin(); it != m_clients.end(); it++) {
+            IpcClientProxy* proxy = *it;
+            if (proxy->m_clientType == filterType &&
+                proxy->m_processId == processId &&
+                proxy->tryAddSendRef()) {
+                recipients.push_back(proxy);
+            }
+        }
+    }
+
+    std::vector<IpcClientProxy*>::iterator it;
+    for (it = recipients.begin(); it != recipients.end(); it++) {
+        IpcClientProxy* proxy = *it;
+        try {
+            proxy->send(message);
+        }
+        catch (...) {
+            proxy->releaseSendRef();
+            throw;
+        }
+        proxy->releaseSendRef();
+    }
+
+    return !recipients.empty();
 }

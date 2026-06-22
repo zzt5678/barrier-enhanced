@@ -401,6 +401,12 @@ Screen::isLockedToScreen() const
     return false;
 }
 
+bool
+Screen::canEnter() const
+{
+    return m_screen->canEnter();
+}
+
 SInt32
 Screen::getJumpZoneSize() const
 {

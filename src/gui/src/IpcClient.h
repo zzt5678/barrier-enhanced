@@ -33,6 +33,10 @@ class IpcClient : public QObject
 
 public:
     IpcClient();
+#if defined(BARRIER_TEST_ENV)
+    explicit IpcClient(QTcpSocket* socket);
+    bool waitForBytesWrittenForTest(int timeoutMs);
+#endif
     virtual ~IpcClient();
 
     void sendHello();
@@ -44,6 +48,7 @@ public slots:
     void retryConnect();
 
 private:
+    void initializeSocket(QTcpSocket* socket);
     void intToBytes(int value, char* buffer, int size);
 
 private slots:

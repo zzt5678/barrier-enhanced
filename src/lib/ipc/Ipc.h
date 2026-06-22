@@ -35,7 +35,8 @@ enum EIpcClientType {
 };
 
 // handshake: node/gui -> daemon
-// $1 = type, the client identifies it's self as gui or node (barrierc/s).
+// $1 = type, the client identifies itself as gui or node (barrierc/s).
+// $2 = client process id, used by the daemon for targeted node shutdown.
 extern const char*        kIpcMsgHello;
 
 // log line: daemon -> gui
@@ -44,7 +45,8 @@ extern const char*        kIpcMsgLogLine;
 
 // command: gui -> daemon
 // $1 = command; the command for the daemon to launch, typically the full
-// path to barriers/c. $2 = true when process must be elevated on ms windows.
+// path to barriers/c. $2 = Windows elevation mode: 0 as-needed, 1 always,
+// 2 never.
 extern const char*        kIpcMsgCommand;
 
 // shutdown: daemon -> node

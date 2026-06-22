@@ -67,6 +67,7 @@ IpcServerProxy::handleData(const Event&, void*)
         else {
             LOG((CLOG_ERR "invalid ipc message"));
             disconnect();
+            return;
         }
 
         // don't delete with this event; the data is passed to a new event.
@@ -88,14 +89,14 @@ IpcServerProxy::send(const IpcMessage& message)
     switch (message.type()) {
     case kIpcHello: {
         const IpcHelloMessage& hm = static_cast<const IpcHelloMessage&>(message);
-        ProtocolUtil::writef(&m_stream, kIpcMsgHello, hm.clientType());
+        ProtocolUtil::writef(&m_stream, kIpcMsgHello, hm.clientType(), hm.processId());
         break;
     }
 
     case kIpcCommand: {
         const IpcCommandMessage& cm = static_cast<const IpcCommandMessage&>(message);
         std::string command = cm.command();
-        ProtocolUtil::writef(&m_stream, kIpcMsgCommand, &command);
+        ProtocolUtil::writef(&m_stream, kIpcMsgCommand, &command, cm.elevateMode());
         break;
     }
 

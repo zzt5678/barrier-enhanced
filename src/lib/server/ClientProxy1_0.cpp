@@ -27,6 +27,13 @@
 
 #include <cstring>
 
+namespace {
+
+const UInt32 kMaxHeartbeatDeferrals = 8;
+const UInt32 kMaxMissedHeartbeatsBeforeDisconnect = 1;
+
+}
+
 //
 // ClientProxy1_0
 //
@@ -34,7 +41,13 @@
 ClientProxy1_0::ClientProxy1_0(const std::string& name, barrier::IStream* stream,
                                IEventQueue* events) :
     ClientProxy(name, stream),
+    m_disconnected(false),
     m_heartbeatTimer(NULL),
+    m_heartbeatDeferrals(0),
+    m_heartbeatMissedAlarms(0),
+    m_lastHeartbeatPendingInput(false),
+    m_lastHeartbeatBufferedOutput(0),
+    m_heartbeatActivityTimer(true),
     m_parser(&ClientProxy1_0::parseHandshakeMessage),
     m_events(events)
 {
@@ -77,6 +90,11 @@ ClientProxy1_0::~ClientProxy1_0()
 void
 ClientProxy1_0::disconnect()
 {
+    if (m_disconnected) {
+        return;
+    }
+
+    m_disconnected = true;
     removeHandlers();
     getStream()->close();
     m_events->addEvent(Event(m_events->forClientProxy().disconnected(), getEventTarget()));
@@ -137,6 +155,12 @@ void
 ClientProxy1_0::setHeartbeatRate(double, double alarm)
 {
     m_heartbeatAlarm = alarm;
+    m_heartbeatDeferrals = 0;
+    m_heartbeatMissedAlarms = 0;
+    m_lastHeartbeatPendingInput = false;
+    m_lastHeartbeatBufferedOutput = 0;
+    m_heartbeatActivityTimer.start();
+    m_heartbeatActivityTimer.reset();
 }
 
 void
@@ -145,6 +169,7 @@ ClientProxy1_0::handleData(const Event&, void*)
     // handle messages until there are no more.  first read message code.
     UInt8 code[4];
     UInt32 n = getStream()->read(code, 4);
+    bool receivedMessage = false;
     while (n != 0) {
         // verify we got an entire code
         if (n != 4) {
@@ -152,6 +177,7 @@ ClientProxy1_0::handleData(const Event&, void*)
             disconnect();
             return;
         }
+        receivedMessage = true;
 
         // parse message
         try {
@@ -175,7 +201,13 @@ ClientProxy1_0::handleData(const Event&, void*)
     }
 
     // restart heartbeat timer
-    resetHeartbeatTimer();
+    if (receivedMessage) {
+        m_heartbeatDeferrals = 0;
+        m_heartbeatMissedAlarms = 0;
+        m_lastHeartbeatPendingInput = false;
+        m_lastHeartbeatBufferedOutput = 0;
+        m_heartbeatActivityTimer.reset();
+    }
 }
 
 bool
@@ -243,8 +275,73 @@ void
 ClientProxy1_0::handleFlatline(const Event&, void*)
 {
     // didn't get a heartbeat fast enough.  assume client is dead.
+    const bool hasPendingInput = getStream()->isReady();
+    const UInt32 bufferedOutput = getStream()->getBufferedOutputSize();
+    if ((hasPendingInput && !m_lastHeartbeatPendingInput) ||
+        (m_lastHeartbeatBufferedOutput > 0 &&
+         bufferedOutput < m_lastHeartbeatBufferedOutput)) {
+        m_heartbeatDeferrals = 0;
+        m_heartbeatMissedAlarms = 0;
+    }
+    m_lastHeartbeatPendingInput = hasPendingInput;
+    m_lastHeartbeatBufferedOutput = bufferedOutput;
+
+    if (shouldDeferFlatline(hasPendingInput, bufferedOutput)) {
+        if (m_heartbeatDeferrals >= kMaxHeartbeatDeferrals) {
+            LOG((CLOG_NOTE
+                 "client \"%s\" heartbeat stalled with pending work; disconnecting, "
+                 "pendingInput=%d bufferedOutput=%u idle=%.3fs",
+                 getName().c_str(),
+                 hasPendingInput ? 1 : 0,
+                 bufferedOutput,
+                 m_heartbeatActivityTimer.getTime()));
+            disconnect();
+            return;
+        }
+
+        ++m_heartbeatDeferrals;
+        m_heartbeatMissedAlarms = 0;
+        LOG((CLOG_WARN
+             "client \"%s\" heartbeat delayed while stream has pending work; deferring disconnect (%u/%u), "
+             "pendingInput=%d bufferedOutput=%u idle=%.3fs",
+             getName().c_str(),
+             m_heartbeatDeferrals,
+             kMaxHeartbeatDeferrals,
+             hasPendingInput ? 1 : 0,
+             bufferedOutput,
+             m_heartbeatActivityTimer.getTime()));
+        resetHeartbeatTimer();
+        return;
+    }
+
+    if (m_heartbeatAlarm > 0.0 &&
+        m_heartbeatActivityTimer.getTime() < m_heartbeatAlarm) {
+        m_heartbeatMissedAlarms = 0;
+        resetHeartbeatTimer();
+        return;
+    }
+
+    if (m_heartbeatMissedAlarms < kMaxMissedHeartbeatsBeforeDisconnect) {
+        ++m_heartbeatMissedAlarms;
+        LOG((CLOG_WARN
+             "client \"%s\" heartbeat missed; querying info before disconnect (%u/%u), idle=%.3fs",
+             getName().c_str(),
+             m_heartbeatMissedAlarms,
+             kMaxMissedHeartbeatsBeforeDisconnect,
+             m_heartbeatActivityTimer.getTime()));
+        ProtocolUtil::writef(getStream(), kMsgQInfo);
+        resetHeartbeatTimer();
+        return;
+    }
+
     LOG((CLOG_NOTE "client \"%s\" is dead", getName().c_str()));
     disconnect();
+}
+
+bool
+ClientProxy1_0::shouldDeferFlatline(bool hasPendingInput, UInt32 bufferedOutput) const
+{
+    return hasPendingInput || bufferedOutput > 0;
 }
 
 bool
@@ -433,11 +530,17 @@ ClientProxy1_0::recvInfo()
     }
     LOG((CLOG_DEBUG "received client \"%s\" info shape=%d,%d %dx%d at %d,%d", getName().c_str(), x, y, w, h, mx, my));
 
-    // validate
+    // A temporarily unavailable secondary can report a 0x0 shape during
+    // monitor hot-unplug. Preserve that as state so the server can recover
+    // from the active client instead of treating the update as a broken
+    // connection.
     if (w <= 0 || h <= 0) {
-        return false;
+        LOG((CLOG_WARN "client \"%s\" reported unavailable screen shape=%d,%d %dx%d",
+            getName().c_str(), x, y, w, h));
+        mx = x;
+        my = y;
     }
-    if (mx < x || mx >= x + w || my < y || my >= y + h) {
+    else if (mx < x || mx >= x + w || my < y || my >= y + h) {
         mx = x + w / 2;
         my = y + h / 2;
     }

@@ -75,6 +75,7 @@ ClientProxyUnknown::orphanClientProxy()
         removeHandlers();
         ClientProxy* proxy = m_proxy;
         m_proxy = NULL;
+        m_stream = NULL;
         return proxy;
     }
     else {

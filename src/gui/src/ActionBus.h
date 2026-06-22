@@ -30,6 +30,17 @@ public:
                              QWidget* anchor = nullptr,
                              QString* errorMessage = nullptr);
 
+#if defined(BARRIER_TEST_ENV)
+    static void testMarkInboxTargetManaged(const QString& path) { markInboxTargetManaged(path); }
+    static void testPruneManagedInboxDir(const QString& inboxDir, int maxItems, qint64 maxBytes)
+    {
+        pruneManagedInboxDir(inboxDir, maxItems, maxBytes);
+    }
+    static bool testCopyRecursively(const QString& sourcePath,
+                                    const QString& destinationPath,
+                                    QString* errorMessage);
+#endif
+
 signals:
     void notificationRequested(const QString& title, const QString& body);
 
@@ -38,6 +49,9 @@ private:
     bool revealContext(const ContextItem& item, QString* errorMessage);
     bool saveContextToInbox(const ContextItem& item, QString* savedPath, QString* errorMessage);
     bool captureScreenshot(QString* contextId, QString* errorMessage);
+    static void markInboxTargetManaged(const QString& path);
+    static void pruneManagedInboxDir(const QString& inboxDir, int maxItems, qint64 maxBytes);
+    void pruneManagedInbox(int maxItems = -1, qint64 maxBytes = -1) const;
     bool confirmIfNeeded(const ContextItem& item,
                          const QString& actionLabel,
                          QWidget* anchor) const;

@@ -22,24 +22,49 @@
 #include "ipc/IpcMessage.h"
 #include "base/TMethodEventJob.h"
 
+#if SYSAPI_WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#else
+#include <unistd.h>
+#endif
+
+namespace {
+
+UInt32
+currentProcessId()
+{
+#if SYSAPI_WIN32
+    return static_cast<UInt32>(GetCurrentProcessId());
+#else
+    return static_cast<UInt32>(getpid());
+#endif
+}
+
+}
+
 //
 // IpcClient
 //
 
-IpcClient::IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer) :
+IpcClient::IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer,
+                     EIpcClientType clientType) :
     m_serverAddress(NetworkAddress(IPC_HOST, IPC_PORT)),
     m_socket(events, socketMultiplexer, IArchNetwork::kINET),
     m_server(nullptr),
-    m_events(events)
+    m_events(events),
+    m_clientType(clientType)
 {
     init();
 }
 
-IpcClient::IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer, int port) :
+IpcClient::IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer, int port,
+                     EIpcClientType clientType) :
     m_serverAddress(NetworkAddress(IPC_HOST, port)),
     m_socket(events, socketMultiplexer, IArchNetwork::kINET),
     m_server(nullptr),
-    m_events(events)
+    m_events(events),
+    m_clientType(clientType)
 {
     init();
 }
@@ -95,7 +120,7 @@ IpcClient::handleConnected(const Event&, void*)
     m_events->addEvent(Event(
         m_events->forIpcClient().connected(), this, m_server, Event::kDontFreeData));
 
-    IpcHelloMessage message(kIpcClientNode);
+    IpcHelloMessage message(m_clientType, currentProcessId());
     send(message);
 }
 

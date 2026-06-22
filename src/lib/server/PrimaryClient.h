@@ -87,7 +87,7 @@ public:
     Return the jump zone size, the size of the regions on the edges of
     the screen that cause the cursor to jump to another screen.
     */
-    SInt32                getJumpZoneSize() const;
+    virtual SInt32        getJumpZoneSize() const;
 
     //! Get cursor center position
     /*!
@@ -109,7 +109,10 @@ public:
     /*!
     Returns true if the user is locked to the screen.
     */
-    bool                isLockedToScreen() const;
+    virtual bool        isLockedToScreen() const;
+
+    //! Test if the primary screen can safely be entered now.
+    virtual bool        canEnter() const;
 
     //@}
 

@@ -143,6 +143,15 @@ public:
     */
     virtual bool        isPrimary() const = 0;
 
+    //! Test if this screen can be entered safely
+    /*!
+    Return false when the platform knows the screen is not currently
+    visible/available for cursor entry.  A display that is merely asleep in
+    DPMS power-save mode may still be enterable because the enter path can
+    wake it.
+    */
+    virtual bool        canEnter() const { return true; }
+
     //@}
 
     // IScreen overrides

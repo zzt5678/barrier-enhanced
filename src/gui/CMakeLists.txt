@@ -9,12 +9,14 @@ set (CMAKE_INCLUDE_CURRENT_DIR ON)
 # files that are used both in tests and the app
 set(GUI_COMMON_SOURCE_FILES
     src/Action.cpp
+    src/CommandLine.cpp
     src/Hotkey.cpp
     src/KeySequence.cpp
 )
 
 set(GUI_COMMON_HEADER_FILES
     src/Action.h
+    src/CommandLine.h
     src/Hotkey.h
     src/KeySequence.h
 )
@@ -198,11 +200,18 @@ endif()
 if (BARRIER_BUILD_TESTS)
     set(GUI_TEST_SOURCE_FILES
         test/KeySequenceTests.cpp
+        test/CommandLineTests.cpp
+        test/ActionBusTests.cpp
         test/HotkeyTests.cpp
         test/IpcReaderTests.cpp
+        test/AppConfigTests.cpp
         test/main.cpp
+        src/AppConfig.cpp
+        src/ActionBus.cpp
         src/Ipc.cpp
+        src/IpcClient.cpp
         src/IpcReader.cpp
+        src/WorkflowStore.cpp
     )
 
     add_executable(guiunittests
@@ -214,5 +223,6 @@ if (BARRIER_BUILD_TESTS)
     add_test(NAME guiunittests COMMAND $<TARGET_FILE:guiunittests>)
 
     target_include_directories(guiunittests PUBLIC ../../ext)
+    target_compile_definitions(guiunittests PRIVATE BARRIER_TEST_ENV)
     target_link_libraries(guiunittests gtest gmock Qt5::Core Qt5::Widgets Qt5::Network ${libs})
 endif()

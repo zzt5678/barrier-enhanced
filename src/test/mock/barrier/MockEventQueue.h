@@ -40,6 +40,7 @@ public:
     MOCK_METHOD2(removeHandler, void(Event::Type, void*));
     MOCK_METHOD1(dispatchEvent, bool(const Event&));
     MOCK_CONST_METHOD2(getHandler, IEventJob*(Event::Type, void*));
+    MOCK_CONST_METHOD0(getQueuedEventCount, size_t());
     MOCK_METHOD1(deleteTimer, void(EventQueueTimer*));
     MOCK_CONST_METHOD1(getRegisteredType, Event::Type(const std::string&));
     MOCK_METHOD0(getSystemTarget, void*());

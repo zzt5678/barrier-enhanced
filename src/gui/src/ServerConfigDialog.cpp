@@ -37,7 +37,9 @@ ServerConfigDialog::ServerConfigDialog(QWidget* parent, ServerConfig& config, co
     setObjectName(QStringLiteral("ServerConfigDialogBase"));
     resize(1040, 700);
 
-    m_pCheckBoxHeartbeat->setChecked(serverConfig().hasHeartbeat());
+    m_pCheckBoxHeartbeat->setChecked(true);
+    m_pCheckBoxHeartbeat->setEnabled(false);
+    m_pCheckBoxHeartbeat->setToolTip(tr("Heartbeat is always enabled to keep reconnects responsive."));
     m_pSpinBoxHeartbeat->setValue(serverConfig().heartbeat());
 
     m_pCheckBoxRelativeMouseMoves->setChecked(serverConfig().relativeMouseMoves());
@@ -92,7 +94,7 @@ void ServerConfigDialog::showEvent(QShowEvent* event)
 
 void ServerConfigDialog::accept()
 {
-    serverConfig().haveHeartbeat(m_pCheckBoxHeartbeat->isChecked());
+    serverConfig().haveHeartbeat(true);
     serverConfig().setHeartbeat(m_pSpinBoxHeartbeat->value());
 
     serverConfig().setRelativeMouseMoves(m_pCheckBoxRelativeMouseMoves->isChecked());

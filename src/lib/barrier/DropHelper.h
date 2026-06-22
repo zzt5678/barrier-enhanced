@@ -19,6 +19,7 @@
 
 #include "barrier/DragInformation.h"
 #include "base/String.h"
+#include "io/filesystem.h"
 
 #include <vector>
 
@@ -26,4 +27,7 @@ class DropHelper {
 public:
     static std::vector<String> writeToDir(const String& destination,
                             DragFileList& fileList, String& data);
+    static std::vector<String> writeToDirFromFile(const String& destination,
+                            DragFileList& fileList,
+                            const barrier::fs::path& sourcePath);
 };

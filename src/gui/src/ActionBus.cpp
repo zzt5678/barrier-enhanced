@@ -4,6 +4,7 @@
 
 #include <QDesktopServices>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
@@ -14,9 +15,19 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QScreen>
+#include <QSet>
 #include <QUrl>
 
+#include <algorithm>
+
 namespace {
+
+const int kManagedInboxItemLimit = 100;
+const qint64 kManagedInboxBudgetBytes = 1024LL * 1024LL * 1024LL;
+const int kInboxCopyFileLimit = 5000;
+const qint64 kInboxCopyByteLimit = 512LL * 1024LL * 1024LL;
+const char kManagedMarkerName[] = ".weave-managed";
+const char kManagedMarkerSuffix[] = ".weave-managed";
 
 QString sanitizePathSegment(QString text)
 {
@@ -30,23 +41,64 @@ QString sanitizePathSegment(QString text)
     return text.left(80);
 }
 
-bool copyRecursively(const QString& sourcePath, const QString& destinationPath, QString* errorMessage)
+struct CopyBudget {
+    int maxItems = kInboxCopyFileLimit;
+    qint64 maxBytes = kInboxCopyByteLimit;
+    int items = 0;
+    qint64 bytes = 0;
+    QSet<QString> visitedDirectories;
+};
+
+bool failCopy(QString* errorMessage, const QString& message)
+{
+    if (errorMessage != nullptr) {
+        *errorMessage = message;
+    }
+    return false;
+}
+
+bool addCopyItem(const QFileInfo& sourceInfo, CopyBudget& budget, QString* errorMessage)
+{
+    ++budget.items;
+    budget.bytes += sourceInfo.size();
+    if (budget.items > budget.maxItems) {
+        return failCopy(errorMessage, QStringLiteral("Refusing to save more than %1 files to the workflow inbox.")
+            .arg(budget.maxItems));
+    }
+    if (budget.bytes > budget.maxBytes) {
+        return failCopy(errorMessage, QStringLiteral("Refusing to save more than %1 MiB to the workflow inbox.")
+            .arg(budget.maxBytes / (1024 * 1024)));
+    }
+    return true;
+}
+
+bool copyRecursively(const QString& sourcePath,
+                     const QString& destinationPath,
+                     CopyBudget& budget,
+                     QString* errorMessage)
 {
     QFileInfo sourceInfo(sourcePath);
     if (!sourceInfo.exists()) {
-        if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("Source path does not exist: %1").arg(sourcePath);
-        }
-        return false;
+        return failCopy(errorMessage, QStringLiteral("Source path does not exist: %1").arg(sourcePath));
+    }
+
+    if (sourceInfo.isSymLink()) {
+        return failCopy(errorMessage, QStringLiteral("Refusing to save symbolic link to the workflow inbox: %1")
+            .arg(sourcePath));
     }
 
     if (sourceInfo.isDir()) {
+        const QString canonicalPath = sourceInfo.canonicalFilePath();
+        if (!canonicalPath.isEmpty()) {
+            if (budget.visitedDirectories.contains(canonicalPath)) {
+                return failCopy(errorMessage, QStringLiteral("Refusing to copy recursive folder: %1").arg(sourcePath));
+            }
+            budget.visitedDirectories.insert(canonicalPath);
+        }
+
         QDir destinationDir(destinationPath);
         if (!destinationDir.exists() && !QDir().mkpath(destinationPath)) {
-            if (errorMessage != nullptr) {
-                *errorMessage = QStringLiteral("Could not create folder: %1").arg(destinationPath);
-            }
-            return false;
+            return failCopy(errorMessage, QStringLiteral("Could not create folder: %1").arg(destinationPath));
         }
 
         QDir sourceDir(sourcePath);
@@ -55,11 +107,15 @@ bool copyRecursively(const QString& sourcePath, const QString& destinationPath, 
         for (const QFileInfo& entry : entries) {
             const QString nextSource = entry.absoluteFilePath();
             const QString nextDestination = QDir(destinationPath).filePath(entry.fileName());
-            if (!copyRecursively(nextSource, nextDestination, errorMessage)) {
+            if (!copyRecursively(nextSource, nextDestination, budget, errorMessage)) {
                 return false;
             }
         }
         return true;
+    }
+
+    if (!addCopyItem(sourceInfo, budget, errorMessage)) {
+        return false;
     }
 
     QDir().mkpath(QFileInfo(destinationPath).absolutePath());
@@ -68,13 +124,75 @@ bool copyRecursively(const QString& sourcePath, const QString& destinationPath, 
     }
 
     if (!QFile::copy(sourcePath, destinationPath)) {
-        if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("Could not copy %1 to %2").arg(sourcePath, destinationPath);
-        }
-        return false;
+        QFile::remove(destinationPath);
+        return failCopy(errorMessage, QStringLiteral("Could not copy %1 to %2").arg(sourcePath, destinationPath));
     }
 
     return true;
+}
+
+bool copyRecursively(const QString& sourcePath, const QString& destinationPath, QString* errorMessage)
+{
+    CopyBudget budget;
+    return copyRecursively(sourcePath, destinationPath, budget, errorMessage);
+}
+
+qint64 pathSize(const QString& path)
+{
+    QFileInfo info(path);
+    if (!info.exists()) {
+        return 0;
+    }
+    if (info.isFile()) {
+        return info.size();
+    }
+
+    qint64 total = 0;
+    QDirIterator it(path, QDir::NoDotAndDotDot | QDir::AllEntries | QDir::Hidden | QDir::System,
+                    QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        it.next();
+        const QFileInfo entry = it.fileInfo();
+        if (entry.isFile()) {
+            total += entry.size();
+        }
+    }
+    return total;
+}
+
+QString managedMarkerPathForTarget(const QString& targetPath)
+{
+    const QFileInfo info(targetPath);
+    if (info.isDir()) {
+        return QDir(targetPath).filePath(QString::fromLatin1(kManagedMarkerName));
+    }
+    return info.dir().filePath(QStringLiteral(".%1%2").arg(info.fileName(), QString::fromLatin1(kManagedMarkerSuffix)));
+}
+
+bool removePath(const QString& path)
+{
+    const QFileInfo info(path);
+    if (!info.exists()) {
+        return true;
+    }
+    if (info.isDir()) {
+        return QDir(path).removeRecursively();
+    }
+    return QFile::remove(path);
+}
+
+struct ManagedInboxItem {
+    QString targetPath;
+    QString markerPath;
+    QDateTime modified;
+    qint64 bytes = 0;
+};
+
+bool pathIsInside(const QString& rootPath, const QString& path)
+{
+    const QString root = QDir::cleanPath(rootPath);
+    const QString candidate = QDir::cleanPath(path);
+    return candidate == root || candidate.startsWith(root + QDir::separator());
 }
 
 QString explorerArgumentForPath(const QString& path)
@@ -91,6 +209,15 @@ ActionBus::ActionBus(WorkflowStore& store, QObject* parent) :
     m_store(&store)
 {
 }
+
+#if defined(BARRIER_TEST_ENV)
+bool ActionBus::testCopyRecursively(const QString& sourcePath,
+                                    const QString& destinationPath,
+                                    QString* errorMessage)
+{
+    return copyRecursively(sourcePath, destinationPath, errorMessage);
+}
+#endif
 
 QStringList ActionBus::capabilities() const
 {
@@ -385,6 +512,8 @@ bool ActionBus::saveContextToInbox(const ContextItem& item, QString* savedPath, 
         if (savedPath != nullptr) {
             *savedPath = destination;
         }
+        markInboxTargetManaged(destination);
+        pruneManagedInbox();
         return true;
     }
 
@@ -421,6 +550,10 @@ bool ActionBus::saveContextToInbox(const ContextItem& item, QString* savedPath, 
         }
     }
 
+    if (savedPath != nullptr && !savedPath->isEmpty()) {
+        markInboxTargetManaged(*savedPath);
+        pruneManagedInbox();
+    }
     return true;
 }
 
@@ -491,4 +624,93 @@ QString ActionBus::uniqueInboxTarget(const QString& baseName, const QString& suf
         candidate = inbox.filePath(QStringLiteral("%1-%2%3").arg(baseName).arg(copyIndex++).arg(suffix));
     }
     return candidate;
+}
+
+void ActionBus::markInboxTargetManaged(const QString& path)
+{
+    const QString markerPath = managedMarkerPathForTarget(path);
+    QDir().mkpath(QFileInfo(markerPath).absolutePath());
+    QFile marker(markerPath);
+    if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        marker.write("weave-managed-inbox-item\n");
+        marker.close();
+    }
+}
+
+void ActionBus::pruneManagedInbox(int maxItems, qint64 maxBytes) const
+{
+    const QString inboxPath = QDir::cleanPath(m_store->inboxDir());
+    if (maxItems < 0) {
+        maxItems = kManagedInboxItemLimit;
+    }
+    if (maxBytes < 0) {
+        maxBytes = kManagedInboxBudgetBytes;
+    }
+
+    pruneManagedInboxDir(inboxPath, maxItems, maxBytes);
+}
+
+void ActionBus::pruneManagedInboxDir(const QString& inboxDir, int maxItems, qint64 maxBytes)
+{
+    const QString inboxPath = QDir::cleanPath(inboxDir);
+    QList<ManagedInboxItem> items;
+    QDirIterator it(inboxPath, QDir::Files | QDir::Hidden | QDir::System,
+                    QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        it.next();
+        const QFileInfo markerInfo = it.fileInfo();
+        QString targetPath;
+        if (markerInfo.fileName() == QString::fromLatin1(kManagedMarkerName)) {
+            targetPath = markerInfo.dir().absolutePath();
+        }
+        else if (markerInfo.fileName().startsWith('.') &&
+                 markerInfo.fileName().endsWith(QString::fromLatin1(kManagedMarkerSuffix))) {
+            QString targetName = markerInfo.fileName().mid(1);
+            targetName.chop(QString::fromLatin1(kManagedMarkerSuffix).size());
+            targetPath = markerInfo.dir().filePath(targetName);
+        }
+        else {
+            continue;
+        }
+
+        if (!pathIsInside(inboxPath, targetPath) || QDir::cleanPath(targetPath) == inboxPath) {
+            continue;
+        }
+
+        ManagedInboxItem item;
+        item.targetPath = targetPath;
+        item.markerPath = markerInfo.absoluteFilePath();
+        item.modified = markerInfo.lastModified();
+        item.bytes = pathSize(targetPath) + markerInfo.size();
+        items << item;
+    }
+
+    qint64 totalBytes = 0;
+    for (const ManagedInboxItem& item : items) {
+        totalBytes += item.bytes;
+    }
+
+    std::sort(items.begin(), items.end(), [](const ManagedInboxItem& lhs, const ManagedInboxItem& rhs) {
+        if (lhs.modified != rhs.modified) {
+            return lhs.modified < rhs.modified;
+        }
+        return lhs.targetPath < rhs.targetPath;
+    });
+
+    int itemCount = items.size();
+    for (const ManagedInboxItem& item : items) {
+        const bool tooManyItems = maxItems > 0 && itemCount > maxItems;
+        const bool tooManyBytes = maxBytes > 0 && totalBytes > maxBytes;
+        if (!tooManyItems && !tooManyBytes) {
+            break;
+        }
+
+        const qint64 bytes = item.bytes;
+        const bool removedTarget = removePath(item.targetPath);
+        if (removedTarget) {
+            QFile::remove(item.markerPath);
+            --itemCount;
+            totalBytes = qMax<qint64>(0, totalBytes - bytes);
+        }
+    }
 }

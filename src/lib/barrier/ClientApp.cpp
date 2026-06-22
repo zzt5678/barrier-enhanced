@@ -59,8 +59,8 @@
 
 namespace {
 static const double kRetryTimeMin = 1.0;
-static const double kRetryTimeMax = 15.0;
-static const double kRetryBackoffMultiplier = 1.8;
+static const double kRetryTimeMax = 3.0;
+static const double kRetryBackoffMultiplier = 1.5;
 }
 
 ClientApp::ClientApp(IEventQueue* events, CreateTaskBarReceiverFunc createTaskBarReceiver) :
@@ -361,9 +361,10 @@ ClientApp::closeClient(Client* client)
         return;
     }
 
-    m_events->removeHandler(m_events->forClient().connected(), client);
-    m_events->removeHandler(m_events->forClient().connectionFailed(), client);
-    m_events->removeHandler(m_events->forClient().disconnected(), client);
+    void* eventTarget = client->getEventTarget();
+    m_events->removeHandler(m_events->forClient().connected(), eventTarget);
+    m_events->removeHandler(m_events->forClient().connectionFailed(), eventTarget);
+    m_events->removeHandler(m_events->forClient().disconnected(), eventTarget);
     delete client;
 }
 

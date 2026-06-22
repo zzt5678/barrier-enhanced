@@ -19,6 +19,7 @@
 #include "IpcClient.h"
 #include <QTcpSocket>
 #include <QHostAddress>
+#include <QCoreApplication>
 #include <iostream>
 #include <QTimer>
 #include "IpcReader.h"
@@ -26,12 +27,54 @@
 #include <QDataStream>
 #include <cstring>
 
+namespace {
+
+char normalizeElevateMode(ElevateMode elevate)
+{
+    switch (elevate) {
+        case ElevateAlways:
+            return 1;
+        case ElevateNever:
+            return 2;
+        case ElevateAsNeeded:
+        default:
+            return 0;
+    }
+}
+
+}
+
 IpcClient::IpcClient() :
 m_ReaderStarted(false),
 m_Enabled(false),
 m_RetryTimer(this)
 {
-    m_Socket = new QTcpSocket(this);
+    initializeSocket(new QTcpSocket(this));
+}
+
+#if defined(BARRIER_TEST_ENV)
+IpcClient::IpcClient(QTcpSocket* socket) :
+m_ReaderStarted(false),
+m_Enabled(false),
+m_RetryTimer(this)
+{
+    initializeSocket(socket);
+}
+
+bool IpcClient::waitForBytesWrittenForTest(int timeoutMs)
+{
+    return m_Socket->waitForBytesWritten(timeoutMs);
+}
+#endif
+
+IpcClient::~IpcClient()
+{
+}
+
+void IpcClient::initializeSocket(QTcpSocket* socket)
+{
+    m_Socket = socket;
+    m_Socket->setParent(this);
     connect(m_Socket, SIGNAL(connected()), this, SLOT(connected()));
     connect(m_Socket, SIGNAL(error(QAbstractSocket::SocketError)), this, SLOT(error(QAbstractSocket::SocketError)));
 
@@ -42,10 +85,6 @@ m_RetryTimer(this)
     m_RetryTimer.setSingleShot(true);
     m_RetryTimer.setInterval(1000);
     connect(&m_RetryTimer, &QTimer::timeout, this, &IpcClient::retryConnect);
-}
-
-IpcClient::~IpcClient()
-{
 }
 
 void IpcClient::connected()
@@ -114,6 +153,10 @@ void IpcClient::sendHello()
     char typeBuf[1];
     typeBuf[0] = kIpcClientGui;
     stream.writeRawData(typeBuf, 1);
+
+    char pidBuf[4];
+    intToBytes(static_cast<int>(QCoreApplication::applicationPid()), pidBuf, 4);
+    stream.writeRawData(pidBuf, 4);
 }
 
 void IpcClient::sendCommand(const QString& command, ElevateMode const elevate)
@@ -132,8 +175,7 @@ void IpcClient::sendCommand(const QString& command, ElevateMode const elevate)
     stream.writeRawData(charCommand, length);
 
     char elevateBuf[1];
-    // Refer to enum ElevateMode documentation for why this flag is mapped this way
-    elevateBuf[0] = (elevate == ElevateAlways) ? 1 : 0;
+    elevateBuf[0] = normalizeElevateMode(elevate);
     stream.writeRawData(elevateBuf, 1);
 }
 

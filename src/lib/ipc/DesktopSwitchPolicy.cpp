@@ -1,0 +1,81 @@
+/*
+ * barrier -- mouse and keyboard sharing utility
+ * Copyright (C) 2026 OpenAI
+ *
+ * This package is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * found in the file LICENSE that should have accompanied this file.
+ */
+
+#include "ipc/DesktopSwitchPolicy.h"
+
+namespace DesktopSwitchPolicy {
+
+RelaunchState::RelaunchState() :
+    pendingSince(0.0),
+    lastRelaunchTime(0.0)
+{
+}
+
+RelaunchDecision::RelaunchDecision() :
+    relaunch(false),
+    rememberDesktop(false),
+    settling(false),
+    debounced(false)
+{
+}
+
+RelaunchDecision
+observeDesktop(
+    RelaunchState& state,
+    const std::string& lastDesktopName,
+    const std::string& observedDesktopName,
+    double now,
+    double settleSeconds,
+    double debounceSeconds)
+{
+    RelaunchDecision decision;
+    if (observedDesktopName.empty()) {
+        return decision;
+    }
+
+    if (lastDesktopName.empty()) {
+        state.pendingDesktopName.clear();
+        state.pendingSince = 0.0;
+        decision.rememberDesktop = true;
+        return decision;
+    }
+
+    if (observedDesktopName == lastDesktopName) {
+        state.pendingDesktopName.clear();
+        state.pendingSince = 0.0;
+        return decision;
+    }
+
+    if (state.pendingDesktopName != observedDesktopName) {
+        state.pendingDesktopName = observedDesktopName;
+        state.pendingSince = now;
+        decision.settling = true;
+        return decision;
+    }
+
+    if (now - state.pendingSince < settleSeconds) {
+        decision.settling = true;
+        return decision;
+    }
+
+    if (state.lastRelaunchTime != 0.0 &&
+        now - state.lastRelaunchTime < debounceSeconds) {
+        decision.debounced = true;
+        return decision;
+    }
+
+    state.pendingDesktopName.clear();
+    state.pendingSince = 0.0;
+    state.lastRelaunchTime = now;
+    decision.relaunch = true;
+    decision.rememberDesktop = true;
+    return decision;
+}
+
+} // namespace DesktopSwitchPolicy

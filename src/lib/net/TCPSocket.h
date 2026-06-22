@@ -25,6 +25,7 @@
 #include "mt/Mutex.h"
 #include "arch/IArchNetwork.h"
 #include "base/Stopwatch.h"
+#include <cstddef>
 #include <memory>
 
 class Mutex;
@@ -65,6 +66,16 @@ public:
 
     virtual std::unique_ptr<ISocketMultiplexerJob> newJob();
 
+#if defined(BARRIER_TEST_ENV)
+    MultiplexerJobStatus testServiceConnected(ISocketMultiplexerJob* job,
+                                              bool read,
+                                              bool write,
+                                              bool error)
+    {
+        return serviceConnected(job, read, write, error);
+    }
+#endif
+
 protected:
     enum EJobResult {
         kBreak = -1,    //!< Break the Job chain
@@ -89,6 +100,12 @@ protected:
     void                sendEvent(Event::Type);
     void                discardWrittenData(StreamBuffer& outputBuffer, int bytesWrote);
     void                writeToBuffer(StreamBuffer& outputBuffer, const void* buffer, UInt32 n);
+    bool                queueInputOrDisconnectNoLock(const void* buffer, UInt32 n);
+    size_t              getInputReadSizeNoLock(size_t maxReadSize) const;
+    UInt32              getOutputWriteSizeNoLock(const StreamBuffer& outputBuffer) const;
+    bool                canReadInputNoLock() const;
+    void                disconnectSocketNoLock(bool notifyInputShutdown,
+                                               bool notifyOutputError = false);
 
 private:
     void                init();
@@ -100,6 +117,8 @@ private:
     void                onInputShutdown();
     void                onOutputShutdown();
     void                onDisconnected();
+    bool                canQueueOutputNoLock(bool lowPriority, UInt32 n) const;
+    bool                shouldResumeInputNoLock(UInt32 previousSize) const;
     void                noteQueuedBytes(bool lowPriority, UInt32 n);
     void                logOutputWindowStatsIfNeeded();
 

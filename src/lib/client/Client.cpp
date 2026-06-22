@@ -33,6 +33,7 @@
 #include "barrier/IClipboard.h"
 #include "common/DataDirectories.h"
 #include "mt/Thread.h"
+#include "mt/XThread.h"
 #include "net/TCPSocket.h"
 #include "net/IDataSocket.h"
 #include "net/ISocketFactory.h"
@@ -61,49 +62,8 @@ bool prepareTransferSource(const char* filename,
                            barrier::fs::path& tempPackagePath,
                            std::string& error);
 
-std::string trimClipboardLine(std::string value)
-{
-    while (!value.empty() && (value.back() == '\r' || value.back() == '\n' ||
-                              value.back() == ' ' || value.back() == '\t')) {
-        value.pop_back();
-    }
-
-    size_t start = 0;
-    while (start < value.size() &&
-           (value[start] == ' ' || value[start] == '\t' ||
-            value[start] == '\r' || value[start] == '\n')) {
-        ++start;
-    }
-
-    return value.substr(start);
-}
-
-std::vector<barrier::fs::path> clipboardFilePaths(const Clipboard& clipboard)
-{
-    std::vector<barrier::fs::path> paths;
-    if (!clipboard.open(0)) {
-        return paths;
-    }
-
-    if (clipboard.has(IClipboard::kText)) {
-        std::istringstream lines(clipboard.get(IClipboard::kText));
-        std::string line;
-        while (std::getline(lines, line)) {
-            line = trimClipboardLine(line);
-            if (line.empty()) {
-                continue;
-            }
-
-            barrier::fs::path path = barrier::fs::u8path(line);
-            if (barrier::fs::exists(path)) {
-                paths.push_back(path);
-            }
-        }
-    }
-
-    clipboard.close();
-    return paths;
-}
+const size_t kMaxPendingDropDirTransfers = 4;
+const size_t kMaxPendingDropDirTransferMemoryBytes = 32 * 1024 * 1024;
 
 std::vector<barrier::fs::path> utf8PathsToFsPaths(const std::vector<std::string>& paths)
 {
@@ -131,6 +91,8 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
     m_socketFactory(socketFactory),
     m_screen(screen),
     m_stream(NULL),
+    m_detachedSendFileStreams(),
+    m_detachedServerProxies(),
     m_timer(NULL),
     m_clipboardRetryTimer(NULL),
     m_server(NULL),
@@ -138,9 +100,15 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
     m_active(false),
     m_suspended(false),
     m_connectOnResume(false),
-    m_events(events),
+	    m_terminalEventSent(false),
+	    m_events(events),
+	    m_expectedFileSize(0),
+    m_receivedFileData(),
+    m_receivedFileSpoolPath(),
     m_sendFileThread(NULL),
+    m_sendFileTransferId(0),
     m_writeToDropDirThread(NULL),
+    m_pendingDropDirTransfers(),
     m_socket(NULL),
     m_useSecureNetwork(args.m_enableCrypto),
     m_args(args),
@@ -152,6 +120,7 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         m_ownClipboard[id] = false;
         m_sentClipboard[id] = false;
+        m_clipboardSendPending[id] = false;
         m_clipboardRetryPending[id] = false;
         m_clipboardRetryCount[id] = 0;
         m_timeClipboard[id] = 0;
@@ -179,6 +148,14 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
                             this,
                             new TMethodEventJob<Client>(this,
                                 &Client::handleFileClipboardReady));
+    m_events->adoptHandler(m_events->forFile().dropDirWriteFinished(),
+                            this,
+                            new TMethodEventJob<Client>(this,
+                                &Client::handleDropDirWriteFinished));
+    m_events->adoptHandler(m_events->forFile().keepAlive(),
+                            this,
+                            new TMethodEventJob<Client>(this,
+                                &Client::handleFileKeepAlive));
 }
 
 Client::~Client()
@@ -191,6 +168,28 @@ Client::~Client()
                               getEventTarget());
     m_events->removeHandler(m_events->forIScreen().resume(),
                               getEventTarget());
+
+	if (!cleanupSendFileThread(true) && m_sendFileThread != NULL) {
+		LOG((CLOG_ERR "waiting for file sender before destroying client state"));
+		m_sendFileThread->wait();
+		delete m_sendFileThread;
+		m_sendFileThread = NULL;
+		m_sendFileChunker.reset();
+        releaseDetachedSendFileStream();
+	}
+	if (!cleanupWriteToDropDirThread() && m_writeToDropDirThread != NULL) {
+		LOG((CLOG_ERR "waiting for drop-dir writer before destroying client state"));
+		m_writeToDropDirThread->wait();
+		delete m_writeToDropDirThread;
+		m_writeToDropDirThread = NULL;
+	}
+	FileChunk::releaseReceiveBuffer(m_receivedFileData, m_expectedFileSize, &m_receivedFileSpoolPath);
+    m_events->removeHandler(m_events->forFile().fileChunkSending(), this);
+    m_events->removeHandler(m_events->forFile().fileRecieveCompleted(), this);
+    m_events->removeHandler(m_events->forFile().fileClipboardReady(), this);
+    m_events->removeHandler(m_events->forFile().dropDirWriteFinished(), this);
+    m_events->removeHandler(m_events->forFile().keepAlive(), this);
+    releasePendingDropDirTransfers();
 
     cleanupTimer();
     cleanupScreen();
@@ -209,6 +208,7 @@ Client::connect()
         m_connectOnResume = true;
         return;
     }
+    m_terminalEventSent = false;
 
     auto security_level = ConnectionSecurityLevel::PLAINTEXT;
     if (m_useSecureNetwork) {
@@ -270,7 +270,7 @@ Client::disconnect(const char* msg)
         sendConnectionFailedEvent(msg);
     }
     else {
-        sendEvent(m_events->forClient().disconnected(), NULL);
+        sendDisconnectedEvent();
     }
 }
 
@@ -333,7 +333,7 @@ Client::enter(SInt32 xAbs, SInt32 yAbs, UInt32, KeyModifierMask mask, bool)
 
     if (m_sendFileChunker) {
         m_sendFileChunker->interruptFile();
-        m_sendFileThread = NULL;
+        reapSendFileThreadIfReady();
     }
 }
 
@@ -361,13 +361,14 @@ Client::leave()
 void
 Client::setClipboard(ClipboardID id, const IClipboard* clipboard)
 {
-    m_screen->setClipboard(id, clipboard);
+    bool publishClipboard = true;
 
     if (id == kClipboardClipboard && clipboard != NULL) {
         RemoteFileClipboard::Data remoteFileClipboard;
         if (RemoteFileClipboard::readFromClipboard(*clipboard, remoteFileClipboard) &&
             remoteFileClipboard.mode == RemoteFileClipboard::Mode::SourcePaths) {
             m_remoteFileClipboardSession = remoteFileClipboard.sessionId;
+            publishClipboard = false;
         }
         else {
             m_remoteFileClipboardSession.clear();
@@ -376,8 +377,13 @@ Client::setClipboard(ClipboardID id, const IClipboard* clipboard)
         }
     }
 
+    if (publishClipboard) {
+        m_screen->setClipboard(id, clipboard);
+    }
+
     m_ownClipboard[id]  = false;
     m_sentClipboard[id] = false;
+    m_clipboardSendPending[id] = false;
 }
 
 void
@@ -386,6 +392,7 @@ Client::grabClipboard(ClipboardID id)
     m_screen->grabClipboard(id);
     m_ownClipboard[id]  = false;
     m_sentClipboard[id] = false;
+    m_clipboardSendPending[id] = false;
 }
 
 void
@@ -504,101 +511,91 @@ Client::sendClipboard(ClipboardID id)
     m_clipboardRetryPending[id] = false;
     m_clipboardRetryCount[id] = 0;
 
-    bool hasFileList = false;
+    RemoteFileClipboard::AutomaticSharingStatus clipboardSharingStatus =
+        RemoteFileClipboard::AutomaticSharingStatus::Safe;
     if (id == kClipboardClipboard) {
-        if (clipboard.open(0)) {
-            hasFileList = clipboard.has(IClipboard::kFileList);
-            clipboard.close();
-        }
-
-        if (hasFileList) {
-            if (RemoteFileClipboard::stripImageFileTransferMetadata(clipboard)) {
-                LOG((CLOG_INFO "stripped image file-transfer metadata before sending clipboard to server"));
-            }
-
-            RemoteFileClipboard::Data remoteFileClipboard;
-            if (RemoteFileClipboard::normalizeClipboard(clipboard, &remoteFileClipboard) &&
-                remoteFileClipboard.mode == RemoteFileClipboard::Mode::SourcePaths) {
-                LOG((CLOG_INFO "remote clipboard source prepared: session=%s items=%lu",
-                     remoteFileClipboard.sessionId.c_str(),
-                     static_cast<unsigned long>(remoteFileClipboard.paths.size())));
-                sendClipboardSelectionToServer(remoteFileClipboard.paths);
-            }
+        clipboardSharingStatus =
+            RemoteFileClipboard::prepareForAutomaticClipboardSharing(clipboard);
+        if (clipboardSharingStatus ==
+            RemoteFileClipboard::AutomaticSharingStatus::SafeAfterRemovingImageFileMetadata) {
+            LOG((CLOG_INFO "stripped image file-transfer metadata before sending clipboard to server"));
         }
     }
 
-    // check time
-    if (m_timeClipboard[id] == 0 ||
-        clipboard.getTime() != m_timeClipboard[id]) {
-        // save new time
+    std::string data = clipboard.marshall();
+
+    if (!finishPendingClipboardSend(id, data)) {
+        return;
+    }
+
+    const bool clipboardTimeChanged =
+        (m_timeClipboard[id] == 0 || clipboard.getTime() != m_timeClipboard[id]);
+    if (clipboardTimeChanged) {
         m_timeClipboard[id] = clipboard.getTime();
+    }
 
-        // marshall the data
-        std::string data = clipboard.marshall();
-
-        // save and send data if different or not yet sent
-        if (!m_sentClipboard[id] || data != m_dataClipboard[id]) {
-            if (!hasFileList && sendClipboardFileSelection(id, clipboard)) {
-                m_sentClipboard[id] = true;
-                m_dataClipboard[id] = data;
-                return;
-            }
+    // save and send data if different or not yet sent
+    if (clipboardTimeChanged || !m_sentClipboard[id] || !m_dataClipboard[id].matches(data)) {
+        if (clipboardSharingStatus ==
+            RemoteFileClipboard::AutomaticSharingStatus::ContainsFileList) {
+            LOG((CLOG_INFO "local file clipboard is not sent automatically"));
+            m_remoteFileClipboardSession.clear();
+            m_readyFileClipboardSession.clear();
+            m_readyFileClipboardPaths.clear();
             m_sentClipboard[id] = true;
-            m_dataClipboard[id] = data;
-            m_server->onClipboardChanged(id, &clipboard);
+            m_clipboardSendPending[id] = false;
+            m_dataClipboard[id].set(data);
+            return;
         }
+        ServerProxy::ClipboardSendResult result =
+            m_server->onClipboardChanged(id, &clipboard);
+        if (result == ServerProxy::kClipboardSendFailed) {
+            scheduleClipboardRetry(id);
+            return;
+        }
+        if (result == ServerProxy::kClipboardSendPending) {
+            m_clipboardSendPending[id] = true;
+            m_pendingClipboardData[id].set(data);
+            scheduleClipboardRetry(id);
+            return;
+        }
+        m_sentClipboard[id] = true;
+        m_clipboardSendPending[id] = false;
+        m_dataClipboard[id].set(data);
     }
 }
 
 bool
-Client::sendClipboardFileSelection(ClipboardID id, const Clipboard& clipboard)
+Client::finishPendingClipboardSend(ClipboardID id, const std::string& data)
 {
-    if (id != kClipboardClipboard || !m_args.m_enableDragDrop || m_server == NULL) {
-        return false;
+    if (!m_clipboardSendPending[id]) {
+        return true;
     }
 
-    if (clipboard.open(0)) {
-        const bool hasImagePayload = clipboard.has(IClipboard::kPNG) ||
-                                     clipboard.has(IClipboard::kBitmap);
-        clipboard.close();
-        if (hasImagePayload) {
-            LOG((CLOG_DEBUG "skipping clipboard file-transfer path because image payload is present"));
+    if (!m_pendingClipboardData[id].matches(data)) {
+        if (!m_server->cleanupClipboardSendThread(true)) {
+            scheduleClipboardRetry(id);
             return false;
         }
+        m_clipboardSendPending[id] = false;
+        return true;
     }
 
-    const std::vector<barrier::fs::path> paths = clipboardFilePaths(clipboard);
-    if (paths.empty()) {
+    bool succeeded = false;
+    if (!m_server->reapClipboardSendResult(id, succeeded)) {
+        scheduleClipboardRetry(id);
         return false;
     }
 
-    DragFileList dragFileList;
-    std::string transferPaths;
-    for (const auto& path : paths) {
-        if (!transferPaths.empty()) {
-            transferPaths.push_back('\n');
-        }
-        transferPaths += path.u8string();
-
-        DragInformation info;
-        std::string pathString = path.u8string();
-        info.setFilename(pathString);
-        if (barrier::fs::is_directory(path)) {
-            info.setEntryType(DragInformation::Directory);
-        }
-        dragFileList.push_back(info);
+    m_clipboardSendPending[id] = false;
+    if (!succeeded) {
+        LOG((CLOG_WARN "clipboard %d async send failed; retrying", id));
+        return true;
     }
 
-    std::string infoString;
-    UInt32 fileCount = DragInformation::setupDragInfo(dragFileList, infoString);
-    if (fileCount == 0) {
-        return false;
-    }
-
-    LOG((CLOG_INFO "clipboard file selection detected, sending %u item(s)", fileCount));
-    sendDragInfo(fileCount, infoString, infoString.size());
-    sendFileToServer(transferPaths);
-    return true;
+    m_sentClipboard[id] = true;
+    m_dataClipboard[id].set(data);
+    return false;
 }
 
 void
@@ -610,6 +607,11 @@ Client::sendEvent(Event::Type type, void* data)
 void
 Client::sendConnectionFailedEvent(const char* msg)
 {
+    if (m_terminalEventSent) {
+        return;
+    }
+    m_terminalEventSent = true;
+
     FailInfo* info = new FailInfo(msg);
     info->m_retry = true;
     Event event(m_events->forClient().connectionFailed(), getEventTarget(), info, Event::kDontFreeData);
@@ -617,11 +619,31 @@ Client::sendConnectionFailedEvent(const char* msg)
 }
 
 void
+Client::sendDisconnectedEvent()
+{
+    if (m_terminalEventSent) {
+        return;
+    }
+    m_terminalEventSent = true;
+    sendEvent(m_events->forClient().disconnected(), NULL);
+}
+
+void
 Client::sendFileChunk(const void* data)
 {
     FileChunk* chunk = static_cast<FileChunk*>(const_cast<void*>(data));
     LOG((CLOG_DEBUG1 "send file chunk"));
-    assert(m_server != NULL);
+    if (m_server == NULL) {
+        LOG((CLOG_WARN "dropping stale file chunk because client is disconnected"));
+        return;
+    }
+    const bool hasTransferGeneration =
+        (chunk->m_transferId != 0 || m_sendFileTransferId != 0);
+    if (hasTransferGeneration && chunk->m_transferId != m_sendFileTransferId) {
+        LOG((CLOG_DEBUG "dropping stale file chunk, transfer=%u current=%u",
+            chunk->m_transferId, m_sendFileTransferId));
+        return;
+    }
 
     // relay
     m_server->fileChunkSending(chunk->m_chunk[0], &chunk->m_chunk[1], chunk->m_dataSize);
@@ -685,6 +707,7 @@ Client::setupConnection()
 void
 Client::setupScreen()
 {
+    reapDetachedConnectionState();
     assert(m_server == NULL);
 
     m_ready  = false;
@@ -716,6 +739,8 @@ Client::cleanupConnecting()
     if (m_stream != NULL) {
         m_events->removeHandler(m_events->forIDataSocket().connected(),
                             m_stream->getEventTarget());
+        m_events->removeHandler(m_events->forIDataSocket().secureConnected(),
+                            m_stream->getEventTarget());
         m_events->removeHandler(m_events->forIDataSocket().connectionFailed(),
                             m_stream->getEventTarget());
     }
@@ -724,6 +749,13 @@ Client::cleanupConnecting()
 void
 Client::cleanupConnection()
 {
+    FileChunk::releaseReceiveBuffer(m_receivedFileData, m_expectedFileSize, &m_receivedFileSpoolPath);
+    ++m_sendFileTransferId;
+    if (m_sendFileTransferId == 0) {
+        ++m_sendFileTransferId;
+    }
+    const bool fileSenderStopped = cleanupSendFileThread(true);
+
     if (m_stream != NULL) {
         m_events->removeHandler(m_events->forIStream().inputReady(),
                             m_stream->getEventTarget());
@@ -737,17 +769,27 @@ Client::cleanupConnection()
                             m_stream->getEventTarget());
         m_events->removeHandler(m_events->forISocket().stopRetry(),
                                 m_stream->getEventTarget());
-        cleanupStream();
+        if (!fileSenderStopped) {
+            LOG((CLOG_WARN "detaching stream so reconnect can proceed while file sender finishes"));
+            detachStreamForSendFileThread();
+            return;
+        }
+
+        delete m_stream;
+        m_stream = NULL;
+        m_socket = NULL;
     }
 }
 
 void
 Client::cleanupScreen()
 {
+    releaseDetachedServerProxies();
     cleanupClipboardRetryTimer();
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         m_clipboardRetryPending[id] = false;
         m_clipboardRetryCount[id] = 0;
+        m_clipboardSendPending[id] = false;
     }
     if (m_server != NULL) {
         if (m_ready) {
@@ -758,6 +800,11 @@ Client::cleanupScreen()
                             getEventTarget());
         m_events->removeHandler(m_events->forClipboard().clipboardGrabbed(),
                             getEventTarget());
+        if (!m_server->cleanupClipboardSendThread(true)) {
+            LOG((CLOG_WARN "detaching server proxy so reconnect can proceed while clipboard sender finishes"));
+            detachServerProxyForClipboardThread();
+            return;
+        }
         delete m_server;
         m_server = NULL;
     }
@@ -825,8 +872,101 @@ Client::cleanupTimer()
 void
 Client::cleanupStream()
 {
+    if (!cleanupSendFileThread(true)) {
+        LOG((CLOG_WARN "detaching stream so reconnect can proceed while file sender finishes"));
+        detachStreamForSendFileThread();
+        return;
+    }
     delete m_stream;
     m_stream = NULL;
+    m_socket = NULL;
+}
+
+void
+Client::detachServerProxyForClipboardThread()
+{
+    if (m_server == NULL) {
+        return;
+    }
+
+    m_server->detachForDeferredCleanup();
+    m_detachedServerProxies.push_back(m_server);
+    m_server = NULL;
+
+    if (m_stream == NULL) {
+        return;
+    }
+
+    m_events->removeHandler(m_events->forIStream().inputReady(),
+                            m_stream->getEventTarget());
+    m_events->removeHandler(m_events->forIStream().outputError(),
+                            m_stream->getEventTarget());
+    m_events->removeHandler(m_events->forIStream().inputShutdown(),
+                            m_stream->getEventTarget());
+    m_events->removeHandler(m_events->forIStream().outputShutdown(),
+                            m_stream->getEventTarget());
+    m_events->removeHandler(m_events->forISocket().disconnected(),
+                            m_stream->getEventTarget());
+    m_events->removeHandler(m_events->forISocket().stopRetry(),
+                            m_stream->getEventTarget());
+    m_stream->close();
+    m_detachedSendFileStreams.push_back(m_stream);
+    m_stream = NULL;
+    m_socket = NULL;
+}
+
+void
+Client::releaseDetachedServerProxies()
+{
+    for (std::vector<ServerProxy*>::iterator i = m_detachedServerProxies.begin();
+         i != m_detachedServerProxies.end();) {
+        ServerProxy* proxy = *i;
+        if (!proxy->cleanupClipboardSendThread(true)) {
+            ++i;
+            continue;
+        }
+        delete proxy;
+        i = m_detachedServerProxies.erase(i);
+    }
+
+    if (m_detachedServerProxies.empty() && m_sendFileThread == NULL) {
+        releaseDetachedSendFileStream();
+    }
+}
+
+void
+Client::reapDetachedConnectionState()
+{
+    reapSendFileThreadIfReady();
+    releaseDetachedServerProxies();
+}
+
+void
+Client::detachStreamForSendFileThread()
+{
+    if (m_stream == NULL) {
+        return;
+    }
+
+    m_stream->close();
+    m_detachedSendFileStreams.push_back(m_stream);
+    m_stream = NULL;
+    m_socket = NULL;
+}
+
+void
+Client::releaseDetachedSendFileStream()
+{
+    if (!m_detachedServerProxies.empty()) {
+        LOG((CLOG_DEBUG "keeping detached stream until server proxy sender finishes"));
+        return;
+    }
+
+    for (std::vector<barrier::IStream*>::iterator i = m_detachedSendFileStreams.begin();
+         i != m_detachedSendFileStreams.end(); ++i) {
+        delete *i;
+    }
+    m_detachedSendFileStreams.clear();
 }
 
 void
@@ -840,6 +980,7 @@ Client::handleConnected(const Event&, void*)
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         m_ownClipboard[id]  = false;
         m_sentClipboard[id] = false;
+        m_clipboardSendPending[id] = false;
         m_clipboardRetryPending[id] = false;
         m_clipboardRetryCount[id] = 0;
         m_timeClipboard[id] = 0;
@@ -879,7 +1020,7 @@ Client::handleOutputError(const Event&, void*)
     cleanupScreen();
     cleanupConnection();
     LOG((CLOG_WARN "error sending to server"));
-    sendEvent(m_events->forClient().disconnected(), NULL);
+    sendDisconnectedEvent();
 }
 
 void
@@ -889,7 +1030,7 @@ Client::handleDisconnected(const Event&, void*)
     cleanupScreen();
     cleanupConnection();
     LOG((CLOG_DEBUG1 "disconnected"));
-    sendEvent(m_events->forClient().disconnected(), NULL);
+    sendDisconnectedEvent();
 }
 
 void
@@ -915,6 +1056,7 @@ Client::handleClipboardGrabbed(const Event& event, void*)
     // we now own the clipboard and it has not been sent to the server
     m_ownClipboard[info->m_id]  = true;
     m_sentClipboard[info->m_id] = false;
+    m_clipboardSendPending[info->m_id] = false;
     m_timeClipboard[info->m_id] = 0;
     m_clipboardRetryPending[info->m_id] = false;
     m_clipboardRetryCount[info->m_id] = 0;
@@ -1019,6 +1161,16 @@ Client::handleFileChunkSending(const Event& event, void*)
 }
 
 void
+Client::handleFileKeepAlive(const Event&, void*)
+{
+    reapDetachedConnectionState();
+    if (m_server == NULL) {
+        return;
+    }
+    m_server->keepAlive();
+}
+
+void
 Client::handleFileRecieveCompleted(const Event& event, void*)
 {
     onFileRecieveCompleted();
@@ -1027,9 +1179,20 @@ Client::handleFileRecieveCompleted(const Event& event, void*)
 void
 Client::onFileRecieveCompleted()
 {
-    if (isReceivedFileSizeValid()) {
-        m_writeToDropDirThread = new Thread([this](){ write_to_drop_dir_thread(); });
-    }
+	if (isReceivedFileSizeValid()) {
+	    std::shared_ptr<CompletedFileTransfer> transfer = takeCompletedFileTransfer();
+	    startDropDirTransfer(transfer);
+	    return;
+	}
+
+    LOG((CLOG_ERR "received file completion with invalid size, expected=%d actual=%d",
+        m_expectedFileSize,
+        m_receivedFileSpoolPath.empty()
+            ? m_receivedFileData.size()
+            : (barrier::fs::exists(m_receivedFileSpoolPath)
+                ? static_cast<size_t>(barrier::fs::file_size(m_receivedFileSpoolPath))
+                : 0)));
+	FileChunk::releaseReceiveBuffer(m_receivedFileData, m_expectedFileSize, &m_receivedFileSpoolPath);
 }
 
 void
@@ -1041,13 +1204,31 @@ Client::handleFileClipboardReady(const Event& event, void*)
         return;
     }
 
+    if (!info->m_publishClipboard &&
+        (m_remoteFileClipboardSession.empty() ||
+         m_remoteFileClipboardSession != info->m_sessionId)) {
+        LOG((CLOG_WARN "ignoring stale remote clipboard ready event: session=%s current=%s",
+            info->m_sessionId.c_str(), m_remoteFileClipboardSession.c_str()));
+        return;
+    }
+
     m_readyFileClipboardSession = info->m_sessionId;
     m_readyFileClipboardPaths = info->m_paths;
-    if (!m_remoteFileClipboardSession.empty() &&
+    if (info->m_publishClipboard) {
+        publishMaterializedFileClipboard(m_readyFileClipboardPaths,
+                                         m_readyFileClipboardSession);
+    }
+    else if (!m_remoteFileClipboardSession.empty() &&
         m_remoteFileClipboardSession == m_readyFileClipboardSession) {
         publishMaterializedFileClipboard(m_readyFileClipboardPaths,
                                          m_readyFileClipboardSession);
     }
+}
+
+void
+Client::handleDropDirWriteFinished(const Event&, void*)
+{
+    drainDropDirTransferQueue();
 }
 
 void
@@ -1056,71 +1237,169 @@ Client::handleStopRetry(const Event&, void*)
     m_args.m_restartable = false;
 }
 
-void Client::write_to_drop_dir_thread()
+void
+Client::startDropDirTransfer(std::shared_ptr<CompletedFileTransfer> transfer)
 {
-    LOG((CLOG_DEBUG "starting write to drop dir thread"));
+    if (!transfer) {
+        return;
+    }
 
-    if (!m_remoteFileClipboardSession.empty() &&
-        TransferArchive::isPackageData(m_receivedFileData)) {
-        LOG((CLOG_INFO "remote clipboard package received: session=%s", m_remoteFileClipboardSession.c_str()));
-        const barrier::fs::path spoolDir =
-            barrier::DataDirectories::profile() / "clipboard-cache" / "client";
-        std::vector<barrier::fs::path> roots;
-        std::string error;
-        if (RemoteFileClipboard::extractPackage(m_receivedFileData, spoolDir, roots, error)) {
-            LOG((CLOG_INFO "remote clipboard package materialized: session=%s items=%lu",
-                 m_remoteFileClipboardSession.c_str(),
-                 static_cast<unsigned long>(roots.size())));
-            FileClipboardReadyInfo* info = new FileClipboardReadyInfo();
-            info->m_sessionId = m_remoteFileClipboardSession;
-            for (size_t i = 0; i < roots.size(); ++i) {
-                info->m_paths.push_back(roots[i].u8string());
-            }
+    if (!reapWriteToDropDirThreadIfReady()) {
+        queueDropDirTransfer(transfer);
+        return;
+    }
+
+    m_writeToDropDirThread = new Thread([this, transfer]() {
+        write_to_drop_dir_thread(transfer);
+        m_events->addEvent(Event(m_events->forFile().dropDirWriteFinished(), this));
+    });
+}
+
+void
+Client::queueDropDirTransfer(std::shared_ptr<CompletedFileTransfer> transfer)
+{
+    if (!transfer) {
+        return;
+    }
+    size_t pendingMemoryBytes = 0;
+    for (std::deque<std::shared_ptr<CompletedFileTransfer> >::const_iterator i =
+             m_pendingDropDirTransfers.begin();
+         i != m_pendingDropDirTransfers.end(); ++i) {
+        if (*i && (*i)->spoolPath.empty()) {
+            pendingMemoryBytes += (*i)->data.size();
+        }
+    }
+    const size_t transferMemoryBytes =
+        transfer->spoolPath.empty() ? transfer->data.size() : 0;
+    if (transferMemoryBytes > 0 &&
+        (transferMemoryBytes > kMaxPendingDropDirTransferMemoryBytes ||
+         pendingMemoryBytes > kMaxPendingDropDirTransferMemoryBytes - transferMemoryBytes)) {
+        LOG((CLOG_ERR "drop-dir writer memory queue full; dropping completed file transfer, queued=%lu incoming=%lu limit=%lu",
+            static_cast<unsigned long>(pendingMemoryBytes),
+            static_cast<unsigned long>(transferMemoryBytes),
+            static_cast<unsigned long>(kMaxPendingDropDirTransferMemoryBytes)));
+        FileChunk::releaseReceiveBuffer(transfer->data, transfer->expectedSize, &transfer->spoolPath);
+        return;
+    }
+    if (m_pendingDropDirTransfers.size() >= kMaxPendingDropDirTransfers) {
+        LOG((CLOG_ERR "drop-dir writer queue full; dropping completed file transfer"));
+        FileChunk::releaseReceiveBuffer(transfer->data, transfer->expectedSize, &transfer->spoolPath);
+        return;
+    }
+    LOG((CLOG_WARN "queueing completed file transfer while drop-dir writer is still running (%lu/%lu)",
+        static_cast<unsigned long>(m_pendingDropDirTransfers.size() + 1),
+        static_cast<unsigned long>(kMaxPendingDropDirTransfers)));
+    m_pendingDropDirTransfers.push_back(transfer);
+}
+
+void
+Client::drainDropDirTransferQueue()
+{
+    if (!reapWriteToDropDirThreadIfReady() || m_pendingDropDirTransfers.empty()) {
+        return;
+    }
+
+    std::shared_ptr<CompletedFileTransfer> transfer = m_pendingDropDirTransfers.front();
+    m_pendingDropDirTransfers.pop_front();
+    startDropDirTransfer(transfer);
+}
+
+void
+Client::releasePendingDropDirTransfers()
+{
+    for (std::deque<std::shared_ptr<CompletedFileTransfer> >::iterator i = m_pendingDropDirTransfers.begin();
+         i != m_pendingDropDirTransfers.end(); ++i) {
+        if (*i) {
+            FileChunk::releaseReceiveBuffer((*i)->data, (*i)->expectedSize, &(*i)->spoolPath);
+        }
+    }
+    m_pendingDropDirTransfers.clear();
+}
+
+void Client::write_to_drop_dir_thread(std::shared_ptr<CompletedFileTransfer> transfer)
+{
+	LOG((CLOG_DEBUG "starting write to drop dir thread"));
+
+	if (!transfer) {
+	    return;
+	}
+
+	bool released = false;
+	const auto releaseReceiveBuffer = [&]() {
+	    if (!released) {
+	        FileChunk::releaseReceiveBuffer(transfer->data, transfer->expectedSize, &transfer->spoolPath);
+	        released = true;
+	    }
+	};
+
+	try {
+	const bool hasSpooledReceive = !transfer->spoolPath.empty();
+	if (!transfer->remoteFileClipboardSession.empty() &&
+	    (hasSpooledReceive
+	        ? TransferArchive::isPackageFile(transfer->spoolPath)
+	        : TransferArchive::isPackageData(transfer->data))) {
+	    LOG((CLOG_INFO "remote clipboard package received: session=%s", transfer->remoteFileClipboardSession.c_str()));
+	    const barrier::fs::path cacheRoot =
+	        barrier::DataDirectories::profile() / "clipboard-cache" / "client";
+	    const barrier::fs::path spoolDir =
+	        RemoteFileClipboard::materializedSessionRoot(cacheRoot, transfer->remoteFileClipboardSession);
+	    std::vector<barrier::fs::path> roots;
+	    std::string error;
+	    const bool extracted = hasSpooledReceive
+	        ? RemoteFileClipboard::extractPackageFile(transfer->spoolPath, spoolDir, roots, error)
+	        : RemoteFileClipboard::extractPackage(transfer->data, spoolDir, roots, error);
+	    if (extracted) {
+	        RemoteFileClipboard::pruneMaterializedCache(
+	            cacheRoot, transfer->remoteFileClipboardSession, 8, 512u * 1024u * 1024u);
+	        LOG((CLOG_INFO "remote clipboard package materialized: session=%s items=%lu",
+	             transfer->remoteFileClipboardSession.c_str(),
+	             static_cast<unsigned long>(roots.size())));
+	        FileClipboardReadyInfo* info = new FileClipboardReadyInfo();
+	        info->m_sessionId = transfer->remoteFileClipboardSession;
+	        for (size_t i = 0; i < roots.size(); ++i) {
+	            info->m_paths.push_back(roots[i].u8string());
+	        }
 
             Event ready(m_events->forFile().fileClipboardReady(), this);
             ready.setDataObject(info);
             m_events->addEvent(ready);
         }
-        else {
-            LOG((CLOG_ERR "failed to materialize remote clipboard package: %s", error.c_str()));
-        }
+	    else {
+	        LOG((CLOG_ERR "failed to materialize remote clipboard package: %s", error.c_str()));
+	    }
 
-        String().swap(m_receivedFileData);
-        return;
-    }
+	    releaseReceiveBuffer();
+	    return;
+	}
 
-    std::vector<String> droppedPaths = DropHelper::writeToDir(m_screen->getDropTarget(), m_dragFileList,
-                    m_receivedFileData);
+	std::vector<String> droppedPaths = hasSpooledReceive
+	    ? DropHelper::writeToDirFromFile(transfer->dropTarget, transfer->dragFileList, transfer->spoolPath)
+	    : DropHelper::writeToDir(transfer->dropTarget, transfer->dragFileList, transfer->data);
 
     if (!droppedPaths.empty()) {
-        std::string clipboardPaths;
-        for (const auto& path : droppedPaths) {
-            if (!clipboardPaths.empty()) {
-                clipboardPaths.push_back('\n');
-            }
-            clipboardPaths += path;
+        const std::string sessionId = RemoteFileClipboard::createSessionId();
+        FileClipboardReadyInfo* info = new FileClipboardReadyInfo();
+        info->m_sessionId = sessionId;
+        info->m_publishClipboard = true;
+        for (size_t i = 0; i < droppedPaths.size(); ++i) {
+            info->m_paths.push_back(droppedPaths[i]);
         }
 
-        Clipboard clipboard;
-        const std::string sessionId = RemoteFileClipboard::createSessionId();
-        if (RemoteFileClipboard::buildMaterializedClipboard(
-                utf8PathsToFsPaths(droppedPaths), sessionId, clipboard)) {
-            setClipboard(kClipboardClipboard, &clipboard);
-            m_sentClipboard[kClipboardClipboard] = true;
-            m_dataClipboard[kClipboardClipboard] = clipboard.marshall();
-            LOG((CLOG_INFO "dropped file(s) published as file clipboard: session=%s items=%lu",
-                 sessionId.c_str(),
-                 static_cast<unsigned long>(droppedPaths.size())));
-        }
-        else if (clipboard.open(0)) {
-            clipboard.empty();
-            clipboard.add(IClipboard::kText, clipboardPaths);
-            clipboard.close();
-            setClipboard(kClipboardClipboard, &clipboard);
-            m_sentClipboard[kClipboardClipboard] = true;
-            m_dataClipboard[kClipboardClipboard] = clipboard.marshall();
-        }
+        Event ready(m_events->forFile().fileClipboardReady(), this);
+        ready.setDataObject(info);
+        m_events->addEvent(ready);
     }
+
+	releaseReceiveBuffer();
+	}
+	catch (XThread&) {
+	    releaseReceiveBuffer();
+	    throw;
+	}
+	catch (std::exception& error) {
+	    LOG((CLOG_ERR "drop-dir writer failed: %s", error.what()));
+	    releaseReceiveBuffer();
+	}
 }
 
 void
@@ -1135,6 +1414,9 @@ Client::publishMaterializedFileClipboard(const std::vector<std::string>& paths,
     }
 
     m_screen->setClipboard(kClipboardClipboard, &clipboard);
+    m_sentClipboard[kClipboardClipboard] = true;
+    m_clipboardSendPending[kClipboardClipboard] = false;
+    m_dataClipboard[kClipboardClipboard].set(clipboard.marshall());
     LOG((CLOG_INFO "remote clipboard published locally: session=%s items=%lu",
          sessionId.c_str(),
          static_cast<unsigned long>(paths.size())));
@@ -1148,25 +1430,35 @@ Client::sendClipboardSelectionToServer(const std::vector<barrier::fs::path>& sou
         return;
     }
 
-    if (m_sendFileChunker) {
-        m_sendFileChunker->interruptFile();
+    if (!cleanupSendFileThread(true)) {
+        LOG((CLOG_WARN "remote clipboard prefetch skipped because previous file sender is still stopping"));
+        return;
     }
 
     auto chunker = std::make_shared<StreamChunker>();
     m_sendFileChunker = chunker;
+    barrier::IStream* stream = m_stream;
+    ++m_sendFileTransferId;
+    if (m_sendFileTransferId == 0) {
+        ++m_sendFileTransferId;
+    }
+    const UInt32 transferId = m_sendFileTransferId;
     LOG((CLOG_INFO "remote clipboard prefetch started: direction=client-to-server items=%lu",
          static_cast<unsigned long>(sourcePaths.size())));
-    m_sendFileThread = new Thread([this, sourcePaths, chunker]() {
-        send_clipboard_file_thread(sourcePaths, chunker);
+    m_sendFileThread = new Thread([this, sourcePaths, stream, chunker, transferId]() {
+        send_clipboard_file_thread(sourcePaths, stream, chunker, transferId);
     });
 }
 
 void
 Client::send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourcePaths,
-                                   const std::shared_ptr<StreamChunker>& chunker)
+                                   barrier::IStream* stream,
+                                   const std::shared_ptr<StreamChunker>& chunker,
+                                   UInt32 transferId)
 {
     barrier::fs::path packagePath;
     try {
+        Thread::testCancel();
         RemoteFileClipboard::Data payload;
         payload.mode = RemoteFileClipboard::Mode::SourcePaths;
         payload.paths = sourcePaths;
@@ -1176,7 +1468,14 @@ Client::send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourceP
             throw std::runtime_error(error);
         }
 
-        chunker->sendFile(packagePath.u8string().c_str(), m_events, this, m_stream);
+        Thread::testCancel();
+        chunker->sendFile(packagePath.u8string().c_str(), m_events, this, stream, transferId);
+    }
+    catch (XThread&) {
+        if (!packagePath.empty()) {
+            barrier::fs::remove(packagePath);
+        }
+        throw;
     }
     catch (std::runtime_error& error) {
         LOG((CLOG_ERR "failed sending remote clipboard file package: %s", error.what()));
@@ -1185,10 +1484,6 @@ Client::send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourceP
     if (!packagePath.empty()) {
         barrier::fs::remove(packagePath);
     }
-    if (m_sendFileChunker == chunker) {
-        m_sendFileChunker.reset();
-    }
-    m_sendFileThread = NULL;
 }
 
 void
@@ -1208,34 +1503,58 @@ Client::dragInfoReceived(UInt32 fileNum, std::string data)
 bool
 Client::isReceivedFileSizeValid()
 {
+    if (!m_receivedFileSpoolPath.empty()) {
+        return barrier::fs::exists(m_receivedFileSpoolPath) &&
+            static_cast<std::size_t>(barrier::fs::file_size(m_receivedFileSpoolPath)) == m_expectedFileSize;
+    }
     return m_expectedFileSize == m_receivedFileData.size();
 }
 
 void
 Client::sendFileToServer(const std::string& filename)
 {
-    if (m_sendFileChunker) {
-        m_sendFileChunker->interruptFile();
+    if (!cleanupSendFileThread(true)) {
+        LOG((CLOG_WARN "file send skipped because previous file sender is still stopping"));
+        return;
     }
 
     auto chunker = std::make_shared<StreamChunker>();
     m_sendFileChunker = chunker;
-    m_sendFileThread = new Thread([this, filename, chunker]() { send_file_thread(filename, chunker); });
+    barrier::IStream* stream = m_stream;
+    ++m_sendFileTransferId;
+    if (m_sendFileTransferId == 0) {
+        ++m_sendFileTransferId;
+    }
+    const UInt32 transferId = m_sendFileTransferId;
+    m_sendFileThread = new Thread([this, stream, filename, chunker, transferId]() {
+        send_file_thread(stream, filename, chunker, transferId);
+    });
 }
 
-void Client::send_file_thread(const std::string& filename, const std::shared_ptr<StreamChunker>& chunker)
+void Client::send_file_thread(barrier::IStream* stream,
+                              const std::string& filename,
+                              const std::shared_ptr<StreamChunker>& chunker,
+                              UInt32 transferId)
 {
     barrier::fs::path sourcePath;
     barrier::fs::path tempPackagePath;
     try {
+        Thread::testCancel();
         std::string error;
         if (!prepareTransferSource(filename.c_str(), sourcePath, tempPackagePath, error)) {
             throw std::runtime_error(error);
         }
 
+        Thread::testCancel();
         const barrier::fs::path& transferPath =
             tempPackagePath.empty() ? sourcePath : tempPackagePath;
-        chunker->sendFile(transferPath.u8string().c_str(), m_events, this, m_stream);
+        chunker->sendFile(transferPath.u8string().c_str(), m_events, this, stream, transferId);
+    }
+    catch (XThread&) {
+        if (!tempPackagePath.empty()) {
+            barrier::fs::remove(tempPackagePath);
+        }
+        throw;
     }
     catch (std::runtime_error& error) {
         LOG((CLOG_ERR "failed sending file chunks: %s", error.what()));
@@ -1244,10 +1563,104 @@ void Client::send_file_thread(const std::string& filename, const std::shared_ptr
     if (!tempPackagePath.empty()) {
         barrier::fs::remove(tempPackagePath);
     }
-    if (m_sendFileChunker == chunker) {
-        m_sendFileChunker.reset();
+}
+
+bool
+Client::cleanupSendFileThread(bool cancel)
+{
+    if (cancel && m_sendFileChunker) {
+        m_sendFileChunker->interruptFile();
     }
+
+    if (m_sendFileThread != NULL) {
+        if (cancel && !m_sendFileThread->wait(2.0)) {
+            LOG((CLOG_WARN "file send thread did not stop after interrupt; cancelling"));
+            m_sendFileThread->cancel();
+            m_sendFileThread->unblockPollSocket();
+            if (!m_sendFileThread->wait(5.0)) {
+                LOG((CLOG_ERR "file send thread still running after cancellation; cleanup deferred"));
+                return false;
+            }
+        }
+        else if (!cancel && !m_sendFileThread->wait(5.0)) {
+            LOG((CLOG_ERR "file send thread still running; cleanup deferred"));
+            return false;
+        }
+		delete m_sendFileThread;
+		m_sendFileThread = NULL;
+	}
+
+	m_sendFileChunker.reset();
+    releaseDetachedServerProxies();
+    releaseDetachedSendFileStream();
+	return true;
+}
+
+bool
+Client::reapSendFileThreadIfReady()
+{
+    if (m_sendFileThread == NULL) {
+        return true;
+    }
+    if (!m_sendFileThread->wait(0.0)) {
+        return false;
+    }
+
+    delete m_sendFileThread;
     m_sendFileThread = NULL;
+    m_sendFileChunker.reset();
+    releaseDetachedSendFileStream();
+    return true;
+}
+
+bool
+Client::cleanupWriteToDropDirThread()
+{
+    if (m_writeToDropDirThread != NULL) {
+        if (!m_writeToDropDirThread->wait(2.0)) {
+            LOG((CLOG_WARN "drop-dir writer thread did not stop; cancelling"));
+            m_writeToDropDirThread->cancel();
+            m_writeToDropDirThread->unblockPollSocket();
+            if (!m_writeToDropDirThread->wait(5.0)) {
+                LOG((CLOG_ERR "drop-dir writer thread still running after cancellation; cleanup deferred"));
+                return false;
+            }
+        }
+        delete m_writeToDropDirThread;
+        m_writeToDropDirThread = NULL;
+	}
+    return true;
+}
+
+bool
+Client::reapWriteToDropDirThreadIfReady()
+{
+    if (m_writeToDropDirThread == NULL) {
+        return true;
+    }
+    if (!m_writeToDropDirThread->wait(0.0)) {
+        return false;
+    }
+    delete m_writeToDropDirThread;
+    m_writeToDropDirThread = NULL;
+    return true;
+}
+
+std::shared_ptr<Client::CompletedFileTransfer>
+Client::takeCompletedFileTransfer()
+{
+	std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
+	transfer->expectedSize = m_expectedFileSize;
+	transfer->data.swap(m_receivedFileData);
+	transfer->spoolPath = m_receivedFileSpoolPath;
+	m_receivedFileSpoolPath.clear();
+	if (m_screen != NULL) {
+		transfer->dropTarget = m_screen->getDropTarget();
+	}
+	transfer->dragFileList.swap(m_dragFileList);
+	transfer->remoteFileClipboardSession = m_remoteFileClipboardSession;
+	m_expectedFileSize = 0;
+	return transfer;
 }
 
 void
@@ -1299,7 +1712,22 @@ bool prepareTransferSource(const char* filename,
         return TransferArchive::createSelectionPackageFile(sourcePaths, tempPackagePath, error);
     }
 
+    if (barrier::fs::is_symlink(barrier::fs::symlink_status(sourcePath)) ||
+        !barrier::fs::is_regular_file(sourcePath)) {
+        error = "transfer source must be a regular file";
+        return false;
+    }
+
     return true;
 }
 
+}
+
+bool
+testClientPrepareTransferSource(const char* filename,
+                                barrier::fs::path& sourcePath,
+                                barrier::fs::path& tempPackagePath,
+                                std::string& error)
+{
+    return prepareTransferSource(filename, sourcePath, tempPackagePath, error);
 }

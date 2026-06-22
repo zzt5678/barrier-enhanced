@@ -127,6 +127,15 @@ TEST(StringTests, stringToUint_inputString_outputInt)
     EXPECT_EQ(123, value);
 }
 
+TEST(StringTests, stringToUint_invalidInput_returnsZero)
+{
+    String number = "invalid";
+
+    size_t value = string::stringToSizeType(number);
+
+    EXPECT_EQ(0u, value);
+}
+
 TEST(StringTests, splitString_twoSeparator_returnThreeParts)
 {
     String string = "stub1:stub2:stub3";

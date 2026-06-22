@@ -106,6 +106,12 @@ PrimaryClient::isLockedToScreen() const
     return m_screen->isLockedToScreen();
 }
 
+bool
+PrimaryClient::canEnter() const
+{
+    return m_screen->canEnter();
+}
+
 void*
 PrimaryClient::getEventTarget() const
 {

@@ -45,20 +45,30 @@
 #include <iostream>
 #include <stdio.h>
 
+#if SYSAPI_WIN32
+#include <process.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 using namespace std;
 using ::testing::_;
 using ::testing::NiceMock;
 using ::testing::Return;
 using ::testing::Invoke;
 
-#define TEST_PORT 24803
-#define TEST_HOST "localhost"
+#define TEST_HOST "127.0.0.1"
 
 const size_t kMockDataSize = 1024 * 1024 * 10; // 10MB
 const UInt16 kMockDataChunkIncrement = 1024; // 1KB
 const char* kMockFilename = "NetworkTests.mock";
 const size_t kMockFileSize = 1024 * 1024 * 10; // 10MB
+const int kRepeatedMockDataTransfers = 8;
 
+int getFreeTestPort();
 void getScreenShape(SInt32& x, SInt32& y, SInt32& w, SInt32& h);
 void getCursorPos(SInt32& x, SInt32& y);
 UInt8* newMockData(size_t size);
@@ -70,7 +80,11 @@ public:
     NetworkTests() :
         m_mockData(NULL),
         m_mockDataSize(0),
-        m_mockFileSize(0)
+        m_mockFileSize(0),
+        m_repeatedServer(NULL),
+        m_repeatedClient(NULL),
+        m_repeatedTransferId(0),
+        m_repeatedCompleted(0)
     {
         m_mockData = newMockData(kMockDataSize);
         createFile(m_mockFile, kMockFilename, kMockFileSize);
@@ -82,7 +96,7 @@ public:
         delete[] m_mockData;
     }
 
-    void                sendMockData(void* eventTarget);
+    void                sendMockData(void* eventTarget, UInt32 transferId = 0);
 
     void                sendToClient_mockData_handleClientConnected(const Event&, void* vlistener);
     void                sendToClient_mockData_fileRecieveCompleted(const Event&, void*);
@@ -96,18 +110,25 @@ public:
     void                sendToServer_mockFile_handleClientConnected(const Event&, void* vlistener);
     void                sendToServer_mockFile_fileRecieveCompleted(const Event& event, void*);
 
+    void                repeatedSendToClient_mockData_handleClientConnected(const Event&, void* vlistener);
+    void                repeatedSendToClient_mockData_fileRecieveCompleted(const Event& event, void*);
+
 public:
     TestEventQueue        m_events;
     UInt8*                m_mockData;
     size_t                m_mockDataSize;
     fstream                m_mockFile;
     size_t                m_mockFileSize;
+    Server*                m_repeatedServer;
+    BaseClientProxy*       m_repeatedClient;
+    UInt32                 m_repeatedTransferId;
+    int                    m_repeatedCompleted;
 };
 
 TEST_F(NetworkTests, sendToClient_mockData)
 {
     // server and client
-    NetworkAddress serverAddress(TEST_HOST, TEST_PORT);
+    NetworkAddress serverAddress(TEST_HOST, getFreeTestPort());
 
     serverAddress.resolve();
 
@@ -166,7 +187,7 @@ TEST_F(NetworkTests, sendToClient_mockData)
 TEST_F(NetworkTests, sendToClient_mockFile)
 {
     // server and client
-    NetworkAddress serverAddress(TEST_HOST, TEST_PORT);
+    NetworkAddress serverAddress(TEST_HOST, getFreeTestPort());
 
     serverAddress.resolve();
 
@@ -215,8 +236,9 @@ TEST_F(NetworkTests, sendToClient_mockFile)
 
     client.connect();
 
-    m_events.initQuitTimeout(10);
+    m_events.initQuitTimeout(30);
     m_events.loop();
+    EXPECT_TRUE(server.testCleanupSendFileThread(false));
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
     m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &client);
     m_events.cleanupQuitTimeout();
@@ -225,7 +247,7 @@ TEST_F(NetworkTests, sendToClient_mockFile)
 TEST_F(NetworkTests, sendToServer_mockData)
 {
     // server and client
-    NetworkAddress serverAddress(TEST_HOST, TEST_PORT);
+    NetworkAddress serverAddress(TEST_HOST, getFreeTestPort());
     serverAddress.resolve();
 
     // server
@@ -282,7 +304,7 @@ TEST_F(NetworkTests, sendToServer_mockData)
 TEST_F(NetworkTests, sendToServer_mockFile)
 {
     // server and client
-    NetworkAddress serverAddress(TEST_HOST, TEST_PORT);
+    NetworkAddress serverAddress(TEST_HOST, getFreeTestPort());
 
     serverAddress.resolve();
 
@@ -330,10 +352,67 @@ TEST_F(NetworkTests, sendToServer_mockFile)
 
     client.connect();
 
-    m_events.initQuitTimeout(10);
+    m_events.initQuitTimeout(30);
     m_events.loop();
+    EXPECT_TRUE(client.testCleanupSendFileThread(false));
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
     m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &server);
+    m_events.cleanupQuitTimeout();
+}
+
+TEST_F(NetworkTests, repeatedSendToClient_mockDataReusesConnection)
+{
+    NetworkAddress serverAddress(TEST_HOST, getFreeTestPort());
+
+    serverAddress.resolve();
+
+    SocketMultiplexer serverSocketMultiplexer;
+    TCPSocketFactory* serverSocketFactory = new TCPSocketFactory(&m_events, &serverSocketMultiplexer);
+    ClientListener listener(serverAddress, serverSocketFactory, &m_events,
+                            ConnectionSecurityLevel::PLAINTEXT);
+    NiceMock<MockScreen> serverScreen;
+    NiceMock<MockPrimaryClient> primaryClient;
+    NiceMock<MockConfig> serverConfig;
+    NiceMock<MockInputFilter> serverInputFilter;
+
+    m_events.adoptHandler(
+        m_events.forClientListener().connected(), &listener,
+        new TMethodEventJob<NetworkTests>(
+            this, &NetworkTests::repeatedSendToClient_mockData_handleClientConnected, &listener));
+
+    ON_CALL(serverConfig, isScreen(_)).WillByDefault(Return(true));
+    ON_CALL(serverConfig, getInputFilter()).WillByDefault(Return(&serverInputFilter));
+
+    ServerArgs serverArgs;
+    serverArgs.m_enableDragDrop = true;
+    Server server(serverConfig, &primaryClient, &serverScreen, &m_events, serverArgs);
+    server.m_mock = true;
+    listener.setServer(&server);
+
+    NiceMock<MockScreen> clientScreen;
+    SocketMultiplexer clientSocketMultiplexer;
+    TCPSocketFactory* clientSocketFactory = new TCPSocketFactory(&m_events, &clientSocketMultiplexer);
+
+    ON_CALL(clientScreen, getShape(_, _, _, _)).WillByDefault(Invoke(getScreenShape));
+    ON_CALL(clientScreen, getCursorPos(_, _)).WillByDefault(Invoke(getCursorPos));
+
+    ClientArgs clientArgs;
+    clientArgs.m_enableDragDrop = true;
+    clientArgs.m_enableCrypto = false;
+    Client client(&m_events, "stub", serverAddress, clientSocketFactory, &clientScreen, clientArgs);
+
+    m_events.adoptHandler(
+        m_events.forFile().fileRecieveCompleted(), &client,
+        new TMethodEventJob<NetworkTests>(
+            this, &NetworkTests::repeatedSendToClient_mockData_fileRecieveCompleted));
+
+    client.connect();
+
+    m_events.initQuitTimeout(30);
+    m_events.loop();
+    EXPECT_EQ(kRepeatedMockDataTransfers, m_repeatedCompleted);
+    m_events.removeHandler(m_events.forClientListener().connected(), &listener);
+    m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &client);
     m_events.cleanupQuitTimeout();
 }
 
@@ -351,8 +430,9 @@ NetworkTests::sendToClient_mockData_handleClientConnected(const Event&, void* vl
     BaseClientProxy* bcp = client;
     server->adoptClient(bcp);
     server->setActive(bcp);
+    server->setFileTransferForTest(bcp, 1);
 
-    sendMockData(server);
+    sendMockData(server, 1);
 }
 
 void
@@ -362,6 +442,49 @@ NetworkTests::sendToClient_mockData_fileRecieveCompleted(const Event& event, voi
     EXPECT_TRUE(client->isReceivedFileSizeValid());
 
     m_events.raiseQuitEvent();
+}
+
+void
+NetworkTests::repeatedSendToClient_mockData_handleClientConnected(const Event&, void* vlistener)
+{
+    ClientListener* listener = static_cast<ClientListener*>(vlistener);
+    Server* server = listener->getServer();
+
+    ClientProxy* client = listener->getNextClient();
+    if (client == NULL) {
+        throw runtime_error("client is null");
+    }
+
+    BaseClientProxy* bcp = client;
+    server->adoptClient(bcp);
+    server->setActive(bcp);
+
+    m_repeatedServer = server;
+    m_repeatedClient = bcp;
+    m_repeatedTransferId = 1;
+    m_repeatedCompleted = 0;
+
+    server->setFileTransferForTest(bcp, m_repeatedTransferId);
+    sendMockData(server, m_repeatedTransferId);
+}
+
+void
+NetworkTests::repeatedSendToClient_mockData_fileRecieveCompleted(const Event& event, void*)
+{
+    Client* client = static_cast<Client*>(event.getTarget());
+    EXPECT_TRUE(client->isReceivedFileSizeValid());
+
+    ++m_repeatedCompleted;
+    if (m_repeatedCompleted >= kRepeatedMockDataTransfers) {
+        m_events.raiseQuitEvent();
+        return;
+    }
+
+    ASSERT_TRUE(m_repeatedServer != NULL);
+    ASSERT_TRUE(m_repeatedClient != NULL);
+    ++m_repeatedTransferId;
+    m_repeatedServer->setFileTransferForTest(m_repeatedClient, m_repeatedTransferId);
+    sendMockData(m_repeatedServer, m_repeatedTransferId);
 }
 
 void
@@ -424,13 +547,16 @@ NetworkTests::sendToServer_mockFile_fileRecieveCompleted(const Event& event, voi
 }
 
 void
-NetworkTests::sendMockData(void* eventTarget)
+NetworkTests::sendMockData(void* eventTarget, UInt32 transferId)
 {
     // send first message (file size)
     String size = barrier::string::sizeTypeToString(kMockDataSize);
     FileChunk* sizeMessage = FileChunk::start(size);
+    sizeMessage->m_transferId = transferId;
 
-    m_events.addEvent(Event(m_events.forFile().fileChunkSending(), eventTarget, sizeMessage));
+    Event sizeEvent(m_events.forFile().fileChunkSending(), eventTarget, sizeMessage);
+    sizeEvent.setDataObject(sizeMessage);
+    m_events.addEvent(sizeEvent);
 
     // send chunk messages with incrementing chunk size
     size_t lastSize = 0;
@@ -445,7 +571,10 @@ NetworkTests::sendMockData(void* eventTarget)
 
         // first byte is the chunk mark, last is \0
         FileChunk* chunk = FileChunk::data(m_mockData, dataSize);
-        m_events.addEvent(Event(m_events.forFile().fileChunkSending(), eventTarget, chunk));
+        chunk->m_transferId = transferId;
+        Event chunkEvent(m_events.forFile().fileChunkSending(), eventTarget, chunk);
+        chunkEvent.setDataObject(chunk);
+        m_events.addEvent(chunkEvent);
 
         sentLength += dataSize;
         lastSize = dataSize;
@@ -458,7 +587,10 @@ NetworkTests::sendMockData(void* eventTarget)
 
     // send last message
     FileChunk* transferFinished = FileChunk::end();
-    m_events.addEvent(Event(m_events.forFile().fileChunkSending(), eventTarget, transferFinished));
+    transferFinished->m_transferId = transferId;
+    Event finishEvent(m_events.forFile().fileChunkSending(), eventTarget, transferFinished);
+    finishEvent.setDataObject(transferFinished);
+    m_events.addEvent(finishEvent);
 }
 
 UInt8*
@@ -507,6 +639,41 @@ createFile(fstream& file, const char* filename, size_t size)
     file.close();
 
     delete[] buffer;
+}
+
+int
+getFreeTestPort()
+{
+#if SYSAPI_WIN32
+    static int offset = 0;
+    return 24803 + (_getpid() % 20000) + offset++;
+#else
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        throw runtime_error("cannot create port probe socket");
+    }
+
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close(fd);
+        throw runtime_error("cannot bind port probe socket");
+    }
+
+    socklen_t addrLen = sizeof(addr);
+    if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &addrLen) != 0) {
+        close(fd);
+        throw runtime_error("cannot read port probe socket address");
+    }
+
+    int port = ntohs(addr.sin_port);
+    close(fd);
+    return port;
+#endif
 }
 
 void

@@ -36,6 +36,12 @@ void open_utf8_path(std::fstream& stream, const fs::path& path,
                     std::ios_base::openmode mode = std::ios_base::in | std::ios_base::out);
 
 std::FILE* fopen_utf8_path(const fs::path& path, const std::string& mode);
+bool create_secure_temp_file(const std::string& prefix, const std::string& suffix,
+                             fs::path& path);
+bool create_secure_temp_file_in_directory(const fs::path& directory,
+                                          const std::string& prefix,
+                                          const std::string& suffix,
+                                          fs::path& path);
 
 } // namespace barrier
 

@@ -50,6 +50,7 @@ public:
     void                sendMessageToServer_serverHandleMessageReceived(const Event&, void*);
     void                sendMessageToClient_serverHandleClientConnected(const Event&, void*);
     void                sendMessageToClient_clientHandleMessageReceived(const Event&, void*);
+    void                runCommandRoundTrip(UInt8 elevateMode);
 
 public:
     SocketMultiplexer    m_multiplexer;
@@ -57,6 +58,9 @@ public:
     bool                m_connectToServer_hasClientNode;
     IpcServer*            m_connectToServer_server;
     String                m_sendMessageToServer_receivedString;
+    UInt8                m_sendMessageToServer_elevateModeToSend;
+    UInt8                m_sendMessageToServer_receivedElevateMode;
+    bool                m_sendMessageToServer_receivedElevate;
     String                m_sendMessageToClient_receivedString;
     IpcClient*            m_sendMessageToServer_client;
     IpcServer*            m_sendMessageToClient_server;
@@ -90,26 +94,34 @@ TEST_F(IpcTests, connectToServer)
 
 TEST_F(IpcTests, sendMessageToServer)
 {
-    SocketMultiplexer socketMultiplexer;
-    IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT);
-    server.listen();
-
-    // event handler sends "test" command to server.
-    m_events.adoptHandler(
-        m_events.forIpcServer().messageReceived(), &server,
-        new TMethodEventJob<IpcTests>(
-        this, &IpcTests::sendMessageToServer_serverHandleMessageReceived));
-
-    IpcClient client(&m_events, &socketMultiplexer, TEST_IPC_PORT);
-    client.connect();
-    m_sendMessageToServer_client = &client;
-
-    m_events.initQuitTimeout(5);
-    m_events.loop();
-    m_events.removeHandler(m_events.forIpcServer().messageReceived(), &server);
-    m_events.cleanupQuitTimeout();
+    runCommandRoundTrip(IpcCommandMessage::kElevateAlways);
 
     EXPECT_EQ("test", m_sendMessageToServer_receivedString);
+    EXPECT_EQ(IpcCommandMessage::kElevateAlways,
+              m_sendMessageToServer_receivedElevateMode);
+    EXPECT_TRUE(m_sendMessageToServer_receivedElevate);
+}
+
+TEST_F(IpcTests, commandMessagePreservesElevateModeAcrossIpcEncoding)
+{
+    runCommandRoundTrip(IpcCommandMessage::kElevateAsNeeded);
+    EXPECT_EQ(IpcCommandMessage::kElevateAsNeeded,
+              m_sendMessageToServer_receivedElevateMode);
+    EXPECT_FALSE(m_sendMessageToServer_receivedElevate);
+
+    runCommandRoundTrip(IpcCommandMessage::kElevateAlways);
+    EXPECT_EQ(IpcCommandMessage::kElevateAlways,
+              m_sendMessageToServer_receivedElevateMode);
+    EXPECT_TRUE(m_sendMessageToServer_receivedElevate);
+
+    runCommandRoundTrip(IpcCommandMessage::kElevateNever);
+    EXPECT_EQ(IpcCommandMessage::kElevateNever,
+              m_sendMessageToServer_receivedElevateMode);
+    EXPECT_FALSE(m_sendMessageToServer_receivedElevate);
+
+    IpcCommandMessage invalid("test", IpcCommandMessage::kElevateNever + 1);
+    EXPECT_EQ(IpcCommandMessage::kElevateAsNeeded, invalid.elevateMode());
+    EXPECT_FALSE(invalid.elevate());
 }
 
 TEST_F(IpcTests, sendMessageToClient)
@@ -146,6 +158,9 @@ IpcTests::IpcTests() :
 m_connectToServer_helloMessageReceived(false),
 m_connectToServer_hasClientNode(false),
 m_connectToServer_server(nullptr),
+m_sendMessageToServer_elevateModeToSend(IpcCommandMessage::kElevateAlways),
+m_sendMessageToServer_receivedElevateMode(IpcCommandMessage::kElevateAsNeeded),
+m_sendMessageToServer_receivedElevate(false),
 m_sendMessageToClient_server(nullptr),
 m_sendMessageToServer_client(nullptr)
 {
@@ -153,6 +168,36 @@ m_sendMessageToServer_client(nullptr)
 
 IpcTests::~IpcTests()
 {
+}
+
+void
+IpcTests::runCommandRoundTrip(UInt8 elevateMode)
+{
+    m_sendMessageToServer_receivedString.clear();
+    m_sendMessageToServer_elevateModeToSend = elevateMode;
+    m_sendMessageToServer_receivedElevateMode = IpcCommandMessage::kElevateAsNeeded;
+    m_sendMessageToServer_receivedElevate = false;
+
+    SocketMultiplexer socketMultiplexer;
+    IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+    server.listen();
+
+    // event handler sends "test" command to server.
+    m_events.adoptHandler(
+        m_events.forIpcServer().messageReceived(), &server,
+        new TMethodEventJob<IpcTests>(
+        this, &IpcTests::sendMessageToServer_serverHandleMessageReceived));
+
+    IpcClient client(&m_events, &socketMultiplexer, TEST_IPC_PORT, kIpcClientGui);
+    client.connect();
+    m_sendMessageToServer_client = &client;
+
+    m_events.initQuitTimeout(5);
+    m_events.loop();
+    m_events.removeHandler(m_events.forIpcServer().messageReceived(), &server);
+    m_events.cleanupQuitTimeout();
+
+    m_sendMessageToServer_client = nullptr;
 }
 
 void
@@ -173,13 +218,15 @@ IpcTests::sendMessageToServer_serverHandleMessageReceived(const Event& e, void*)
     IpcMessage* m = static_cast<IpcMessage*>(e.getDataObject());
     if (m->type() == kIpcHello) {
         LOG((CLOG_DEBUG "client said hello, sending test to server"));
-        IpcCommandMessage m("test", true);
+        IpcCommandMessage m("test", m_sendMessageToServer_elevateModeToSend);
         m_sendMessageToServer_client->send(m);
     }
     else if (m->type() == kIpcCommand) {
         IpcCommandMessage* cm = static_cast<IpcCommandMessage*>(m);
         LOG((CLOG_DEBUG "got ipc command message, %d", cm->command().c_str()));
         m_sendMessageToServer_receivedString = cm->command();
+        m_sendMessageToServer_receivedElevateMode = cm->elevateMode();
+        m_sendMessageToServer_receivedElevate = cm->elevate();
         m_events.raiseQuitEvent();
     }
 }

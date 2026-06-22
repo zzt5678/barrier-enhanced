@@ -221,7 +221,7 @@ void SettingsDialog::updatePlatformReadiness()
     m_pButtonPlatformAction->setText(tr("Prompt Accessibility Access"));
 #elif defined(Q_OS_WIN)
     m_pLabelPlatformStatus->setText(tr("Windows permission flow is handled in-app"));
-    m_pLabelPlatformDetail->setText(tr("Keep Elevate set to As Needed so Weave can prompt when UAC or desktop switching requires it."));
+    m_pLabelPlatformDetail->setText(tr("Use Service mode with Elevate Always so Weave can keep input working across UAC and desktop switching."));
     m_pButtonPlatformAction->setVisible(false);
 #elif defined(WINAPI_XWINDOWS)
     const bool isWayland = QGuiApplication::platformName() == QStringLiteral("wayland");

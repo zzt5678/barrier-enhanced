@@ -100,6 +100,40 @@ TEST(IpcLogOutputterTests, write_underBufferMaxSize_allLinesAreSent)
     outputter.sendBuffer();
 }
 
+TEST(IpcLogOutputterTests, write_overBufferMaxBytes_oldestLinesAreTruncated)
+{
+    MockIpcServer mockServer;
+
+    ON_CALL(mockServer, hasClients(_)).WillByDefault(Return(true));
+
+    EXPECT_CALL(mockServer, hasClients(_)).Times(1);
+    EXPECT_CALL(mockServer, send(IpcLogLineMessageEq("2222\n3333\n"), _)).Times(1);
+
+    IpcLogOutputter outputter(mockServer, kIpcClientUnknown, false);
+    outputter.bufferMaxBytes(9);
+
+    outputter.write(kNOTE, "1111");
+    outputter.write(kNOTE, "2222");
+    outputter.write(kNOTE, "3333");
+    outputter.sendBuffer();
+}
+
+TEST(IpcLogOutputterTests, write_overBufferMaxLineBytes_lineIsTruncated)
+{
+    MockIpcServer mockServer;
+
+    ON_CALL(mockServer, hasClients(_)).WillByDefault(Return(true));
+
+    EXPECT_CALL(mockServer, hasClients(_)).Times(1);
+    EXPECT_CALL(mockServer, send(IpcLogLineMessageEq("01234... [truncated]\n"), _)).Times(1);
+
+    IpcLogOutputter outputter(mockServer, kIpcClientUnknown, false);
+    outputter.bufferMaxLineBytes(20);
+
+    outputter.write(kNOTE, "012345678901234567890123456789");
+    outputter.sendBuffer();
+}
+
 // HACK: temporarily disable this intermittently failing unit test.
 // when the build machine is under heavy load, a race condition
 // usually happens.

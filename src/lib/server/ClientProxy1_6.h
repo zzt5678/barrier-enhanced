@@ -17,10 +17,15 @@
 
 #pragma once
 
+#include "barrier/ClipboardChunk.h"
 #include "server/ClientProxy1_5.h"
+
+#include <memory>
 
 class Server;
 class IEventQueue;
+class StreamChunker;
+class Thread;
 
 //! Proxy for client implementing protocol version 1.6
 class ClientProxy1_6 : public ClientProxy1_5 {
@@ -32,9 +37,25 @@ public:
     virtual void        setClipboard(ClipboardID id, const IClipboard* clipboard);
     virtual bool        recvClipboard();
 
+    virtual bool        cleanupClipboardSendThread(bool cancel);
+
+#ifdef BARRIER_TEST_ENV
+    bool                testClipboardDirty(ClipboardID id) const { return m_clipboard[id].m_dirty; }
+#endif
+
 private:
     void                handleClipboardSendingEvent(const Event&, void*);
+    void                sendClipboardThread(
+                            const std::shared_ptr<const std::string>& data,
+                            ClipboardID id,
+                            const std::shared_ptr<StreamChunker>& chunker);
 
 private:
     IEventQueue*        m_events;
+    ClipboardChunk::ReceiveBuffer m_clipboardReceiveBuffer;
+    Thread*             m_clipboardSendThread;
+    std::shared_ptr<StreamChunker> m_clipboardChunker;
+    ClipboardID         m_clipboardSendId;
+    bool                m_clipboardSendSucceeded;
+    bool                m_clipboardSendResultAvailable;
 };

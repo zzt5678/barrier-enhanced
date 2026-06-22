@@ -1,6 +1,7 @@
 #include "platform/MSWindowsClipboardFileListConverter.h"
 
 #include "barrier/RemoteFileClipboard.h"
+#include "base/Log.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -10,6 +11,9 @@
 #include <vector>
 
 namespace {
+
+const size_t kMaxRemoteFileListPaths = 1024;
+const size_t kMaxRemoteFileListUtf8Bytes = 1024 * 1024;
 
 std::wstring wideFromUtf8(const std::string& value)
 {
@@ -74,11 +78,25 @@ MSWindowsClipboardFileListConverter::fromIClipboard(const std::string& data) con
         payload.paths.empty()) {
         return NULL;
     }
+    if (payload.paths.size() > kMaxRemoteFileListPaths) {
+        LOG((CLOG_WARN "refusing to publish oversized remote file list to CF_HDROP: %u paths",
+            static_cast<unsigned>(payload.paths.size())));
+        return NULL;
+    }
 
     std::vector<std::wstring> paths;
     size_t charCount = 1;
+    size_t utf8Bytes = 0;
     for (size_t i = 0; i < payload.paths.size(); ++i) {
-        const std::wstring widePath = wideFromUtf8(payload.paths[i].u8string());
+        const std::string utf8Path = payload.paths[i].u8string();
+        utf8Bytes += utf8Path.size();
+        if (utf8Bytes > kMaxRemoteFileListUtf8Bytes) {
+            LOG((CLOG_WARN "refusing to publish oversized remote file list to CF_HDROP: %u bytes",
+                static_cast<unsigned>(utf8Bytes)));
+            return NULL;
+        }
+
+        const std::wstring widePath = wideFromUtf8(utf8Path);
         if (widePath.empty()) {
             return NULL;
         }
@@ -128,10 +146,15 @@ MSWindowsClipboardFileListConverter::toIClipboard(HANDLE data) const
     if (fileCount == 0) {
         return std::string();
     }
+    if (fileCount > kMaxRemoteFileListPaths) {
+        LOG((CLOG_WARN "refusing to serialize oversized CF_HDROP clipboard list: %u files", fileCount));
+        return std::string();
+    }
 
     RemoteFileClipboard::Data payload;
     payload.mode = RemoteFileClipboard::Mode::SourcePaths;
     payload.cut = false;
+    size_t utf8Bytes = 0;
 
     for (UINT i = 0; i < fileCount; ++i) {
         const UINT length = DragQueryFileW(drop, i, NULL, 0);
@@ -146,7 +169,15 @@ MSWindowsClipboardFileListConverter::toIClipboard(HANDLE data) const
         }
         widePath.resize(length);
 
-        payload.paths.push_back(barrier::fs::u8path(utf8FromWide(widePath)));
+        const std::string utf8Path = utf8FromWide(widePath);
+        utf8Bytes += utf8Path.size();
+        if (utf8Bytes > kMaxRemoteFileListUtf8Bytes) {
+            LOG((CLOG_WARN "refusing to serialize oversized CF_HDROP clipboard list: %u bytes",
+                static_cast<unsigned>(utf8Bytes)));
+            return std::string();
+        }
+
+        payload.paths.push_back(barrier::fs::u8path(utf8Path));
     }
 
     return payload.paths.empty() ? std::string() : RemoteFileClipboard::serialize(payload);

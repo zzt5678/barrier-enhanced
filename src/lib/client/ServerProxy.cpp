@@ -32,8 +32,17 @@
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
 #include "base/XBase.h"
+#include "mt/Thread.h"
 
 #include <memory>
+
+namespace {
+
+const UInt32 kMaxKeepAliveAlarmDeferrals = 8;
+const UInt32 kMaxMissedKeepAliveAlarmsBeforeDisconnect = 1;
+const size_t kSynchronousClipboardSendLimit = 256 * 1024;
+
+}
 
 //
 // ServerProxy
@@ -55,8 +64,18 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_nestedRemoteMode(false),
     m_keepAliveAlarm(0.0),
     m_keepAliveAlarmTimer(NULL),
+    m_keepAliveAlarmDeferrals(0),
+    m_keepAliveMissedAlarms(0),
+    m_lastKeepAlivePendingInput(false),
+    m_lastKeepAliveBufferedOutput(0),
+    m_keepAliveActivityTimer(true),
     m_parser(&ServerProxy::parseHandshakeMessage),
-    m_events(events)
+    m_events(events),
+    m_clipboardSendThread(NULL),
+    m_detachedForDeferredCleanup(false),
+    m_clipboardSendId(kClipboardEnd),
+    m_clipboardSendSucceeded(false),
+    m_clipboardSendResultAvailable(false)
 {
     assert(m_client != NULL);
     assert(m_stream != NULL);
@@ -75,6 +94,10 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
                             this,
                             new TMethodEventJob<ServerProxy>(this,
                                 &ServerProxy::handleClipboardSendingEvent));
+    m_events->adoptHandler(m_events->forFile().keepAlive(),
+                            this,
+                            new TMethodEventJob<ServerProxy>(this,
+                                &ServerProxy::handleKeepAliveEvent));
 
     // send heartbeat
     setKeepAliveRate(kKeepAliveRate);
@@ -82,10 +105,20 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
 
 ServerProxy::~ServerProxy()
 {
+    if (!cleanupClipboardSendThread(true) && m_clipboardSendThread != NULL) {
+        LOG((CLOG_ERR "waiting for clipboard sender before destroying server proxy"));
+        m_clipboardSendThread->wait();
+        delete m_clipboardSendThread;
+        m_clipboardSendThread = NULL;
+        m_clipboardChunker.reset();
+    }
     setKeepAliveRate(-1.0);
-    m_events->removeHandler(m_events->forIStream().inputReady(),
-                            m_stream->getEventTarget());
-    m_events->removeHandler(m_events->forClipboard().clipboardSending(), this);
+    if (!m_detachedForDeferredCleanup) {
+        m_events->removeHandler(m_events->forIStream().inputReady(),
+                                m_stream->getEventTarget());
+        m_events->removeHandler(m_events->forClipboard().clipboardSending(), this);
+        m_events->removeHandler(m_events->forFile().keepAlive(), this);
+    }
 }
 
 void
@@ -109,6 +142,12 @@ void
 ServerProxy::setKeepAliveRate(double rate)
 {
     m_keepAliveAlarm = rate * kKeepAlivesUntilDeath;
+    m_keepAliveAlarmDeferrals = 0;
+    m_keepAliveMissedAlarms = 0;
+    m_lastKeepAlivePendingInput = false;
+    m_lastKeepAliveBufferedOutput = 0;
+    m_keepAliveActivityTimer.start();
+    m_keepAliveActivityTimer.reset();
     resetKeepAliveAlarm();
 }
 
@@ -118,6 +157,7 @@ ServerProxy::handleData(const Event&, void*)
     // handle messages until there are no more.  first read message code.
     UInt8 code[4];
     UInt32 n = m_stream->read(code, 4);
+    bool receivedMessage = false;
     while (n != 0) {
         // verify we got an entire code
         if (n != 4) {
@@ -125,6 +165,7 @@ ServerProxy::handleData(const Event&, void*)
             m_client->disconnect("incomplete message from server");
             return;
         }
+        receivedMessage = true;
 
         // parse message
         LOG((CLOG_DEBUG2 "msg from server: %c%c%c%c", code[0], code[1], code[2], code[3]));
@@ -155,6 +196,13 @@ ServerProxy::handleData(const Event&, void*)
         n = m_stream->read(code, 4);
     }
 
+    if (receivedMessage) {
+        m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
+        m_lastKeepAlivePendingInput = false;
+        m_lastKeepAliveBufferedOutput = 0;
+        m_keepAliveActivityTimer.reset();
+    }
     flushCompressedMouse();
 }
 
@@ -184,6 +232,8 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
     else if (memcmp(code, kMsgCKeepAlive, 4) == 0) {
         // echo keep alives and reset alarm
         ProtocolUtil::writef(m_stream, kMsgCKeepAlive);
+        m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
         resetKeepAliveAlarm();
     }
 
@@ -269,6 +319,8 @@ ServerProxy::parseMessage(const UInt8* code)
     else if (memcmp(code, kMsgCKeepAlive, 4) == 0) {
         // echo keep alives and reset alarm
         ProtocolUtil::writef(m_stream, kMsgCKeepAlive);
+        m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
         resetKeepAliveAlarm();
     }
 
@@ -346,11 +398,85 @@ ServerProxy::parseMessage(const UInt8* code)
     return kOkay;
 }
 
+bool
+ServerProxy::shouldDeferKeepAliveAlarm(bool hasPendingInput, UInt32 bufferedOutput) const
+{
+    return hasPendingInput || bufferedOutput > 0;
+}
+
+void
+ServerProxy::keepAlive()
+{
+    ProtocolUtil::writef(m_stream, kMsgCKeepAlive);
+}
+
 void
 ServerProxy::handleKeepAliveAlarm(const Event&, void*)
 {
+    const bool hasPendingInput = m_stream->isReady();
+    const UInt32 bufferedOutput = m_stream->getBufferedOutputSize();
+    if ((hasPendingInput && !m_lastKeepAlivePendingInput) ||
+        (m_lastKeepAliveBufferedOutput > 0 &&
+         bufferedOutput < m_lastKeepAliveBufferedOutput)) {
+        m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
+    }
+    m_lastKeepAlivePendingInput = hasPendingInput;
+    m_lastKeepAliveBufferedOutput = bufferedOutput;
+
+    if (shouldDeferKeepAliveAlarm(hasPendingInput, bufferedOutput)) {
+        if (m_keepAliveAlarmDeferrals >= kMaxKeepAliveAlarmDeferrals) {
+            LOG((CLOG_NOTE
+                 "server keepalive stalled with pending work; disconnecting, "
+                 "pendingInput=%d bufferedOutput=%u idle=%.3fs",
+                 hasPendingInput ? 1 : 0,
+                 bufferedOutput,
+                 m_keepAliveActivityTimer.getTime()));
+            m_client->disconnect("server is not making progress");
+            return;
+        }
+
+        ++m_keepAliveAlarmDeferrals;
+        m_keepAliveMissedAlarms = 0;
+        LOG((CLOG_WARN
+             "server keepalive delayed while stream has pending work; deferring disconnect (%u/%u), "
+             "pendingInput=%d bufferedOutput=%u idle=%.3fs",
+             m_keepAliveAlarmDeferrals,
+             kMaxKeepAliveAlarmDeferrals,
+             hasPendingInput ? 1 : 0,
+             bufferedOutput,
+             m_keepAliveActivityTimer.getTime()));
+        resetKeepAliveAlarm();
+        return;
+    }
+
+    if (m_keepAliveAlarm > 0.0 &&
+        m_keepAliveActivityTimer.getTime() < m_keepAliveAlarm) {
+        m_keepAliveMissedAlarms = 0;
+        resetKeepAliveAlarm();
+        return;
+    }
+
+    if (m_keepAliveMissedAlarms < kMaxMissedKeepAliveAlarmsBeforeDisconnect) {
+        ++m_keepAliveMissedAlarms;
+        LOG((CLOG_WARN
+             "server keepalive missed; sending probe before disconnect (%u/%u), idle=%.3fs",
+             m_keepAliveMissedAlarms,
+             kMaxMissedKeepAliveAlarmsBeforeDisconnect,
+             m_keepAliveActivityTimer.getTime()));
+        keepAlive();
+        resetKeepAliveAlarm();
+        return;
+    }
+
     LOG((CLOG_NOTE "server is dead"));
     m_client->disconnect("server is not responding");
+}
+
+void
+ServerProxy::handleKeepAliveEvent(const Event&, void*)
+{
+    keepAlive();
 }
 
 void
@@ -384,13 +510,120 @@ ServerProxy::onGrabClipboard(ClipboardID id)
     return true;
 }
 
-void
+ServerProxy::ClipboardSendResult
 ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard* clipboard)
 {
-    std::string data = IClipboard::marshall(clipboard);
     LOG((CLOG_DEBUG "sending clipboard %d seqnum=%d", id, m_seqNum));
 
-    StreamChunker::sendClipboard(data, data.size(), id, m_seqNum, m_events, this, m_stream);
+    if (!cleanupClipboardSendThread(true)) {
+        LOG((CLOG_WARN "clipboard %d send skipped because previous sender is still stopping", id));
+        return kClipboardSendFailed;
+    }
+
+    std::shared_ptr<const std::string> data(
+        new std::string(IClipboard::marshall(clipboard)));
+
+    if (data->size() <= kSynchronousClipboardSendLimit) {
+        const bool sent = StreamChunker::sendClipboard(
+            *data, data->size(), id, m_seqNum, m_events, this, m_stream);
+        if (!sent) {
+            LOG((CLOG_WARN "clipboard %d was not fully queued for sending", id));
+        }
+        return sent ? kClipboardSendQueued : kClipboardSendFailed;
+    }
+
+    std::shared_ptr<StreamChunker> chunker = std::make_shared<StreamChunker>();
+    m_clipboardChunker = chunker;
+    const UInt32 sequence = m_seqNum;
+    m_clipboardSendId = id;
+    m_clipboardSendSucceeded = false;
+    m_clipboardSendResultAvailable = false;
+    m_clipboardSendThread = new Thread([this, data, id, sequence, chunker]() {
+        sendClipboardThread(data, id, sequence, chunker);
+    });
+    return kClipboardSendPending;
+}
+
+void
+ServerProxy::sendClipboardThread(const std::shared_ptr<const std::string>& data,
+                                 ClipboardID id,
+                                 UInt32 sequence,
+                                 const std::shared_ptr<StreamChunker>& chunker)
+{
+    const bool sent = chunker->sendClipboardData(
+            *data, data->size(), id, sequence, m_events, this, m_stream);
+    m_clipboardSendSucceeded = sent;
+    m_clipboardSendResultAvailable = true;
+    if (!sent) {
+        LOG((CLOG_WARN "clipboard %d was not fully queued for sending", id));
+    }
+}
+
+bool
+ServerProxy::reapClipboardSendResult(ClipboardID id, bool& succeeded)
+{
+    if (m_clipboardSendThread == NULL) {
+        return false;
+    }
+    if (!m_clipboardSendThread->wait(0.0)) {
+        return false;
+    }
+
+    delete m_clipboardSendThread;
+    m_clipboardSendThread = NULL;
+    m_clipboardChunker.reset();
+
+    succeeded = m_clipboardSendResultAvailable &&
+        m_clipboardSendId == id &&
+        m_clipboardSendSucceeded;
+    m_clipboardSendId = kClipboardEnd;
+    m_clipboardSendSucceeded = false;
+    m_clipboardSendResultAvailable = false;
+    return true;
+}
+
+bool
+ServerProxy::cleanupClipboardSendThread(bool cancel)
+{
+    if (cancel && m_clipboardChunker) {
+        m_clipboardChunker->interruptFile();
+    }
+
+    if (m_clipboardSendThread != NULL) {
+        if (cancel && !m_clipboardSendThread->wait(0.5)) {
+            LOG((CLOG_WARN "clipboard send thread did not stop after interrupt; cancelling"));
+            m_clipboardSendThread->cancel();
+            m_clipboardSendThread->unblockPollSocket();
+            if (!m_clipboardSendThread->wait(2.0)) {
+                LOG((CLOG_ERR "clipboard send thread still running after cancellation; cleanup deferred"));
+                return false;
+            }
+        }
+        else if (!cancel && !m_clipboardSendThread->wait(2.0)) {
+            LOG((CLOG_ERR "clipboard send thread still running; cleanup deferred"));
+            return false;
+        }
+        delete m_clipboardSendThread;
+        m_clipboardSendThread = NULL;
+    }
+
+    m_clipboardChunker.reset();
+    return true;
+}
+
+void
+ServerProxy::detachForDeferredCleanup()
+{
+    if (m_detachedForDeferredCleanup) {
+        return;
+    }
+
+    setKeepAliveRate(-1.0);
+    m_events->removeHandler(m_events->forIStream().inputReady(),
+                            m_stream->getEventTarget());
+    m_events->removeHandler(m_events->forClipboard().clipboardSending(), this);
+    m_events->removeHandler(m_events->forFile().keepAlive(), this);
+    m_detachedForDeferredCleanup = true;
 }
 
 void
@@ -583,23 +816,23 @@ void
 ServerProxy::setClipboard()
 {
     // parse
-    static std::string dataCached;
     ClipboardID id;
     UInt32 seq;
 
-    int r = ClipboardChunk::assemble(m_stream, dataCached, id, seq);
+    int r = ClipboardChunk::assemble(m_stream, m_clipboardReceiveBuffer, id, seq);
 
     if (r == kStart) {
-        size_t size = ClipboardChunk::getExpectedSize();
+        size_t size = m_clipboardReceiveBuffer.expectedSize;
         LOG((CLOG_DEBUG "receiving clipboard %d size=%d", id, size));
     }
     else if (r == kFinish) {
-        LOG((CLOG_DEBUG "received clipboard %d size=%d", id, dataCached.size()));
+        LOG((CLOG_DEBUG "received clipboard %d size=%d", id, m_clipboardReceiveBuffer.data.size()));
 
         // forward
         Clipboard clipboard;
-        clipboard.unmarshall(dataCached, 0);
+        clipboard.unmarshall(m_clipboardReceiveBuffer.data, 0);
         m_client->setClipboard(id, &clipboard);
+        m_clipboardReceiveBuffer.release();
 
         LOG((CLOG_INFO "clipboard was updated"));
     }
@@ -843,7 +1076,16 @@ ServerProxy::setOptions()
 {
     // parse
     OptionsList options;
-    ProtocolUtil::readf(m_stream, kMsgDSetOptions + 4, &options);
+    if (!ProtocolUtil::readf(m_stream, kMsgDSetOptions + 4, &options)) {
+        LOG((CLOG_ERR "invalid options from server: could not read options list"));
+        m_client->disconnect("invalid options from server");
+        return;
+    }
+    if (!hasCompleteOptionPairs(options)) {
+        LOG((CLOG_ERR "invalid options from server: odd option list size=%d", options.size()));
+        m_client->disconnect("invalid options from server");
+        return;
+    }
     LOG((CLOG_DEBUG1 "recv set options size=%d", options.size()));
 
     // forward
@@ -896,6 +1138,12 @@ ServerProxy::setOptions()
     }
 }
 
+bool
+ServerProxy::hasCompleteOptionPairs(const OptionsList& options)
+{
+    return (options.size() % 2) == 0;
+}
+
 void
 ServerProxy::queryInfo()
 {
@@ -918,7 +1166,8 @@ ServerProxy::fileChunkReceived()
     int result = FileChunk::assemble(
                     m_stream,
                     m_client->getReceivedFileData(),
-                    m_client->getExpectedFileSize());
+                    m_client->getExpectedFileSize(),
+                    &m_client->getReceivedFileSpoolPath());
 
     if (result == kFinish) {
         m_events->addEvent(Event(m_events->forFile().fileRecieveCompleted(), m_client));

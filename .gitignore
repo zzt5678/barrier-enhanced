@@ -10,6 +10,8 @@ config.h
 /bin
 /lib
 /build
+/_build/
+/compile_commands.json
 /CMakeFiles
 /src/gui/Makefile*
 /src/gui/object_script*

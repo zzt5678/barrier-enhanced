@@ -85,8 +85,12 @@ Event::deleteData(const Event& event)
 
     default:
         if ((event.getFlags() & kDontFreeData) == 0) {
-            free(event.getData());
-            delete event.getDataObject();
+            if (event.getDataObject() != nullptr) {
+                delete event.getDataObject();
+            }
+            else {
+                free(event.getData());
+            }
         }
         break;
     }

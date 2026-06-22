@@ -25,7 +25,32 @@
 
 static const size_t kClipboardReceiveReserveLimit = 16 * 1024 * 1024;
 
-thread_local size_t ClipboardChunk::s_expectedSize = 0;
+const size_t ClipboardChunk::kMaxReceiveSize = 64 * 1024 * 1024;
+
+static bool
+canAppendClipboardData(
+        const ClipboardChunk::ReceiveBuffer& buffer,
+        const String& data)
+{
+    return buffer.data.size() <= buffer.expectedSize &&
+        data.size() <= buffer.expectedSize - buffer.data.size();
+}
+
+void
+ClipboardChunk::ReceiveBuffer::clear()
+{
+    data.clear();
+    expectedSize = 0;
+    inProgress = false;
+}
+
+void
+ClipboardChunk::ReceiveBuffer::release()
+{
+    String().swap(data);
+    expectedSize = 0;
+    inProgress = false;
+}
 
 ClipboardChunk::ClipboardChunk(size_t size) :
     Chunk(size)
@@ -85,9 +110,23 @@ ClipboardChunk::end(ClipboardID id, UInt32 sequence)
     return end;
 }
 
+ClipboardChunk*
+ClipboardChunk::cancel(ClipboardID id, UInt32 sequence)
+{
+    ClipboardChunk* cancel = new ClipboardChunk(CLIPBOARD_CHUNK_META_SIZE);
+    char* chunk = cancel->m_chunk;
+
+    chunk[0] = id;
+    std::memcpy (&chunk[1], &sequence, 4);
+    chunk[5] = kDataCancel;
+    chunk[CLIPBOARD_CHUNK_META_SIZE - 1] = '\0';
+
+    return cancel;
+}
+
 int
 ClipboardChunk::assemble(barrier::IStream* stream,
-                    String& dataCached,
+                    ReceiveBuffer& buffer,
                     ClipboardID& id,
                     UInt32& sequence)
 {
@@ -95,35 +134,69 @@ ClipboardChunk::assemble(barrier::IStream* stream,
     String data;
 
     if (!ProtocolUtil::readf(stream, kMsgDClipboard + 4, &id, &sequence, &mark, &data)) {
+        buffer.release();
+        return kError;
+    }
+
+    if (id >= kClipboardEnd) {
+        buffer.release();
         return kError;
     }
 
     if (mark == kDataStart) {
-        s_expectedSize = barrier::string::stringToSizeType(data);
+        buffer.expectedSize = barrier::string::stringToSizeType(data);
         LOG((CLOG_DEBUG "start receiving clipboard data"));
-        dataCached.clear();
-        if (s_expectedSize <= kClipboardReceiveReserveLimit) {
-            dataCached.reserve(s_expectedSize);
+        String().swap(buffer.data);
+        buffer.inProgress = true;
+        if (buffer.expectedSize > kMaxReceiveSize) {
+            LOG((CLOG_ERR "refusing clipboard transfer larger than receive limit, expected size=%d limit=%d",
+                buffer.expectedSize, kMaxReceiveSize));
+            buffer.release();
+            return kError;
+        }
+        if (buffer.expectedSize <= kClipboardReceiveReserveLimit) {
+            buffer.data.reserve(buffer.expectedSize);
         }
         return kStart;
     }
     else if (mark == kDataChunk) {
-        dataCached.append(data);
+        if (!buffer.inProgress) {
+            LOG((CLOG_WARN "ignoring clipboard chunk without an active receive"));
+            buffer.release();
+            return kError;
+        }
+        if (!canAppendClipboardData(buffer, data)) {
+            LOG((CLOG_ERR "corrupted clipboard data, received chunk exceeds expected size=%d current size=%d chunk size=%d",
+                buffer.expectedSize, buffer.data.size(), data.size()));
+            buffer.release();
+            return kError;
+        }
+        buffer.data.append(data);
         return kNotFinish;
     }
     else if (mark == kDataEnd) {
+        if (!buffer.inProgress) {
+            LOG((CLOG_WARN "ignoring clipboard end without an active receive"));
+            buffer.release();
+            return kError;
+        }
         // validate
-        if (id >= kClipboardEnd) {
+        if (buffer.expectedSize != buffer.data.size()) {
+            LOG((CLOG_ERR "corrupted clipboard data, expected size=%d actual size=%d", buffer.expectedSize, buffer.data.size()));
+            buffer.release();
             return kError;
         }
-        else if (s_expectedSize != dataCached.size()) {
-            LOG((CLOG_ERR "corrupted clipboard data, expected size=%d actual size=%d", s_expectedSize, dataCached.size()));
-            return kError;
-        }
+        buffer.inProgress = false;
         return kFinish;
+    }
+    else if (mark == kDataCancel) {
+        LOG((CLOG_WARN "clipboard transfer cancelled by sender"));
+        buffer.release();
+        return kError;
     }
 
     LOG((CLOG_ERR "clipboard transmission failed: unknown error"));
+    buffer.release();
     return kError;
 }
 
@@ -152,6 +225,10 @@ ClipboardChunk::send(barrier::IStream* stream, void* data)
 
     case kDataEnd:
         LOG((CLOG_DEBUG2 "sending clipboard finished"));
+        break;
+
+    case kDataCancel:
+        LOG((CLOG_DEBUG2 "sending clipboard cancelled"));
         break;
     }
 

@@ -283,7 +283,7 @@ size_t
 stringToSizeType(std::string string)
 {
     std::istringstream iss(string);
-    size_t value;
+    size_t value = 0;
     iss >> value;
     return value;
 }

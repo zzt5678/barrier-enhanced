@@ -30,6 +30,18 @@ class IStream;
 
 class ClipboardChunk : public Chunk {
 public:
+    static const size_t kMaxReceiveSize;
+
+    class ReceiveBuffer {
+    public:
+        void clear();
+        void release();
+
+        String data;
+        size_t expectedSize = 0;
+        bool inProgress = false;
+    };
+
     ClipboardChunk(size_t size);
 
     static ClipboardChunk*
@@ -44,17 +56,15 @@ public:
                             const String& data);
     static ClipboardChunk*
                         end(ClipboardID id, UInt32 sequence);
+    static ClipboardChunk*
+                        cancel(ClipboardID id, UInt32 sequence);
 
     static int            assemble(
                             barrier::IStream* stream,
-                            String& dataCached,
+                            ReceiveBuffer& buffer,
                             ClipboardID& id,
                             UInt32& sequence);
 
     static void            send(barrier::IStream* stream, void* data);
 
-    static size_t        getExpectedSize() { return s_expectedSize; }
-
-private:
-    static thread_local size_t s_expectedSize;
 };

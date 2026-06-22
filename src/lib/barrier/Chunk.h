@@ -17,12 +17,14 @@
 
 #pragma once
 
+#include "base/Event.h"
+
 #include <cstddef>
 
-class Chunk {
+class Chunk : public EventData {
 public:
     Chunk(size_t size);
-    ~Chunk();
+    ~Chunk() override;
 
 public:
     size_t                m_dataSize;

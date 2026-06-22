@@ -32,7 +32,9 @@
 #include "common/stdmap.h"
 #include "common/stdset.h"
 #include "common/stdvector.h"
+#include "io/filesystem.h"
 
+#include <deque>
 #include <memory>
 #include <vector>
 
@@ -41,7 +43,10 @@ class EventQueueTimer;
 class PrimaryClient;
 class InputFilter;
 class StreamChunker;
-namespace barrier { class Screen; }
+namespace barrier {
+class IStream;
+class Screen;
+}
 class IEventQueue;
 class Thread;
 class ClientListener;
@@ -52,11 +57,14 @@ This class implements the top-level server algorithms for barrier.
 */
 class Server : public INode {
 public:
-    class FileClipboardReadyInfo : public EventData {
-    public:
-        std::string m_sessionId;
-        std::vector<std::string> m_paths;
-    };
+	class FileClipboardReadyInfo : public EventData {
+	public:
+		FileClipboardReadyInfo() : m_publishClipboard(false) { }
+
+		std::string m_sessionId;
+		std::vector<std::string> m_paths;
+		bool m_publishClipboard;
+	};
 
     //! Lock cursor to screen data
     class LockCursorToScreenInfo {
@@ -121,8 +129,67 @@ public:
     ~Server();
 
 #ifdef BARRIER_TEST_ENV
-    Server() : m_mock(true), m_config(NULL) { }
+    Server() :
+        m_mock(true),
+        m_primaryClient(NULL),
+        m_active(NULL),
+        m_seqNum(0),
+        m_x(0),
+        m_y(0),
+        m_xDelta(0),
+        m_yDelta(0),
+        m_xDelta2(0),
+        m_yDelta2(0),
+        m_config(NULL),
+        m_inputFilter(NULL),
+        m_activeSaver(NULL),
+        m_xSaver(0),
+        m_ySaver(0),
+        m_switchDir(kNoDirection),
+        m_switchScreen(NULL),
+        m_switchWaitDelay(0.0),
+        m_switchWaitTimer(NULL),
+        m_primaryKeyStateTimer(NULL),
+        m_switchWaitX(0),
+        m_switchWaitY(0),
+        m_switchTwoTapDelay(0.0),
+        m_switchTwoTapEngaged(false),
+        m_switchTwoTapArmed(false),
+        m_switchTwoTapZone(3),
+        m_switchNeedsShift(false),
+        m_switchNeedsControl(false),
+        m_switchNeedsAlt(false),
+        m_relativeMoves(false),
+        m_keyboardBroadcasting(false),
+        m_lockedToScreen(false),
+        m_screen(NULL),
+        m_events(NULL),
+        m_expectedFileSize(0),
+        m_sendFileThread(NULL),
+        m_sendFileTarget(NULL),
+        m_sendFileTransferId(0),
+        m_sendFileCompletionPending(false),
+        m_writeToDropDirThread(NULL),
+        m_ignoreFileTransfer(false),
+        m_enableClipboard(false),
+        m_localShortcutMode(false),
+        m_lowLatencyMode(false),
+        m_nestedRemoteMode(false),
+        m_primaryLeaveFailedRecently(false),
+        m_primaryLeaveFailureTimer(true),
+        m_clientListener(NULL)
+    { }
     void setActive(BaseClientProxy* active) {    m_active = active; }
+    void setFileTransferForTest(BaseClientProxy* target, UInt32 transferId)
+    {
+        m_sendFileTarget = target;
+        m_sendFileTransferId = transferId;
+        m_sendFileCompletionPending = false;
+    }
+    static void addDefaultConnectionOptionsForTest(OptionsList& optionsList)
+    {
+        addDefaultConnectionOptions(optionsList);
+    }
 #endif
 
     //! @name manipulators
@@ -186,12 +253,26 @@ public:
     //! Return received file data
     std::string& getReceivedFileData() { return m_receivedFileData; }
 
+    //! Return received file spool path when large payload is kept on disk
+    barrier::fs::path& getReceivedFileSpoolPath() { return m_receivedFileSpoolPath; }
+
     //! Return fake drag file list
     DragFileList        getFakeDragFileList() { return m_fakeDragFileList; }
 
     //@}
 
 private:
+    struct CompletedFileTransfer {
+        size_t expectedSize;
+		std::string data;
+		barrier::fs::path spoolPath;
+		std::string dropTarget;
+		DragFileList dragFileList;
+		std::string remoteFileClipboardSession;
+
+        CompletedFileTransfer() : expectedSize(0) { }
+    };
+
     // get canonical name of client
     std::string getName(const BaseClientProxy*) const;
 
@@ -207,12 +288,15 @@ private:
     // according to this object or the primary client.
     bool                isLockedToScreen() const;
 
+    // returns true iff the destination screen may be entered now.
+    bool                canEnterScreen(BaseClientProxy*) const;
+
     // returns the jump zone of the client
     SInt32                getJumpZoneSize(BaseClientProxy*) const;
 
     // change the active screen
-    void                switchScreen(BaseClientProxy*,
-                            SInt32 x, SInt32 y, bool forScreenSaver);
+    bool                switchScreen(BaseClientProxy*,
+	                            SInt32 x, SInt32 y, bool forScreenSaver);
 
     // jump to screen
     void                jumpToScreen(BaseClientProxy*);
@@ -296,6 +380,7 @@ private:
 
     // send screen options to \c client
     void                sendOptions(BaseClientProxy* client) const;
+    static void         addDefaultConnectionOptions(OptionsList& optionsList);
 
     // process options from configuration
     void                processOptions();
@@ -328,13 +413,14 @@ private:
     void                handleFileChunkSendingEvent(const Event&, void*);
     void                handleFileRecieveCompletedEvent(const Event&, void*);
     void                handleFileClipboardReadyEvent(const Event&, void*);
+    void                handleDropDirWriteFinishedEvent(const Event&, void*);
+    void                handleFileKeepAliveEvent(const Event&, void*);
 
     // event processing
     bool                canLeavePrimaryNow(const char* reason);
     void                recoverToPrimaryFromActive(const char* reason);
     void                recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y);
-    bool                sendClipboardFileSelection(BaseClientProxy* sender,
-                            ClipboardID id, const Clipboard& clipboard);
+    void                reanchorActiveAfterFailedSwitch(BaseClientProxy* dst);
     void                fetchPendingPrimaryClipboards();
     void                replayClipboardsToActive();
     void                onClipboardChanged(BaseClientProxy* sender,
@@ -364,7 +450,8 @@ private:
     bool                removeClient(BaseClientProxy*);
 
     // close a client
-    void                closeClient(BaseClientProxy*, const char* msg);
+    void                closeClient(BaseClientProxy*, const char* msg,
+                            bool forceLeave = true);
 
     // close clients not in \p config
     void                closeClients(const Config& config);
@@ -381,23 +468,67 @@ private:
     void                forceLeaveClient(BaseClientProxy* client);
 
     // thread function for sending file
-    void                send_file_thread(const std::string& filename, const std::shared_ptr<StreamChunker>& chunker);
-    void                send_clipboard_file_thread(BaseClientProxy* target,
+    void                send_file_thread(barrier::IStream* stream,
+                                         const std::string& filename,
+                                         const std::shared_ptr<StreamChunker>& chunker,
+                                         UInt32 transferId);
+	void                send_clipboard_file_thread(barrier::IStream* stream,
                                                    const std::vector<barrier::fs::path>& sourcePaths,
-                                                   const std::shared_ptr<StreamChunker>& chunker);
+                                                   const std::shared_ptr<StreamChunker>& chunker,
+                                                   UInt32 transferId);
+	bool                cleanupSendFileThread(bool cancel);
+	bool                reapSendFileThreadIfReady();
+	bool                finishCompletedSendFileIfReady();
+	bool                cleanupWriteToDropDirThread();
+	bool                reapWriteToDropDirThreadIfReady();
+	bool                deferDeleteIfSendingToClient(BaseClientProxy* client);
+	bool                deleteClientIfReady(BaseClientProxy* client);
+	bool                clientReadyForDelete(BaseClientProxy* client);
+	void                deleteDeferredClient(BaseClientProxy* client);
+	void                deleteDeferredClients();
+	std::shared_ptr<CompletedFileTransfer> takeCompletedFileTransfer();
+	void                startDropDirTransfer(std::shared_ptr<CompletedFileTransfer> transfer);
+	void                queueDropDirTransfer(std::shared_ptr<CompletedFileTransfer> transfer);
+	void                drainDropDirTransferQueue();
+	void                releasePendingDropDirTransfers();
 
-    // thread function for writing file to drop directory
-    void write_to_drop_dir_thread();
-
-    // thread function for sending drag information
-    void send_drag_info_thread(BaseClientProxy* newScreen);
+	// thread function for writing file to drop directory
+	void write_to_drop_dir_thread(std::shared_ptr<CompletedFileTransfer> transfer);
 
     // send drag info to new client screen
     void                sendDragInfo(BaseClientProxy* newScreen);
 
 public:
-    bool                m_mock;
-
+	bool                m_mock;
+#ifdef BARRIER_TEST_ENV
+	std::shared_ptr<CompletedFileTransfer> testTakeCompletedFileTransfer()
+	{
+		return takeCompletedFileTransfer();
+	}
+	void testWriteRemoteClipboardTransfer(const std::string& data,
+	                                      const std::string& sessionId)
+	{
+		std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
+		transfer->expectedSize = data.size();
+		transfer->data = data;
+		transfer->remoteFileClipboardSession = sessionId;
+		write_to_drop_dir_thread(transfer);
+	}
+	void testQueueDropDirTransfer(const std::string& data)
+	{
+		std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
+		transfer->expectedSize = data.size();
+		transfer->data = data;
+		transfer->dropTarget = barrier::fs::temp_directory_path().u8string();
+		queueDropDirTransfer(transfer);
+	}
+	bool testCleanupWriteToDropDirThread() { return cleanupWriteToDropDirThread(); }
+	bool testHasWriteToDropDirThread() const { return m_writeToDropDirThread != NULL; }
+	void testSetWriteToDropDirThread(Thread* thread) { m_writeToDropDirThread = thread; }
+	void testDrainDropDirTransferQueue() { drainDropDirTransferQueue(); }
+	std::size_t testPendingDropDirTransferCount() const { return m_pendingDropDirTransfers.size(); }
+	bool testCleanupSendFileThread(bool cancel) { return cleanupSendFileThread(cancel); }
+#endif
 private:
     class ClipboardInfo {
     public:
@@ -405,7 +536,7 @@ private:
 
     public:
         Clipboard        m_clipboard;
-        std::string m_clipboardData;
+        ClipboardDataSnapshot m_clipboardData;
         std::string m_clipboardOwner;
         UInt32            m_clipboardSeqNum;
         bool              m_pendingPrimaryFetch;
@@ -496,11 +627,17 @@ private:
     // file transfer
     size_t                m_expectedFileSize;
     std::string m_receivedFileData;
+    barrier::fs::path m_receivedFileSpoolPath;
     DragFileList        m_dragFileList;
     DragFileList        m_fakeDragFileList;
     Thread*                m_sendFileThread;
     std::shared_ptr<StreamChunker> m_sendFileChunker;
+    BaseClientProxy*       m_sendFileTarget;
+    UInt32                 m_sendFileTransferId;
+    bool                   m_sendFileCompletionPending;
+    ClientSet              m_deferredDeleteClients;
     Thread*                m_writeToDropDirThread;
+	std::deque<std::shared_ptr<CompletedFileTransfer> > m_pendingDropDirTransfers;
     std::string         m_remoteFileClipboardSession;
     std::string         m_readyFileClipboardSession;
     std::vector<std::string> m_readyFileClipboardPaths;
@@ -518,9 +655,6 @@ private:
     bool                m_nestedRemoteMode;
     bool                m_primaryLeaveFailedRecently;
     Stopwatch           m_primaryLeaveFailureTimer;
-
-    Thread*                m_sendDragInfoThread;
-    bool                m_waitDragInfoThread;
 
     ClientListener*        m_clientListener;
     ServerArgs            m_args;

@@ -27,6 +27,7 @@
 #include "ZeroconfService.h"
 #include "DataDownloader.h"
 #include "CommandProcess.h"
+#include "CommandLine.h"
 #include "FingerprintAcceptDialog.h"
 #include "ActionBus.h"
 #include "CommandPaletteDialog.h"
@@ -78,6 +79,7 @@ static const char bonjourTargetFilename[] = "Bonjour.msi";
 static const char barrierConfigName[] = "weave.conf";
 static const QString barrierConfigFilter(QObject::tr("Weave Configurations (*.conf)"));
 #endif
+
 static const QString barrierConfigOpenFilter(barrierConfigFilter + ";;" + allFilesFilter);
 static const QString barrierConfigSaveFilter(barrierConfigFilter);
 
@@ -766,17 +768,11 @@ void MainWindow::startBarrier()
         args << "--ipc";
 
 #if defined(Q_OS_WIN)
-        // tell the client/server to shut down when a ms windows desk
-        // is switched; this is because we may need to elevate or not
-        // based on which desk the user is in (login always needs
-        // elevation, where as default desk does not).
-        // Note that this is only enabled when barrier is set to elevate
-        // 'as needed' (e.g. on a UAC dialog popup) in order to prevent
-        // unnecessary restarts when barrier was started elevated or
-        // when it is not allowed to elevate. In these cases restarting
-        // the server is fruitless.
-        if (appConfig().elevateMode() == ElevateAsNeeded) {
-                args << "--stop-on-desk-switch";
+        // Service mode must relaunch on Windows desktop switches even when the
+        // child is already elevated. UAC/Winlogon input only stays reliable when
+        // the watchdog can bind the process to the active input desktop.
+        if (appConfig().elevateMode() != ElevateNever) {
+            args << "--stop-on-desk-switch";
         }
 #endif
     }
@@ -850,7 +846,7 @@ void MainWindow::startBarrier()
 
     if (serviceMode)
     {
-        QString command(QString("\"%1\" %2").arg(app, args.join(" ")));
+        QString command = CommandLine::assembleCommand(app, args);
         m_IpcClient.sendCommand(command, appConfig().elevateMode());
     }
 }
@@ -980,10 +976,6 @@ bool MainWindow::serverArgs(QStringList& args, QString& app)
     }
 
     QString configFilename = this->configFilename();
-#if defined(Q_OS_WIN)
-    // wrap in quotes in case username contains spaces.
-    configFilename = QString("\"%1\"").arg(configFilename);
-#endif
     args << "-c" << configFilename << "--address" << address();
 
     return true;
@@ -1357,7 +1349,7 @@ void MainWindow::updateZeroconfService()
                 m_pZeroconfService = NULL;
             }
 
-            if (m_AppConfig->autoConfig() || barrier_type() == BarrierType::Server) {
+            if (m_AppConfig->autoConfig()) {
                 m_pZeroconfService = new ZeroconfService(this);
             }
         }
@@ -1708,7 +1700,7 @@ void MainWindow::promptAutoConfig()
 
 void MainWindow::on_m_pComboServerList_currentIndexChanged(QString )
 {
-    if (m_pComboServerList->count() != 0) {
+    if (barrier_type() == BarrierType::Client && m_pComboServerList->count() != 0) {
         restartBarrier();
     }
 }

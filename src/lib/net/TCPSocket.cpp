@@ -33,8 +33,12 @@
 #include <cstdlib>
 #include <memory>
 
-// Increased from 1MB to 4MB for better throughput on large clipboard transfers
-static const std::size_t MAX_INPUT_BUFFER_SIZE = 4 * 1024 * 1024;
+static const std::size_t MAX_INPUT_BUFFER_SIZE = 32 * 1024 * 1024;
+static const std::size_t kResumeInputBufferSize = MAX_INPUT_BUFFER_SIZE / 2;
+static const UInt32 kMaxHighPriorityOutputBufferSize = 16 * 1024 * 1024;
+static const UInt32 kMaxLowPriorityOutputBufferSize = 8 * 1024 * 1024;
+static const UInt32 kMaxTotalOutputBufferSize = 24 * 1024 * 1024;
+static const UInt32 kLowPriorityWriteWindowSize = 128 * 1024;
 
 TCPSocket::TCPSocket(IEventQueue* events, SocketMultiplexer* socketMultiplexer, IArchNetwork::EAddressFamily family) :
     IDataSocket(events),
@@ -151,20 +155,32 @@ UInt32
 TCPSocket::read(void* buffer, UInt32 n)
 {
     // copy data directly from our input buffer
-    Lock lock(&m_mutex);
-    UInt32 size = m_inputBuffer.getSize();
-    if (n > size) {
-        n = size;
-    }
-    if (buffer != NULL && n != 0) {
-        memcpy(buffer, m_inputBuffer.peek(n), n);
-    }
-    m_inputBuffer.pop(n);
+    std::unique_ptr<ISocketMultiplexerJob> job;
+    {
+        Lock lock(&m_mutex);
+        UInt32 size = m_inputBuffer.getSize();
+        const UInt32 previousSize = size;
+        if (n > size) {
+            n = size;
+        }
+        if (buffer != NULL && n != 0) {
+            memcpy(buffer, m_inputBuffer.peek(n), n);
+        }
+        m_inputBuffer.pop(n);
 
-    // if no more data and we cannot read or write then send disconnected
-    if (n > 0 && m_inputBuffer.getSize() == 0 && !m_readable && !m_writable) {
-        sendEvent(m_events->forISocket().disconnected());
-        m_connected = false;
+        // if no more data and we cannot read or write then send disconnected
+        if (n > 0 && m_inputBuffer.getSize() == 0 && !m_readable && !m_writable) {
+            sendEvent(m_events->forISocket().disconnected());
+            m_connected = false;
+        }
+
+        if (shouldResumeInputNoLock(previousSize)) {
+            job = newJob();
+        }
+    }
+
+    if (job) {
+        setJob(std::move(job));
     }
 
     return n;
@@ -185,7 +201,7 @@ TCPSocket::writeLowPriority(const void* buffer, UInt32 n)
 void
 TCPSocket::writeToBuffer(StreamBuffer& outputBuffer, const void* buffer, UInt32 n)
 {
-    bool wasEmpty;
+    std::unique_ptr<ISocketMultiplexerJob> job;
     {
         Lock lock(&m_mutex);
 
@@ -200,18 +216,48 @@ TCPSocket::writeToBuffer(StreamBuffer& outputBuffer, const void* buffer, UInt32 
             return;
         }
 
+        const bool lowPriority = (&outputBuffer == &m_lowPriorityOutputBuffer);
+        if (!canQueueOutputNoLock(lowPriority, n)) {
+            if (lowPriority) {
+                LOG((CLOG_WARN
+                    "socket low-priority output backlog exceeded; dropping %u bytes "
+                    "without disconnecting (high=%u low=%u total=%u)",
+                    n,
+                    m_outputBuffer.getSize(),
+                    m_lowPriorityOutputBuffer.getSize(),
+                    m_outputBuffer.getSize() + m_lowPriorityOutputBuffer.getSize()));
+                return;
+            }
+
+            LOG((CLOG_WARN
+                "socket output backlog exceeded; dropping connection before buffering %u %s-priority bytes "
+                "(high=%u low=%u total=%u)",
+                n,
+                lowPriority ? "low" : "high",
+                m_outputBuffer.getSize(),
+                m_lowPriorityOutputBuffer.getSize(),
+                m_outputBuffer.getSize() + m_lowPriorityOutputBuffer.getSize()));
+            onDisconnected();
+            sendEvent(m_events->forIStream().outputError());
+            sendEvent(m_events->forISocket().disconnected());
+            return;
+        }
+
         // copy data to the output buffer
-        wasEmpty = !hasBufferedOutputNoLock();
+        const bool wasEmpty = !hasBufferedOutputNoLock();
         outputBuffer.write(buffer, n);
-        noteQueuedBytes(&outputBuffer == &m_lowPriorityOutputBuffer, n);
+        noteQueuedBytes(lowPriority, n);
 
         // there's data to write
         m_flushed = false;
+        if (wasEmpty) {
+            job = newJob();
+        }
     }
 
     // make sure we're waiting to write
-    if (wasEmpty) {
-        setJob(newJob());
+    if (job) {
+        setJob(std::move(job));
     }
 }
 
@@ -227,7 +273,8 @@ TCPSocket::flush()
 void
 TCPSocket::shutdownInput()
 {
-    bool useNewJob = false;
+    bool updateJob = false;
+    std::unique_ptr<ISocketMultiplexerJob> job;
     {
         Lock lock(&m_mutex);
 
@@ -243,18 +290,20 @@ TCPSocket::shutdownInput()
         if (m_readable) {
             sendEvent(m_events->forIStream().inputShutdown());
             onInputShutdown();
-            useNewJob = true;
+            updateJob = true;
+            job = newJob();
         }
     }
-    if (useNewJob) {
-        setJob(newJob());
+    if (updateJob) {
+        setJob(std::move(job));
     }
 }
 
 void
 TCPSocket::shutdownOutput()
 {
-    bool useNewJob = false;
+    bool updateJob = false;
+    std::unique_ptr<ISocketMultiplexerJob> job;
     {
         Lock lock(&m_mutex);
 
@@ -270,11 +319,12 @@ TCPSocket::shutdownOutput()
         if (m_writable) {
             sendEvent(m_events->forIStream().outputShutdown());
             onOutputShutdown();
-            useNewJob = true;
+            updateJob = true;
+            job = newJob();
         }
     }
-    if (useNewJob) {
-        setJob(newJob());
+    if (updateJob) {
+        setJob(std::move(job));
     }
 }
 
@@ -310,6 +360,7 @@ TCPSocket::getBufferedOutputSize() const
 void
 TCPSocket::connect(const NetworkAddress& addr)
 {
+    std::unique_ptr<ISocketMultiplexerJob> job;
     {
         Lock lock(&m_mutex);
 
@@ -328,12 +379,13 @@ TCPSocket::connect(const NetworkAddress& addr)
                 // connection is in progress
                 m_writable = true;
             }
+            job = newJob();
         }
         catch (XArchNetwork& e) {
             throw XSocketConnect(e.what());
         }
     }
-    setJob(newJob());
+    setJob(std::move(job));
 }
 
 void
@@ -365,25 +417,48 @@ TCPSocket::init()
 TCPSocket::EJobResult
 TCPSocket::doRead()
 {
+    if (!canReadInputNoLock()) {
+        LOG((CLOG_DEBUG1 "socket input backlog full; pausing reads until buffered input is drained"));
+        return kNew;
+    }
+
     // Increased from 4096 to 65536 for better throughput on large transfers
     // (e.g., clipboard images). This reduces syscall overhead.
     UInt8 buffer[65536];
     size_t bytesRead = 0;
 
-    bytesRead = ARCH->readSocket(m_socket, buffer, sizeof(buffer));
+    size_t readSize = getInputReadSizeNoLock(sizeof(buffer));
+    if (readSize == 0) {
+        LOG((CLOG_DEBUG1 "socket input backlog full; pausing reads until buffered input is drained"));
+        return kNew;
+    }
+
+    bytesRead = ARCH->readSocket(m_socket, buffer, readSize);
 
     if (bytesRead > 0) {
         bool wasEmpty = (m_inputBuffer.getSize() == 0);
 
         // slurp up as much as possible
         do {
-            m_inputBuffer.write(buffer, (UInt32)bytesRead);
-
-            if (m_inputBuffer.getSize() > MAX_INPUT_BUFFER_SIZE) {
-                break;
+            if (!queueInputOrDisconnectNoLock(buffer, static_cast<UInt32>(bytesRead))) {
+                return kNew;
+            }
+            if (!canReadInputNoLock()) {
+                if (wasEmpty) {
+                    sendEvent(m_events->forIStream().inputReady());
+                }
+                return kNew;
             }
 
-            bytesRead = ARCH->readSocket(m_socket, buffer, sizeof(buffer));
+            readSize = getInputReadSizeNoLock(sizeof(buffer));
+            if (readSize == 0) {
+                if (wasEmpty) {
+                    sendEvent(m_events->forIStream().inputReady());
+                }
+                return kNew;
+            }
+
+            bytesRead = ARCH->readSocket(m_socket, buffer, readSize);
         } while (bytesRead > 0);
 
         // send input ready if input buffer was empty
@@ -407,6 +482,51 @@ TCPSocket::doRead()
     return kRetry;
 }
 
+bool
+TCPSocket::queueInputOrDisconnectNoLock(const void* buffer, UInt32 n)
+{
+    const UInt32 currentSize = m_inputBuffer.getSize();
+    if (n > MAX_INPUT_BUFFER_SIZE ||
+        currentSize > MAX_INPUT_BUFFER_SIZE - n) {
+        LOG((CLOG_WARN
+            "socket input backlog exceeded; dropping connection before buffering %u bytes "
+            "(input=%u limit=%u)",
+            n,
+            currentSize,
+            static_cast<UInt32>(MAX_INPUT_BUFFER_SIZE)));
+        onDisconnected();
+        sendEvent(m_events->forIStream().inputShutdown());
+        sendEvent(m_events->forISocket().disconnected());
+        return false;
+    }
+
+    m_inputBuffer.write(buffer, n);
+    return true;
+}
+
+size_t
+TCPSocket::getInputReadSizeNoLock(size_t maxReadSize) const
+{
+    const size_t currentSize = m_inputBuffer.getSize();
+    if (currentSize >= MAX_INPUT_BUFFER_SIZE) {
+        return 0;
+    }
+
+    const size_t remainingSize = MAX_INPUT_BUFFER_SIZE - currentSize;
+    return remainingSize < maxReadSize ? remainingSize : maxReadSize;
+}
+
+UInt32
+TCPSocket::getOutputWriteSizeNoLock(const StreamBuffer& outputBuffer) const
+{
+    UInt32 bufferSize = outputBuffer.getSize();
+    if (&outputBuffer == &m_lowPriorityOutputBuffer &&
+        bufferSize > kLowPriorityWriteWindowSize) {
+        bufferSize = kLowPriorityWriteWindowSize;
+    }
+    return bufferSize;
+}
+
 TCPSocket::EJobResult
 TCPSocket::doWrite()
 {
@@ -425,7 +545,10 @@ TCPSocket::doWrite()
         return kRetry;
     }
 
-    bufferSize = outputBuffer->getSize();
+    bufferSize = getOutputWriteSizeNoLock(*outputBuffer);
+    if (bufferSize == 0) {
+        return kRetry;
+    }
     const void* buffer = outputBuffer->peek(bufferSize);
     bytesWrote = (UInt32)ARCH->writeSocket(m_socket, buffer, bufferSize);
 
@@ -480,13 +603,14 @@ std::unique_ptr<ISocketMultiplexerJob> TCPSocket::newJob()
     }
     else {
         auto writable = m_writable && hasBufferedOutputNoLock();
-        if (!(m_readable || writable)) {
+        auto readable = m_readable && canReadInputNoLock();
+        if (!(readable || writable)) {
             return {};
         }
         return std::make_unique<TSocketMultiplexerMethodJob>(
                     [this](auto j, auto r, auto w, auto e)
                     { return serviceConnected(j, r, w, e); },
-                    m_socket, m_readable, writable);
+                    m_socket, readable, writable);
     }
 }
 
@@ -563,6 +687,71 @@ TCPSocket::onDisconnected()
     onInputShutdown();
     onOutputShutdown();
     m_connected = false;
+}
+
+void
+TCPSocket::disconnectSocketNoLock(bool notifyInputShutdown, bool notifyOutputError)
+{
+    const bool wasConnected = m_connected;
+    const bool wasReadable = m_readable;
+    const bool wasWritable = m_writable;
+
+    if (notifyInputShutdown && wasReadable) {
+        sendEvent(m_events->forIStream().inputShutdown());
+    }
+    if (notifyOutputError && wasWritable) {
+        sendEvent(m_events->forIStream().outputError());
+    }
+    if (wasConnected || wasReadable || wasWritable) {
+        sendEvent(m_events->forISocket().disconnected());
+    }
+
+    onDisconnected();
+
+    if (m_socket != NULL) {
+        ArchSocket socket = m_socket;
+        m_socket = NULL;
+        try {
+            ARCH->closeSocket(socket);
+        }
+        catch (XArchNetwork& e) {
+            LOG((CLOG_WARN "error closing socket: %s", e.what()));
+        }
+    }
+}
+
+bool
+TCPSocket::canQueueOutputNoLock(bool lowPriority, UInt32 n) const
+{
+    const UInt32 highSize = m_outputBuffer.getSize();
+    const UInt32 lowSize = m_lowPriorityOutputBuffer.getSize();
+    const UInt32 totalSize = highSize + lowSize;
+
+    if (n > kMaxTotalOutputBufferSize || totalSize > kMaxTotalOutputBufferSize - n) {
+        return false;
+    }
+
+    if (lowPriority) {
+        return n <= kMaxLowPriorityOutputBufferSize &&
+            lowSize <= kMaxLowPriorityOutputBufferSize - n;
+    }
+
+    return n <= kMaxHighPriorityOutputBufferSize &&
+        highSize <= kMaxHighPriorityOutputBufferSize - n;
+}
+
+bool
+TCPSocket::canReadInputNoLock() const
+{
+    return m_inputBuffer.getSize() < MAX_INPUT_BUFFER_SIZE;
+}
+
+bool
+TCPSocket::shouldResumeInputNoLock(UInt32 previousSize) const
+{
+    return m_readable &&
+        previousSize >= MAX_INPUT_BUFFER_SIZE &&
+        m_inputBuffer.getSize() <= kResumeInputBufferSize;
 }
 
 void
@@ -702,6 +891,10 @@ MultiplexerJobStatus TCPSocket::serviceConnected(ISocketMultiplexerJob* job,
             sendEvent(m_events->forISocket().disconnected());
             writeResult = kNew;
         }
+        catch (XArchNetworkTimedOut& e) {
+            LOG((CLOG_DEBUG1 "timed out writing socket, retrying: %s", e.what()));
+            writeResult = kRetry;
+        }
         catch (XArchNetwork& e) {
             // other write error
             LOG((CLOG_WARN "error writing socket: %s", e.what()));
@@ -722,9 +915,20 @@ MultiplexerJobStatus TCPSocket::serviceConnected(ISocketMultiplexerJob* job,
             onDisconnected();
             readResult = kNew;
         }
+        catch (XArchNetworkInterrupted& e) {
+            LOG((CLOG_DEBUG1 "interrupted reading socket: %s", e.what()));
+            readResult = kRetry;
+        }
+        catch (XArchNetworkTimedOut& e) {
+            LOG((CLOG_DEBUG1 "timed out reading socket, retrying: %s", e.what()));
+            readResult = kRetry;
+        }
         catch (XArchNetwork& e) {
-            // ignore other read error
             LOG((CLOG_WARN "error reading socket: %s", e.what()));
+            onDisconnected();
+            sendEvent(m_events->forIStream().inputShutdown());
+            sendEvent(m_events->forISocket().disconnected());
+            readResult = kNew;
         }
     }
 

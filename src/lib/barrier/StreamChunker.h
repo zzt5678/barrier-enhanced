@@ -19,6 +19,7 @@
 
 #include "barrier/clipboard_types.h"
 #include "base/String.h"
+#include "common/basic_types.h"
 
 #include <atomic>
 
@@ -30,9 +31,17 @@ public:
     StreamChunker();
 
     void sendFile(const char* filename, IEventQueue* events, void* eventTarget,
-                  barrier::IStream* stream = nullptr);
-    static void            sendClipboard(
-                            String& data,
+                  barrier::IStream* stream = nullptr, UInt32 transferId = 0);
+    bool                   sendClipboardData(
+                            const String& data,
+                            size_t size,
+                            ClipboardID id,
+                            UInt32 sequence,
+                            IEventQueue* events,
+                            void* eventTarget,
+                            barrier::IStream* stream = nullptr);
+    static bool            sendClipboard(
+                            const String& data,
                             size_t size,
                             ClipboardID id,
                             UInt32 sequence,

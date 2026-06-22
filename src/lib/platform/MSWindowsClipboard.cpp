@@ -30,22 +30,17 @@
 #include "base/Log.h"
 #include "ext/lodepng/lodepng.h"
 
-#include <objidl.h>
-#include <gdiplus.h>
 #include <shellapi.h>
-#include <ShlObj.h>
-#include <cwctype>
-#include <sstream>
-
-#pragma comment(lib, "gdiplus.lib")
 
 static std::string convertBMPToPNG(const std::string& dibData);
 static std::string convertPNGToDIB(const std::string& pngData);
-static std::string convertHDropToPNG(HANDLE dropHandle);
 static std::string convertHDropToPathList(HANDLE dropHandle);
-static HANDLE createHDropFromInboxText(const std::string& text);
 
 namespace {
+
+const UINT kMaxHDropTextPaths = 1024;
+const size_t kMaxHDropTextBytes = 1024 * 1024;
+const unsigned long long kMaxClipboardImagePixels = 32ull * 1024ull * 1024ull;
 
 UINT preferredDropEffectFormat()
 {
@@ -91,30 +86,6 @@ HANDLE createDropEffectHandle(DWORD effect)
     return handle;
 }
 
-ULONG_PTR ensureGdiplusToken()
-{
-    static ULONG_PTR token = 0;
-    static bool initialized = false;
-
-    if (!initialized) {
-        Gdiplus::GdiplusStartupInput startupInput;
-        if (Gdiplus::GdiplusStartup(&token, &startupInput, NULL) != Gdiplus::Ok) {
-            token = 0;
-        }
-        initialized = true;
-    }
-
-    return token;
-}
-
-std::wstring toLowerCopy(std::wstring value)
-{
-    for (size_t i = 0; i < value.size(); ++i) {
-        value[i] = static_cast<wchar_t>(std::towlower(value[i]));
-    }
-    return value;
-}
-
 std::string utf8FromWide(const std::wstring& value)
 {
     if (value.empty()) {
@@ -129,124 +100,6 @@ std::string utf8FromWide(const std::wstring& value)
     std::string result(static_cast<size_t>(size - 1), '\0');
     WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, &result[0], size, NULL, NULL);
     return result;
-}
-
-std::string pathLabel(const std::wstring& path)
-{
-    if (path.empty()) {
-        return {};
-    }
-
-    const size_t separator = path.find_last_of(L"\\/");
-    if (separator != std::wstring::npos && separator + 1 < path.size()) {
-        return utf8FromWide(path.substr(separator + 1));
-    }
-
-    return utf8FromWide(path);
-}
-
-bool isSupportedImagePath(const std::wstring& path)
-{
-    const std::wstring lower = toLowerCopy(path);
-    return lower.size() >= 4 && (
-        lower.rfind(L".png") == lower.size() - 4 ||
-        lower.rfind(L".jpg") == lower.size() - 4 ||
-        lower.rfind(L".bmp") == lower.size() - 4 ||
-        lower.rfind(L".gif") == lower.size() - 4 ||
-        lower.rfind(L".tif") == lower.size() - 4 ||
-        lower.rfind(L".webp") == lower.size() - 5 ||
-        lower.rfind(L".jpeg") == lower.size() - 5 ||
-        lower.rfind(L".tiff") == lower.size() - 5
-    );
-}
-
-bool dropListContainsSupportedImage(HANDLE dropHandle)
-{
-    if (dropHandle == NULL) {
-        return false;
-    }
-
-    const HDROP drop = static_cast<HDROP>(dropHandle);
-    const UINT fileCount = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
-    for (UINT i = 0; i < fileCount; ++i) {
-        const UINT length = DragQueryFileW(drop, i, NULL, 0);
-        if (length == 0) {
-            continue;
-        }
-
-        std::wstring path;
-        path.resize(length);
-        if (DragQueryFileW(drop, i, &path[0], length + 1) == 0) {
-            continue;
-        }
-
-        if (isSupportedImagePath(path)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-std::string convertImageFileToPNG(const std::wstring& path)
-{
-    if (ensureGdiplusToken() == 0) {
-        LOG((CLOG_WARN "GDI+ initialization failed, cannot convert image file clipboard payload"));
-        return {};
-    }
-
-    Gdiplus::Bitmap source(path.c_str());
-    if (source.GetLastStatus() != Gdiplus::Ok) {
-        LOG((CLOG_WARN "failed to load image file from clipboard path: %s", pathLabel(path).c_str()));
-        return {};
-    }
-
-    const UINT width = source.GetWidth();
-    const UINT height = source.GetHeight();
-    if (width == 0 || height == 0) {
-        return {};
-    }
-
-    Gdiplus::Bitmap converted(width, height, PixelFormat32bppARGB);
-    Gdiplus::Graphics graphics(&converted);
-    if (graphics.DrawImage(&source, 0, 0, width, height) != Gdiplus::Ok) {
-        LOG((CLOG_WARN "failed to normalize image file to 32-bit ARGB: %s", pathLabel(path).c_str()));
-        return {};
-    }
-
-    Gdiplus::Rect rect(0, 0, width, height);
-    Gdiplus::BitmapData bitmapData;
-    if (converted.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bitmapData) != Gdiplus::Ok) {
-        LOG((CLOG_WARN "failed to lock normalized image pixels: %s", pathLabel(path).c_str()));
-        return {};
-    }
-
-    std::vector<unsigned char> rgba;
-    rgba.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
-    for (UINT y = 0; y < height; ++y) {
-        const unsigned char* srcRow = static_cast<const unsigned char*>(bitmapData.Scan0) + y * bitmapData.Stride;
-        unsigned char* dstRow = &rgba[static_cast<size_t>(y) * width * 4];
-        for (UINT x = 0; x < width; ++x) {
-            const unsigned char* srcPixel = srcRow + x * 4;
-            unsigned char* dstPixel = dstRow + x * 4;
-            dstPixel[0] = srcPixel[2];
-            dstPixel[1] = srcPixel[1];
-            dstPixel[2] = srcPixel[0];
-            dstPixel[3] = srcPixel[3];
-        }
-    }
-
-    converted.UnlockBits(&bitmapData);
-
-    std::vector<unsigned char> png;
-    unsigned error = lodepng::encode(png, rgba, width, height, LCT_RGBA);
-    if (error != 0) {
-        LOG((CLOG_WARN "failed to encode image file clipboard payload to PNG: %s", lodepng_error_text(error)));
-        return {};
-    }
-
-    LOG((CLOG_INFO "converted clipboard image file to PNG payload: %s", pathLabel(path).c_str()));
-    return std::string(reinterpret_cast<const char*>(png.data()), png.size());
 }
 
 } // namespace
@@ -379,13 +232,6 @@ MSWindowsClipboard::add(EFormat format, const std::string& data)
         }
     }
 
-    if (format == IClipboard::kText) {
-        HANDLE dropHandle = createHDropFromInboxText(data);
-        if (dropHandle != NULL) {
-            LOG((CLOG_INFO "also publishing received file path as CF_HDROP"));
-            m_facade->write(dropHandle, CF_HDROP);
-        }
-    }
 }
 
 bool
@@ -445,12 +291,6 @@ MSWindowsClipboard::has(EFormat format) const
         // Fallback: check if BMP is available (most apps provide BMP instead of PNG)
         if (IsClipboardFormatAvailable(CF_DIB)) {
             return true;
-        }
-        if (IsClipboardFormatAvailable(CF_HDROP)) {
-            HANDLE dropData = GetClipboardData(CF_HDROP);
-            if (dropListContainsSupportedImage(dropData)) {
-                return true;
-            }
         }
         return false;
     }
@@ -549,14 +389,6 @@ std::string MSWindowsClipboard::get(EFormat format) const
 
                 LOG((CLOG_DEBUG "Converting BMP (%u bytes) to PNG", bmpSize));
                 return convertBMPToPNG(dibData);
-            }
-        }
-
-        HANDLE dropData = GetClipboardData(CF_HDROP);
-        if (dropData != NULL) {
-            std::string filePng = convertHDropToPNG(dropData);
-            if (!filePng.empty()) {
-                return filePng;
             }
         }
 
@@ -660,6 +492,15 @@ static std::string convertBMPToPNG(const std::string& dibData)
     if (height < 0) {
         height = -height;
     }
+    if (width <= 0 || height <= 0) {
+        LOG((CLOG_WARN "DIB has invalid dimensions: %d x %d", width, height));
+        return {};
+    }
+    if (static_cast<unsigned long long>(width) * static_cast<unsigned long long>(height) >
+        kMaxClipboardImagePixels) {
+        LOG((CLOG_WARN "DIB image is too large to convert safely: %d x %d", width, height));
+        return {};
+    }
 
     // Only support uncompressed 24-bit or 32-bit DIB
     if (compression != 0) {  // BI_RGB = 0
@@ -673,11 +514,14 @@ static std::string convertBMPToPNG(const std::string& dibData)
     }
 
     UInt32 bytesPerPixel = bitCount / 8;
-    UInt32 rowSize = ((width * bitCount + 31) / 32) * 4;  // Row is aligned to 4 bytes
-    UInt32 expectedDataSize = 40 + rowSize * height;
+    const unsigned long long rowSize =
+        ((static_cast<unsigned long long>(width) * bitCount + 31) / 32) * 4;
+    const unsigned long long expectedDataSize =
+        40 + rowSize * static_cast<unsigned long long>(height);
 
     if (dibData.size() < expectedDataSize) {
-        LOG((CLOG_WARN "DIB data size mismatch: expected %u, got %u", expectedDataSize, dibData.size()));
+        LOG((CLOG_WARN "DIB data size mismatch: expected %u, got %u",
+            static_cast<unsigned>(expectedDataSize), static_cast<unsigned>(dibData.size())));
         return {};
     }
 
@@ -738,6 +582,11 @@ static std::string convertPNGToDIB(const std::string& pngData)
         LOG((CLOG_WARN "PNG decode produced empty image"));
         return {};
     }
+    if (static_cast<unsigned long long>(width) * static_cast<unsigned long long>(height) >
+        kMaxClipboardImagePixels) {
+        LOG((CLOG_WARN "PNG image is too large to publish as CF_DIB: %u x %u", width, height));
+        return {};
+    }
 
     BITMAPINFOHEADER header;
     ZeroMemory(&header, sizeof(header));
@@ -773,37 +622,6 @@ static std::string convertPNGToDIB(const std::string& pngData)
     return dibData;
 }
 
-static std::string convertHDropToPNG(HANDLE dropHandle)
-{
-    const HDROP drop = static_cast<HDROP>(dropHandle);
-    const UINT fileCount = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
-    if (fileCount == 0) {
-        return {};
-    }
-
-    for (UINT index = 0; index < fileCount; ++index) {
-        const UINT pathLength = DragQueryFileW(drop, index, NULL, 0);
-        if (pathLength == 0) {
-            continue;
-        }
-
-        std::wstring path(pathLength + 1, L'\0');
-        const UINT copied = DragQueryFileW(drop, index, &path[0], pathLength + 1);
-        path.resize(copied);
-
-        if (!isSupportedImagePath(path)) {
-            continue;
-        }
-
-        std::string png = convertImageFileToPNG(path);
-        if (!png.empty()) {
-            return png;
-        }
-    }
-
-    return {};
-}
-
 static std::string convertHDropToPathList(HANDLE dropHandle)
 {
     if (dropHandle == NULL) {
@@ -812,6 +630,11 @@ static std::string convertHDropToPathList(HANDLE dropHandle)
 
     const HDROP drop = static_cast<HDROP>(dropHandle);
     const UINT fileCount = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+    if (fileCount > kMaxHDropTextPaths) {
+        LOG((CLOG_WARN "skipping CF_HDROP text metadata for oversized clipboard list: %u files", fileCount));
+        return {};
+    }
+
     std::string pathList;
     for (UINT index = 0; index < fileCount; ++index) {
         const UINT pathLength = DragQueryFileW(drop, index, NULL, 0);
@@ -823,126 +646,19 @@ static std::string convertHDropToPathList(HANDLE dropHandle)
         const UINT copied = DragQueryFileW(drop, index, &path[0], pathLength + 1);
         path.resize(copied);
 
+        const std::string utf8Path = utf8FromWide(path);
+        const size_t extraBytes = utf8Path.size() + (pathList.empty() ? 0 : 1);
+        if (pathList.size() + extraBytes > kMaxHDropTextBytes) {
+            LOG((CLOG_WARN "skipping CF_HDROP text metadata after exceeding %u bytes",
+                static_cast<unsigned>(kMaxHDropTextBytes)));
+            return {};
+        }
+
         if (!pathList.empty()) {
             pathList.push_back('\n');
         }
-        pathList += utf8FromWide(path);
+        pathList += utf8Path;
     }
 
     return pathList;
-}
-
-static std::wstring wideFromUtf8(const std::string& value)
-{
-    if (value.empty()) {
-        return {};
-    }
-
-    const int size = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, NULL, 0);
-    if (size <= 1) {
-        return {};
-    }
-
-    std::wstring result(static_cast<size_t>(size - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, &result[0], size);
-    return result;
-}
-
-static std::string trimTextLine(std::string value)
-{
-    while (!value.empty() && (value.back() == '\r' || value.back() == '\n' ||
-                              value.back() == ' ' || value.back() == '\t')) {
-        value.pop_back();
-    }
-
-    size_t start = 0;
-    while (start < value.size() &&
-           (value[start] == ' ' || value[start] == '\t' ||
-            value[start] == '\r' || value[start] == '\n')) {
-        ++start;
-    }
-
-    return value.substr(start);
-}
-
-static bool pathExistsForHDrop(const std::wstring& path)
-{
-    if (path.empty()) {
-        return false;
-    }
-
-    const DWORD attributes = GetFileAttributesW(path.c_str());
-    return attributes != INVALID_FILE_ATTRIBUTES;
-}
-
-static bool pathLooksLikeReceivedInboxItem(const std::wstring& path)
-{
-    wchar_t localAppData[MAX_PATH] = {};
-    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
-        std::wstring prefix(localAppData);
-        prefix += L"\\Barrier\\workflow\\inbox\\";
-        const std::wstring lowerPath = toLowerCopy(path);
-        const std::wstring lowerPrefix = toLowerCopy(prefix);
-        if (lowerPath.compare(0, lowerPrefix.size(), lowerPrefix) == 0) {
-            return true;
-        }
-    }
-
-    const std::wstring lowerPath = toLowerCopy(path);
-    return lowerPath.find(L"\\workflow\\inbox\\") != std::wstring::npos ||
-        lowerPath.find(L"\\weave inbox\\") != std::wstring::npos;
-}
-
-static HANDLE createHDropFromInboxText(const std::string& text)
-{
-    std::vector<std::wstring> paths;
-    std::istringstream lines(text);
-    std::string line;
-    while (std::getline(lines, line)) {
-        line = trimTextLine(line);
-        if (line.empty()) {
-            continue;
-        }
-
-        std::wstring path = wideFromUtf8(line);
-        if (pathExistsForHDrop(path) && pathLooksLikeReceivedInboxItem(path)) {
-            paths.push_back(path);
-        }
-    }
-
-    if (paths.empty()) {
-        return NULL;
-    }
-
-    size_t pathChars = 1;
-    for (const auto& path : paths) {
-        pathChars += path.size() + 1;
-    }
-
-    const size_t bytes = sizeof(DROPFILES) + pathChars * sizeof(wchar_t);
-    HGLOBAL memory = GlobalAlloc(GHND | GMEM_SHARE, bytes);
-    if (memory == NULL) {
-        return NULL;
-    }
-
-    DROPFILES* dropFiles = static_cast<DROPFILES*>(GlobalLock(memory));
-    if (dropFiles == NULL) {
-        GlobalFree(memory);
-        return NULL;
-    }
-
-    dropFiles->pFiles = sizeof(DROPFILES);
-    dropFiles->fWide = TRUE;
-
-    wchar_t* cursor = reinterpret_cast<wchar_t*>(
-        reinterpret_cast<unsigned char*>(dropFiles) + sizeof(DROPFILES));
-    for (const auto& path : paths) {
-        std::memcpy(cursor, path.c_str(), path.size() * sizeof(wchar_t));
-        cursor += path.size();
-        *cursor++ = L'\0';
-    }
-    *cursor = L'\0';
-
-    GlobalUnlock(memory);
-    return memory;
 }

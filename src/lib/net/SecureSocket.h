@@ -60,6 +60,10 @@ public:
     void                initSsl(bool server);
     bool load_certificates(const barrier::fs::path& path);
 
+#if defined(BARRIER_TEST_ENV)
+    void testDisconnectTLSFailureNoLock() { disconnect(); }
+#endif
+
 private:
     // SSL
     void initContext(bool server); // may only be called with ssl_mutex_ acquired
@@ -85,6 +89,8 @@ private:
     void showSecureCipherInfo(); // may only be called with ssl_mutex_ acquired
 
     void                handleTCPConnected(const Event& event, void*);
+    void                removeTCPConnectedHandler();
+    void                sendTLSConnectionFailedEvent(const char* msg);
 
     void freeSSLResources();
 
@@ -97,6 +103,7 @@ private:
     Ssl*                m_ssl;
     bool                m_secureReady;
     bool                m_fatal;
+    bool                m_tlsFailureNotified = false;
     ConnectionSecurityLevel security_level_ = ConnectionSecurityLevel::ENCRYPTED;
 
     int secure_accept_retry_ = 0; // used only in secureAccept()

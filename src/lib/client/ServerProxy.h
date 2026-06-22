@@ -19,14 +19,21 @@
 #pragma once
 
 #include "barrier/clipboard_types.h"
+#include "barrier/ClipboardChunk.h"
 #include "barrier/key_types.h"
+#include "barrier/option_types.h"
 #include "base/Event.h"
 #include "base/Stopwatch.h"
+
+#include <memory>
+#include <string>
 
 class Client;
 class ClientInfo;
 class EventQueueTimer;
 class IClipboard;
+class StreamChunker;
+class Thread;
 namespace barrier { class IStream; }
 class IEventQueue;
 
@@ -37,20 +44,30 @@ to the server and messages from the server to calls on the client.
 */
 class ServerProxy {
 public:
+    enum ClipboardSendResult {
+        kClipboardSendFailed,
+        kClipboardSendQueued,
+        kClipboardSendPending
+    };
+
     /*!
     Process messages from the server on \p stream and forward to
     \p client.
     */
     ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* events);
-    ~ServerProxy();
+    virtual ~ServerProxy();
 
     //! @name manipulators
     //@{
 
     void                onInfoChanged();
     bool                onGrabClipboard(ClipboardID);
-    void                onClipboardChanged(ClipboardID, const IClipboard*);
+    virtual ClipboardSendResult onClipboardChanged(ClipboardID, const IClipboard*);
     barrier::IStream*   getStream() const { return m_stream; }
+    void                keepAlive();
+    virtual bool        cleanupClipboardSendThread(bool cancel);
+    virtual bool        reapClipboardSendResult(ClipboardID id, bool& succeeded);
+    void                detachForDeferredCleanup();
 
     //@}
 
@@ -59,6 +76,8 @@ public:
 
     // sending dragging information to server
     void                sendDragInfo(UInt32 fileCount, const char* info, size_t size);
+
+    static bool         hasCompleteOptionPairs(const OptionsList& options);
 
 #ifdef BARRIER_TEST_ENV
     void                handleDataForTest() { handleData(Event(), NULL); }
@@ -79,6 +98,12 @@ private:
 
     void                resetKeepAliveAlarm();
     void                setKeepAliveRate(double);
+    bool                shouldDeferKeepAliveAlarm(bool hasPendingInput, UInt32 bufferedOutput) const;
+    void                sendClipboardThread(
+                            const std::shared_ptr<const std::string>& data,
+                            ClipboardID id,
+                            UInt32 sequence,
+                            const std::shared_ptr<StreamChunker>& chunker);
 
     // modifier key translation
     KeyID                translateKey(KeyID) const;
@@ -87,6 +112,7 @@ private:
     // event handlers
     void                handleData(const Event&, void*);
     void                handleKeepAliveAlarm(const Event&, void*);
+    void                handleKeepAliveEvent(const Event&, void*);
 
     // message handlers
     void                enter();
@@ -132,7 +158,19 @@ private:
 
     double                m_keepAliveAlarm;
     EventQueueTimer*    m_keepAliveAlarmTimer;
+    UInt32              m_keepAliveAlarmDeferrals;
+    UInt32              m_keepAliveMissedAlarms;
+    bool                m_lastKeepAlivePendingInput;
+    UInt32              m_lastKeepAliveBufferedOutput;
+    Stopwatch           m_keepAliveActivityTimer;
+    ClipboardChunk::ReceiveBuffer m_clipboardReceiveBuffer;
 
     MessageParser        m_parser;
     IEventQueue*        m_events;
+    Thread*             m_clipboardSendThread;
+    std::shared_ptr<StreamChunker> m_clipboardChunker;
+    bool                m_detachedForDeferredCleanup;
+    ClipboardID         m_clipboardSendId;
+    bool                m_clipboardSendSucceeded;
+    bool                m_clipboardSendResultAvailable;
 };

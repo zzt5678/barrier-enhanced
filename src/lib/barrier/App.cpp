@@ -222,6 +222,11 @@ void
 App::handleIpcMessage(const Event& e, void*)
 {
     IpcMessage* m = static_cast<IpcMessage*>(e.getDataObject());
+    if (m == NULL) {
+        LOG((CLOG_WARN "ignoring empty ipc message"));
+        return;
+    }
+
     if (m->type() == kIpcShutdown) {
         LOG((CLOG_INFO "got ipc shutdown message"));
         m_events->addEvent(Event(Event::kQuit));

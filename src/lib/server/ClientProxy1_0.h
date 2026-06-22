@@ -21,6 +21,7 @@
 #include "server/ClientProxy.h"
 #include "barrier/Clipboard.h"
 #include "barrier/protocol_types.h"
+#include "base/Stopwatch.h"
 
 class Event;
 class EventQueueTimer;
@@ -79,6 +80,7 @@ private:
     void                handleDisconnect(const Event&, void*);
     void                handleWriteError(const Event&, void*);
     void                handleFlatline(const Event&, void*);
+    bool                shouldDeferFlatline(bool hasPendingInput, UInt32 bufferedOutput) const;
 
     bool                recvInfo();
     bool                recvGrabClipboard();
@@ -100,8 +102,14 @@ private:
     typedef bool (ClientProxy1_0::*MessageParser)(const UInt8*);
 
     ClientInfo            m_info;
+    bool                m_disconnected;
     double                m_heartbeatAlarm;
     EventQueueTimer*    m_heartbeatTimer;
+    UInt32              m_heartbeatDeferrals;
+    UInt32              m_heartbeatMissedAlarms;
+    bool                m_lastHeartbeatPendingInput;
+    UInt32              m_lastHeartbeatBufferedOutput;
+    Stopwatch           m_heartbeatActivityTimer;
     MessageParser        m_parser;
     IEventQueue*        m_events;
 };

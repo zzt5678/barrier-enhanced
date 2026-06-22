@@ -30,6 +30,9 @@ public:
     MOCK_CONST_METHOD0(getEventTarget, void*());
     MOCK_CONST_METHOD2(getCursorPos, void(SInt32&, SInt32&));
     MOCK_CONST_METHOD2(setJumpCursorPos, void(SInt32, SInt32));
+    MOCK_CONST_METHOD0(canEnter, bool());
+    MOCK_CONST_METHOD0(getJumpZoneSize, SInt32());
+    MOCK_CONST_METHOD0(isLockedToScreen, bool());
     MOCK_METHOD1(reconfigure, void(UInt32));
     MOCK_METHOD0(resetOptions, void());
     MOCK_METHOD1(setOptions, void(const OptionsList&));

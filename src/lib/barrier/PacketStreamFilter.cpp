@@ -19,16 +19,35 @@
 #include "barrier/PacketStreamFilter.h"
 #include "barrier/protocol_types.h"
 #include "base/IEventQueue.h"
+#include "base/Log.h"
 #include "mt/Lock.h"
 #include "base/TMethodEventJob.h"
 
-#include <array>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 //
 // PacketStreamFilter
 //
+
+namespace {
+
+bool
+rejectOversizedOutputPacket(IEventQueue* events, void* eventTarget, UInt32 count)
+{
+    if (count <= PROTOCOL_MAX_MESSAGE_LENGTH) {
+        return false;
+    }
+
+    LOG((CLOG_WARN "refusing to send packet larger than protocol limit, size=%u limit=%u",
+        count,
+        PROTOCOL_MAX_MESSAGE_LENGTH));
+    events->addEvent(Event(events->forIStream().outputError(), eventTarget));
+    return true;
+}
+
+}
 
 PacketStreamFilter::PacketStreamFilter(IEventQueue* events, barrier::IStream* stream, bool adoptStream) :
     StreamFilter(events, stream, adoptStream),
@@ -94,7 +113,9 @@ PacketStreamFilter::read(void* buffer, UInt32 n)
 void
 PacketStreamFilter::write(const void* buffer, UInt32 count)
 {
-    static const UInt32 kSingleWritePacketThreshold = 1024;
+    if (rejectOversizedOutputPacket(m_events, getEventTarget(), count)) {
+        return;
+    }
 
     // write the length of the payload
     UInt8 length[4];
@@ -103,26 +124,20 @@ PacketStreamFilter::write(const void* buffer, UInt32 count)
     length[2] = (UInt8)((count >>  8) & 0xff);
     length[3] = (UInt8)( count        & 0xff);
 
-    if (count <= kSingleWritePacketThreshold) {
-        std::array<UInt8, kSingleWritePacketThreshold + 4> packet;
-        std::memcpy(packet.data(), length, sizeof(length));
-        if (count > 0) {
-            std::memcpy(packet.data() + sizeof(length), buffer, count);
-        }
-        getStream()->write(packet.data(), count + sizeof(length));
-        return;
+    std::vector<UInt8> packet(static_cast<size_t>(count) + sizeof(length));
+    std::memcpy(packet.data(), length, sizeof(length));
+    if (count > 0) {
+        std::memcpy(packet.data() + sizeof(length), buffer, count);
     }
-
-    getStream()->write(length, sizeof(length));
-
-    // write the payload
-    getStream()->write(buffer, count);
+    getStream()->write(packet.data(), count + sizeof(length));
 }
 
 void
 PacketStreamFilter::writeLowPriority(const void* buffer, UInt32 count)
 {
-    static const UInt32 kSingleWritePacketThreshold = 1024;
+    if (rejectOversizedOutputPacket(m_events, getEventTarget(), count)) {
+        return;
+    }
 
     UInt8 length[4];
     length[0] = (UInt8)((count >> 24) & 0xff);
@@ -130,18 +145,12 @@ PacketStreamFilter::writeLowPriority(const void* buffer, UInt32 count)
     length[2] = (UInt8)((count >>  8) & 0xff);
     length[3] = (UInt8)( count        & 0xff);
 
-    if (count <= kSingleWritePacketThreshold) {
-        std::array<UInt8, kSingleWritePacketThreshold + 4> packet;
-        std::memcpy(packet.data(), length, sizeof(length));
-        if (count > 0) {
-            std::memcpy(packet.data() + sizeof(length), buffer, count);
-        }
-        getStream()->writeLowPriority(packet.data(), count + sizeof(length));
-        return;
+    std::vector<UInt8> packet(static_cast<size_t>(count) + sizeof(length));
+    std::memcpy(packet.data(), length, sizeof(length));
+    if (count > 0) {
+        std::memcpy(packet.data() + sizeof(length), buffer, count);
     }
-
-    getStream()->writeLowPriority(length, sizeof(length));
-    getStream()->writeLowPriority(buffer, count);
+    getStream()->writeLowPriority(packet.data(), count + sizeof(length));
 }
 
 void
@@ -203,9 +212,6 @@ bool PacketStreamFilter::readPacketSize()
 bool
 PacketStreamFilter::readMore()
 {
-    // note if we have whole packet
-    bool wasReady = isReadyNoLock();
-
     // read more data
     char buffer[4096];
     UInt32 n = getStream()->read(buffer, sizeof(buffer));
@@ -222,12 +228,10 @@ PacketStreamFilter::readMore()
         n = getStream()->read(buffer, sizeof(buffer));
     }
 
-    // note if we now have a whole packet
-    bool isReady = isReadyNoLock();
-
-    // if we weren't ready before but now we are then send a
-    // input ready event apparently from the filtered stream.
-    return (wasReady != isReady);
+    // Forward readiness whenever a complete packet is buffered.  The upstream
+    // socket may deliver more data while a previous packet is still buffered,
+    // so relying only on a not-ready -> ready transition can strand data.
+    return isReadyNoLock();
 }
 
 void

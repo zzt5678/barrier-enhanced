@@ -28,9 +28,10 @@ IpcMessage::~IpcMessage()
 {
 }
 
-IpcHelloMessage::IpcHelloMessage(EIpcClientType clientType) :
+IpcHelloMessage::IpcHelloMessage(EIpcClientType clientType, UInt32 processId) :
     IpcMessage(kIpcHello),
-    m_clientType(clientType)
+    m_clientType(clientType),
+    m_processId(processId)
 {
 }
 
@@ -57,11 +58,14 @@ IpcLogLineMessage::~IpcLogLineMessage()
 {
 }
 
-IpcCommandMessage::IpcCommandMessage(const std::string& command, bool elevate) :
+IpcCommandMessage::IpcCommandMessage(const std::string& command, UInt8 elevateMode) :
     IpcMessage(kIpcCommand),
     m_command(command),
-    m_elevate(elevate)
+    m_elevateMode(elevateMode)
 {
+    if (m_elevateMode > kElevateNever) {
+        m_elevateMode = kElevateAsNeeded;
+    }
 }
 
 IpcCommandMessage::~IpcCommandMessage()

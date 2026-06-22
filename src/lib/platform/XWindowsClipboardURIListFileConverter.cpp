@@ -194,12 +194,9 @@ XWindowsClipboardURIListFileConverter::getDataSize() const
 }
 
 std::string
-XWindowsClipboardURIListFileConverter::fromIClipboard(const std::string& pathList) const
+XWindowsClipboardURIListFileConverter::fromIClipboard(const std::string&) const
 {
-    if (m_gnomeSpecial) {
-        return pathListToGnomeCopiedFiles(pathList);
-    }
-    return pathListToUriList(pathList);
+    return "";
 }
 
 std::string

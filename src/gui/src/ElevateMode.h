@@ -17,20 +17,17 @@
 
 #pragma once
 
-// The elevate mode tristate determines two behaviours on Windows.
-// The first, switch-on-desk-switch (SodS), passed through barrierd as a
-// command line argument to barrier core, determines if the server restarts
-// when switching Windows desktops (e.g. when Windows UAC dialog pops up).
-// The second, passed as a boolean flag to Barrierd over the IPC inside
-// kIpcCommandMessage, determines whether Barrier should be started with
-// elevated privileges.
+// The elevate mode tristate determines whether the Windows service asks
+// Barrierd to start Barrier with elevated privileges. In service mode the GUI
+// always passes switch-on-desk-switch separately so UAC/Winlogon desktop
+// changes can relaunch the process on the active input desktop.
 //
 // The matrix for these two behaviours is as follows:
-//                          SodS        Elevate
-//                     ___________________________
-//  ElevateAsNeeded    |    true    |   false
-//  ElevateAlways      |    false   |   true
-//  ElevateNever       |    false   |   false
+//                          Service SodS      Elevate
+//                     _________________________________
+//  ElevateAsNeeded    |      true       |     false
+//  ElevateAlways      |      true       |     true
+//  ElevateNever       |      false      |     false
 //
 enum ElevateMode {
     ElevateAsNeeded = 0,

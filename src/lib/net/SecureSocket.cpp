@@ -20,7 +20,9 @@
 
 #include "net/TSocketMultiplexerMethodJob.h"
 #include "base/TMethodEventJob.h"
+#include "base/Event.h"
 #include "net/TCPSocket.h"
+#include "net/IDataSocket.h"
 #include "mt/Lock.h"
 #include "arch/XArch.h"
 #include "base/Log.h"
@@ -33,6 +35,8 @@
 #include <openssl/err.h>
 #include <cstring>
 #include <cstdlib>
+
+static const int kSecureWriteWindowSize = 128 * 1024;
 #include <memory>
 #include <fstream>
 
@@ -42,8 +46,9 @@
 
 #define MAX_ERROR_SIZE 65535
 
-static const std::size_t MAX_INPUT_BUFFER_SIZE = 1024 * 1024;
 static const float s_retryDelay = 0.01f;
+static const int kMaxSecureAcceptRetries = 500;
+static const int kMaxSecureConnectRetries = 1500;
 
 enum {
     kMsgSize = 128
@@ -78,6 +83,7 @@ SecureSocket::SecureSocket(IEventQueue* events, SocketMultiplexer* socketMultipl
 SecureSocket::~SecureSocket()
 {
     isFatal(true);
+    removeTCPConnectedHandler();
     // take socket from multiplexer ASAP otherwise the race condition
     // could cause events to get called on a dead object. TCPSocket
     // will do this, too, but the double-call is harmless
@@ -94,6 +100,7 @@ void
 SecureSocket::close()
 {
     isFatal(true);
+    removeTCPConnectedHandler();
     freeSSLResources();
     TCPSocket::close();
 }
@@ -121,6 +128,7 @@ void SecureSocket::freeSSLResources()
 void
 SecureSocket::connect(const NetworkAddress& addr)
 {
+    removeTCPConnectedHandler();
     m_events->adoptHandler(m_events->forIDataSocket().connected(),
                 getEventTarget(),
                 new TMethodEventJob<SecureSocket>(this,
@@ -159,12 +167,23 @@ SecureSocket::secureAccept()
 TCPSocket::EJobResult
 SecureSocket::doRead()
 {
+    if (!canReadInputNoLock()) {
+        LOG((CLOG_DEBUG1 "secure socket input backlog full; pausing reads until buffered input is drained"));
+        return kNew;
+    }
+
     UInt8 buffer[4096];
     int bytesRead = 0;
     int status = 0;
 
     if (isSecureReady()) {
-        status = secureRead(buffer, sizeof(buffer), bytesRead);
+        const size_t readSize = getInputReadSizeNoLock(sizeof(buffer));
+        if (readSize == 0) {
+            LOG((CLOG_DEBUG1 "secure socket input backlog full; pausing reads until buffered input is drained"));
+            return kNew;
+        }
+
+        status = secureRead(buffer, static_cast<int>(readSize), bytesRead);
         if (status < 0) {
             return kBreak;
         }
@@ -181,13 +200,25 @@ SecureSocket::doRead()
 
         // slurp up as much as possible
         do {
-            m_inputBuffer.write(buffer, bytesRead);
-
-            if (m_inputBuffer.getSize() > MAX_INPUT_BUFFER_SIZE) {
-                break;
+            if (!queueInputOrDisconnectNoLock(buffer, static_cast<UInt32>(bytesRead))) {
+                return kNew;
+            }
+            if (!canReadInputNoLock()) {
+                if (wasEmpty) {
+                    sendEvent(m_events->forIStream().inputReady());
+                }
+                return kNew;
             }
 
-            status = secureRead(buffer, sizeof(buffer), bytesRead);
+            const size_t readSize = getInputReadSizeNoLock(sizeof(buffer));
+            if (readSize == 0) {
+                if (wasEmpty) {
+                    sendEvent(m_events->forIStream().inputReady());
+                }
+                return kNew;
+            }
+
+            status = secureRead(buffer, static_cast<int>(readSize), bytesRead);
             if (status < 0) {
                 return kBreak;
             }
@@ -242,6 +273,9 @@ SecureSocket::doWrite()
         }
 
         bufferSize = outputBuffer->getSize();
+        if (bufferSize > kSecureWriteWindowSize) {
+            bufferSize = kSecureWriteWindowSize;
+        }
         if (bufferSize > do_write_retry_buffer_size_) {
             do_write_retry_buffer_.reset(new char[bufferSize]);
             do_write_retry_buffer_size_ = bufferSize;
@@ -519,12 +553,16 @@ SecureSocket::secureAccept(int socket)
 
     checkResult(r, secure_accept_retry_);
 
+    if (!isFatal() && secure_accept_retry_ > kMaxSecureAcceptRetries) {
+        LOG((CLOG_WARN "timed out accepting secure socket after %d retries",
+            secure_accept_retry_));
+        isFatal(true);
+    }
+
     if (isFatal()) {
-        // tell user and sleep so the socket isn't hammered.
         LOG((CLOG_ERR "failed to accept secure socket"));
         LOG((CLOG_INFO "client connection may not be secure"));
         m_secureReady = false;
-        ARCH->sleep(1);
         secure_accept_retry_ = 0;
         return -1; // Failed, error out
     }
@@ -577,8 +615,9 @@ SecureSocket::secureConnect(int socket)
     // note that load_certificates acquires ssl_mutex_
     if (!load_certificates(barrier::DataDirectories::ssl_certificate_path())) {
         LOG((CLOG_ERR "could not load client certificates"));
-        // FIXME: this is fatal error, but we current don't disconnect because whole logic in this
-        // function needs to be cleaned up
+        m_secureReady = false;
+        secure_connect_retry_ = 0;
+        return -1;
     }
 
     std::lock_guard<std::mutex> ssl_lock{ssl_mutex_};
@@ -597,8 +636,15 @@ SecureSocket::secureConnect(int socket)
 
     checkResult(r, secure_connect_retry_);
 
+    if (!isFatal() && secure_connect_retry_ > kMaxSecureConnectRetries) {
+        LOG((CLOG_WARN "timed out connecting secure socket after %d retries",
+            secure_connect_retry_));
+        isFatal(true);
+    }
+
     if (isFatal()) {
         LOG((CLOG_ERR "failed to connect secure socket"));
+        m_secureReady = false;
         secure_connect_retry_ = 0;
         return -1;
     }
@@ -612,20 +658,20 @@ SecureSocket::secureConnect(int socket)
     }
 
     secure_connect_retry_ = 0;
-    // No error, set ready, process and return ok
-    m_secureReady = true;
+    // No transport error. Mark secure only after trust checks pass.
     if (verify_cert_fingerprint(barrier::DataDirectories::trusted_servers_ssl_fingerprints_path())) {
         LOG((CLOG_INFO "connected to secure socket"));
         if (!ensure_peer_certificate()) {
-            disconnect();
+            m_secureReady = false;
             return -1;// Cert fail, error
         }
     }
     else {
         LOG((CLOG_ERR "failed to verify server certificate fingerprint"));
-        disconnect();
+        m_secureReady = false;
         return -1; // Fingerprint failed, error
     }
+    m_secureReady = true;
     LOG((CLOG_DEBUG2 "connected secure socket"));
     if (CLOG->getFilter() >= kDEBUG1) {
         showSecureCipherInfo();
@@ -770,9 +816,17 @@ std::string SecureSocket::getError()
 void
 SecureSocket::disconnect()
 {
+    if (m_tlsFailureNotified) {
+        return;
+    }
+
+    m_tlsFailureNotified = true;
+    m_secureReady = false;
+    isFatal(true);
+    removeTCPConnectedHandler();
+    removeJob();
     sendEvent(getEvents()->forISocket().stopRetry());
-    sendEvent(getEvents()->forISocket().disconnected());
-    sendEvent(getEvents()->forIStream().inputShutdown());
+    disconnectSocketNoLock(true);
 }
 
 bool SecureSocket::verify_cert_fingerprint(const barrier::fs::path& fingerprint_db_path)
@@ -836,11 +890,14 @@ MultiplexerJobStatus SecureSocket::serviceConnect(ISocketMultiplexerJob* job,
 
     // If status < 0, error happened
     if (status < 0) {
+        disconnect();
+        sendTLSConnectionFailedEvent("TLS handshake failed");
         return {false, {}};
     }
 
     // If status > 0, success
     if (status > 0) {
+        removeTCPConnectedHandler();
         sendEvent(m_events->forIDataSocket().secureConnected());
         return newJobOrStopServicing();
     }
@@ -866,8 +923,9 @@ MultiplexerJobStatus SecureSocket::serviceAccept(ISocketMultiplexerJob* job,
 #elif SYSAPI_UNIX
     status = secureAccept(getSocket()->m_fd);
 #endif
-        // If status < 0, error happened
+    // If status < 0, error happened
     if (status < 0) {
+        disconnect();
         return {false, {}};
     }
 
@@ -959,4 +1017,19 @@ SecureSocket::handleTCPConnected(const Event& event, void*)
         return;
     }
     secureConnect();
+}
+
+void
+SecureSocket::removeTCPConnectedHandler()
+{
+    m_events->removeHandler(m_events->forIDataSocket().connected(), getEventTarget());
+}
+
+void
+SecureSocket::sendTLSConnectionFailedEvent(const char* msg)
+{
+    IDataSocket::ConnectionFailedInfo* info =
+        new IDataSocket::ConnectionFailedInfo(msg);
+    m_events->addEvent(Event(m_events->forIDataSocket().connectionFailed(),
+                             getEventTarget(), info, Event::kDontFreeData));
 }

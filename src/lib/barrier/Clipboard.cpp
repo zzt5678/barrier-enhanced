@@ -18,6 +18,63 @@
 
 #include "barrier/Clipboard.h"
 
+static const size_t kClipboardFormatReleaseThreshold = 1024 * 1024;
+static const size_t kClipboardSnapshotExactLimit = 1024 * 1024;
+static const std::uint64_t kFnv1aOffset = 1469598103934665603ull;
+static const std::uint64_t kFnv1aPrime = 1099511628211ull;
+
+static std::uint64_t
+hashClipboardData(const String& data)
+{
+    std::uint64_t hash = kFnv1aOffset;
+    for (String::const_iterator i = data.begin(); i != data.end(); ++i) {
+        hash ^= static_cast<unsigned char>(*i);
+        hash *= kFnv1aPrime;
+    }
+    return hash;
+}
+
+void
+ClipboardDataSnapshot::set(const String& data)
+{
+    m_valid = true;
+    m_size = data.size();
+    m_hash = hashClipboardData(data);
+
+    if (data.size() <= kClipboardSnapshotExactLimit) {
+        m_exactData = data;
+        m_hasExactData = true;
+    }
+    else {
+        String().swap(m_exactData);
+        m_hasExactData = false;
+    }
+}
+
+bool
+ClipboardDataSnapshot::matches(const String& data) const
+{
+    if (!m_valid || data.size() != m_size) {
+        return false;
+    }
+
+    if (m_hasExactData) {
+        return data == m_exactData;
+    }
+
+    return hashClipboardData(data) == m_hash;
+}
+
+void
+ClipboardDataSnapshot::clear()
+{
+    m_valid = false;
+    m_hasExactData = false;
+    m_size = 0;
+    m_hash = 0;
+    String().swap(m_exactData);
+}
+
 //
 // Clipboard
 //
@@ -43,7 +100,12 @@ Clipboard::empty()
 
     // clear all data
     for (SInt32 index = 0; index < kNumFormats; ++index) {
-        m_data[index]  = "";
+        if (m_data[index].capacity() > kClipboardFormatReleaseThreshold) {
+            String().swap(m_data[index]);
+        }
+        else {
+            m_data[index].clear();
+        }
         m_added[index] = false;
     }
 

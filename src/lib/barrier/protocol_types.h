@@ -46,8 +46,11 @@ static const UInt32        kMaxHelloLength = 1024;
 // option.
 static const double        kKeepAliveRate = 3.0;
 
-// number of skipped kMsgCKeepAlive messages that indicates a problem
-static const double        kKeepAlivesUntilDeath = 3.0;
+// number of skipped kMsgCKeepAlive messages that indicates a problem.
+// Desktop switches, secure-desktop prompts, and large clipboard payloads can
+// briefly stall one side's event loop, so avoid treating a short scheduling
+// pause as a dead connection.
+static const double        kKeepAlivesUntilDeath = 5.0;
 
 // obsolete heartbeat stuff
 static const double        kHeartRate = -1.0;
@@ -82,7 +85,8 @@ enum EDirectionMask {
 enum EDataTransfer {
     kDataStart = 1,
     kDataChunk = 2,
-    kDataEnd = 3
+    kDataEnd = 3,
+    kDataCancel = 4
 };
 
 // Data received constants

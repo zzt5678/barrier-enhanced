@@ -43,9 +43,6 @@ ClientProxy::close(const char* msg)
 {
     LOG((CLOG_DEBUG1 "send close \"%s\" to \"%s\"", msg, getName().c_str()));
     ProtocolUtil::writef(getStream(), msg);
-
-    // force the close to be sent before we return
-    getStream()->flush();
 }
 
 barrier::IStream*

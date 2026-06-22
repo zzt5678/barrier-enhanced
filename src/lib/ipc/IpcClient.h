@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "ipc/Ipc.h"
 #include "net/NetworkAddress.h"
 #include "net/TCPSocket.h"
 #include "base/EventTypes.h"
@@ -33,8 +34,10 @@ class SocketMultiplexer;
  */
 class IpcClient {
 public:
-    IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer);
-    IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer, int port);
+    IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer,
+              EIpcClientType clientType = kIpcClientNode);
+    IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer, int port,
+              EIpcClientType clientType = kIpcClientNode);
     virtual ~IpcClient();
 
     //! @name manipulators
@@ -61,4 +64,5 @@ private:
     TCPSocket            m_socket;
     IpcServerProxy*    m_server;
     IEventQueue*        m_events;
+    EIpcClientType      m_clientType;
 };

@@ -24,6 +24,76 @@
 
 using ::testing::_;
 
+TEST(CXWindowsScreenTests, drmConnectorEnterable_allowsDpmsOffForWake)
+{
+    EXPECT_TRUE(XWindowsScreen::isDrmConnectorEnterableForTest(
+        "connected", "enabled", "Off"));
+    EXPECT_TRUE(XWindowsScreen::isDrmConnectorEnterableForTest(
+        "connected", "", "Off"));
+    EXPECT_FALSE(XWindowsScreen::isDrmConnectorEnterableForTest(
+        "connected", "disabled", "On"));
+    EXPECT_FALSE(XWindowsScreen::isDrmConnectorEnterableForTest(
+        "disconnected", "enabled", "On"));
+}
+
+TEST(CXWindowsScreenTests, drmConnectorEnterable_distinguishesDpmsOffFromDisconnected)
+{
+    EXPECT_TRUE(XWindowsScreen::isDrmConnectorEnterableForTest(
+        "connected", "enabled", "Off"));
+    EXPECT_TRUE(XWindowsScreen::isDrmConnectorEnterableForTest(
+        "connected", "", "Off"));
+    EXPECT_FALSE(XWindowsScreen::isDrmConnectorEnterableForTest(
+        "disconnected", "enabled", "Off"));
+    EXPECT_FALSE(XWindowsScreen::isDrmConnectorEnterableForTest(
+        "disconnected", "", "Off"));
+	EXPECT_FALSE(XWindowsScreen::isDrmConnectorEnterableForTest(
+		"connected", "disabled", "Off"));
+}
+
+TEST(CXWindowsScreenTests, primaryDisplayEnterable_rejectsValidXShapeWhenDrmIsUnusable)
+{
+	EXPECT_FALSE(XWindowsScreen::isPrimaryDisplayEnterableForTest(
+		false, 1920, 1080));
+	EXPECT_FALSE(XWindowsScreen::isPrimaryDisplayEnterableForTest(
+		false, 64, 64));
+}
+
+TEST(CXWindowsScreenTests, primaryDisplayEnterable_rejectsInvalidShapeEvenWhenDrmIsUsable)
+{
+	EXPECT_FALSE(XWindowsScreen::isPrimaryDisplayEnterableForTest(
+		false, 0, 1080));
+	EXPECT_FALSE(XWindowsScreen::isPrimaryDisplayEnterableForTest(
+		false, 1920, 0));
+	EXPECT_FALSE(XWindowsScreen::isPrimaryDisplayEnterableForTest(
+		false, 63, 1080));
+	EXPECT_FALSE(XWindowsScreen::isPrimaryDisplayEnterableForTest(
+		true, 0, 0));
+	EXPECT_TRUE(XWindowsScreen::isPrimaryDisplayEnterableForTest(
+		true, 64, 64));
+}
+
+TEST(CXWindowsScreenTests, secondaryDisplayAdvertisable_rejectsValidXShapeWhenDrmIsUnusable)
+{
+	EXPECT_FALSE(XWindowsScreen::isSecondaryDisplayAdvertisableForTest(
+		false, 1920, 1080));
+	EXPECT_FALSE(XWindowsScreen::isSecondaryDisplayAdvertisableForTest(
+		false, 64, 64));
+}
+
+TEST(CXWindowsScreenTests, secondaryDisplayAdvertisable_rejectsInvalidShapeEvenWhenDrmIsUsable)
+{
+	EXPECT_FALSE(XWindowsScreen::isSecondaryDisplayAdvertisableForTest(
+		false, 0, 1080));
+	EXPECT_FALSE(XWindowsScreen::isSecondaryDisplayAdvertisableForTest(
+		false, 1920, 0));
+	EXPECT_FALSE(XWindowsScreen::isSecondaryDisplayAdvertisableForTest(
+		false, 63, 1080));
+	EXPECT_FALSE(XWindowsScreen::isSecondaryDisplayAdvertisableForTest(
+		true, 0, 0));
+	EXPECT_TRUE(XWindowsScreen::isSecondaryDisplayAdvertisableForTest(
+		true, 64, 64));
+}
+
 TEST(CXWindowsScreenTests, fakeMouseMove_nonPrimary_getCursorPosValuesCorrect)
 {
     const char* displayName = std::getenv("DISPLAY");

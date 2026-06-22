@@ -16,6 +16,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#define BARRIER_TEST_ENV
+
 #include "barrier/Clipboard.h"
 
 #include "test/global/gtest.h"
@@ -40,6 +42,45 @@ TEST(ClipboardTests, empty_singleFormat_hasReturnsFalse)
 
     bool actual = clipboard.has(Clipboard::kText);
     EXPECT_FALSE(actual);
+}
+
+TEST(ClipboardTests, empty_largeFormat_releasesRetainedCapacity)
+{
+    Clipboard clipboard;
+    clipboard.open(0);
+    clipboard.add(Clipboard::kPNG, String(2 * 1024 * 1024, 'x'));
+
+    EXPECT_GE(clipboard.dataCapacityForTest(Clipboard::kPNG), 2u * 1024u * 1024u);
+    const size_t largeCapacity = clipboard.dataCapacityForTest(Clipboard::kPNG);
+
+    clipboard.empty();
+
+    EXPECT_LT(clipboard.dataCapacityForTest(Clipboard::kPNG), largeCapacity / 2);
+    EXPECT_FALSE(clipboard.has(Clipboard::kPNG));
+}
+
+TEST(ClipboardDataSnapshotTests, set_smallDataRetainsExactData)
+{
+    ClipboardDataSnapshot snapshot;
+    snapshot.set("plain text");
+
+    EXPECT_TRUE(snapshot.matches("plain text"));
+    EXPECT_FALSE(snapshot.matches("plain texu"));
+    EXPECT_GT(snapshot.retainedDataCapacityForTest(), 0u);
+}
+
+TEST(ClipboardDataSnapshotTests, set_largeDataStoresSignatureWithoutRetainingPayload)
+{
+    ClipboardDataSnapshot snapshot;
+    const String largeData(2 * 1024 * 1024, 'x');
+    String changedData = largeData;
+    changedData[changedData.size() - 1] = 'y';
+
+    snapshot.set(largeData);
+
+    EXPECT_TRUE(snapshot.matches(largeData));
+    EXPECT_FALSE(snapshot.matches(changedData));
+    EXPECT_LT(snapshot.retainedDataCapacityForTest(), largeData.size() / 2);
 }
 
 TEST(ClipboardTests, add_newValue_valueWasStored)

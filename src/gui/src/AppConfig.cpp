@@ -27,7 +27,7 @@
 const char AppConfig::m_BarriersName[] = "weaves.exe";
 const char AppConfig::m_BarriercName[] = "weavec.exe";
 const char AppConfig::m_BarrierLogDir[] = "log/";
-#define DEFAULT_PROCESS_MODE Desktop
+#define DEFAULT_PROCESS_MODE Service
 #else
 const char AppConfig::m_BarriersName[] = "weaves";
 const char AppConfig::m_BarriercName[] = "weavec";
@@ -35,7 +35,11 @@ const char AppConfig::m_BarrierLogDir[] = "/var/log/";
 #define DEFAULT_PROCESS_MODE Desktop
 #endif
 
+#if defined(Q_OS_WIN)
+const ElevateMode defaultElevateMode = ElevateAlways;
+#else
 const ElevateMode defaultElevateMode = ElevateAsNeeded;
+#endif
 
 static const char* logLevelNames[] =
 {
@@ -57,6 +61,7 @@ AppConfig::AppConfig(QSettings* settings) :
     m_WizardLastRun(0),
     m_ProcessMode(DEFAULT_PROCESS_MODE),
     m_AutoConfig(true),
+    m_AutoConfigUserSet(false),
     m_ElevateMode(defaultElevateMode),
     m_AutoConfigPrompted(false),
     m_CryptoEnabled(false),
@@ -166,7 +171,24 @@ void AppConfig::loadSettings()
     m_WizardLastRun = settings().value("wizardLastRun", 0).toInt();
     m_Language = settings().value("language", QLocale::system().name()).toString();
     m_StartedBefore = settings().value("startedBefore", false).toBool();
+    m_AutoConfigUserSet = settings().value("autoConfigUserSet", false).toBool();
+#if defined(Q_OS_WIN)
     m_AutoConfig = settings().value("autoConfig", true).toBool();
+#else
+    m_AutoConfig = m_AutoConfigUserSet &&
+        settings().value("autoConfig", false).toBool();
+#endif
+    const int processMode = settings().value("processMode",
+                                            QVariant(static_cast<int>(DEFAULT_PROCESS_MODE))).toInt();
+    if (processMode == static_cast<int>(Service)) {
+        m_ProcessMode = Service;
+    }
+    else if (processMode == static_cast<int>(Desktop)) {
+        m_ProcessMode = Desktop;
+    }
+    else {
+        m_ProcessMode = DEFAULT_PROCESS_MODE;
+    }
     QVariant elevateMode = settings().value("elevateModeEnum");
     if (!elevateMode.isValid()) {
         elevateMode = settings().value ("elevateMode",
@@ -185,7 +207,7 @@ void AppConfig::loadSettings()
     m_GameMode = settings().value("gameMode", false).toBool();
     m_LowLatencyMode = settings().value("lowLatencyMode", false).toBool();
     m_NestedRemoteMode = settings().value("nestedRemoteMode", false).toBool();
-    m_WorkflowEnabled = settings().value("workflowEnabled", true).toBool();
+    m_WorkflowEnabled = settings().value("workflowEnabled", false).toBool();
     m_SuggestionsEnabled = settings().value("workflowSuggestionsEnabled", true).toBool();
     m_WorkflowHistoryLimit = settings().value("workflowHistoryLimit", 100).toInt();
     m_WorkflowDormantSeconds = settings().value("workflowDormantSeconds", 60).toInt();
@@ -203,6 +225,8 @@ void AppConfig::saveSettings()
     settings().setValue("language", m_Language);
     settings().setValue("startedBefore", m_StartedBefore);
     settings().setValue("autoConfig", m_AutoConfig);
+    settings().setValue("autoConfigUserSet", m_AutoConfigUserSet);
+    settings().setValue("processMode", static_cast<int>(m_ProcessMode));
     // Refer to enum ElevateMode declaration for insight in to why this
     // flag is mapped this way
     settings().setValue("elevateMode", m_ElevateMode == ElevateAlways);
@@ -247,7 +271,11 @@ void AppConfig::setStartedBefore(bool b) { m_StartedBefore = b; }
 
 void AppConfig::setElevateMode(ElevateMode em) { m_ElevateMode = em; }
 
-void AppConfig::setAutoConfig(bool autoConfig) { m_AutoConfig = autoConfig; }
+void AppConfig::setAutoConfig(bool autoConfig)
+{
+    m_AutoConfig = autoConfig;
+    m_AutoConfigUserSet = true;
+}
 
 bool AppConfig::autoConfigPrompted() { return m_AutoConfigPrompted; }
 

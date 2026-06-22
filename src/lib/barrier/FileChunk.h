@@ -20,6 +20,7 @@
 #include "barrier/Chunk.h"
 #include "base/String.h"
 #include "common/basic_types.h"
+#include "io/filesystem.h"
 
 #define FILE_CHUNK_META_SIZE 2
 
@@ -30,14 +31,24 @@ class IStream;
 class FileChunk : public Chunk {
 public:
     FileChunk(size_t size);
+    UInt32 m_transferId;
+
+    static const size_t kMaxReceiveSize;
+    static const size_t kMemoryReceiveLimit;
 
     static FileChunk*    start(const String& size);
     static FileChunk*    data(const UInt8* data, size_t dataSize);
     static FileChunk*    end();
+    static FileChunk*    cancel();
     static int            assemble(
                             barrier::IStream* stream,
                             String& dataCached,
-                            size_t& expectedSize);
+                            size_t& expectedSize,
+                            barrier::fs::path* spoolPath = NULL);
+    static void            releaseReceiveBuffer(
+                            String& dataCached,
+                            size_t& expectedSize,
+                            barrier::fs::path* spoolPath = NULL);
     static void            send(
                             barrier::IStream* stream,
                             UInt8 mark,

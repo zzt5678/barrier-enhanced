@@ -23,6 +23,53 @@
 
 #include <Wtsapi32.h>
 
+namespace {
+
+bool
+isValidHandle(HANDLE handle)
+{
+    return handle != NULL && handle != INVALID_HANDLE_VALUE;
+}
+
+class ScopedHandle {
+public:
+    ScopedHandle() :
+        m_handle(NULL)
+    {
+    }
+
+    explicit ScopedHandle(HANDLE handle) :
+        m_handle(handle)
+    {
+    }
+
+    ~ScopedHandle()
+    {
+        reset();
+    }
+
+    HANDLE get() const
+    {
+        return m_handle;
+    }
+
+    void reset(HANDLE handle = NULL)
+    {
+        if (isValidHandle(m_handle)) {
+            CloseHandle(m_handle);
+        }
+        m_handle = handle;
+    }
+
+private:
+    ScopedHandle(const ScopedHandle&);
+    ScopedHandle& operator=(const ScopedHandle&);
+
+    HANDLE m_handle;
+};
+
+}
+
 MSWindowsSession::MSWindowsSession() :
     m_activeSessionId(-1)
 {
@@ -41,6 +88,7 @@ MSWindowsSession::isProcessInSession(const char* name, PHANDLE process = NULL)
         LOG((CLOG_ERR "could not get process snapshot"));
         throw XArch(new XArchEvalWindows());
     }
+    ScopedHandle snapshotHandle(snapshot);
 
     PROCESSENTRY32 entry;
     entry.dwSize = sizeof(PROCESSENTRY32);
@@ -71,7 +119,7 @@ MSWindowsSession::isProcessInSession(const char* name, PHANDLE process = NULL)
                 // if we can not acquire session associated with a specified process,
                 // simply ignore it
                 LOG((CLOG_ERR "could not get session id for process id %i", entry.th32ProcessID));
-                gotEntry = nextProcessEntry(snapshot, &entry);
+                gotEntry = nextProcessEntry(snapshotHandle.get(), &entry);
                 continue;
             }
             else {
@@ -90,7 +138,7 @@ MSWindowsSession::isProcessInSession(const char* name, PHANDLE process = NULL)
         }
 
         // now move on to the next entry (if we're not at the end)
-        gotEntry = nextProcessEntry(snapshot, &entry);
+        gotEntry = nextProcessEntry(snapshotHandle.get(), &entry);
     }
 
     std::string nameListJoin;
@@ -102,8 +150,6 @@ MSWindowsSession::isProcessInSession(const char* name, PHANDLE process = NULL)
 
     LOG((CLOG_DEBUG "processes in session %d: %s",
         m_activeSessionId, nameListJoin.c_str()));
-
-    CloseHandle(snapshot);
 
     if (pid) {
         if (process != NULL) {
@@ -122,22 +168,23 @@ MSWindowsSession::isProcessInSession(const char* name, PHANDLE process = NULL)
 HANDLE
 MSWindowsSession::getUserToken(LPSECURITY_ATTRIBUTES security)
 {
-    HANDLE sourceToken;
+    HANDLE sourceToken = NULL;
     if (!WTSQueryUserToken(m_activeSessionId, &sourceToken)) {
         LOG((CLOG_ERR "could not get token from session %d", m_activeSessionId));
         throw XArch(new XArchEvalWindows);
     }
+    ScopedHandle sourceTokenHandle(sourceToken);
 
-    HANDLE newToken;
+    HANDLE newToken = NULL;
     if (!DuplicateTokenEx(
-        sourceToken, TOKEN_ASSIGN_PRIMARY | TOKEN_ALL_ACCESS, security,
+        sourceTokenHandle.get(), TOKEN_ASSIGN_PRIMARY | TOKEN_ALL_ACCESS, security,
         SecurityImpersonation, TokenPrimary, &newToken)) {
 
         LOG((CLOG_ERR "could not duplicate token"));
         throw XArch(new XArchEvalWindows);
     }
 
-    LOG((CLOG_DEBUG "duplicated, new token: %i", newToken));
+    LOG((CLOG_DEBUG "duplicated, new token: %p", newToken));
     return newToken;
 }
 

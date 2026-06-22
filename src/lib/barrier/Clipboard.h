@@ -20,6 +20,29 @@
 
 #include "barrier/IClipboard.h"
 
+#include <cstdint>
+
+class ClipboardDataSnapshot {
+public:
+    void                set(const String& data);
+    bool                matches(const String& data) const;
+    void                clear();
+
+#ifdef BARRIER_TEST_ENV
+    size_t              retainedDataCapacityForTest() const
+    {
+        return m_exactData.capacity();
+    }
+#endif
+
+private:
+    bool                m_valid = false;
+    bool                m_hasExactData = false;
+    size_t              m_size = 0;
+    std::uint64_t       m_hash = 0;
+    String              m_exactData;
+};
+
 //! Memory buffer clipboard
 /*!
 This class implements a clipboard that stores data in memory.
@@ -60,6 +83,13 @@ public:
     virtual Time        getTime() const;
     virtual bool        has(EFormat) const;
     virtual String        get(EFormat) const;
+
+#ifdef BARRIER_TEST_ENV
+    size_t              dataCapacityForTest(EFormat format) const
+    {
+        return m_data[format].capacity();
+    }
+#endif
 
 private:
     mutable bool        m_open;

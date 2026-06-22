@@ -63,6 +63,8 @@ public:
     from runaway logging.
     */
     void                bufferMaxSize(UInt16 bufferMaxSize);
+    void                bufferMaxBytes(size_t bufferMaxBytes);
+    void                bufferMaxLineBytes(size_t bufferMaxLineBytes);
 
     //! Set the rate limit
     /*!
@@ -87,6 +89,8 @@ public:
     Returns the maximum size of the buffer.
     */
     UInt16                bufferMaxSize() const;
+    size_t                bufferMaxBytes() const;
+    size_t                bufferMaxLineBytes() const;
 
     //@}
 
@@ -95,6 +99,9 @@ private:
     void buffer_thread();
     std::string getChunk(size_t count);
     void appendBuffer(const std::string& text);
+    void popOldestBufferedLine();
+    bool hasBufferedLines();
+    void setRunning(bool running);
     bool                isRunning();
 
 private:
@@ -102,6 +109,7 @@ private:
 
     IpcServer&            m_ipcServer;
     Buffer                m_buffer;
+    size_t                m_bufferBytes;
     std::mutex m_bufferMutex;
     bool                m_sending;
     Thread*                m_bufferThread;
@@ -112,6 +120,8 @@ private:
     IArchMultithread::ThreadID
                         m_bufferThreadId;
     UInt16                m_bufferMaxSize;
+    size_t                m_bufferMaxBytes;
+    size_t                m_bufferMaxLineBytes;
     UInt16                m_bufferRateWriteLimit;
     double                m_bufferRateTimeLimit;
     UInt16                m_bufferWriteCount;

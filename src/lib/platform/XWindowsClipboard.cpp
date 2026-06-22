@@ -27,7 +27,6 @@
 #include "platform/XWindowsClipboardPNGConverter.h"
 #include "platform/XWindowsClipboardURIListFileConverter.h"
 #include "platform/XWindowsClipboardURIListPNGConverter.h"
-#include "barrier/RemoteFileClipboard.h"
 #include "platform/XWindowsUtil.h"
 #include "mt/Thread.h"
 #include "arch/Arch.h"
@@ -115,24 +114,6 @@ void suppressImagePathTextFallback(bool* added, std::string* data)
         LOG((CLOG_DEBUG "suppressing text clipboard path because PNG payload is available"));
         added[IClipboard::kText] = false;
         data[IClipboard::kText].clear();
-    }
-}
-
-void suppressImageFileListFallback(bool* added, std::string* data)
-{
-    if (!added[IClipboard::kPNG] || !added[IClipboard::kFileList]) {
-        return;
-    }
-
-    RemoteFileClipboard::Data payload;
-    if (!RemoteFileClipboard::parse(data[IClipboard::kFileList], payload)) {
-        return;
-    }
-
-    if (RemoteFileClipboard::allPathsLookLikeImages(payload)) {
-        LOG((CLOG_DEBUG "suppressing file-list clipboard payload because PNG payload is available"));
-        added[IClipboard::kFileList] = false;
-        data[IClipboard::kFileList].clear();
     }
 }
 
@@ -708,7 +689,6 @@ XWindowsClipboard::icccmFillCache()
     }
 
     suppressImagePathTextFallback(m_added, m_data);
-    suppressImageFileListFallback(m_added, m_data);
 }
 
 bool
@@ -957,7 +937,6 @@ XWindowsClipboard::motifFillCache()
     }
 
     suppressImagePathTextFallback(m_added, m_data);
-    suppressImageFileListFallback(m_added, m_data);
 }
 
 bool

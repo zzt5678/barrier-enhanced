@@ -28,7 +28,9 @@
 #include "net/NetworkAddress.h"
 #include "base/EventTypes.h"
 #include "mt/CondVar.h"
+#include "io/filesystem.h"
 
+#include <deque>
 #include <memory>
 #include <vector>
 
@@ -49,11 +51,14 @@ This class implements the top-level client algorithms for barrier.
 */
 class Client : public IClient, public INode {
 public:
-    class FileClipboardReadyInfo : public EventData {
-    public:
-        std::string m_sessionId;
-        std::vector<std::string> m_paths;
-    };
+	class FileClipboardReadyInfo : public EventData {
+	public:
+		FileClipboardReadyInfo() : m_publishClipboard(false) { }
+
+		std::string m_sessionId;
+		std::vector<std::string> m_paths;
+		bool m_publishClipboard;
+	};
 
     class FailInfo {
     public:
@@ -139,6 +144,9 @@ public:
     //! Return received file data
     std::string& getReceivedFileData() { return m_receivedFileData; }
 
+    //! Return received file spool path when large payload is kept on disk
+    barrier::fs::path& getReceivedFileSpoolPath() { return m_receivedFileSpoolPath; }
+
     //! Return drag file list
     DragFileList        getDragFileList() { return m_dragFileList; }
 
@@ -174,15 +182,35 @@ public:
     virtual std::string getName() const;
 
 private:
+    struct CompletedFileTransfer {
+        std::size_t expectedSize;
+		std::string data;
+		barrier::fs::path spoolPath;
+		std::string dropTarget;
+		DragFileList dragFileList;
+		std::string remoteFileClipboardSession;
+
+        CompletedFileTransfer() : expectedSize(0) { }
+    };
+
     void                sendClipboard(ClipboardID);
-    bool                sendClipboardFileSelection(ClipboardID, const Clipboard&);
+    bool                finishPendingClipboardSend(ClipboardID id, const std::string& data);
     void                sendEvent(Event::Type, void*);
     void                sendConnectionFailedEvent(const char* msg);
     void                sendFileChunk(const void* data);
-    void                send_file_thread(const std::string& filename, const std::shared_ptr<StreamChunker>& chunker);
+    void                send_file_thread(barrier::IStream* stream,
+                                         const std::string& filename,
+                                         const std::shared_ptr<StreamChunker>& chunker,
+                                         UInt32 transferId);
     void                send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourcePaths,
-                                                   const std::shared_ptr<StreamChunker>& chunker);
-    void write_to_drop_dir_thread();
+                                                   barrier::IStream* stream,
+                                                   const std::shared_ptr<StreamChunker>& chunker,
+                                                   UInt32 transferId);
+    void write_to_drop_dir_thread(std::shared_ptr<CompletedFileTransfer> transfer);
+    void                startDropDirTransfer(std::shared_ptr<CompletedFileTransfer> transfer);
+    void                queueDropDirTransfer(std::shared_ptr<CompletedFileTransfer> transfer);
+    void                drainDropDirTransferQueue();
+    void                releasePendingDropDirTransfers();
     void                handleFileClipboardReady(const Event&, void*);
     void                setupConnecting();
     void                setupConnection();
@@ -193,6 +221,17 @@ private:
     void                cleanupScreen();
     void                cleanupTimer();
     void                cleanupStream();
+    void                detachServerProxyForClipboardThread();
+    void                releaseDetachedServerProxies();
+    void                detachStreamForSendFileThread();
+    void                releaseDetachedSendFileStream();
+    bool                cleanupSendFileThread(bool cancel);
+    bool                reapSendFileThreadIfReady();
+    void                reapDetachedConnectionState();
+    bool                cleanupWriteToDropDirThread();
+    bool                reapWriteToDropDirThreadIfReady();
+    std::shared_ptr<CompletedFileTransfer> takeCompletedFileTransfer();
+    void                sendDisconnectedEvent();
     void                handleConnected(const Event&, void*);
     void                handleConnectionFailed(const Event&, void*);
     void                handleConnectTimeout(const Event&, void*);
@@ -206,6 +245,8 @@ private:
     void                handleResume(const Event& event, void*);
     void                handleFileChunkSending(const Event&, void*);
     void                handleFileRecieveCompleted(const Event&, void*);
+    void                handleFileKeepAlive(const Event&, void*);
+    void                handleDropDirWriteFinished(const Event&, void*);
     void                handleStopRetry(const Event&, void*);
     void                cleanupClipboardRetryTimer();
     void                scheduleClipboardRetry(ClipboardID id);
@@ -218,13 +259,105 @@ private:
 
 public:
     bool                m_mock;
-
+#if defined(BARRIER_TEST_ENV)
+    void                testOnFileRecieveCompleted() { onFileRecieveCompleted(); }
+    void                testAttachStream(barrier::IStream* stream)
+    {
+        m_stream = stream;
+        setupScreen();
+    }
+    void                testSetSendFileTransferId(UInt32 transferId)
+    {
+        m_sendFileTransferId = transferId;
+    }
+    void                testSendClipboard(ClipboardID id) { sendClipboard(id); }
+    void                testSendFileChunk(const void* data) { sendFileChunk(data); }
+    void                testCleanupConnection() { cleanupConnection(); }
+    void                testCleanupScreen() { cleanupScreen(); }
+    void                testSetStreamOnly(barrier::IStream* stream) { m_stream = stream; }
+    void                testSetServerProxy(ServerProxy* server) { m_server = server; }
+    void                testReleaseDetachedServerProxies() { releaseDetachedServerProxies(); }
+    std::size_t         testDetachedServerProxyCount() const { return m_detachedServerProxies.size(); }
+    std::size_t         testDetachedSendFileStreamCount() const { return m_detachedSendFileStreams.size(); }
+    bool                testCleanupSendFileThread(bool cancel) { return cleanupSendFileThread(cancel); }
+    bool                testReapSendFileThreadIfReady() { return reapSendFileThreadIfReady(); }
+    void                testReapDetachedConnectionState() { reapDetachedConnectionState(); }
+    void                testHandleFileKeepAlive() { handleFileKeepAlive(Event(), NULL); }
+    bool                testCleanupWriteToDropDirThread() { return cleanupWriteToDropDirThread(); }
+    bool                testHasWriteToDropDirThread() const { return m_writeToDropDirThread != NULL; }
+    void                testSetWriteToDropDirThread(Thread* thread) { m_writeToDropDirThread = thread; }
+    void                testDrainDropDirTransferQueue() { drainDropDirTransferQueue(); }
+    std::size_t         testPendingDropDirTransferCount() const { return m_pendingDropDirTransfers.size(); }
+    bool                testClipboardSent(ClipboardID id) const { return m_sentClipboard[id]; }
+    bool                testClipboardSendPending(ClipboardID id) const { return m_clipboardSendPending[id]; }
+    void                testStartDropDirTransfer(const std::string& data)
+    {
+        std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
+        transfer->expectedSize = data.size();
+        transfer->data = data;
+        transfer->dropTarget = barrier::fs::temp_directory_path().u8string();
+        startDropDirTransfer(transfer);
+    }
+    void                testQueueDropDirTransfer(const std::string& data)
+    {
+        std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
+        transfer->expectedSize = data.size();
+        transfer->data = data;
+        transfer->dropTarget = barrier::fs::temp_directory_path().u8string();
+        queueDropDirTransfer(transfer);
+    }
+    void                testSetDetachedSendFileStream(barrier::IStream* stream)
+    {
+        m_detachedSendFileStreams.push_back(stream);
+    }
+    void                testSetSendFileThread(Thread* thread) { m_sendFileThread = thread; }
+    bool                testHasSendFileThread() const { return m_sendFileThread != NULL; }
+    void                testSetSendFileChunker(const std::shared_ptr<StreamChunker>& chunker)
+    {
+        m_sendFileChunker = chunker;
+    }
+    void                testSetFileClipboardSessions(const std::string& remoteSession,
+                                                     const std::string& readySession,
+                                                     const std::vector<std::string>& readyPaths)
+    {
+        m_remoteFileClipboardSession = remoteSession;
+        m_readyFileClipboardSession = readySession;
+        m_readyFileClipboardPaths = readyPaths;
+    }
+    const std::string&  testRemoteFileClipboardSession() const { return m_remoteFileClipboardSession; }
+    const std::string&  testReadyFileClipboardSession() const { return m_readyFileClipboardSession; }
+    const std::vector<std::string>& testReadyFileClipboardPaths() const { return m_readyFileClipboardPaths; }
+    void                testHandleFileClipboardReady(const std::string& sessionId,
+                                                     const std::vector<std::string>& paths,
+                                                     bool publishClipboard)
+    {
+        FileClipboardReadyInfo* info = new FileClipboardReadyInfo();
+        info->m_sessionId = sessionId;
+        info->m_paths = paths;
+        info->m_publishClipboard = publishClipboard;
+        Event event(Event::kUnknown, getEventTarget(), info);
+        event.setDataObject(info);
+        handleFileClipboardReady(event, NULL);
+        Event::deleteData(event);
+    }
+    void                testWriteRemoteClipboardTransfer(const std::string& data,
+                                                         const std::string& sessionId)
+    {
+        std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
+        transfer->expectedSize = data.size();
+        transfer->data = data;
+        transfer->remoteFileClipboardSession = sessionId;
+        write_to_drop_dir_thread(transfer);
+    }
+#endif
 private:
     std::string                m_name;
     NetworkAddress        m_serverAddress;
     ISocketFactory*        m_socketFactory;
     barrier::Screen*    m_screen;
     barrier::IStream*    m_stream;
+    std::vector<barrier::IStream*> m_detachedSendFileStreams;
+    std::vector<ServerProxy*> m_detachedServerProxies;
     EventQueueTimer*    m_timer;
     EventQueueTimer*    m_clipboardRetryTimer;
     ServerProxy*        m_server;
@@ -232,20 +365,26 @@ private:
     bool                m_active;
     bool                m_suspended;
     bool                m_connectOnResume;
+    bool                m_terminalEventSent;
     bool                m_ownClipboard[kClipboardEnd];
     bool                m_sentClipboard[kClipboardEnd];
+    bool                m_clipboardSendPending[kClipboardEnd];
     bool                m_clipboardRetryPending[kClipboardEnd];
     UInt32              m_clipboardRetryCount[kClipboardEnd];
     IClipboard::Time    m_timeClipboard[kClipboardEnd];
-    std::string m_dataClipboard[kClipboardEnd];
+    ClipboardDataSnapshot m_dataClipboard[kClipboardEnd];
+    ClipboardDataSnapshot m_pendingClipboardData[kClipboardEnd];
     IEventQueue*        m_events;
     std::size_t            m_expectedFileSize;
     std::string m_receivedFileData;
+    barrier::fs::path m_receivedFileSpoolPath;
     DragFileList        m_dragFileList;
     std::string m_dragFileExt;
     Thread*                m_sendFileThread;
     std::shared_ptr<StreamChunker> m_sendFileChunker;
+    UInt32              m_sendFileTransferId;
     Thread*                m_writeToDropDirThread;
+    std::deque<std::shared_ptr<CompletedFileTransfer> > m_pendingDropDirTransfers;
     TCPSocket*            m_socket;
     bool                m_useSecureNetwork;
     ClientArgs            m_args;

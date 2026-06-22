@@ -33,11 +33,14 @@ enum EIpcLogOutputter {
     kBufferMaxSize = 1000,
     kMaxSendLines = 100,
     kBufferRateWriteLimit = 1000, // writes per kBufferRateTime
-    kBufferRateTimeLimit = 1 // seconds
+    kBufferRateTimeLimit = 1, // seconds
+    kBufferMaxBytes = 256 * 1024,
+    kBufferMaxLineBytes = 64 * 1024
 };
 
 IpcLogOutputter::IpcLogOutputter(IpcServer& ipcServer, EIpcClientType clientType, bool useThread) :
     m_ipcServer(ipcServer),
+    m_bufferBytes(0),
     m_sending(false),
     m_bufferThread(nullptr),
     m_running(false),
@@ -46,6 +49,8 @@ IpcLogOutputter::IpcLogOutputter(IpcServer& ipcServer, EIpcClientType clientType
     m_bufferWaiting(false),
     m_bufferThreadId(0),
     m_bufferMaxSize(kBufferMaxSize),
+    m_bufferMaxBytes(kBufferMaxBytes),
+    m_bufferMaxLineBytes(kBufferMaxLineBytes),
     m_bufferRateWriteLimit(kBufferRateWriteLimit),
     m_bufferRateTimeLimit(kBufferRateTimeLimit),
     m_bufferWriteCount(0),
@@ -80,8 +85,7 @@ void
 IpcLogOutputter::close()
 {
     if (m_bufferThread != nullptr) {
-        std::lock_guard<std::mutex> lock(m_runningMutex);
-        m_running = false;
+        setRunning(false);
         notifyBuffer();
         m_bufferThread->wait(5);
     }
@@ -123,13 +127,39 @@ void IpcLogOutputter::appendBuffer(const std::string& text)
         m_bufferRateStart = ARCH->time();
     }
 
-    if (m_buffer.size() >= m_bufferMaxSize) {
-        // if the queue is exceeds size limit,
-        // throw away the oldest item
-        m_buffer.pop_front();
+    if (m_bufferMaxSize == 0 || m_bufferMaxBytes == 0) {
+        return;
     }
 
-    m_buffer.push_back(text);
+    std::string line = text;
+    const std::string truncatedSuffix = "... [truncated]";
+    if (m_bufferMaxLineBytes > 0 && line.size() > m_bufferMaxLineBytes) {
+        if (m_bufferMaxLineBytes > truncatedSuffix.size()) {
+            line.resize(m_bufferMaxLineBytes - truncatedSuffix.size());
+            line.append(truncatedSuffix);
+        }
+        else {
+            line.resize(m_bufferMaxLineBytes);
+        }
+    }
+
+    if (line.size() > m_bufferMaxBytes) {
+        if (m_bufferMaxBytes > truncatedSuffix.size()) {
+            line.resize(m_bufferMaxBytes - truncatedSuffix.size());
+            line.append(truncatedSuffix);
+        }
+        else {
+            line.resize(m_bufferMaxBytes);
+        }
+    }
+
+    while (m_buffer.size() >= m_bufferMaxSize ||
+           (!m_buffer.empty() && m_bufferBytes + line.size() > m_bufferMaxBytes)) {
+        popOldestBufferedLine();
+    }
+
+    m_buffer.push_back(line);
+    m_bufferBytes += line.size();
     m_bufferWriteCount++;
 }
 
@@ -140,16 +170,33 @@ IpcLogOutputter::isRunning()
     return m_running;
 }
 
+void
+IpcLogOutputter::setRunning(bool running)
+{
+    std::lock_guard<std::mutex> lock(m_runningMutex);
+    m_running = running;
+}
+
+bool
+IpcLogOutputter::hasBufferedLines()
+{
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
+    return !m_buffer.empty();
+}
+
 void IpcLogOutputter::buffer_thread()
 {
-    m_bufferThreadId = m_bufferThread->getID();
-    m_running = true;
+    m_bufferThreadId = Thread::getCurrentThread().getID();
+    setRunning(true);
 
     try {
         while (isRunning()) {
-            if (m_buffer.empty() || !m_ipcServer.hasClients(m_clientType)) {
+            {
                 ArchMutexLock lock(m_notifyMutex);
-                ARCH->waitCondVar(m_notifyCond, m_notifyMutex, -1);
+                while (isRunning() &&
+                       (!hasBufferedLines() || !m_ipcServer.hasClients(m_clientType))) {
+                    ARCH->waitCondVar(m_notifyCond, m_notifyMutex, 1.0);
+                }
             }
 
             sendBuffer();
@@ -181,15 +228,26 @@ std::string IpcLogOutputter::getChunk(size_t count)
     for (size_t i = 0; i < count; i++) {
         chunk.append(m_buffer.front());
         chunk.append("\n");
-        m_buffer.pop_front();
+        popOldestBufferedLine();
     }
     return chunk;
 }
 
 void
+IpcLogOutputter::popOldestBufferedLine()
+{
+    if (m_buffer.empty()) {
+        return;
+    }
+
+    m_bufferBytes -= m_buffer.front().size();
+    m_buffer.pop_front();
+}
+
+void
 IpcLogOutputter::sendBuffer()
 {
-    if (m_buffer.empty() || !m_ipcServer.hasClients(m_clientType)) {
+    if (!hasBufferedLines() || !m_ipcServer.hasClients(m_clientType)) {
         return;
     }
 
@@ -202,13 +260,46 @@ IpcLogOutputter::sendBuffer()
 void
 IpcLogOutputter::bufferMaxSize(UInt16 bufferMaxSize)
 {
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
     m_bufferMaxSize = bufferMaxSize;
+    while (m_buffer.size() > m_bufferMaxSize) {
+        popOldestBufferedLine();
+    }
 }
 
 UInt16
 IpcLogOutputter::bufferMaxSize() const
 {
     return m_bufferMaxSize;
+}
+
+void
+IpcLogOutputter::bufferMaxBytes(size_t bufferMaxBytes)
+{
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
+    m_bufferMaxBytes = bufferMaxBytes;
+    while (m_bufferBytes > m_bufferMaxBytes) {
+        popOldestBufferedLine();
+    }
+}
+
+size_t
+IpcLogOutputter::bufferMaxBytes() const
+{
+    return m_bufferMaxBytes;
+}
+
+void
+IpcLogOutputter::bufferMaxLineBytes(size_t bufferMaxLineBytes)
+{
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
+    m_bufferMaxLineBytes = bufferMaxLineBytes;
+}
+
+size_t
+IpcLogOutputter::bufferMaxLineBytes() const
+{
+    return m_bufferMaxLineBytes;
 }
 
 void

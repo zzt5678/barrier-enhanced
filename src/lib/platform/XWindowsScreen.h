@@ -26,6 +26,8 @@
 
 #include <X11/Xlib.h>
 
+#include <string>
+
 class XWindowsClipboard;
 class XWindowsKeyState;
 class XWindowsScreenSaver;
@@ -81,6 +83,19 @@ public:
     virtual void        setOptions(const OptionsList& options) override;
     virtual void        setSequenceNumber(UInt32) override;
     virtual bool        isPrimary() const override;
+	virtual bool        canEnter() const override;
+	static bool         isPrimaryDisplayEnterableForTest(
+	                            bool hasUsableDrmDisplay,
+	                            SInt32 width,
+	                            SInt32 height);
+	static bool         isSecondaryDisplayAdvertisableForTest(
+	                            bool hasUsableDrmDisplay,
+	                            SInt32 width,
+	                            SInt32 height);
+	static bool         isDrmConnectorEnterableForTest(
+	                            const std::string& status,
+	                            const std::string& enabled,
+                            const std::string& dpms);
     virtual void        fakeDraggingFiles(DragFileList fileList) override;
     virtual const String& getDropTarget() const override;
     virtual void        setDropTarget(const String& target) override;

@@ -23,6 +23,8 @@
 #include "barrier/ServerArgs.h"
 #include "barrier/ClientArgs.h"
 #include "ipc/IpcClientProxy.h"
+#include "ipc/IpcCommandValidator.h"
+#include "ipc/ElevationPolicy.h"
 #include "ipc/IpcMessage.h"
 #include "ipc/IpcLogOutputter.h"
 #include "net/SocketMultiplexer.h"
@@ -49,10 +51,19 @@
 #include <string>
 #include <iostream>
 #include <sstream>
+#include <cstdlib>
 
 using namespace std;
 
 DaemonApp* DaemonApp::s_instance = NULL;
+
+static UInt8
+readElevateModeSetting()
+{
+    return ElevationPolicy::modeFromSettings(
+        ARCH->setting("ElevateMode"),
+        ARCH->setting("Elevate"));
+}
 
 int
 mainLoopStatic()
@@ -203,10 +214,16 @@ DaemonApp::mainLoop(bool daemonized)
         m_events->adoptBuffer(new MSWindowsEventQueueBuffer(m_events));
 
         String command = ARCH->setting("Command");
-        bool elevate = ARCH->setting("Elevate") == "1";
+        UInt8 elevateMode = readElevateModeSetting();
         if (command != "") {
-            LOG((CLOG_INFO "using last known command: %s", command.c_str()));
-            m_watchdog->setCommand(command, elevate);
+            std::string rejectReason;
+            if (IpcCommandValidator::isAllowedDaemonCommand(command, &rejectReason)) {
+                LOG((CLOG_INFO "using last known command: %s", command.c_str()));
+                m_watchdog->setCommand(command, elevateMode);
+            }
+            else {
+                LOG((CLOG_ERR "ignoring invalid last known command: %s", rejectReason.c_str()));
+            }
         }
 
         m_watchdog->startAsync();
@@ -253,6 +270,11 @@ void
 DaemonApp::handleIpcMessage(const Event& e, void*)
 {
     IpcMessage* m = static_cast<IpcMessage*>(e.getDataObject());
+    if (m == NULL) {
+        LOG((CLOG_WARN "ignoring empty ipc message"));
+        return;
+    }
+
     switch (m->type()) {
         case kIpcCommand: {
             IpcCommandMessage* cm = static_cast<IpcCommandMessage*>(m);
@@ -264,16 +286,27 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
             }
 
             if (!command.empty()) {
-                LOG((CLOG_DEBUG "new command, elevate=%d command=%s", cm->elevate(), command.c_str()));
+                std::string rejectReason;
+                if (!IpcCommandValidator::isAllowedDaemonCommand(command, &rejectReason)) {
+                    LOG((CLOG_ERR "rejecting ipc command: %s", rejectReason.c_str()));
+                    break;
+                }
+
+                LOG((CLOG_DEBUG "new command, elevateMode=%d command=%s", cm->elevateMode(), command.c_str()));
 
                 std::vector<String> argsArray;
                 ArgParser::splitCommandString(command, argsArray);
+                if (argsArray.empty()) {
+                    LOG((CLOG_ERR "rejecting ipc command: command parsed to no arguments"));
+                    break;
+                }
+
                 ArgParser argParser(NULL);
                 const char** argv = argParser.getArgv(argsArray);
                 ServerArgs serverArgs;
                 ClientArgs clientArgs;
                 int argc = static_cast<int>(argsArray.size());
-                bool server = argsArray[0].find("barriers") != String::npos ? true : false;
+                bool server = IpcCommandValidator::isServerCommand(command);
                 ArgsBase* argBase = NULL;
 
                 if (server) {
@@ -309,7 +342,7 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
                         m_watchdog->setFileLogOutputter(m_fileLogOutputter);
                         command = ArgParser::assembleCommand(argsArray, "--log", 1);
                         LOG((CLOG_DEBUG "removed log file argument and filename %s from command ", logFilename.c_str()));
-                        LOG((CLOG_DEBUG "new command, elevate=%d command=%s", cm->elevate(), command.c_str()));
+                        LOG((CLOG_DEBUG "new command, elevateMode=%d command=%s", cm->elevateMode(), command.c_str()));
                     } else {
                         m_watchdog->setFileLogOutputter(NULL);
                     }
@@ -317,7 +350,7 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
                 }
             }
             else {
-                LOG((CLOG_DEBUG "empty command, elevate=%d", cm->elevate()));
+                LOG((CLOG_DEBUG "empty command, elevateMode=%d", cm->elevateMode()));
             }
 
             try {
@@ -327,6 +360,7 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
 
                 // TODO: it would be nice to store bools/ints...
                 ARCH->setting("Elevate", String(cm->elevate() ? "1" : "0"));
+                ARCH->setting("ElevateMode", String(std::to_string(cm->elevateMode())));
             }
             catch (XArch& e) {
                 LOG((CLOG_ERR "failed to save settings, %s", e.what()));
@@ -335,7 +369,7 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
             // tell the relauncher about the new command. this causes the
             // relauncher to stop the existing command and start the new
             // command.
-            m_watchdog->setCommand(command, cm->elevate());
+            m_watchdog->setCommand(command, cm->elevateMode());
 
             break;
         }

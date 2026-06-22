@@ -20,6 +20,7 @@
 
 #include "common/IInterface.h"
 #include "base/Event.h"
+#include <cstddef>
 #include <string>
 
 class IEventJob;
@@ -208,6 +209,13 @@ public:
     Returns the registered type for an event for a given name.
     */
     virtual Event::Type getRegisteredType(const std::string& name) const = 0;
+
+    //! Get the number of queued user events waiting to be dispatched.
+    /*!
+    This is intended for producer-side throttling of bulk work.  It does
+    not include the event currently being dispatched.
+    */
+    virtual size_t      getQueuedEventCount() const = 0;
 
     //! Get the system event type target
     /*!

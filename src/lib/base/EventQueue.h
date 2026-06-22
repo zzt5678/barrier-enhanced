@@ -61,12 +61,15 @@ public:
     virtual IEventJob*    getHandler(Event::Type type, void* target) const;
     virtual const char*    getTypeName(Event::Type type);
     virtual Event::Type getRegisteredType(const std::string& name) const;
+    virtual size_t      getQueuedEventCount() const;
     void*                getSystemTarget();
     virtual void        waitForReady() const;
 
 private:
     UInt32                saveEvent(const Event& event);
     Event                removeEvent(UInt32 eventID);
+    Event::Type        getFileKeepAliveTypeForCoalescing(const Event& event);
+    void                clearCoalescedEvent(const Event& event);
     bool                hasTimerExpired(Event& event);
     double                getNextTimerTimeout() const;
     void                addEventToBuffer(const Event& event);
@@ -124,6 +127,8 @@ private:
     // saved events
     EventTable            m_events;
     EventIDList        m_oldEventIDs;
+    Event::Type        m_fileKeepAliveType;
+    std::set<void*>    m_pendingFileKeepAliveTargets;
 
     // timers
     Stopwatch            m_time;

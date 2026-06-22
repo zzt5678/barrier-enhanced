@@ -249,6 +249,9 @@ public:
     */
     bool                isLockedToScreen() const;
 
+    //! Test if the platform can safely enter this screen now.
+    bool                canEnter() const;
+
     //! Get jump zone size
     /*!
     Return the jump zone size, the size of the regions on the edges of

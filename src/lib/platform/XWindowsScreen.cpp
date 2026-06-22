@@ -36,7 +36,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <fstream>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <unistd.h>
 
 static int xi_opcode;
@@ -80,6 +82,99 @@ normalizeToScreenShape(const char* operation,
 	}
 
 	return true;
+}
+
+std::string
+readTrimmedFile(const std::string& path)
+{
+	std::ifstream stream(path.c_str());
+	std::string value;
+	if (!std::getline(stream, value)) {
+		return "";
+	}
+
+	while (!value.empty() && (value[value.size() - 1] == '\n' ||
+		value[value.size() - 1] == '\r' ||
+		value[value.size() - 1] == ' ' ||
+		value[value.size() - 1] == '\t')) {
+		value.erase(value.size() - 1);
+	}
+
+	return value;
+}
+
+bool
+isDrmConnectorName(const char* name)
+{
+	return std::strncmp(name, "card", 4) == 0 &&
+		std::strchr(name, '-') != NULL;
+}
+
+bool
+isDrmConnectorEnterable(const std::string& status,
+						const std::string& enabled,
+						const std::string& dpms)
+{
+	if (status != "connected") {
+		return false;
+	}
+	if (enabled == "disabled") {
+		return false;
+	}
+	if (dpms == "Off") {
+		LOG((CLOG_DEBUG "DRM connector is DPMS Off but still enterable; enter path will attempt wake"));
+	}
+	return true;
+}
+
+bool
+hasUsableDrmDisplay()
+{
+	DIR* dir = opendir("/sys/class/drm");
+	if (dir == NULL) {
+		return true;
+	}
+
+	bool sawConnector = false;
+	bool sawConnectedConnector = false;
+	bool hasUsableConnector = false;
+	while (!hasUsableConnector) {
+		dirent* entry = readdir(dir);
+		if (entry == NULL) {
+			break;
+		}
+		if (!isDrmConnectorName(entry->d_name)) {
+			continue;
+		}
+
+		sawConnector = true;
+		const std::string base = std::string("/sys/class/drm/") + entry->d_name;
+		if (readTrimmedFile(base + "/status") != "connected") {
+			continue;
+		}
+
+		sawConnectedConnector = true;
+		const std::string enabled = readTrimmedFile(base + "/enabled");
+		const std::string dpms = readTrimmedFile(base + "/dpms");
+		if (isDrmConnectorEnterable("connected", enabled, dpms)) {
+			hasUsableConnector = true;
+		}
+	}
+	closedir(dir);
+
+	return !sawConnector || (sawConnectedConnector && hasUsableConnector);
+}
+
+bool
+isPrimaryDisplayEnterable(bool hasUsableDrmDisplay, SInt32 width, SInt32 height)
+{
+	return hasUsableDrmDisplay && width >= 64 && height >= 64;
+}
+
+bool
+isSecondaryDisplayAdvertisable(bool hasUsableDrmDisplay, SInt32 width, SInt32 height)
+{
+	return hasUsableDrmDisplay && width >= 64 && height >= 64;
 }
 
 }
@@ -545,6 +640,51 @@ XWindowsScreen::isPrimary() const
 	return m_isPrimary;
 }
 
+bool
+XWindowsScreen::canEnter() const
+{
+	if (!m_isPrimary) {
+		return true;
+	}
+
+	if (m_screensaver != NULL && m_screensaver->isActive()) {
+		LOG((CLOG_DEBUG "primary X11 display is in screensaver/DPMS state; enter path will attempt wake"));
+	}
+
+	const bool drmUsable = hasUsableDrmDisplay();
+	if (!isPrimaryDisplayEnterable(drmUsable, m_w, m_h)) {
+		LOG((CLOG_WARN "primary X11 display is not enterable; drmUsable=%d shape=%d,%d %dx%d",
+			drmUsable ? 1 : 0, m_x, m_y, m_w, m_h));
+		return false;
+	}
+
+	return true;
+}
+
+bool
+XWindowsScreen::isPrimaryDisplayEnterableForTest(bool hasUsableDrmDisplay,
+												 SInt32 width,
+												 SInt32 height)
+{
+	return isPrimaryDisplayEnterable(hasUsableDrmDisplay, width, height);
+}
+
+bool
+XWindowsScreen::isSecondaryDisplayAdvertisableForTest(bool hasUsableDrmDisplay,
+													  SInt32 width,
+													  SInt32 height)
+{
+	return isSecondaryDisplayAdvertisable(hasUsableDrmDisplay, width, height);
+}
+
+bool
+XWindowsScreen::isDrmConnectorEnterableForTest(const std::string& status,
+											   const std::string& enabled,
+											   const std::string& dpms)
+{
+	return isDrmConnectorEnterable(status, enabled, dpms);
+}
+
 void*
 XWindowsScreen::getEventTarget() const
 {
@@ -574,6 +714,15 @@ XWindowsScreen::getShape(SInt32& x, SInt32& y, SInt32& w, SInt32& h) const
 {
 	x = m_x;
 	y = m_y;
+	const bool drmUsable = m_isPrimary ? true : hasUsableDrmDisplay();
+	if (!m_isPrimary && !isSecondaryDisplayAdvertisable(drmUsable, m_w, m_h)) {
+		LOG((CLOG_WARN "secondary X11 display is not usable; advertising unavailable shape drmUsable=%d shape=%d,%d %dx%d",
+			drmUsable ? 1 : 0, m_x, m_y, m_w, m_h));
+		w = 0;
+		h = 0;
+		return;
+	}
+
 	w = m_w;
 	h = m_h;
 }
@@ -1363,7 +1512,13 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 						&xmotion.y,
 						&msk);
 				if (!xmotion.same_screen) {
-					LOG((CLOG_WARN "ignoring XI2 raw motion because XQueryPointer failed"));
+					LOG((CLOG_WARN "resynchronizing XI2 raw motion after XQueryPointer failed"));
+					m_xCursor = m_xCenter;
+					m_yCursor = m_yCenter;
+					if (!m_isOnScreen) {
+						m_impl->XMoveWindow(m_display, m_window, m_xCenter, m_yCenter);
+						fakeMouseMove(m_xCenter, m_yCenter);
+					}
 					m_impl->XFreeEventData(m_display, cookie);
 					return;
 				}

@@ -54,6 +54,8 @@ public:
 
     //! Send a message to all clients matching the filter type.
     virtual void        send(const IpcMessage& message, EIpcClientType filterType);
+    virtual bool        sendToProcess(const IpcMessage& message, EIpcClientType filterType,
+                                      UInt32 processId);
 
     //@}
     //! @name accessors

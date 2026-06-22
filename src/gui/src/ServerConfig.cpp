@@ -41,6 +41,7 @@ static const struct
 };
 
 const int serverDefaultIndex = 7;
+const int defaultHeartbeatMilliseconds = 10000;
 
 ServerConfig::ServerConfig(QSettings* settings, int numColumns, int numRows ,
                 QString serverName, MainWindow* mainWindow) :
@@ -106,7 +107,7 @@ void ServerConfig::saveSettings()
     settings().setValue("numColumns", numColumns());
     settings().setValue("numRows", numRows());
 
-    settings().setValue("hasHeartbeat", hasHeartbeat());
+    settings().setValue("hasHeartbeat", true);
     settings().setValue("heartbeat", heartbeat());
     settings().setValue("relativeMouseMoves", relativeMouseMoves());
     settings().setValue("screenSaverSync", screenSaverSync());
@@ -151,8 +152,8 @@ void ServerConfig::loadSettings()
     // we need to know the number of columns and rows before we can set up ourselves
     init();
 
-    haveHeartbeat(settings().value("hasHeartbeat", false).toBool());
-    setHeartbeat(settings().value("heartbeat", 5000).toInt());
+    haveHeartbeat(true);
+    setHeartbeat(settings().value("heartbeat", defaultHeartbeatMilliseconds).toInt());
     setRelativeMouseMoves(settings().value("relativeMouseMoves", false).toBool());
     setScreenSaverSync(settings().value("screenSaverSync", true).toBool());
     setWin32KeepForeground(settings().value("win32KeepForeground", false).toBool());
@@ -247,8 +248,7 @@ QTextStream& operator<<(QTextStream& outStream, const ServerConfig& config)
 
     outStream << "section: options" << endl;
 
-    if (config.hasHeartbeat())
-        outStream << "\t" << "heartbeat = " << config.heartbeat() << endl;
+    outStream << "\t" << "heartbeat = " << config.heartbeat() << endl;
 
     outStream << "\t" << "relativeMouseMoves = " << (config.relativeMouseMoves() ? "true" : "false") << endl;
     outStream << "\t" << "screenSaverSync = " << (config.screenSaverSync() ? "true" : "false") << endl;

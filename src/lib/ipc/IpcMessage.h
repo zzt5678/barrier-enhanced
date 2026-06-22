@@ -39,14 +39,16 @@ private:
 
 class IpcHelloMessage : public IpcMessage {
 public:
-    IpcHelloMessage(EIpcClientType clientType);
+    IpcHelloMessage(EIpcClientType clientType, UInt32 processId = 0);
     virtual ~IpcHelloMessage();
 
     //! Gets the message type ID.
     EIpcClientType            clientType() const { return m_clientType; }
+    UInt32                    processId() const { return m_processId; }
 
 private:
     EIpcClientType            m_clientType;
+    UInt32                    m_processId;
 };
 
 class IpcShutdownMessage : public IpcMessage {
@@ -70,16 +72,25 @@ private:
 
 class IpcCommandMessage : public IpcMessage {
 public:
-    IpcCommandMessage(const std::string& command, bool elevate);
+    enum ElevateMode : UInt8 {
+        kElevateAsNeeded = 0,
+        kElevateAlways = 1,
+        kElevateNever = 2
+    };
+
+    IpcCommandMessage(const std::string& command, UInt8 elevateMode);
     virtual ~IpcCommandMessage();
 
     //! Gets the command.
     std::string command() const { return m_command; }
 
     //! Gets whether or not the process should be elevated on MS Windows.
-    bool                elevate() const { return m_elevate; }
+    bool                elevate() const { return m_elevateMode == kElevateAlways; }
+
+    //! Gets the requested Windows elevation mode.
+    UInt8               elevateMode() const { return m_elevateMode; }
 
 private:
     std::string m_command;
-    bool                m_elevate;
+    UInt8               m_elevateMode;
 };

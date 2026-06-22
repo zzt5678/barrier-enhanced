@@ -151,6 +151,7 @@ protected:
         QString m_Language;
         bool m_StartedBefore;
         bool m_AutoConfig;
+        bool m_AutoConfigUserSet;
         ElevateMode m_ElevateMode;
         bool m_AutoConfigPrompted;
         bool m_CryptoEnabled;

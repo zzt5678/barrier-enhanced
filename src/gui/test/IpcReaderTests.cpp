@@ -15,6 +15,7 @@
 */
 
 #include "../src/Ipc.h"
+#include "../src/IpcClient.h"
 #include "../src/IpcReader.h"
 
 #include <gtest/gtest.h>
@@ -82,6 +83,28 @@ void writeFrame(QTcpSocket& socket, const QByteArray& frame)
     QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
 }
 
+int readBigEndianInt(const QByteArray& data, int offset)
+{
+    return ((static_cast<unsigned char>(data[offset]) << 24) |
+            (static_cast<unsigned char>(data[offset + 1]) << 16) |
+            (static_cast<unsigned char>(data[offset + 2]) << 8) |
+            static_cast<unsigned char>(data[offset + 3]));
+}
+
+bool waitForAvailableBytes(QTcpSocket& socket, int expectedBytes, int timeoutMs = 1000)
+{
+    QElapsedTimer timer;
+    timer.start();
+
+    while (socket.bytesAvailable() < expectedBytes && timer.elapsed() < timeoutMs) {
+        if (!socket.waitForReadyRead(50)) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        }
+    }
+
+    return socket.bytesAvailable() >= expectedBytes;
+}
+
 struct IpcSockets {
     QTcpServer server;
     QTcpSocket client;
@@ -97,6 +120,55 @@ struct IpcSockets {
         ASSERT_NE(serverSocket, nullptr);
     }
 };
+
+QByteArray sendCommandFrame(ElevateMode elevate)
+{
+    QTcpServer server;
+    if (!server.listen(QHostAddress::LocalHost)) {
+        ADD_FAILURE() << "failed to listen for IPC command test";
+        return QByteArray();
+    }
+
+    std::unique_ptr<QTcpSocket> rawClient(new QTcpSocket());
+    rawClient->connectToHost(QHostAddress::LocalHost, server.serverPort());
+    if (!rawClient->waitForConnected(1000)) {
+        ADD_FAILURE() << "failed to connect IPC command test client";
+        return QByteArray();
+    }
+    if (!server.waitForNewConnection(1000)) {
+        ADD_FAILURE() << "failed to accept IPC command test client";
+        return QByteArray();
+    }
+    std::unique_ptr<QTcpSocket> serverSocket(server.nextPendingConnection());
+    if (!serverSocket) {
+        ADD_FAILURE() << "missing accepted IPC command socket";
+        return QByteArray();
+    }
+
+    IpcClient commandClient(rawClient.release());
+    commandClient.sendCommand("weaves --example", elevate);
+    EXPECT_TRUE(commandClient.waitForBytesWrittenForTest(1000));
+
+    if (!waitForAvailableBytes(*serverSocket, 8)) {
+        ADD_FAILURE() << "timed out waiting for IPC command header";
+        return QByteArray();
+    }
+
+    QByteArray frame = serverSocket->peek(8);
+    const int commandLength = readBigEndianInt(frame, 4);
+    if (commandLength < 0) {
+        ADD_FAILURE() << "invalid IPC command length";
+        return QByteArray();
+    }
+
+    const int frameLength = 8 + commandLength + 1;
+    if (!waitForAvailableBytes(*serverSocket, frameLength)) {
+        ADD_FAILURE() << "timed out waiting for full IPC command frame";
+        return QByteArray();
+    }
+
+    return serverSocket->read(frameLength);
+}
 
 } // namespace
 
@@ -171,4 +243,35 @@ TEST(IpcReaderTests, RejectsHighBitPayloadLengthAndResynchronizesNextMessage)
     writeFrame(sockets.client, invalidLengthHeader + buildFrame("after high-bit length"));
     ASSERT_TRUE(spinUntil([&]() { return lines.size() == 1; }));
     EXPECT_EQ(lines.front().toStdString(), "after high-bit length");
+}
+
+TEST(IpcClientTests, SendCommandWritesElevateModeByte)
+{
+    ensureCoreApplication();
+
+    const struct {
+        ElevateMode mode;
+        unsigned char expected;
+    } cases[] = {
+        {ElevateAsNeeded, 0},
+        {ElevateAlways, 1},
+        {ElevateNever, 2},
+        {static_cast<ElevateMode>(-1), 0},
+        {static_cast<ElevateMode>(257), 0},
+        {static_cast<ElevateMode>(258), 0},
+        {static_cast<ElevateMode>(999), 0},
+    };
+
+    for (const auto& testCase : cases) {
+        const QByteArray frame = sendCommandFrame(testCase.mode);
+
+        ASSERT_GE(frame.size(), 10);
+        EXPECT_EQ(QByteArray(frame.constData(), 4), QByteArray(kIpcMsgCommand, 4));
+
+        const int commandLength = readBigEndianInt(frame, 4);
+        ASSERT_EQ(commandLength, 16);
+        ASSERT_EQ(frame.size(), 4 + 4 + commandLength + 1);
+        EXPECT_EQ(QByteArray(frame.constData() + 8, commandLength), QByteArray("weaves --example"));
+        EXPECT_EQ(static_cast<unsigned char>(frame[8 + commandLength]), testCase.expected);
+    }
 }

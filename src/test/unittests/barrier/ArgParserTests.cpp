@@ -205,3 +205,32 @@ TEST(ArgParserTests, assembleCommand_stringArrayWithSpace_returnCommand)
     EXPECT_EQ("\"stub1 space\" stub2 \"stub3 space\"", command);
 }
 
+TEST(ArgParserTests, assembleCommand_serviceCommandWithSpacedPaths_roundTrips)
+{
+    std::vector<String> argArray;
+    argArray.push_back("C:/Program Files/Weave/weaves.exe");
+    argArray.push_back("-f");
+    argArray.push_back("--drop-dir");
+    argArray.push_back("C:/Users/Test User/AppData/Local/Weave/workflow/inbox");
+    argArray.push_back("--profile-dir");
+    argArray.push_back("C:/Users/Test User/AppData/Roaming/Weave");
+    argArray.push_back("--log");
+    argArray.push_back("C:/Users/Test User/AppData/Local/Weave/weave log.txt");
+    argArray.push_back("-c");
+    argArray.push_back("C:/Users/Test User/AppData/Local/Temp/Weave Config.sgc");
+
+    String command = ArgParser::assembleCommand(argArray);
+    std::vector<String> parsed;
+    ArgParser::splitCommandString(command, parsed);
+
+    ASSERT_EQ(10, parsed.size());
+    EXPECT_EQ("C:/Program Files/Weave/weaves.exe", parsed.at(0));
+    EXPECT_EQ("--drop-dir", parsed.at(2));
+    EXPECT_EQ("C:/Users/Test User/AppData/Local/Weave/workflow/inbox", parsed.at(3));
+    EXPECT_EQ("--profile-dir", parsed.at(4));
+    EXPECT_EQ("C:/Users/Test User/AppData/Roaming/Weave", parsed.at(5));
+    EXPECT_EQ("--log", parsed.at(6));
+    EXPECT_EQ("C:/Users/Test User/AppData/Local/Weave/weave log.txt", parsed.at(7));
+    EXPECT_EQ("-c", parsed.at(8));
+    EXPECT_EQ("C:/Users/Test User/AppData/Local/Temp/Weave Config.sgc", parsed.at(9));
+}
