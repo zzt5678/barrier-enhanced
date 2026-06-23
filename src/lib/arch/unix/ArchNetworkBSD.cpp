@@ -26,6 +26,7 @@
 #    include <unistd.h>
 #endif
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <netdb.h>
 #if !defined(TCP_NODELAY)
 #    include <netinet/tcp.h>
@@ -59,6 +60,8 @@ static const int s_type[] = {
     SOCK_DGRAM,
     SOCK_STREAM
 };
+
+static const int kListenBacklog = SOMAXCONN;
 
 #if !HAVE_INET_ATON
 // parse dotted quad addresses.  we don't bother with the weird BSD'ism
@@ -207,8 +210,7 @@ ArchNetworkBSD::listenOnSocket(ArchSocket s)
 {
     assert(s != NULL);
 
-    // hardcoding backlog
-    if (listen(s->m_fd, 3) == -1) {
+    if (listen(s->m_fd, kListenBacklog) == -1) {
         throwError(errno);
     }
 }

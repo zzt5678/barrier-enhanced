@@ -34,6 +34,8 @@ static const int s_type[] = {
     SOCK_STREAM
 };
 
+static const int kListenBacklog = SOMAXCONN;
+
 static SOCKET (PASCAL FAR *accept_winsock)(SOCKET s, struct sockaddr FAR *addr, int FAR *addrlen);
 static int (PASCAL FAR *bind_winsock)(SOCKET s, const struct sockaddr FAR *addr, int namelen);
 static int (PASCAL FAR *close_winsock)(SOCKET s);
@@ -310,8 +312,7 @@ ArchNetworkWinsock::listenOnSocket(ArchSocket s)
 {
     assert(s != NULL);
 
-    // hardcoding backlog
-    if (listen_winsock(s->m_socket, 3) == SOCKET_ERROR) {
+    if (listen_winsock(s->m_socket, kListenBacklog) == SOCKET_ERROR) {
         throwError(getsockerror_winsock());
     }
 }

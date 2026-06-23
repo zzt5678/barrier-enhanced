@@ -303,6 +303,58 @@ TEST(ClientProxyDisconnectTests, flatlineQueriesInfoBeforeDisconnectingIdleClien
     EXPECT_EQ(1u, proxy.m_heartbeatMissedAlarms);
 }
 
+TEST(ClientProxyDisconnectTests, flatlineToleratesMultipleIdleHeartbeatMissesBeforeDisconnect)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClientProxyEvents clientProxyEvents;
+    setClientProxyEventDefaults(events, streamEvents, clientProxyEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    ON_CALL(*stream, isReady()).WillByDefault(Return(false));
+    ON_CALL(*stream, getBufferedOutputSize()).WillByDefault(Return(0));
+    ON_CALL(events, newOneShotTimer(_, _))
+        .WillByDefault(Return(reinterpret_cast<EventQueueTimer*>(1)));
+
+    ClientProxy1_0 proxy("client", stream, &events);
+    proxy.m_heartbeatAlarm = 0.0;
+    proxy.m_heartbeatMissedAlarms = 2;
+    Mock::VerifyAndClearExpectations(stream);
+
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(*stream, write(_, 4)).Times(1);
+
+    proxy.handleFlatline(Event(), NULL);
+
+    EXPECT_EQ(3u, proxy.m_heartbeatMissedAlarms);
+}
+
+TEST(ClientProxyDisconnectTests, flatlineDisconnectsIdleClientAfterMissBudget)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClientProxyEvents clientProxyEvents;
+    setClientProxyEventDefaults(events, streamEvents, clientProxyEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    ON_CALL(*stream, isReady()).WillByDefault(Return(false));
+    ON_CALL(*stream, getBufferedOutputSize()).WillByDefault(Return(0));
+    ON_CALL(events, newOneShotTimer(_, _))
+        .WillByDefault(Return(reinterpret_cast<EventQueueTimer*>(1)));
+
+    ClientProxy1_0 proxy("client", stream, &events);
+    proxy.m_heartbeatAlarm = 0.0;
+    proxy.m_heartbeatMissedAlarms = 3;
+    Mock::VerifyAndClearExpectations(stream);
+
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).Times(1);
+
+    proxy.handleFlatline(Event(), NULL);
+}
+
 TEST(ClientProxyDisconnectTests, dInfoWithUnavailableShapeStillRaisesShapeChanged)
 {
     NiceMock<MockEventQueue> events;

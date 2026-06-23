@@ -30,7 +30,7 @@
 namespace {
 
 const UInt32 kMaxHeartbeatDeferrals = 8;
-const UInt32 kMaxMissedHeartbeatsBeforeDisconnect = 1;
+const UInt32 kMaxMissedHeartbeatsBeforeDisconnect = 3;
 
 }
 
