@@ -66,7 +66,7 @@ namespace {
 const SInt32 kMinUsableScreenDimension = 64;
 const SInt32 kSwitchEdgeHysteresisInset = 16;
 const SInt32 kSwitchReverseClearDistance = 96;
-const double kSwitchReverseGuardMaxSeconds = 0.25;
+const double kSwitchReverseGuardMaxSeconds = 2.0;
 const int kClipboardReadAttempts = 8;
 const double kClipboardReadRetrySeconds = 0.025;
 const UInt32 kDefaultHeartbeatMilliseconds = 10000;

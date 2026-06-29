@@ -1788,6 +1788,14 @@ TEST(ServerReconnectTests, delayedSwitchArmsRecentReverseSwitchGuard)
 
     ARCH->sleep(0.3);
     server.onMouseMoveSecondary(-40, 0);
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(0u, primary.enterCount);
+
+    server.onMouseMoveSecondary(160, 0);
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_GE(server.m_x, 96);
+
+    server.onMouseMoveSecondary(-300, 0);
     EXPECT_EQ(&primary, server.m_active);
     EXPECT_EQ(1u, primary.enterCount);
     EXPECT_GE(primary.enterX, 0);
