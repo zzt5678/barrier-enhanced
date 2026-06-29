@@ -101,9 +101,9 @@ static const char* barrierIconFiles[] =
 static const char* barrierLargeIcon = ":/res/icons/256x256/weave.png";
 
 namespace {
-constexpr int kRestartBaseDelayMs = 1000;
-constexpr int kRestartMaxDelayMs = 15000;
-constexpr int kRestartStabilityWindowMs = 30000;
+constexpr int kRestartBaseDelayMs = 500;
+constexpr int kRestartMaxDelayMs = 3000;
+constexpr int kRestartStabilityWindowMs = 10000;
 
 void refreshDashboardScrollArea(QWidget* root)
 {
