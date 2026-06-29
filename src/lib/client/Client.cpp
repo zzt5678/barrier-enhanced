@@ -361,6 +361,11 @@ Client::leave()
 void
 Client::setClipboard(ClipboardID id, const IClipboard* clipboard)
 {
+    if (m_ownClipboard[id] && !m_sentClipboard[id]) {
+        LOG((CLOG_INFO "preserving unsent local clipboard %d instead of applying remote clipboard", id));
+        return;
+    }
+
     bool publishClipboard = true;
 
     if (id == kClipboardClipboard && clipboard != NULL) {
@@ -1061,11 +1066,8 @@ Client::handleClipboardGrabbed(const Event& event, void*)
     m_clipboardRetryPending[info->m_id] = false;
     m_clipboardRetryCount[info->m_id] = 0;
 
-    // if we're not the active screen then send the clipboard now,
-    // otherwise we'll wait until we leave.
-    if (!m_active) {
-        sendClipboard(info->m_id);
-    }
+    // Do not push local clipboard changes while the user is still working on
+    // this machine. The clipboard is synchronized when this screen is left.
 }
 
 void

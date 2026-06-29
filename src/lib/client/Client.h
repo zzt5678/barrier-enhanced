@@ -276,6 +276,13 @@ public:
     void                testCleanupScreen() { cleanupScreen(); }
     void                testSetStreamOnly(barrier::IStream* stream) { m_stream = stream; }
     void                testSetServerProxy(ServerProxy* server) { m_server = server; }
+    void                testHandleClipboardGrabbed(ClipboardID id, UInt32 sequenceNumber = 1)
+    {
+        IScreen::ClipboardInfo info;
+        info.m_id = id;
+        info.m_sequenceNumber = sequenceNumber;
+        handleClipboardGrabbed(Event(Event::kUnknown, NULL, &info, Event::kDontFreeData), NULL);
+    }
     void                testReleaseDetachedServerProxies() { releaseDetachedServerProxies(); }
     std::size_t         testDetachedServerProxyCount() const { return m_detachedServerProxies.size(); }
     std::size_t         testDetachedSendFileStreamCount() const { return m_detachedSendFileStreams.size(); }
@@ -288,6 +295,7 @@ public:
     void                testSetWriteToDropDirThread(Thread* thread) { m_writeToDropDirThread = thread; }
     void                testDrainDropDirTransferQueue() { drainDropDirTransferQueue(); }
     std::size_t         testPendingDropDirTransferCount() const { return m_pendingDropDirTransfers.size(); }
+    bool                testOwnClipboard(ClipboardID id) const { return m_ownClipboard[id]; }
     bool                testClipboardSent(ClipboardID id) const { return m_sentClipboard[id]; }
     bool                testClipboardSendPending(ClipboardID id) const { return m_clipboardSendPending[id]; }
     void                testStartDropDirTransfer(const std::string& data)

@@ -333,6 +333,7 @@ public:
     ClipboardPrimaryClient() :
         PrimaryClient("primary", NULL),
         clipboardAvailable(false),
+        getClipboardCount(0),
         clipboardDirtyCount(0),
         setClipboardCount(0),
         lastSetClipboardId(kClipboardEnd)
@@ -341,6 +342,7 @@ public:
 
     bool getClipboard(ClipboardID, IClipboard* clipboard) const override
     {
+        ++getClipboardCount;
         if (!clipboardAvailable) {
             return false;
         }
@@ -358,6 +360,7 @@ public:
 
     Clipboard sourceClipboard;
     bool clipboardAvailable;
+    mutable UInt32 getClipboardCount;
     UInt32 clipboardDirtyCount;
     UInt32 setClipboardCount;
     ClipboardID lastSetClipboardId;
@@ -1765,7 +1768,7 @@ TEST(ServerReconnectTests, onClipboardChangedBlocksLocalFileListWithoutDirtyingO
 	EXPECT_EQ("/tmp/local-file.txt", remoteFileClipboard.paths[0].u8string());
 }
 
-TEST(ServerReconnectTests, handleClipboardGrabbedDoesNotPreGrabOtherScreensForLocalFileList)
+TEST(ServerReconnectTests, handleClipboardGrabbedDefersReadAndDoesNotPreGrabOtherScreens)
 {
     Config config;
     config.addScreen("primary");
@@ -1800,21 +1803,57 @@ TEST(ServerReconnectTests, handleClipboardGrabbedDoesNotPreGrabOtherScreensForLo
         &primary);
 
     Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
-    EXPECT_FALSE(clipboard.m_pendingPrimaryFetch);
-    EXPECT_TRUE(server.m_remoteFileClipboardSession.empty());
-    EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
-    EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
+    EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
+    EXPECT_EQ(10u, clipboard.m_clipboardSeqNum);
+    EXPECT_TRUE(clipboard.m_pendingPrimaryFetch);
+    EXPECT_EQ(0u, primary.getClipboardCount);
     EXPECT_EQ(0u, client.grabClipboardCount);
     EXPECT_EQ(0u, client.clipboardDirtyCount);
     EXPECT_EQ(0u, client.setClipboardCount);
-    EXPECT_EQ(1u, primary.clipboardDirtyCount);
+    EXPECT_EQ(0u, primary.clipboardDirtyCount);
+}
 
-    RemoteFileClipboard::Data remoteFileClipboard;
-    ASSERT_TRUE(RemoteFileClipboard::readFromClipboard(
-        clipboard.m_clipboard, remoteFileClipboard));
-    EXPECT_EQ(RemoteFileClipboard::Mode::SourcePaths, remoteFileClipboard.mode);
-    ASSERT_EQ(1u, remoteFileClipboard.paths.size());
-    EXPECT_EQ("/tmp/local-file.txt", remoteFileClipboard.paths[0].u8string());
+TEST(ServerReconnectTests, handleClipboardGrabbedOnActivePrimaryDefersReadAndBroadcast)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+    primary.sourceClipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/local-file.txt"));
+    primary.clipboardAvailable = true;
+
+    IScreen::ClipboardInfo eventInfo;
+    eventInfo.m_id = kClipboardClipboard;
+    eventInfo.m_sequenceNumber = 10;
+    server.handleClipboardGrabbed(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &primary);
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
+    EXPECT_EQ(10u, clipboard.m_clipboardSeqNum);
+    EXPECT_TRUE(clipboard.m_pendingPrimaryFetch);
+    EXPECT_EQ(0u, primary.getClipboardCount);
+    EXPECT_EQ(0u, primary.clipboardDirtyCount);
+    EXPECT_EQ(0u, primary.setClipboardCount);
+    EXPECT_EQ(0u, client.grabClipboardCount);
+    EXPECT_EQ(0u, client.clipboardDirtyCount);
+    EXPECT_EQ(0u, client.setClipboardCount);
 }
 
 TEST(ServerReconnectTests, onClipboardChangedForwardsTextAfterBlockingLocalFileList)

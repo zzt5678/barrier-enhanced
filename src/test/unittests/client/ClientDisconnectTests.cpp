@@ -80,7 +80,9 @@ public:
         enterCount(0),
         mouseMoveCount(0),
         setClipboardCount(0),
-        lastSetClipboardWasNull(false)
+        lastSetClipboardWasNull(false),
+        clipboardAvailable(false),
+        clipboardText("stable clipboard")
     {
     }
 
@@ -107,7 +109,19 @@ public:
     void setDraggingStarted(bool) override { }
     bool isPrimary() const override { return false; }
     void* getEventTarget() const override { return const_cast<EnterPlatformScreen*>(this); }
-    bool getClipboard(ClipboardID, IClipboard*) const override { return false; }
+    bool getClipboard(ClipboardID id, IClipboard* clipboard) const override
+    {
+        if (!clipboardAvailable || id != kClipboardClipboard) {
+            return false;
+        }
+        if (!clipboard->open(42)) {
+            return false;
+        }
+        clipboard->empty();
+        clipboard->add(IClipboard::kText, clipboardText);
+        clipboard->close();
+        return true;
+    }
     void getShape(SInt32& x, SInt32& y, SInt32& width, SInt32& height) const override
     {
         x = 0;
@@ -164,6 +178,8 @@ public:
     UInt32 setClipboardCount;
     bool lastSetClipboardWasNull;
     Clipboard lastSetClipboard;
+    bool clipboardAvailable;
+    std::string clipboardText;
     String draggingFilename;
     String dropTarget;
 };
@@ -522,6 +538,101 @@ TEST(ClientDisconnectTests, setClipboardStillPublishesPlainText)
     EXPECT_TRUE(client.testRemoteFileClipboardSession().empty());
     EXPECT_TRUE(client.testReadyFileClipboardSession().empty());
     EXPECT_TRUE(client.testReadyFileClipboardPaths().empty());
+}
+
+TEST(ClientDisconnectTests, localClipboardGrabDoesNotSendUntilClipboardIsExplicitlySynced)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    StableTextClipboardScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+
+    client.testHandleClipboardGrabbed(kClipboardClipboard);
+
+    EXPECT_TRUE(client.testOwnClipboard(kClipboardClipboard));
+    EXPECT_FALSE(client.testClipboardSent(kClipboardClipboard));
+    EXPECT_EQ(0u, proxy->sendCalls);
+
+    proxy->result = ServerProxy::kClipboardSendQueued;
+    client.testSendClipboard(kClipboardClipboard);
+
+    EXPECT_EQ(1u, proxy->sendCalls);
+    EXPECT_TRUE(client.testClipboardSent(kClipboardClipboard));
+}
+
+TEST(ClientDisconnectTests, remoteClipboardDoesNotOverwriteUnsentLocalClipboard)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->clipboardAvailable = true;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+
+    client.testHandleClipboardGrabbed(kClipboardClipboard);
+
+    Clipboard remoteClipboard;
+    ASSERT_TRUE(remoteClipboard.open(0));
+    remoteClipboard.empty();
+    remoteClipboard.add(IClipboard::kText, "remote clipboard");
+    remoteClipboard.close();
+
+    client.setClipboard(kClipboardClipboard, &remoteClipboard);
+
+    EXPECT_TRUE(client.testOwnClipboard(kClipboardClipboard));
+    EXPECT_FALSE(client.testClipboardSent(kClipboardClipboard));
+    EXPECT_EQ(0u, platform->setClipboardCount);
+    EXPECT_EQ(0u, proxy->sendCalls);
+
+    proxy->result = ServerProxy::kClipboardSendQueued;
+    client.testSendClipboard(kClipboardClipboard);
+    EXPECT_EQ(1u, proxy->sendCalls);
+    EXPECT_TRUE(client.testClipboardSent(kClipboardClipboard));
+
+    client.setClipboard(kClipboardClipboard, &remoteClipboard);
+
+    EXPECT_FALSE(client.testOwnClipboard(kClipboardClipboard));
+    EXPECT_EQ(1u, platform->setClipboardCount);
+    ASSERT_TRUE(platform->lastSetClipboard.has(IClipboard::kText));
+    EXPECT_EQ("remote clipboard", platform->lastSetClipboard.get(IClipboard::kText));
 }
 
 TEST(ClientDisconnectTests, invalidFileCompletionReleasesReceiveState)

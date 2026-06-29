@@ -424,6 +424,9 @@ void WorkflowStore::handleClipboardChanged()
     if (!m_appConfig->getWorkflowEnabled() || m_ignoreClipboardChanges || m_clipboard == nullptr) {
         return;
     }
+    if (m_runtimeMode == WorkflowRuntimeMode::Dormant && m_interactiveSessionDepth == 0) {
+        return;
+    }
 
     consumeClipboardMime(m_clipboard->mimeData());
 }

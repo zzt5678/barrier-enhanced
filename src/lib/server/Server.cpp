@@ -1819,51 +1819,8 @@ Server::handleClipboardGrabbed(const Event& event, void* vclient)
 	clipboard.m_clipboardSeqNum = info->m_sequenceNumber;
 	clipboard.m_pendingPrimaryFetch = (grabber == m_primaryClient);
 
-	if (info->m_id == kClipboardClipboard) {
-		Clipboard grabbedClipboard;
-		if (readClipboardWithRetry(grabber, info->m_id, grabbedClipboard)) {
-			RemoteFileClipboard::AutomaticSharingStatus clipboardSharingStatus =
-				RemoteFileClipboard::prepareForAutomaticClipboardSharing(grabbedClipboard);
-			if (clipboardSharingStatus ==
-				RemoteFileClipboard::AutomaticSharingStatus::ContainsFileList) {
-				LOG((CLOG_INFO "local file clipboard grab is not broadcast automatically"));
-				m_remoteFileClipboardSession.clear();
-				m_readyFileClipboardSession.clear();
-				m_readyFileClipboardPaths.clear();
-				clipboard.m_clipboard = grabbedClipboard;
-				clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
-				clipboard.m_pendingPrimaryFetch = false;
-				grabber->setClipboardDirty(info->m_id, false);
-				return;
-			}
-		}
-	}
-
-	// clear the clipboard data (since it's not known at this point)
-	if (clipboard.m_clipboard.open(0)) {
-		clipboard.m_clipboard.empty();
-		clipboard.m_clipboard.close();
-	}
-	clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
-
-	// tell all other screens to take ownership of clipboard.  tell the
-	// grabber that it's clipboard isn't dirty.
-	for (ClientList::iterator index = m_clients.begin();
-								index != m_clients.end(); ++index) {
-		BaseClientProxy* client = index->second;
-		if (client == grabber) {
-			// The primary screen needs a later fetch on leave; secondary
-			// clients push their clipboard contents immediately.
-			client->setClipboardDirty(info->m_id, grabber == m_primaryClient);
-		}
-		else {
-			client->grabClipboard(info->m_id);
-		}
-	}
-
-	if (grabber == m_primaryClient && m_active != m_primaryClient) {
-		onClipboardChanged(m_primaryClient, info->m_id, info->m_sequenceNumber);
-	}
+	LOG((CLOG_DEBUG "deferred clipboard %d fetch from \"%s\" until screen leave",
+		info->m_id, getName(grabber).c_str()));
 }
 
 void
