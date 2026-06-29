@@ -35,6 +35,20 @@ class XWindowsScreenSaver;
 //! Implementation of IPlatformScreen for X11
 class XWindowsScreen : public PlatformScreen {
 public:
+	struct VisibleArea {
+	public:
+		VisibleArea();
+		VisibleArea(SInt32 x, SInt32 y, SInt32 width, SInt32 height,
+			bool primary);
+
+		SInt32            x;
+		SInt32            y;
+		SInt32            width;
+		SInt32            height;
+		bool              primary;
+	};
+	typedef std::vector<VisibleArea> VisibleAreas;
+
     XWindowsScreen(IXWindowsImpl* impl, const char* displayName, bool isPrimary,
         bool disableXInitThreads, int mouseScrollDelta,
         IEventQueue* events);
@@ -99,6 +113,9 @@ public:
 	static bool         clampPointToRectForTest(SInt32 rx, SInt32 ry,
 	                            SInt32 rw, SInt32 rh,
 	                            SInt32& x, SInt32& y);
+	static bool         adjustPointToVisibleAreaForTest(
+	                            const VisibleAreas& areas,
+	                            SInt32& x, SInt32& y);
     virtual void        fakeDraggingFiles(DragFileList fileList) override;
     virtual const String& getDropTarget() const override;
     virtual void        setDropTarget(const String& target) override;
@@ -147,10 +164,12 @@ private:
     void                openIM();
 
     void                wakeDisplayFromPowerSave();
-    bool                updatePrimaryVisibleAreaFromRandR();
+    bool                updateVisibleAreasFromRandR();
     void                setPrimaryVisibleArea(SInt32 x, SInt32 y,
                             SInt32 width, SInt32 height);
-    bool                clampToPrimaryVisibleArea(SInt32& x, SInt32& y) const;
+    void                setVisibleAreas(const VisibleAreas& areas);
+    bool                adjustPointToVisibleArea(const char* operation,
+                            SInt32& x, SInt32& y) const;
     bool                grabMouseAndKeyboard();
     void                onKeyPress(XKeyEvent&);
     void                onKeyRelease(XKeyEvent&, bool isRepeat);
@@ -226,6 +245,7 @@ private:
     SInt32                m_xCenter, m_yCenter;
     SInt32                m_primaryVisibleX, m_primaryVisibleY;
     SInt32                m_primaryVisibleW, m_primaryVisibleH;
+    VisibleAreas        m_visibleAreas;
 
     // last mouse position
     SInt32                m_xCursor, m_yCursor;

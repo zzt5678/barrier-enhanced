@@ -92,6 +92,108 @@ clampPointToRect(const char* operation,
 	return normalizeToScreenShape(operation, rx, ry, rw, rh, x, y);
 }
 
+bool
+visibleAreaContains(const XWindowsScreen::VisibleArea& area,
+	SInt32 x, SInt32 y)
+{
+	return area.width > 0 && area.height > 0 &&
+		x >= area.x && x < area.x + area.width &&
+		y >= area.y && y < area.y + area.height;
+}
+
+bool
+visibleAreaEquals(const XWindowsScreen::VisibleArea& a,
+	const XWindowsScreen::VisibleArea& b)
+{
+	return a.x == b.x && a.y == b.y &&
+		a.width == b.width && a.height == b.height;
+}
+
+long long
+squaredDistance(SInt32 x1, SInt32 y1, SInt32 x2, SInt32 y2)
+{
+	const long long dx = static_cast<long long>(x1) - static_cast<long long>(x2);
+	const long long dy = static_cast<long long>(y1) - static_cast<long long>(y2);
+	return dx * dx + dy * dy;
+}
+
+void
+clampPointToAreaSilently(const XWindowsScreen::VisibleArea& area,
+	SInt32& x, SInt32& y)
+{
+	const SInt32 maxX = area.x + area.width - 1;
+	const SInt32 maxY = area.y + area.height - 1;
+
+	if (x < area.x) {
+		x = area.x;
+	}
+	else if (x > maxX) {
+		x = maxX;
+	}
+	if (y < area.y) {
+		y = area.y;
+	}
+	else if (y > maxY) {
+		y = maxY;
+	}
+}
+
+bool
+adjustPointToVisibleAreas(const char* operation,
+	const XWindowsScreen::VisibleAreas& areas,
+	SInt32& x, SInt32& y)
+{
+	for (XWindowsScreen::VisibleAreas::const_iterator i = areas.begin();
+		i != areas.end(); ++i) {
+		if (visibleAreaContains(*i, x, y)) {
+			return true;
+		}
+	}
+
+	bool found = false;
+	long long bestDistance = 0;
+	SInt32 bestX = x;
+	SInt32 bestY = y;
+	XWindowsScreen::VisibleArea bestArea;
+
+	for (XWindowsScreen::VisibleAreas::const_iterator i = areas.begin();
+		i != areas.end(); ++i) {
+		if (i->width <= 0 || i->height <= 0) {
+			continue;
+		}
+
+		SInt32 candidateX = x;
+		SInt32 candidateY = y;
+		clampPointToAreaSilently(*i, candidateX, candidateY);
+		const long long distance =
+			squaredDistance(x, y, candidateX, candidateY);
+		if (!found || distance < bestDistance ||
+			(distance == bestDistance && i->primary && !bestArea.primary)) {
+			found = true;
+			bestDistance = distance;
+			bestX = candidateX;
+			bestY = candidateY;
+			bestArea = *i;
+		}
+	}
+
+	if (!found) {
+		LOG((CLOG_WARN "ignoring %s for no visible output areas",
+			operation));
+		return false;
+	}
+
+	if (x != bestX || y != bestY) {
+		LOG((CLOG_WARN "normalized unavailable %s from %+d,%+d to %+d,%+d within visible output %+d,%+d %dx%d",
+			operation, x, y, bestX, bestY, bestArea.x, bestArea.y,
+			bestArea.width, bestArea.height));
+	}
+
+	x = bestX;
+	y = bestY;
+	return true;
+}
+
 std::string
 readTrimmedFile(const std::string& path)
 {
@@ -203,6 +305,25 @@ isSecondaryDisplayAdvertisable(bool hasUsableDrmDisplay, SInt32 width, SInt32 he
 // to use the display, and wait to be destroyed.
 
 XWindowsScreen*		XWindowsScreen::s_screen = NULL;
+
+XWindowsScreen::VisibleArea::VisibleArea() :
+	x(0),
+	y(0),
+	width(0),
+	height(0),
+	primary(false)
+{
+}
+
+XWindowsScreen::VisibleArea::VisibleArea(SInt32 x_, SInt32 y_,
+	SInt32 width_, SInt32 height_, bool primary_) :
+	x(x_),
+	y(y_),
+	width(width_),
+	height(height_),
+	primary(primary_)
+{
+}
 
 XWindowsScreen::XWindowsScreen(
         IXWindowsImpl* impl,
@@ -703,6 +824,13 @@ XWindowsScreen::clampPointToRectForTest(SInt32 rx, SInt32 ry,
 	return clampPointToRect("test point", rx, ry, rw, rh, x, y);
 }
 
+bool
+XWindowsScreen::adjustPointToVisibleAreaForTest(const VisibleAreas& areas,
+												SInt32& x, SInt32& y)
+{
+	return adjustPointToVisibleAreas("test point", areas, x, y);
+}
+
 void*
 XWindowsScreen::getEventTarget() const
 {
@@ -775,7 +903,10 @@ XWindowsScreen::warpCursor(SInt32 x, SInt32 y)
 		return;
 	}
 	if (m_isPrimary) {
-		clampToPrimaryVisibleArea(x, y);
+		updateVisibleAreasFromRandR();
+		if (!adjustPointToVisibleArea("primary cursor warp", x, y)) {
+			return;
+		}
 	}
 
 	// warp mouse
@@ -1227,9 +1358,11 @@ XWindowsScreen::saveShape()
 	// get center of default screen
 	m_xCenter = m_x + (m_w >> 1);
 	m_yCenter = m_y + (m_h >> 1);
-	setPrimaryVisibleArea(m_x, m_y, m_w, m_h);
+	VisibleAreas areas;
+	areas.push_back(VisibleArea(m_x, m_y, m_w, m_h, true));
+	setVisibleAreas(areas);
 
-	if (updatePrimaryVisibleAreaFromRandR()) {
+	if (updateVisibleAreasFromRandR()) {
 		return;
 	}
 
@@ -1257,10 +1390,17 @@ XWindowsScreen::saveShape()
             XineramaQueryScreens(m_display, &numScreens));
 
 		if (screens != NULL) {
+			VisibleAreas xineramaAreas;
 			if (numScreens > 1) {
 				m_xinerama = true;
-				setPrimaryVisibleArea(screens[0].x_org, screens[0].y_org,
-					screens[0].width, screens[0].height);
+			}
+			for (int i = 0; i < numScreens; ++i) {
+				xineramaAreas.push_back(VisibleArea(screens[i].x_org,
+					screens[i].y_org, screens[i].width, screens[i].height,
+					i == 0));
+			}
+			if (!xineramaAreas.empty()) {
+				setVisibleAreas(xineramaAreas);
 			}
 			XFree(screens);
 		}
@@ -1284,8 +1424,39 @@ XWindowsScreen::setPrimaryVisibleArea(SInt32 x, SInt32 y,
 	m_yCenter = y + (height >> 1);
 }
 
+void
+XWindowsScreen::setVisibleAreas(const VisibleAreas& areas)
+{
+	VisibleAreas validAreas;
+	VisibleAreas::const_iterator fallback = areas.end();
+	VisibleAreas::const_iterator primary = areas.end();
+	for (VisibleAreas::const_iterator i = areas.begin(); i != areas.end();
+		++i) {
+		if (i->width <= 0 || i->height <= 0) {
+			continue;
+		}
+		if (fallback == areas.end()) {
+			fallback = i;
+		}
+		if (i->primary && primary == areas.end()) {
+			primary = i;
+		}
+		validAreas.push_back(*i);
+	}
+
+	if (validAreas.empty()) {
+		return;
+	}
+
+	m_visibleAreas = validAreas;
+	const VisibleArea& centerArea =
+		(primary != areas.end()) ? *primary : *fallback;
+	setPrimaryVisibleArea(centerArea.x, centerArea.y, centerArea.width,
+		centerArea.height);
+}
+
 bool
-XWindowsScreen::updatePrimaryVisibleAreaFromRandR()
+XWindowsScreen::updateVisibleAreasFromRandR()
 {
 #if HAVE_X11_EXTENSIONS_XRANDR_H
 	if (!m_xrandr) {
@@ -1294,9 +1465,6 @@ XWindowsScreen::updatePrimaryVisibleAreaFromRandR()
 
 	Window root = DefaultRootWindow(m_display);
 	RROutput primary = XRRGetOutputPrimary(m_display, root);
-	if (primary == None) {
-		return false;
-	}
 
 	XRRScreenResources* resources =
 		XRRGetScreenResourcesCurrent(m_display, root);
@@ -1304,22 +1472,36 @@ XWindowsScreen::updatePrimaryVisibleAreaFromRandR()
 		return false;
 	}
 
-	bool found = false;
-	XRROutputInfo* outputInfo =
-		XRRGetOutputInfo(m_display, resources, primary);
-	if (outputInfo != NULL) {
+	VisibleAreas areas;
+	for (int i = 0; i < resources->noutput; ++i) {
+		RROutput output = resources->outputs[i];
+		XRROutputInfo* outputInfo =
+			XRRGetOutputInfo(m_display, resources, output);
+		if (outputInfo == NULL) {
+			continue;
+		}
+
 		if (outputInfo->connection == RR_Connected &&
 			outputInfo->crtc != None) {
 			XRRCrtcInfo* crtcInfo =
 				XRRGetCrtcInfo(m_display, resources, outputInfo->crtc);
 			if (crtcInfo != NULL) {
 				if (crtcInfo->width > 0 && crtcInfo->height > 0) {
-					setPrimaryVisibleArea(crtcInfo->x, crtcInfo->y,
-						crtcInfo->width, crtcInfo->height);
-					LOG((CLOG_INFO "using XRandR primary output area %+d,%+d %dx%d for primary cursor entry",
-						m_primaryVisibleX, m_primaryVisibleY,
-						m_primaryVisibleW, m_primaryVisibleH));
-					found = true;
+					VisibleArea area(crtcInfo->x, crtcInfo->y,
+						crtcInfo->width, crtcInfo->height,
+						output == primary);
+					bool duplicate = false;
+					for (VisibleAreas::iterator j = areas.begin();
+						j != areas.end(); ++j) {
+						if (visibleAreaEquals(*j, area)) {
+							j->primary = j->primary || area.primary;
+							duplicate = true;
+							break;
+						}
+					}
+					if (!duplicate) {
+						areas.push_back(area);
+					}
 				}
 				XRRFreeCrtcInfo(crtcInfo);
 			}
@@ -1327,18 +1509,21 @@ XWindowsScreen::updatePrimaryVisibleAreaFromRandR()
 		XRRFreeOutputInfo(outputInfo);
 	}
 	XRRFreeScreenResources(resources);
-	return found;
+	if (areas.empty()) {
+		return false;
+	}
+	setVisibleAreas(areas);
+	return true;
 #else
 	return false;
 #endif
 }
 
 bool
-XWindowsScreen::clampToPrimaryVisibleArea(SInt32& x, SInt32& y) const
+XWindowsScreen::adjustPointToVisibleArea(const char* operation,
+										 SInt32& x, SInt32& y) const
 {
-	return clampPointToRect("primary visible cursor warp",
-		m_primaryVisibleX, m_primaryVisibleY,
-		m_primaryVisibleW, m_primaryVisibleH, x, y);
+	return adjustPointToVisibleAreas(operation, m_visibleAreas, x, y);
 }
 
 Window
