@@ -1,0 +1,19 @@
+[Unit]
+Description=Weave Enhanced desktop input sharing
+After=graphical-session.target network-online.target
+Wants=network-online.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_DIR@
+ExecStart=@PROJECT_DIR@/_build/bin/weave
+Restart=always
+RestartSec=2
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Environment=QT_QPA_PLATFORM=xcb
+
+[Install]
+WantedBy=default.target

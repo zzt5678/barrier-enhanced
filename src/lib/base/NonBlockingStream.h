@@ -42,6 +42,7 @@ public:
 
 private:
     int _fd;
+    bool _restore_terminal;
     termios * _p_ta_previous;
     int _cntl_previous;
 };

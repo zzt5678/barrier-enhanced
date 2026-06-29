@@ -23,37 +23,53 @@
 #include <termios.h> // tcgetattr/tcsetattr
 #include <fcntl.h>
 #include <errno.h>
-#include <assert.h>
 
 NonBlockingStream::NonBlockingStream(int fd) :
-    _fd(fd)
+    _fd(fd),
+    _restore_terminal(false),
+    _p_ta_previous(nullptr),
+    _cntl_previous(-1)
 {
-    // disable ICANON & ECHO so we don't have to wait for a newline
-    // before we get data (and to keep it from being echoed back out)
-    termios ta;
-    tcgetattr(fd, &ta);
-    _p_ta_previous = new termios(ta);
-    ta.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(fd, TCSANOW, &ta);
+    if (isatty(fd)) {
+        // Disable ICANON & ECHO so terminal input can be polled one byte at a time.
+        termios ta;
+        if (tcgetattr(fd, &ta) == 0) {
+            _p_ta_previous = new termios(ta);
+            ta.c_lflag &= ~(ICANON | ECHO);
+            _restore_terminal = (tcsetattr(fd, TCSANOW, &ta) == 0);
+        }
+    }
 
     // prevent IO from blocking so we can poll (read())
-    int _cntl_previous = fcntl(fd, F_GETFL);
-    fcntl(fd, F_SETFL, _cntl_previous | O_NONBLOCK);
+    _cntl_previous = fcntl(fd, F_GETFL);
+    if (_cntl_previous != -1) {
+        fcntl(fd, F_SETFL, _cntl_previous | O_NONBLOCK);
+    }
 }
 
 NonBlockingStream::~NonBlockingStream()
 {
-    tcsetattr(_fd, TCSANOW, _p_ta_previous);
-    fcntl(_fd, F_SETFL, _cntl_previous);
+    if (_restore_terminal && _p_ta_previous != nullptr) {
+        tcsetattr(_fd, TCSANOW, _p_ta_previous);
+    }
+    if (_cntl_previous != -1) {
+        fcntl(_fd, F_SETFL, _cntl_previous);
+    }
     delete _p_ta_previous;
 }
 
 bool NonBlockingStream::try_read_char(char &ch) const
 {
-    int result = read(_fd, &ch, 1);
-    if (result == 1)
+    const ssize_t result = read(_fd, &ch, 1);
+    if (result == 1) {
         return true;
-    assert(result == -1 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    }
+    if (result == 0) {
+        return false;
+    }
+    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        return false;
+    }
     return false;
 }
 
