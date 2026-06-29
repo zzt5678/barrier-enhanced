@@ -66,6 +66,7 @@ namespace {
 const SInt32 kMinUsableScreenDimension = 64;
 const SInt32 kSwitchEdgeHysteresisInset = 16;
 const SInt32 kSwitchReverseClearDistance = 96;
+const double kSwitchReverseGuardMaxSeconds = 0.25;
 const int kClipboardReadAttempts = 8;
 const double kClipboardReadRetrySeconds = 0.025;
 const UInt32 kDefaultHeartbeatMilliseconds = 10000;
@@ -249,6 +250,7 @@ Server::Server(
 	m_switchDir(kNoDirection),
 	m_switchScreen(NULL),
 	m_recentSwitchGuardActive(false),
+	m_recentSwitchGuardLogged(false),
 	m_recentSwitchReverseDir(kNoDirection),
 	m_recentSwitchEntryX(0),
 	m_recentSwitchEntryY(0),
@@ -1299,11 +1301,13 @@ Server::armRecentSwitchGuard(BaseClientProxy* from, BaseClientProxy* to,
 	}
 
 	m_recentSwitchGuardActive = true;
+	m_recentSwitchGuardLogged = false;
 	m_recentSwitchFromName = getName(from);
 	m_recentSwitchToName = getName(to);
 	m_recentSwitchReverseDir = oppositeDirection(dir);
 	m_recentSwitchEntryX = m_x;
 	m_recentSwitchEntryY = m_y;
+	m_recentSwitchGuardTimer.reset();
 	LOG((CLOG_INFO "armed reverse switch guard from \"%s\" to \"%s\" reverse=%s entry=%d,%d",
 		m_recentSwitchFromName.c_str(),
 		m_recentSwitchToName.c_str(),
@@ -1357,6 +1361,10 @@ Server::isRecentReverseSwitch(BaseClientProxy* dst, EDirection dir)
 	if (!m_recentSwitchGuardActive || m_active == NULL || dst == NULL) {
 		return false;
 	}
+	if (m_recentSwitchGuardTimer.getTime() > kSwitchReverseGuardMaxSeconds) {
+		m_recentSwitchGuardActive = false;
+		return false;
+	}
 	if (getName(m_active) != m_recentSwitchToName ||
 		getName(dst) != m_recentSwitchFromName) {
 		return false;
@@ -1386,10 +1394,13 @@ Server::isSwitchOkay(BaseClientProxy* newScreen,
 	}
 
 	if (isRecentReverseSwitch(newScreen, dir)) {
-		LOG((CLOG_INFO "suppressing immediate reverse switch from \"%s\" to \"%s\" on %s until cursor moves inward",
-			getName(m_active).c_str(),
-			getName(newScreen).c_str(),
-			Config::dirName(dir)));
+		if (!m_recentSwitchGuardLogged) {
+			LOG((CLOG_INFO "suppressing immediate reverse switch from \"%s\" to \"%s\" on %s briefly after screen entry",
+				getName(m_active).c_str(),
+				getName(newScreen).c_str(),
+				Config::dirName(dir)));
+			m_recentSwitchGuardLogged = true;
+		}
 		stopSwitch();
 		return false;
 	}

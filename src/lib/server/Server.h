@@ -148,6 +148,7 @@ public:
         m_switchDir(kNoDirection),
         m_switchScreen(NULL),
         m_recentSwitchGuardActive(false),
+        m_recentSwitchGuardLogged(false),
         m_recentSwitchReverseDir(kNoDirection),
         m_recentSwitchEntryX(0),
         m_recentSwitchEntryY(0),
@@ -600,6 +601,8 @@ private:
     EDirection            m_switchDir;
     BaseClientProxy*    m_switchScreen;
     bool                m_recentSwitchGuardActive;
+    bool                m_recentSwitchGuardLogged;
+    Stopwatch           m_recentSwitchGuardTimer;
     std::string         m_recentSwitchFromName;
     std::string         m_recentSwitchToName;
     EDirection          m_recentSwitchReverseDir;

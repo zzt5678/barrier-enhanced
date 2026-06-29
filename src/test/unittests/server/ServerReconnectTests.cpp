@@ -477,6 +477,7 @@ void initializeServer(Server& server, Config& config, PrimaryClient& primary,
     server.m_activeSaver = NULL;
     server.m_switchScreen = NULL;
     server.m_recentSwitchGuardActive = false;
+    server.m_recentSwitchGuardLogged = false;
     server.m_recentSwitchFromName.clear();
     server.m_recentSwitchToName.clear();
     server.m_recentSwitchReverseDir = kNoDirection;
@@ -1692,6 +1693,14 @@ TEST(ServerReconnectTests, delayedSwitchArmsRecentReverseSwitchGuard)
     EXPECT_EQ(0, server.m_x);
     EXPECT_EQ(1u, client.enterCount);
     EXPECT_EQ(0u, primary.enterCount);
+
+    ARCH->sleep(0.3);
+    server.onMouseMoveSecondary(-40, 0);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_GE(primary.enterX, 0);
+    EXPECT_LT(primary.enterX, 1024);
+    EXPECT_EQ(100, primary.enterY);
 }
 
 TEST(ServerReconnectTests, secondaryMotion_reanchorsActiveClientWhenLeaveFails)

@@ -39,7 +39,6 @@
 namespace {
 
 const UInt32 kMaxKeepAliveAlarmDeferrals = 8;
-const UInt32 kMaxMissedKeepAliveAlarmsBeforeDisconnect = 1;
 const size_t kSynchronousClipboardSendLimit = 256 * 1024;
 
 }
@@ -65,7 +64,6 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_keepAliveAlarm(0.0),
     m_keepAliveAlarmTimer(NULL),
     m_keepAliveAlarmDeferrals(0),
-    m_keepAliveMissedAlarms(0),
     m_lastKeepAlivePendingInput(false),
     m_lastKeepAliveBufferedOutput(0),
     m_keepAliveActivityTimer(true),
@@ -143,7 +141,6 @@ ServerProxy::setKeepAliveRate(double rate)
 {
     m_keepAliveAlarm = rate * kKeepAlivesUntilDeath;
     m_keepAliveAlarmDeferrals = 0;
-    m_keepAliveMissedAlarms = 0;
     m_lastKeepAlivePendingInput = false;
     m_lastKeepAliveBufferedOutput = 0;
     m_keepAliveActivityTimer.start();
@@ -198,7 +195,6 @@ ServerProxy::handleData(const Event&, void*)
 
     if (receivedMessage) {
         m_keepAliveAlarmDeferrals = 0;
-        m_keepAliveMissedAlarms = 0;
         m_lastKeepAlivePendingInput = false;
         m_lastKeepAliveBufferedOutput = 0;
         m_keepAliveActivityTimer.reset();
@@ -233,7 +229,6 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
         // echo keep alives and reset alarm
         ProtocolUtil::writef(m_stream, kMsgCKeepAlive);
         m_keepAliveAlarmDeferrals = 0;
-        m_keepAliveMissedAlarms = 0;
         resetKeepAliveAlarm();
     }
 
@@ -320,7 +315,6 @@ ServerProxy::parseMessage(const UInt8* code)
         // echo keep alives and reset alarm
         ProtocolUtil::writef(m_stream, kMsgCKeepAlive);
         m_keepAliveAlarmDeferrals = 0;
-        m_keepAliveMissedAlarms = 0;
         resetKeepAliveAlarm();
     }
 
@@ -419,7 +413,6 @@ ServerProxy::handleKeepAliveAlarm(const Event&, void*)
         (m_lastKeepAliveBufferedOutput > 0 &&
          bufferedOutput < m_lastKeepAliveBufferedOutput)) {
         m_keepAliveAlarmDeferrals = 0;
-        m_keepAliveMissedAlarms = 0;
     }
     m_lastKeepAlivePendingInput = hasPendingInput;
     m_lastKeepAliveBufferedOutput = bufferedOutput;
@@ -437,7 +430,6 @@ ServerProxy::handleKeepAliveAlarm(const Event&, void*)
         }
 
         ++m_keepAliveAlarmDeferrals;
-        m_keepAliveMissedAlarms = 0;
         LOG((CLOG_WARN
              "server keepalive delayed while stream has pending work; deferring disconnect (%u/%u), "
              "pendingInput=%d bufferedOutput=%u idle=%.3fs",
@@ -452,19 +444,6 @@ ServerProxy::handleKeepAliveAlarm(const Event&, void*)
 
     if (m_keepAliveAlarm > 0.0 &&
         m_keepAliveActivityTimer.getTime() < m_keepAliveAlarm) {
-        m_keepAliveMissedAlarms = 0;
-        resetKeepAliveAlarm();
-        return;
-    }
-
-    if (m_keepAliveMissedAlarms < kMaxMissedKeepAliveAlarmsBeforeDisconnect) {
-        ++m_keepAliveMissedAlarms;
-        LOG((CLOG_WARN
-             "server keepalive missed; sending probe before disconnect (%u/%u), idle=%.3fs",
-             m_keepAliveMissedAlarms,
-             kMaxMissedKeepAliveAlarmsBeforeDisconnect,
-             m_keepAliveActivityTimer.getTime()));
-        keepAlive();
         resetKeepAliveAlarm();
         return;
     }

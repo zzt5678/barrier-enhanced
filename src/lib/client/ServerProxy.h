@@ -159,7 +159,6 @@ private:
     double                m_keepAliveAlarm;
     EventQueueTimer*    m_keepAliveAlarmTimer;
     UInt32              m_keepAliveAlarmDeferrals;
-    UInt32              m_keepAliveMissedAlarms;
     bool                m_lastKeepAlivePendingInput;
     UInt32              m_lastKeepAliveBufferedOutput;
     Stopwatch           m_keepAliveActivityTimer;
