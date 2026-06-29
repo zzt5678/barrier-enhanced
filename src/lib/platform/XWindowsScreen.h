@@ -96,6 +96,9 @@ public:
 	                            const std::string& status,
 	                            const std::string& enabled,
                             const std::string& dpms);
+	static bool         clampPointToRectForTest(SInt32 rx, SInt32 ry,
+	                            SInt32 rw, SInt32 rh,
+	                            SInt32& x, SInt32& y);
     virtual void        fakeDraggingFiles(DragFileList fileList) override;
     virtual const String& getDropTarget() const override;
     virtual void        setDropTarget(const String& target) override;
@@ -144,6 +147,10 @@ private:
     void                openIM();
 
     void                wakeDisplayFromPowerSave();
+    bool                updatePrimaryVisibleAreaFromRandR();
+    void                setPrimaryVisibleArea(SInt32 x, SInt32 y,
+                            SInt32 width, SInt32 height);
+    bool                clampToPrimaryVisibleArea(SInt32& x, SInt32& y) const;
     bool                grabMouseAndKeyboard();
     void                onKeyPress(XKeyEvent&);
     void                onKeyRelease(XKeyEvent&, bool isRepeat);
@@ -217,6 +224,8 @@ private:
     SInt32                m_x, m_y;
     SInt32                m_w, m_h;
     SInt32                m_xCenter, m_yCenter;
+    SInt32                m_primaryVisibleX, m_primaryVisibleY;
+    SInt32                m_primaryVisibleW, m_primaryVisibleH;
 
     // last mouse position
     SInt32                m_xCursor, m_yCursor;

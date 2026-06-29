@@ -84,6 +84,14 @@ normalizeToScreenShape(const char* operation,
 	return true;
 }
 
+bool
+clampPointToRect(const char* operation,
+	SInt32 rx, SInt32 ry, SInt32 rw, SInt32 rh,
+	SInt32& x, SInt32& y)
+{
+	return normalizeToScreenShape(operation, rx, ry, rw, rh, x, y);
+}
+
 std::string
 readTrimmedFile(const std::string& path)
 {
@@ -214,6 +222,8 @@ XWindowsScreen::XWindowsScreen(
 	m_x(0), m_y(0),
 	m_w(0), m_h(0),
 	m_xCenter(0), m_yCenter(0),
+	m_primaryVisibleX(0), m_primaryVisibleY(0),
+	m_primaryVisibleW(0), m_primaryVisibleH(0),
 	m_xCursor(0), m_yCursor(0),
 	m_keyState(NULL),
 	m_lastFocus(None),
@@ -685,6 +695,14 @@ XWindowsScreen::isDrmConnectorEnterableForTest(const std::string& status,
 	return isDrmConnectorEnterable(status, enabled, dpms);
 }
 
+bool
+XWindowsScreen::clampPointToRectForTest(SInt32 rx, SInt32 ry,
+										SInt32 rw, SInt32 rh,
+										SInt32& x, SInt32& y)
+{
+	return clampPointToRect("test point", rx, ry, rw, rh, x, y);
+}
+
 void*
 XWindowsScreen::getEventTarget() const
 {
@@ -755,6 +773,9 @@ XWindowsScreen::warpCursor(SInt32 x, SInt32 y)
 {
 	if (!normalizeToScreenShape("cursor warp", m_x, m_y, m_w, m_h, x, y)) {
 		return;
+	}
+	if (m_isPrimary) {
+		clampToPrimaryVisibleArea(x, y);
 	}
 
 	// warp mouse
@@ -1206,6 +1227,11 @@ XWindowsScreen::saveShape()
 	// get center of default screen
 	m_xCenter = m_x + (m_w >> 1);
 	m_yCenter = m_y + (m_h >> 1);
+	setPrimaryVisibleArea(m_x, m_y, m_w, m_h);
+
+	if (updatePrimaryVisibleAreaFromRandR()) {
+		return;
+	}
 
 	// check if xinerama is enabled and there is more than one screen.
 	// get center of first Xinerama screen.  Xinerama appears to have
@@ -1233,13 +1259,86 @@ XWindowsScreen::saveShape()
 		if (screens != NULL) {
 			if (numScreens > 1) {
 				m_xinerama = true;
-				m_xCenter  = screens[0].x_org + (screens[0].width  >> 1);
-				m_yCenter  = screens[0].y_org + (screens[0].height >> 1);
+				setPrimaryVisibleArea(screens[0].x_org, screens[0].y_org,
+					screens[0].width, screens[0].height);
 			}
 			XFree(screens);
 		}
 	}
 #endif
+}
+
+void
+XWindowsScreen::setPrimaryVisibleArea(SInt32 x, SInt32 y,
+									  SInt32 width, SInt32 height)
+{
+	if (width <= 0 || height <= 0) {
+		return;
+	}
+
+	m_primaryVisibleX = x;
+	m_primaryVisibleY = y;
+	m_primaryVisibleW = width;
+	m_primaryVisibleH = height;
+	m_xCenter = x + (width >> 1);
+	m_yCenter = y + (height >> 1);
+}
+
+bool
+XWindowsScreen::updatePrimaryVisibleAreaFromRandR()
+{
+#if HAVE_X11_EXTENSIONS_XRANDR_H
+	if (!m_xrandr) {
+		return false;
+	}
+
+	Window root = DefaultRootWindow(m_display);
+	RROutput primary = XRRGetOutputPrimary(m_display, root);
+	if (primary == None) {
+		return false;
+	}
+
+	XRRScreenResources* resources =
+		XRRGetScreenResourcesCurrent(m_display, root);
+	if (resources == NULL) {
+		return false;
+	}
+
+	bool found = false;
+	XRROutputInfo* outputInfo =
+		XRRGetOutputInfo(m_display, resources, primary);
+	if (outputInfo != NULL) {
+		if (outputInfo->connection == RR_Connected &&
+			outputInfo->crtc != None) {
+			XRRCrtcInfo* crtcInfo =
+				XRRGetCrtcInfo(m_display, resources, outputInfo->crtc);
+			if (crtcInfo != NULL) {
+				if (crtcInfo->width > 0 && crtcInfo->height > 0) {
+					setPrimaryVisibleArea(crtcInfo->x, crtcInfo->y,
+						crtcInfo->width, crtcInfo->height);
+					LOG((CLOG_INFO "using XRandR primary output area %+d,%+d %dx%d for primary cursor entry",
+						m_primaryVisibleX, m_primaryVisibleY,
+						m_primaryVisibleW, m_primaryVisibleH));
+					found = true;
+				}
+				XRRFreeCrtcInfo(crtcInfo);
+			}
+		}
+		XRRFreeOutputInfo(outputInfo);
+	}
+	XRRFreeScreenResources(resources);
+	return found;
+#else
+	return false;
+#endif
+}
+
+bool
+XWindowsScreen::clampToPrimaryVisibleArea(SInt32& x, SInt32& y) const
+{
+	return clampPointToRect("primary visible cursor warp",
+		m_primaryVisibleX, m_primaryVisibleY,
+		m_primaryVisibleW, m_primaryVisibleH, x, y);
 }
 
 Window
