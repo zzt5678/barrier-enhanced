@@ -65,11 +65,30 @@ namespace {
 
 const SInt32 kMinUsableScreenDimension = 64;
 const SInt32 kSwitchEdgeHysteresisInset = 16;
+const SInt32 kSwitchReverseClearDistance = 96;
 const int kClipboardReadAttempts = 8;
 const double kClipboardReadRetrySeconds = 0.025;
 const UInt32 kDefaultHeartbeatMilliseconds = 10000;
 const size_t kMaxPendingDropDirTransfers = 4;
 const size_t kMaxPendingDropDirTransferMemoryBytes = 32 * 1024 * 1024;
+
+EDirection
+oppositeDirection(EDirection dir)
+{
+	switch (dir) {
+	case kLeft:
+		return kRight;
+	case kRight:
+		return kLeft;
+	case kTop:
+		return kBottom;
+	case kBottom:
+		return kTop;
+	case kNoDirection:
+		break;
+	}
+	return kNoDirection;
+}
 
 bool prepareTransferSource(const char* filename,
                            barrier::fs::path& sourcePath,
@@ -229,6 +248,10 @@ Server::Server(
 	m_activeSaver(NULL),
 	m_switchDir(kNoDirection),
 	m_switchScreen(NULL),
+	m_recentSwitchGuardActive(false),
+	m_recentSwitchReverseDir(kNoDirection),
+	m_recentSwitchEntryX(0),
+	m_recentSwitchEntryY(0),
 	m_switchWaitDelay(0.0),
 	m_switchWaitTimer(NULL),
 	m_primaryKeyStateTimer(NULL),
@@ -713,7 +736,8 @@ Server::getJumpZoneSize(BaseClientProxy* client) const
 
 bool
 Server::switchScreen(BaseClientProxy* dst,
-					SInt32 x, SInt32 y, bool forScreensaver)
+					SInt32 x, SInt32 y, bool forScreensaver,
+					EDirection guardDir)
 {
 	assert(dst != NULL);
 
@@ -808,6 +832,9 @@ Server::switchScreen(BaseClientProxy* dst,
 		Server::SwitchToScreenInfo* info =
 			Server::SwitchToScreenInfo::alloc(m_active->getName());
 		m_events->addEvent(Event(m_events->forServer().screenSwitched(), this, info));
+		if (!forScreensaver && guardDir != kNoDirection) {
+			armRecentSwitchGuard(oldActive, m_active, guardDir);
+		}
 		}
 		else {
 			m_x       = x;
@@ -1262,6 +1289,82 @@ Server::avoidJumpZone(BaseClientProxy* dst,
 	}
 }
 
+void
+Server::armRecentSwitchGuard(BaseClientProxy* from, BaseClientProxy* to,
+				EDirection dir)
+{
+	if (from == NULL || to == NULL || from == to) {
+		m_recentSwitchGuardActive = false;
+		return;
+	}
+
+	m_recentSwitchGuardActive = true;
+	m_recentSwitchFromName = getName(from);
+	m_recentSwitchToName = getName(to);
+	m_recentSwitchReverseDir = oppositeDirection(dir);
+	m_recentSwitchEntryX = m_x;
+	m_recentSwitchEntryY = m_y;
+	LOG((CLOG_INFO "armed reverse switch guard from \"%s\" to \"%s\" reverse=%s entry=%d,%d",
+		m_recentSwitchFromName.c_str(),
+		m_recentSwitchToName.c_str(),
+		Config::dirName(m_recentSwitchReverseDir),
+		m_recentSwitchEntryX,
+		m_recentSwitchEntryY));
+}
+
+void
+Server::clearRecentSwitchGuardIfMovedAway()
+{
+	if (!m_recentSwitchGuardActive || m_active == NULL ||
+		getName(m_active) != m_recentSwitchToName) {
+		return;
+	}
+
+	switch (m_recentSwitchReverseDir) {
+	case kLeft:
+		if (m_x >= m_recentSwitchEntryX + kSwitchReverseClearDistance) {
+			m_recentSwitchGuardActive = false;
+		}
+		break;
+
+	case kRight:
+		if (m_x <= m_recentSwitchEntryX - kSwitchReverseClearDistance) {
+			m_recentSwitchGuardActive = false;
+		}
+		break;
+
+	case kTop:
+		if (m_y >= m_recentSwitchEntryY + kSwitchReverseClearDistance) {
+			m_recentSwitchGuardActive = false;
+		}
+		break;
+
+	case kBottom:
+		if (m_y <= m_recentSwitchEntryY - kSwitchReverseClearDistance) {
+			m_recentSwitchGuardActive = false;
+		}
+		break;
+
+	case kNoDirection:
+		m_recentSwitchGuardActive = false;
+		break;
+	}
+}
+
+bool
+Server::isRecentReverseSwitch(BaseClientProxy* dst, EDirection dir)
+{
+	if (!m_recentSwitchGuardActive || m_active == NULL || dst == NULL) {
+		return false;
+	}
+	if (getName(m_active) != m_recentSwitchToName ||
+		getName(dst) != m_recentSwitchFromName) {
+		return false;
+	}
+
+	return dir == m_recentSwitchReverseDir;
+}
+
 bool
 Server::isSwitchOkay(BaseClientProxy* newScreen,
 				EDirection dir, SInt32 x, SInt32 y,
@@ -1278,6 +1381,15 @@ Server::isSwitchOkay(BaseClientProxy* newScreen,
 		// there's no neighbor.  we don't want to switch and we don't
 		// want to try to switch later.
 		LOG((CLOG_DEBUG1 "no neighbor %s", Config::dirName(dir)));
+		stopSwitch();
+		return false;
+	}
+
+	if (isRecentReverseSwitch(newScreen, dir)) {
+		LOG((CLOG_INFO "suppressing immediate reverse switch from \"%s\" to \"%s\" on %s until cursor moves inward",
+			getName(m_active).c_str(),
+			getName(newScreen).c_str(),
+			Config::dirName(dir)));
 		stopSwitch();
 		return false;
 	}
@@ -1931,7 +2043,7 @@ Server::handleSwitchWaitTimeout(const Event&, void*)
 
 	// switch screen
 	BaseClientProxy* dst = m_switchScreen;
-	if (!switchScreen(dst, m_switchWaitX, m_switchWaitY, false)) {
+	if (!switchScreen(dst, m_switchWaitX, m_switchWaitY, false, m_switchDir)) {
 		reanchorActiveAfterFailedSwitch(dst);
 	}
 }
@@ -2494,6 +2606,7 @@ Server::onMouseMovePrimary(SInt32 x, SInt32 y)
 	// save position
 	m_x       = x;
 	m_y       = y;
+	clearRecentSwitchGuardIfMovedAway();
 
 	// get screen shape
 	SInt32 ax, ay, aw, ah;
@@ -2570,7 +2683,7 @@ Server::onMouseMovePrimary(SInt32 x, SInt32 y)
 			}
 
 			// switch screen
-			if (!switchScreen(newScreen, x, y, false)) {
+			if (!switchScreen(newScreen, x, y, false, dir)) {
 				reanchorActiveAfterFailedSwitch(newScreen);
 				return false;
 			}
@@ -2656,6 +2769,7 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 	// accumulate motion
 	m_x      += dx;
 	m_y      += dy;
+	clearRecentSwitchGuardIfMovedAway();
 
 	// get screen shape
 	SInt32 ax, ay, aw, ah;
@@ -2670,6 +2784,7 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 	// find direction of neighbor and get the neighbor
 	bool jump = true;
 	BaseClientProxy* newScreen;
+	EDirection switchDir = kNoDirection;
 	do {
 		// clamp position to screen
 		SInt32 xc = m_x, yc = m_y;
@@ -2743,6 +2858,7 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 
 		// try to switch screen.  get the neighbor.
 		newScreen = mapToNeighbor(m_active, dir, m_x, m_y);
+		switchDir = dir;
 
 		// see if we should switch
 		if (!isSwitchOkay(newScreen, dir, m_x, m_y, xc, yc)) {
@@ -2760,7 +2876,7 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 		SInt32 newY = m_y;
 
 			// switch screens
-			if (!switchScreen(newScreen, newX, newY, false) && m_active != newScreen &&
+			if (!switchScreen(newScreen, newX, newY, false, switchDir) && m_active != newScreen &&
 				clampToClientShape(m_active, m_x, m_y)) {
 				LOG((CLOG_WARN "reanchoring \"%s\" at %d,%d after failed switch to \"%s\"",
 					getName(m_active).c_str(), m_x, m_y, getName(newScreen).c_str()));

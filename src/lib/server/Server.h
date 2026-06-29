@@ -147,6 +147,10 @@ public:
         m_ySaver(0),
         m_switchDir(kNoDirection),
         m_switchScreen(NULL),
+        m_recentSwitchGuardActive(false),
+        m_recentSwitchReverseDir(kNoDirection),
+        m_recentSwitchEntryX(0),
+        m_recentSwitchEntryY(0),
         m_switchWaitDelay(0.0),
         m_switchWaitTimer(NULL),
         m_primaryKeyStateTimer(NULL),
@@ -296,7 +300,8 @@ private:
 
     // change the active screen
     bool                switchScreen(BaseClientProxy*,
-	                            SInt32 x, SInt32 y, bool forScreenSaver);
+	                            SInt32 x, SInt32 y, bool forScreenSaver,
+                            EDirection guardDir = kNoDirection);
 
     // jump to screen
     void                jumpToScreen(BaseClientProxy*);
@@ -338,6 +343,11 @@ private:
     // implement them.  returns true iff a switch is permitted.
     bool                isSwitchOkay(BaseClientProxy* dst, EDirection,
                             SInt32 x, SInt32 y, SInt32 xActive, SInt32 yActive);
+    void                armRecentSwitchGuard(BaseClientProxy* from,
+                            BaseClientProxy* to, EDirection dir);
+    void                clearRecentSwitchGuardIfMovedAway();
+    bool                isRecentReverseSwitch(BaseClientProxy* dst,
+                            EDirection dir);
 
     // update switch state due to a mouse move at \p x, \p y that
     // doesn't switch screens.
@@ -589,6 +599,12 @@ private:
     // trying to reach the same screen in the same direction.
     EDirection            m_switchDir;
     BaseClientProxy*    m_switchScreen;
+    bool                m_recentSwitchGuardActive;
+    std::string         m_recentSwitchFromName;
+    std::string         m_recentSwitchToName;
+    EDirection          m_recentSwitchReverseDir;
+    SInt32              m_recentSwitchEntryX;
+    SInt32              m_recentSwitchEntryY;
 
     // state for delayed screen switching
     double                m_switchWaitDelay;

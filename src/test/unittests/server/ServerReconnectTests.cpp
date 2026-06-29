@@ -476,6 +476,12 @@ void initializeServer(Server& server, Config& config, PrimaryClient& primary,
     server.m_active = &active;
     server.m_activeSaver = NULL;
     server.m_switchScreen = NULL;
+    server.m_recentSwitchGuardActive = false;
+    server.m_recentSwitchFromName.clear();
+    server.m_recentSwitchToName.clear();
+    server.m_recentSwitchReverseDir = kNoDirection;
+    server.m_recentSwitchEntryX = 0;
+    server.m_recentSwitchEntryY = 0;
     server.m_switchWaitDelay = 0.0;
     server.m_switchWaitTimer = NULL;
     server.m_switchTwoTapDelay = 0.0;
@@ -1578,6 +1584,114 @@ TEST(ServerReconnectTests, avoidJumpZoneInsetsSecondaryScreenAwayFromReverseEdge
 
     EXPECT_EQ(16, x);
     EXPECT_EQ(100, y);
+}
+
+TEST(ServerReconnectTests, recentReverseSwitchGuardKeepsClientActiveUntilMovedInward)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kRight, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kLeft, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1022;
+    server.m_y = 100;
+
+    EXPECT_TRUE(server.onMouseMovePrimary(1023, 100));
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(16, client.enterX);
+    EXPECT_EQ(100, client.enterY);
+    EXPECT_TRUE(server.m_recentSwitchGuardActive);
+    EXPECT_EQ("primary", server.m_recentSwitchFromName);
+    EXPECT_EQ("client", server.m_recentSwitchToName);
+    EXPECT_EQ(kLeft, server.m_recentSwitchReverseDir);
+    EXPECT_EQ(16, server.m_recentSwitchEntryX);
+    EXPECT_EQ(100, server.m_recentSwitchEntryY);
+
+    server.onMouseMoveSecondary(-40, 0);
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(0, server.m_x);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_EQ(0u, primary.enterCount);
+
+    server.onMouseMoveSecondary(160, 0);
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_GE(server.m_x, 96);
+
+    server.onMouseMoveSecondary(-300, 0);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_GE(primary.enterX, 0);
+    EXPECT_LT(primary.enterX, 1024);
+    EXPECT_EQ(100, primary.enterY);
+}
+
+TEST(ServerReconnectTests, delayedSwitchArmsRecentReverseSwitchGuard)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kRight, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kLeft, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1023;
+    server.m_y = 100;
+    server.m_switchScreen = &client;
+    server.m_switchDir = kRight;
+    server.m_switchWaitX = 16;
+    server.m_switchWaitY = 100;
+
+    server.handleSwitchWaitTimeout(Event(Event::kUnknown), NULL);
+
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_TRUE(server.m_recentSwitchGuardActive);
+    EXPECT_EQ("primary", server.m_recentSwitchFromName);
+    EXPECT_EQ("client", server.m_recentSwitchToName);
+    EXPECT_EQ(kLeft, server.m_recentSwitchReverseDir);
+    EXPECT_EQ(16, server.m_recentSwitchEntryX);
+    EXPECT_EQ(100, server.m_recentSwitchEntryY);
+
+    server.onMouseMoveSecondary(-40, 0);
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(0, server.m_x);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_EQ(0u, primary.enterCount);
 }
 
 TEST(ServerReconnectTests, secondaryMotion_reanchorsActiveClientWhenLeaveFails)
