@@ -1248,9 +1248,11 @@ Server::avoidJumpZone(BaseClientProxy* dst,
 	if (dw < kMinUsableScreenDimension || dh < kMinUsableScreenDimension) {
 		return;
 	}
-	const SInt32 maxInset = std::max<SInt32>(1, std::min(dw, dh) / 8);
-	SInt32 z = std::min(kSwitchEdgeHysteresisInset, maxInset);
-	z = std::max(z, getJumpZoneSize(dst));
+	const SInt32 maxInset =
+		(std::max)(static_cast<SInt32>(1),
+				   static_cast<SInt32>((std::min)(dw, dh) / 8));
+	SInt32 z = (std::min)(kSwitchEdgeHysteresisInset, maxInset);
+	z = (std::max)(z, getJumpZoneSize(dst));
 
 	// move in far enough to avoid the jump zone.  if entering a side
 	// that doesn't have a neighbor (i.e. an asymmetrical side) then we
