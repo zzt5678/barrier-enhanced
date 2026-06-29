@@ -116,6 +116,13 @@ public:
 	static bool         adjustPointToVisibleAreaForTest(
 	                            const VisibleAreas& areas,
 	                            SInt32& x, SInt32& y);
+	static bool         adjustPointToVisibleAreaNearAnchorForTest(
+	                            const VisibleAreas& areas,
+	                            SInt32 anchorX, SInt32 anchorY,
+	                            SInt32& x, SInt32& y);
+	virtual bool        adjustPointToVisibleAreaNearAnchor(
+	                            SInt32 anchorX, SInt32 anchorY,
+	                            SInt32& x, SInt32& y) override;
     virtual void        fakeDraggingFiles(DragFileList fileList) override;
     virtual const String& getDropTarget() const override;
     virtual void        setDropTarget(const String& target) override;

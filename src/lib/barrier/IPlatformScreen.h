@@ -160,6 +160,8 @@ public:
     virtual void        getShape(SInt32& x, SInt32& y,
                             SInt32& width, SInt32& height) const = 0;
     virtual void        getCursorPos(SInt32& x, SInt32& y) const = 0;
+    virtual bool        adjustPointToVisibleAreaNearAnchor(
+                            SInt32, SInt32, SInt32&, SInt32&) { return false; }
 
     // IPrimaryScreen overrides
     virtual void        reconfigure(UInt32 activeSides) = 0;

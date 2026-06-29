@@ -448,6 +448,56 @@ public:
     String dropTarget;
 };
 
+class AnchoringPlatformScreen : public DragPlatformScreen
+{
+public:
+    struct Area {
+        Area(SInt32 x, SInt32 y, SInt32 w, SInt32 h) :
+            x(x), y(y), w(w), h(h) { }
+
+        SInt32 x;
+        SInt32 y;
+        SInt32 w;
+        SInt32 h;
+    };
+
+    bool adjustPointToVisibleAreaNearAnchor(SInt32 anchorX, SInt32 anchorY,
+                                            SInt32& x, SInt32& y) override
+    {
+        const Area* target = NULL;
+        for (std::vector<Area>::const_iterator i = areas.begin();
+             i != areas.end(); ++i) {
+            if (anchorX >= i->x && anchorX < i->x + i->w &&
+                anchorY >= i->y && anchorY < i->y + i->h) {
+                target = &*i;
+                break;
+            }
+        }
+        if (target == NULL && !areas.empty()) {
+            target = &areas.front();
+        }
+        if (target == NULL) {
+            return false;
+        }
+
+        if (x < target->x) {
+            x = target->x;
+        }
+        else if (x >= target->x + target->w) {
+            x = target->x + target->w - 1;
+        }
+        if (y < target->y) {
+            y = target->y;
+        }
+        else if (y >= target->y + target->h) {
+            y = target->y + target->h - 1;
+        }
+        return true;
+    }
+
+    std::vector<Area> areas;
+};
+
 void setEventTypeDefaults(MockEventQueue& events,
                           ClientProxyEvents& clientProxyEvents,
                           IScreenEvents& screenEvents,
@@ -483,6 +533,10 @@ void initializeServer(Server& server, Config& config, PrimaryClient& primary,
     server.m_recentSwitchReverseDir = kNoDirection;
     server.m_recentSwitchEntryX = 0;
     server.m_recentSwitchEntryY = 0;
+    server.m_primaryReturnAnchorActive = false;
+    server.m_primaryReturnAnchorClientName.clear();
+    server.m_primaryReturnAnchorX = 0;
+    server.m_primaryReturnAnchorY = 0;
     server.m_switchWaitDelay = 0.0;
     server.m_switchWaitTimer = NULL;
     server.m_switchTwoTapDelay = 0.0;
@@ -1642,6 +1696,44 @@ TEST(ServerReconnectTests, recentReverseSwitchGuardKeepsClientActiveUntilMovedIn
     EXPECT_EQ(1u, primary.enterCount);
     EXPECT_GE(primary.enterX, 0);
     EXPECT_LT(primary.enterX, 1024);
+    EXPECT_EQ(100, primary.enterY);
+}
+
+TEST(ServerReconnectTests, primaryReturnUsesLastPrimaryOutputAnchor)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kRight, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kLeft, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    AnchoringPlatformScreen* platformScreen = new AnchoringPlatformScreen();
+    platformScreen->areas.push_back(AnchoringPlatformScreen::Area(0, 0, 512, 768));
+    platformScreen->areas.push_back(AnchoringPlatformScreen::Area(512, 0, 512, 768));
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &client;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.rememberPrimaryReturnAnchor(&client, 900, 100);
+
+    ASSERT_TRUE(server.switchScreen(&primary, 16, 100, false));
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(512, primary.enterX);
     EXPECT_EQ(100, primary.enterY);
 }
 

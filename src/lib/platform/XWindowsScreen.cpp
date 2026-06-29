@@ -194,6 +194,58 @@ adjustPointToVisibleAreas(const char* operation,
 	return true;
 }
 
+bool
+adjustPointToVisibleAreasNearAnchor(const char* operation,
+	const XWindowsScreen::VisibleAreas& areas,
+	SInt32 anchorX, SInt32 anchorY,
+	SInt32& x, SInt32& y)
+{
+	bool found = false;
+	long long bestDistance = 0;
+	XWindowsScreen::VisibleArea bestArea;
+
+	for (XWindowsScreen::VisibleAreas::const_iterator i = areas.begin();
+		i != areas.end(); ++i) {
+		if (i->width <= 0 || i->height <= 0) {
+			continue;
+		}
+		if (visibleAreaContains(*i, anchorX, anchorY)) {
+			bestArea = *i;
+			found = true;
+			break;
+		}
+
+		SInt32 candidateX = anchorX;
+		SInt32 candidateY = anchorY;
+		clampPointToAreaSilently(*i, candidateX, candidateY);
+		const long long distance =
+			squaredDistance(anchorX, anchorY, candidateX, candidateY);
+		if (!found || distance < bestDistance ||
+			(distance == bestDistance && i->primary && !bestArea.primary)) {
+			found = true;
+			bestDistance = distance;
+			bestArea = *i;
+		}
+	}
+
+	if (!found) {
+		LOG((CLOG_WARN "ignoring %s for no visible output areas",
+			operation));
+		return false;
+	}
+
+	const SInt32 originalX = x;
+	const SInt32 originalY = y;
+	clampPointToAreaSilently(bestArea, x, y);
+	if (x != originalX || y != originalY) {
+		LOG((CLOG_WARN "normalized anchored %s from %+d,%+d to %+d,%+d using visible output %+d,%+d %dx%d near anchor %+d,%+d",
+			operation, originalX, originalY, x, y, bestArea.x, bestArea.y,
+			bestArea.width, bestArea.height, anchorX, anchorY));
+	}
+
+	return true;
+}
+
 std::string
 readTrimmedFile(const std::string& path)
 {
@@ -831,6 +883,15 @@ XWindowsScreen::adjustPointToVisibleAreaForTest(const VisibleAreas& areas,
 	return adjustPointToVisibleAreas("test point", areas, x, y);
 }
 
+bool
+XWindowsScreen::adjustPointToVisibleAreaNearAnchorForTest(
+	const VisibleAreas& areas, SInt32 anchorX, SInt32 anchorY,
+	SInt32& x, SInt32& y)
+{
+	return adjustPointToVisibleAreasNearAnchor("test point", areas,
+		anchorX, anchorY, x, y);
+}
+
 void*
 XWindowsScreen::getEventTarget() const
 {
@@ -888,6 +949,17 @@ XWindowsScreen::getCursorPos(SInt32& x, SInt32& y) const
 		x = m_xCenter;
 		y = m_yCenter;
 	}
+}
+
+bool
+XWindowsScreen::adjustPointToVisibleAreaNearAnchor(SInt32 anchorX,
+												   SInt32 anchorY,
+												   SInt32& x,
+												   SInt32& y)
+{
+	updateVisibleAreasFromRandR();
+	return adjustPointToVisibleAreasNearAnchor("primary return",
+		m_visibleAreas, anchorX, anchorY, x, y);
 }
 
 void

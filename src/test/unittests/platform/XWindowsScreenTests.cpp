@@ -81,3 +81,30 @@ TEST(XWindowsScreenTests, adjustPointToVisibleAreaForTest_noValidOutputsReturnsF
 	EXPECT_EQ(40, x);
 	EXPECT_EQ(2709, y);
 }
+
+TEST(XWindowsScreenTests, adjustPointToVisibleAreaNearAnchorForTest_usesAnchorOutput)
+{
+	XWindowsScreen::VisibleAreas areas;
+	areas.push_back(XWindowsScreen::VisibleArea(0, 0, 5120, 2880, false));
+	areas.push_back(XWindowsScreen::VisibleArea(5120, 0, 5120, 2880, true));
+	SInt32 x = 40;
+	SInt32 y = 900;
+
+	EXPECT_TRUE(XWindowsScreen::adjustPointToVisibleAreaNearAnchorForTest(
+		areas, 8000, 1200, x, y));
+	EXPECT_EQ(5120, x);
+	EXPECT_EQ(900, y);
+}
+
+TEST(XWindowsScreenTests, adjustPointToVisibleAreaNearAnchorForTest_closedAnchorOutputFallsBackToVisible)
+{
+	XWindowsScreen::VisibleAreas areas;
+	areas.push_back(XWindowsScreen::VisibleArea(5120, 0, 5120, 2880, true));
+	SInt32 x = 40;
+	SInt32 y = 900;
+
+	EXPECT_TRUE(XWindowsScreen::adjustPointToVisibleAreaNearAnchorForTest(
+		areas, 100, 1200, x, y));
+	EXPECT_EQ(5120, x);
+	EXPECT_EQ(900, y);
+}

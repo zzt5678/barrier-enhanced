@@ -152,6 +152,9 @@ public:
         m_recentSwitchReverseDir(kNoDirection),
         m_recentSwitchEntryX(0),
         m_recentSwitchEntryY(0),
+        m_primaryReturnAnchorActive(false),
+        m_primaryReturnAnchorX(0),
+        m_primaryReturnAnchorY(0),
         m_switchWaitDelay(0.0),
         m_switchWaitTimer(NULL),
         m_primaryKeyStateTimer(NULL),
@@ -349,6 +352,10 @@ private:
     void                clearRecentSwitchGuardIfMovedAway();
     bool                isRecentReverseSwitch(BaseClientProxy* dst,
                             EDirection dir);
+    void                rememberPrimaryReturnAnchor(BaseClientProxy* dst,
+                            SInt32 x, SInt32 y);
+    void                adjustPrimaryReturnPoint(BaseClientProxy* src,
+                            SInt32& x, SInt32& y);
 
     // update switch state due to a mouse move at \p x, \p y that
     // doesn't switch screens.
@@ -608,6 +615,10 @@ private:
     EDirection          m_recentSwitchReverseDir;
     SInt32              m_recentSwitchEntryX;
     SInt32              m_recentSwitchEntryY;
+    bool                m_primaryReturnAnchorActive;
+    std::string         m_primaryReturnAnchorClientName;
+    SInt32              m_primaryReturnAnchorX;
+    SInt32              m_primaryReturnAnchorY;
 
     // state for delayed screen switching
     double                m_switchWaitDelay;

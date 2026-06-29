@@ -254,6 +254,9 @@ Server::Server(
 	m_recentSwitchReverseDir(kNoDirection),
 	m_recentSwitchEntryX(0),
 	m_recentSwitchEntryY(0),
+	m_primaryReturnAnchorActive(false),
+	m_primaryReturnAnchorX(0),
+	m_primaryReturnAnchorY(0),
 	m_switchWaitDelay(0.0),
 	m_switchWaitTimer(NULL),
 	m_primaryKeyStateTimer(NULL),
@@ -748,6 +751,11 @@ Server::switchScreen(BaseClientProxy* dst,
 		return false;
 	}
 
+	if (dst == m_primaryClient && m_active != NULL &&
+		m_active != m_primaryClient) {
+		adjustPrimaryReturnPoint(m_active, x, y);
+	}
+
 	if (!clampToClientShape(dst, x, y)) {
 		LOG((CLOG_WARN "refusing to switch to \"%s\" with unusable destination shape",
 			getName(dst).c_str()));
@@ -781,6 +789,9 @@ Server::switchScreen(BaseClientProxy* dst,
 		BaseClientProxy* oldActive = m_active;
 		const SInt32 oldX = m_x;
 		const SInt32 oldY = m_y;
+		if (oldActive == m_primaryClient && dst != m_primaryClient) {
+			rememberPrimaryReturnAnchor(dst, oldX, oldY);
+		}
 
 			// leave active screen
 			if (!m_active->leave()) {
@@ -1373,6 +1384,44 @@ Server::isRecentReverseSwitch(BaseClientProxy* dst, EDirection dir)
 	}
 
 	return dir == m_recentSwitchReverseDir;
+}
+
+void
+Server::rememberPrimaryReturnAnchor(BaseClientProxy* dst, SInt32 x, SInt32 y)
+{
+	if (dst == NULL) {
+		m_primaryReturnAnchorActive = false;
+		m_primaryReturnAnchorClientName.clear();
+		return;
+	}
+
+	m_primaryReturnAnchorActive = true;
+	m_primaryReturnAnchorClientName = getName(dst);
+	m_primaryReturnAnchorX = x;
+	m_primaryReturnAnchorY = y;
+	LOG((CLOG_INFO "remembered primary return anchor for \"%s\" at %d,%d",
+		m_primaryReturnAnchorClientName.c_str(), x, y));
+}
+
+void
+Server::adjustPrimaryReturnPoint(BaseClientProxy* src, SInt32& x, SInt32& y)
+{
+	if (!m_primaryReturnAnchorActive || src == NULL ||
+		getName(src) != m_primaryReturnAnchorClientName ||
+		m_screen == NULL || m_screen->getPlatformScreen() == NULL) {
+		return;
+	}
+
+	const SInt32 originalX = x;
+	const SInt32 originalY = y;
+	if (m_screen->getPlatformScreen()->adjustPointToVisibleAreaNearAnchor(
+			m_primaryReturnAnchorX, m_primaryReturnAnchorY, x, y)) {
+		if (x != originalX || y != originalY) {
+			LOG((CLOG_INFO "anchored primary return from \"%s\" at %d,%d to %d,%d using primary exit %d,%d",
+				getName(src).c_str(), originalX, originalY, x, y,
+				m_primaryReturnAnchorX, m_primaryReturnAnchorY));
+		}
+	}
 }
 
 bool
