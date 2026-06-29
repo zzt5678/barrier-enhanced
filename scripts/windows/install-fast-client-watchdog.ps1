@@ -47,14 +47,14 @@ Option Explicit
 
 Dim shell, fso, wmi
 Dim serverHost, serverPort, startVbs, logPath, checkIntervalMs
-Dim disconnectedCount
+Dim lastAliveLog
 
 serverHost = "$ServerHost"
 serverPort = "$ServerPort"
 startVbs = "$startVbs"
 logPath = "$fastLog"
 checkIntervalMs = $CheckIntervalMs
-disconnectedCount = 0
+lastAliveLog = Timer
 
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -70,23 +70,6 @@ End Sub
 
 Function WeavecCount()
     WeavecCount = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='weavec.exe'").Count
-End Function
-
-Function HasEstablishedConnection()
-    Dim exec, line, upperLine
-    HasEstablishedConnection = False
-    Set exec = shell.Exec("%ComSpec% /c netstat -ano -p tcp")
-    Do While exec.Status = 0
-        WScript.Sleep 100
-    Loop
-    Do Until exec.StdOut.AtEndOfStream
-        line = exec.StdOut.ReadLine
-        upperLine = UCase(line)
-        If InStr(line, serverHost & ":" & serverPort) > 0 And InStr(upperLine, "ESTABLISHED") > 0 Then
-            HasEstablishedConnection = True
-            Exit Function
-        End If
-    Loop
 End Function
 
 Sub StopWeavec()
@@ -106,12 +89,7 @@ Sub RestartClient(reason)
     WScript.Sleep 1500
     StartClient
     WScript.Sleep 3000
-    If HasEstablishedConnection() Then
-        WriteLog "after restart: connected"
-        disconnectedCount = 0
-    Else
-        WriteLog "after restart: not connected"
-    End If
+    WriteLog "after restart: start requested"
 End Sub
 
 WriteLog "fast watchdog started; interval_ms=" & checkIntervalMs
@@ -119,12 +97,10 @@ WriteLog "fast watchdog started; interval_ms=" & checkIntervalMs
 Do
     If WeavecCount() = 0 Then
         RestartClient "weavec missing"
-    ElseIf HasEstablishedConnection() Then
-        disconnectedCount = 0
     Else
-        disconnectedCount = disconnectedCount + 1
-        If disconnectedCount >= 2 Then
-            RestartClient "no established connection"
+        If Abs(Timer - lastAliveLog) >= 60 Then
+            WriteLog "ok: weavec running"
+            lastAliveLog = Timer
         End If
     End If
     WScript.Sleep checkIntervalMs
