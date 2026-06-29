@@ -24,6 +24,7 @@
 
 using ::testing::_;
 using ::testing::AtLeast;
+using ::testing::DoubleEq;
 using ::testing::Invoke;
 using ::testing::Mock;
 using ::testing::NiceMock;
@@ -149,6 +150,28 @@ TEST(ServerProxyTests, hasCompleteOptionPairs_rejectsOddSizedOptions)
     malformed.push_back(kOptionHeartbeat);
 
     EXPECT_FALSE(ServerProxy::hasCompleteOptionPairs(malformed));
+}
+
+TEST(ServerProxyTests, setKeepAliveRateUsesShortIdleDeathWindow)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    setServerProxyEventDefaults(events, streamEvents, clipboardEvents, fileEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Return(&stream));
+    ON_CALL(stream, isReady()).WillByDefault(Return(false));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0));
+
+    ServerProxy proxy(reinterpret_cast<Client*>(1), &stream, &events);
+    Mock::VerifyAndClearExpectations(&events);
+
+    EXPECT_CALL(events, newOneShotTimer(DoubleEq(2.0), _))
+        .WillOnce(Return(reinterpret_cast<EventQueueTimer*>(2)));
+
+    proxy.setKeepAliveRate(1.0);
 }
 
 TEST(ServerProxyTests, ordinaryMessageResetsKeepAliveAlarm)

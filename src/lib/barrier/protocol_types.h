@@ -47,10 +47,9 @@ static const UInt32        kMaxHelloLength = 1024;
 static const double        kKeepAliveRate = 3.0;
 
 // number of skipped kMsgCKeepAlive messages that indicates a problem.
-// Desktop switches, secure-desktop prompts, and large clipboard payloads can
-// briefly stall one side's event loop, so avoid treating a short scheduling
-// pause as a dead connection.
-static const double        kKeepAlivesUntilDeath = 5.0;
+// Pending stream input/output gets a separate deferral budget, so idle stale
+// sockets should be retired quickly enough for hands-off reconnects.
+static const double        kKeepAlivesUntilDeath = 2.0;
 
 // obsolete heartbeat stuff
 static const double        kHeartRate = -1.0;
