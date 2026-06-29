@@ -1543,7 +1543,40 @@ TEST(ServerReconnectTests, avoidJumpZoneStillHonorsUsableNeighbor)
 
     server.avoidJumpZone(&primary, kLeft, x, y);
 
-    EXPECT_EQ(1022, x);
+    EXPECT_EQ(1007, x);
+    EXPECT_EQ(100, y);
+}
+
+TEST(ServerReconnectTests, avoidJumpZoneInsetsSecondaryScreenAwayFromReverseEdge)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kRight, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kLeft, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    EnterablePrimaryClient primary;
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+
+    SInt32 x = 0;
+    SInt32 y = 100;
+
+    server.avoidJumpZone(&client, kRight, x, y);
+
+    EXPECT_EQ(16, x);
     EXPECT_EQ(100, y);
 }
 

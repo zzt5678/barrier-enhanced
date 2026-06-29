@@ -53,6 +53,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <algorithm>
 #include <memory>
 #include <sstream>
 #include <fstream>
@@ -63,6 +64,7 @@
 namespace {
 
 const SInt32 kMinUsableScreenDimension = 64;
+const SInt32 kSwitchEdgeHysteresisInset = 16;
 const int kClipboardReadAttempts = 8;
 const double kClipboardReadRetrySeconds = 0.025;
 const UInt32 kDefaultHeartbeatMilliseconds = 10000;
@@ -1200,10 +1202,9 @@ Server::mapToNeighbor(BaseClientProxy* src,
 	assert(lastGoodScreen != NULL);
 	dst = lastGoodScreen;
 
-	// if entering primary screen then be sure to move in far enough
-	// to avoid the jump zone.  if entering a side that doesn't have
-	// a neighbor (i.e. an asymmetrical side) then we don't need to
-	// move inwards because that side can't provoke a jump.
+	// Move in far enough to avoid the jump zone.  If entering a side
+	// that doesn't have a neighbor (i.e. an asymmetrical side) then we
+	// don't need to move inwards because that side can't provoke a jump.
 	avoidJumpZone(dst, srcSide, x, y);
 
 	return dst;
@@ -1213,14 +1214,14 @@ void
 Server::avoidJumpZone(BaseClientProxy* dst,
 				EDirection dir, SInt32& x, SInt32& y) const
 {
-	// we only need to avoid jump zones on the primary screen
-	if (dst != m_primaryClient) {
-		return;
-	}
-
 	SInt32 dx, dy, dw, dh;
 	dst->getShape(dx, dy, dw, dh);
-	SInt32 z = getJumpZoneSize(dst);
+	if (dw < kMinUsableScreenDimension || dh < kMinUsableScreenDimension) {
+		return;
+	}
+	const SInt32 maxInset = std::max<SInt32>(1, std::min(dw, dh) / 8);
+	SInt32 z = std::min(kSwitchEdgeHysteresisInset, maxInset);
+	z = std::max(z, getJumpZoneSize(dst));
 
 	// move in far enough to avoid the jump zone.  if entering a side
 	// that doesn't have a neighbor (i.e. an asymmetrical side) then we
