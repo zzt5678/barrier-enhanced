@@ -7,7 +7,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=@PROJECT_DIR@
-ExecStart=@PROJECT_DIR@/_build/bin/weave
+ExecStart=@WEAVE_BIN@
 Restart=always
 RestartSec=2
 KillMode=control-group

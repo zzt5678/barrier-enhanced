@@ -1,8 +1,11 @@
 #include "test/global/gtest.h"
 
+#include "barrier/RemoteFileClipboard.h"
 #include "platform/XWindowsClipboardURIListFileConverter.h"
 
 #include <X11/Xlib.h>
+
+#include <string>
 
 TEST(XWindowsClipboardURIListFileConverterTests, fromIClipboard_withPlainText_returnsEmpty)
 {
@@ -34,6 +37,33 @@ TEST(XWindowsClipboardURIListFileConverterTests, fromIClipboard_withPathLikeText
 
     EXPECT_EQ("", converter.fromIClipboard("/tmp/example.txt"));
     EXPECT_EQ("", gnomeConverter.fromIClipboard("/tmp/example.txt"));
+
+    XCloseDisplay(display);
+}
+
+TEST(XWindowsClipboardURIListFileConverterTests, toIClipboard_rejectsOversizedRawSelection)
+{
+    Display* display = XOpenDisplay(NULL);
+    if (display == NULL) {
+        return;
+    }
+
+    XWindowsClipboardURIListFileConverter converter(display);
+    EXPECT_EQ("", converter.toIClipboard(std::string(RemoteFileClipboard::kMaxNativeFileSelectionBytes + 1, 'x')));
+
+    XCloseDisplay(display);
+}
+
+TEST(XWindowsClipboardURIListFileConverterTests, toIClipboard_rejectsDecodedPathOverSharedLimit)
+{
+    Display* display = XOpenDisplay(NULL);
+    if (display == NULL) {
+        return;
+    }
+
+    XWindowsClipboardURIListFileConverter converter(display);
+    const std::string uri = "file:///tmp/" + std::string(RemoteFileClipboard::kMaxClipboardPathBytes, 'a') + "\r\n";
+    EXPECT_EQ("", converter.toIClipboard(uri));
 
     XCloseDisplay(display);
 }

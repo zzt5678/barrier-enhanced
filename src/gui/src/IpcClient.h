@@ -20,6 +20,7 @@
 
 #include <QObject>
 #include <QAbstractSocket>
+#include <QString>
 #include <QTimer>
 
 #include "ElevateMode.h"
@@ -50,6 +51,7 @@ public slots:
 private:
     void initializeSocket(QTcpSocket* socket);
     void intToBytes(int value, char* buffer, int size);
+    void writeCommand(const QString& command, ElevateMode elevate);
 
 private slots:
     void connected();
@@ -66,5 +68,8 @@ private:
     IpcReader* m_Reader;
     bool m_ReaderStarted;
     bool m_Enabled;
+    bool m_HasPendingCommand;
+    QString m_PendingCommand;
+    ElevateMode m_PendingElevate;
     QTimer m_RetryTimer;
 };

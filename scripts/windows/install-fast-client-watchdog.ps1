@@ -2,6 +2,8 @@ param(
     [string]$ServerHost = '100.76.98.15',
     [int]$ServerPort = 24800,
     [string]$ClientName = 'zyt',
+    [string]$BuildDir = '',
+    [string]$ClientExe = '',
     [int]$CheckIntervalMs = 5000,
     [string]$FastWatchdogTask = 'WeaveFastClientWatchdog',
     [string]$LegacyWatchdogTask = 'WeaveClientWatchdog'
@@ -11,11 +13,28 @@ $ErrorActionPreference = 'Stop'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent (Split-Path -Parent $scriptDir)
-$binDir = Join-Path $repoRoot 'build-final\bin\Release'
-$clientExe = Join-Path $binDir 'weavec.exe'
 
-if (!(Test-Path $clientExe)) {
-    throw "Missing client executable: $clientExe"
+if ([string]::IsNullOrWhiteSpace($ClientExe)) {
+    $buildRoot = if ([string]::IsNullOrWhiteSpace($BuildDir)) {
+        Join-Path $repoRoot 'build'
+    } else {
+        [System.IO.Path]::GetFullPath($BuildDir)
+    }
+    $clientCandidates = @(
+        (Join-Path $buildRoot 'bin\weavec.exe'),
+        (Join-Path $buildRoot 'bin\Release\weavec.exe'),
+        (Join-Path $buildRoot 'bin\Debug\weavec.exe')
+    )
+    $clientExePath = $clientCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($clientExePath)) {
+        $clientExePath = $clientCandidates[0]
+    }
+} else {
+    $clientExePath = [System.IO.Path]::GetFullPath($ClientExe)
+}
+
+if (!(Test-Path $clientExePath)) {
+    throw "Missing client executable: $clientExePath"
 }
 
 $localWeaveDir = Join-Path $env:LOCALAPPDATA 'Weave'
@@ -29,7 +48,7 @@ $fastLog = Join-Path $localWeaveDir 'weave-fast-watchdog.log'
 New-Item -ItemType Directory -Force -Path $localWeaveDir, $profileDir, $dropDir | Out-Null
 
 $clientCommand =
-    '"' + $clientExe + '" -f --no-tray --debug INFO --name ' + $ClientName +
+    '"' + $clientExePath + '" -f --no-tray --debug INFO --name ' + $ClientName +
     ' --enable-drag-drop --drop-dir "' + $dropDir +
     '" --profile-dir "' + $profileDir +
     '" --log "' + $clientLog +
@@ -42,15 +61,22 @@ shell.Run "$escapedClientCommand", 0, False
 "@
 Set-Content -Path $startVbs -Value $startVbsContent -Encoding ASCII
 
+$vbsClientExe = $clientExePath.Replace('"', '""')
+$vbsServerAddress = ("{0}:{1}" -f $ServerHost, $ServerPort).Replace('"', '""')
+$vbsClientName = $ClientName.Replace('"', '""')
+
 $fastVbsContent = @"
 Option Explicit
 
 Dim shell, fso, wmi
-Dim serverHost, serverPort, startVbs, logPath, checkIntervalMs
+Dim serverHost, serverPort, serverAddress, clientName, clientExe, startVbs, logPath, checkIntervalMs
 Dim lastAliveLog
 
 serverHost = "$ServerHost"
 serverPort = "$ServerPort"
+serverAddress = "$vbsServerAddress"
+clientName = "$vbsClientName"
+clientExe = "$vbsClientExe"
 startVbs = "$startVbs"
 logPath = "$fastLog"
 checkIntervalMs = $CheckIntervalMs
@@ -68,14 +94,37 @@ Sub WriteLog(message)
     file.Close
 End Sub
 
+Function IsManagedWeavec(proc)
+    Dim commandLine
+    IsManagedWeavec = False
+    If IsNull(proc.CommandLine) Then
+        Exit Function
+    End If
+    commandLine = proc.CommandLine
+    If InStr(1, commandLine, clientExe, vbTextCompare) > 0 And _
+        InStr(1, commandLine, serverAddress, vbTextCompare) > 0 And _
+        InStr(1, commandLine, "--name " & clientName, vbTextCompare) > 0 Then
+        IsManagedWeavec = True
+    End If
+End Function
+
 Function WeavecCount()
-    WeavecCount = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='weavec.exe'").Count
+    Dim count, proc
+    count = 0
+    For Each proc In wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='weavec.exe'")
+        If IsManagedWeavec(proc) Then
+            count = count + 1
+        End If
+    Next
+    WeavecCount = count
 End Function
 
 Sub StopWeavec()
     Dim proc
-    For Each proc In wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='weavec.exe'")
-        proc.Terminate()
+    For Each proc In wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='weavec.exe'")
+        If IsManagedWeavec(proc) Then
+            proc.Terminate()
+        End If
     Next
 End Sub
 
@@ -129,3 +178,4 @@ Write-Output "disabled legacy watchdog task if present: $LegacyWatchdogTask"
 Write-Output "start script: $startVbs"
 Write-Output "watchdog script: $fastVbs"
 Write-Output "watchdog log: $fastLog"
+Write-Output "client executable: $clientExePath"

@@ -9,6 +9,8 @@
 
 #include "platform/XWindowsClipboardURIListFileConverter.h"
 
+#include "barrier/RemoteFileClipboard.h"
+
 #include <cctype>
 #include <sstream>
 
@@ -89,6 +91,8 @@ std::string uriListToPathList(const std::string& uriList)
     std::istringstream lines(uriList);
     std::string line;
     std::string paths;
+    std::size_t pathCount = 0;
+    std::size_t totalPathBytes = 0;
     while (std::getline(lines, line)) {
         line = trimLine(line);
         if (line.empty() || line[0] == '#') {
@@ -109,10 +113,18 @@ std::string uriListToPathList(const std::string& uriList)
             continue;
         }
 
+        const std::string decodedPath = percentDecode(path);
+        if (!RemoteFileClipboard::validatePathUtf8ForAppend(pathCount,
+                                                            totalPathBytes,
+                                                            decodedPath)) {
+            return std::string();
+        }
         if (!paths.empty()) {
             paths.push_back('\n');
         }
-        paths += percentDecode(path);
+        paths += decodedPath;
+        ++pathCount;
+        totalPathBytes += decodedPath.size();
     }
     return paths;
 }
@@ -141,12 +153,21 @@ std::string pathListToUriList(const std::string& pathList)
     std::istringstream lines(pathList);
     std::string line;
     std::string uris;
+    std::size_t pathCount = 0;
+    std::size_t totalPathBytes = 0;
     while (std::getline(lines, line)) {
         line = trimLine(line);
         if (line.empty() || line[0] != '/') {
             continue;
         }
+        if (!RemoteFileClipboard::validatePathUtf8ForAppend(pathCount,
+                                                            totalPathBytes,
+                                                            line)) {
+            return std::string();
+        }
         uris += "file://" + encodeFileUriPath(line) + "\r\n";
+        ++pathCount;
+        totalPathBytes += line.size();
     }
     return uris;
 }
@@ -202,6 +223,10 @@ XWindowsClipboardURIListFileConverter::fromIClipboard(const std::string&) const
 std::string
 XWindowsClipboardURIListFileConverter::toIClipboard(const std::string& uriList) const
 {
+    if (uriList.size() > RemoteFileClipboard::kMaxNativeFileSelectionBytes) {
+        return "";
+    }
+
     if (m_gnomeSpecial) {
         return gnomeCopiedFilesToPathList(uriList);
     }

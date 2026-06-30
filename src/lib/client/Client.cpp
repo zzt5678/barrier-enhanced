@@ -676,6 +676,10 @@ Client::setupConnecting()
                             m_stream->getEventTarget(),
                             new TMethodEventJob<Client>(this,
                                 &Client::handleConnectionFailed));
+    m_events->adoptHandler(m_events->forISocket().stopRetry(),
+                           m_stream->getEventTarget(),
+                           new TMethodEventJob<Client>(this,
+                               &Client::handleStopRetry));
 }
 
 void
@@ -747,6 +751,8 @@ Client::cleanupConnecting()
         m_events->removeHandler(m_events->forIDataSocket().secureConnected(),
                             m_stream->getEventTarget());
         m_events->removeHandler(m_events->forIDataSocket().connectionFailed(),
+                            m_stream->getEventTarget());
+        m_events->removeHandler(m_events->forISocket().stopRetry(),
                             m_stream->getEventTarget());
     }
 }

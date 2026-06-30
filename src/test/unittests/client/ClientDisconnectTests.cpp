@@ -34,6 +34,7 @@ bool testClientPrepareTransferSource(const char* filename,
                                      std::string& error);
 
 using ::testing::_;
+using ::testing::AnyNumber;
 using ::testing::AtLeast;
 using ::testing::Invoke;
 using ::testing::NiceMock;
@@ -474,6 +475,38 @@ TEST(ClientDisconnectTests, disconnectWithoutMessageIsIdempotent)
 
     client.disconnect(NULL);
     client.disconnect(NULL);
+}
+
+TEST(ClientDisconnectTests, setupConnectingRegistersStopRetryBeforeSecureConnectCompletes)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents,
+                                    dataSocketEvents, socketEvents);
+
+    TestScreen screen;
+    ClientArgs args;
+    args.m_enableCrypto = true;
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Return(&stream));
+
+    EXPECT_CALL(events, adoptHandler(_, _, _)).Times(AnyNumber());
+    EXPECT_CALL(events, removeHandler(_, _)).Times(AnyNumber());
+    EXPECT_CALL(events, adoptHandler(_, &stream, _)).Times(3);
+    EXPECT_CALL(events, removeHandler(_, &stream)).Times(4);
+
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    client.testSetupConnecting(&stream);
+    client.testCleanupConnecting();
+    client.testSetStreamOnly(NULL);
 }
 
 TEST(ClientDisconnectTests, setClipboardDoesNotPublishSourcePathsToSystemClipboard)

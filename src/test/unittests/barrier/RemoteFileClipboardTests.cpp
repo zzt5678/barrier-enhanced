@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <fstream>
+#include <string>
 
 namespace {
 
@@ -87,6 +88,59 @@ TEST(RemoteFileClipboardTests, parseRejectsPathCountThatCannotFitPayload)
 
     RemoteFileClipboard::Data parsed;
     EXPECT_FALSE(RemoteFileClipboard::parse(payload, parsed));
+}
+
+TEST(RemoteFileClipboardTests, parseRejectsPathCountOverSharedLimit)
+{
+    RemoteFileClipboard::Data payload;
+    payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+    for (std::size_t i = 0; i < RemoteFileClipboard::kMaxClipboardPathCount + 1; ++i) {
+        payload.paths.push_back(barrier::fs::u8path("/tmp/file-" + std::to_string(i)));
+    }
+
+    RemoteFileClipboard::Data parsed;
+    std::string error;
+    EXPECT_FALSE(RemoteFileClipboard::parse(RemoteFileClipboard::serialize(payload), parsed, &error));
+    EXPECT_EQ("remote file clipboard path count is too large", error);
+}
+
+TEST(RemoteFileClipboardTests, parseRejectsSinglePathOverSharedLimit)
+{
+    RemoteFileClipboard::Data payload;
+    payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+    payload.paths.push_back(barrier::fs::u8path("/tmp/" + std::string(RemoteFileClipboard::kMaxClipboardPathBytes, 'a')));
+
+    RemoteFileClipboard::Data parsed;
+    std::string error;
+    EXPECT_FALSE(RemoteFileClipboard::parse(RemoteFileClipboard::serialize(payload), parsed, &error));
+    EXPECT_EQ("remote file clipboard path entry is too large", error);
+}
+
+TEST(RemoteFileClipboardTests, parseRejectsTotalPathBytesOverSharedLimit)
+{
+    RemoteFileClipboard::Data payload;
+    payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+    for (std::size_t i = 0; i < 17; ++i) {
+        payload.paths.push_back(barrier::fs::u8path("/tmp/" + std::string(64 * 1024 - 5, 'a')));
+    }
+
+    RemoteFileClipboard::Data parsed;
+    std::string error;
+    EXPECT_FALSE(RemoteFileClipboard::parse(RemoteFileClipboard::serialize(payload), parsed, &error));
+    EXPECT_EQ("remote file clipboard path list is too large", error);
+}
+
+TEST(RemoteFileClipboardTests, createPackageRejectsOversizedPathListBeforeArchiveCreation)
+{
+    RemoteFileClipboard::Data payload;
+    payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+    payload.paths.push_back(barrier::fs::u8path("/tmp/" + std::string(RemoteFileClipboard::kMaxClipboardPathBytes, 'a')));
+
+    barrier::fs::path packagePath;
+    std::string error;
+    EXPECT_FALSE(RemoteFileClipboard::createPackage(payload, packagePath, error));
+    EXPECT_EQ("remote file clipboard path entry is too large", error);
+    EXPECT_TRUE(packagePath.empty());
 }
 
 TEST(RemoteFileClipboardTests, createAndExtractPackageRestoresRoots)

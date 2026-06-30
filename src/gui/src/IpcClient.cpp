@@ -47,6 +47,8 @@ char normalizeElevateMode(ElevateMode elevate)
 IpcClient::IpcClient() :
 m_ReaderStarted(false),
 m_Enabled(false),
+m_HasPendingCommand(false),
+m_PendingElevate(ElevateAsNeeded),
 m_RetryTimer(this)
 {
     initializeSocket(new QTcpSocket(this));
@@ -56,6 +58,8 @@ m_RetryTimer(this)
 IpcClient::IpcClient(QTcpSocket* socket) :
 m_ReaderStarted(false),
 m_Enabled(false),
+m_HasPendingCommand(false),
+m_PendingElevate(ElevateAsNeeded),
 m_RetryTimer(this)
 {
     initializeSocket(socket);
@@ -91,6 +95,11 @@ void IpcClient::connected()
 {
     m_RetryTimer.stop();
     sendHello();
+    if (m_HasPendingCommand) {
+        writeCommand(m_PendingCommand, m_PendingElevate);
+        m_HasPendingCommand = false;
+        m_PendingCommand.clear();
+    }
     infoMessage("connection established");
 }
 
@@ -115,6 +124,8 @@ void IpcClient::connectToHost()
 void IpcClient::disconnectFromHost()
 {
     m_Enabled = false;
+    m_HasPendingCommand = false;
+    m_PendingCommand.clear();
     m_RetryTimer.stop();
     infoMessage("service disconnect");
     m_Reader->stop();
@@ -160,6 +171,19 @@ void IpcClient::sendHello()
 }
 
 void IpcClient::sendCommand(const QString& command, ElevateMode const elevate)
+{
+    if (m_Socket->state() != QAbstractSocket::ConnectedState) {
+        m_PendingCommand = command;
+        m_PendingElevate = elevate;
+        m_HasPendingCommand = true;
+        infoMessage("service command queued until connection is established");
+        return;
+    }
+
+    writeCommand(command, elevate);
+}
+
+void IpcClient::writeCommand(const QString& command, ElevateMode const elevate)
 {
     QDataStream stream(m_Socket);
 

@@ -29,6 +29,7 @@
 #include "arch/XArch.h"
 
 #include <climits>
+#include <cstdint>
 #include <cstring>
 
 namespace {
@@ -136,7 +137,7 @@ bool writeFileUrls(PasteboardRef pboard, const std::vector<barrier::fs::path>& p
 
         const OSStatus status = PasteboardPutItemFlavor(
             pboard,
-            static_cast<PasteboardItemID>(i + 1),
+            reinterpret_cast<PasteboardItemID>(static_cast<std::uintptr_t>(i + 1)),
             kFileUrlFlavor(),
             dataRef,
             kPasteboardFlavorNoFlags);

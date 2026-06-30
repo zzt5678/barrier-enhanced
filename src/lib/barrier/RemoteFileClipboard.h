@@ -12,6 +12,11 @@ class IClipboard;
 
 namespace RemoteFileClipboard {
 
+constexpr std::size_t kMaxClipboardPathCount = 1024;
+constexpr std::size_t kMaxClipboardPathBytes = 64 * 1024;
+constexpr std::size_t kMaxClipboardTotalPathBytes = 1024 * 1024;
+constexpr std::size_t kMaxNativeFileSelectionBytes = 4 * 1024 * 1024;
+
 enum class Mode {
     SourcePaths = 0,
     MaterializedPaths = 1
@@ -33,6 +38,12 @@ struct Data {
 std::string createSessionId();
 std::string serialize(const Data& data);
 bool parse(const std::string& payload, Data& data, std::string* error = nullptr);
+bool validatePathList(const std::vector<barrier::fs::path>& paths,
+                      std::string* error = nullptr);
+bool validatePathUtf8ForAppend(std::size_t currentPathCount,
+                               std::size_t currentTotalBytes,
+                               const std::string& pathUtf8,
+                               std::string* error = nullptr);
 bool readFromClipboard(const IClipboard& clipboard, Data& data, std::string* error = nullptr);
 bool normalizeClipboard(Clipboard& clipboard, Data* normalized = nullptr, std::string* error = nullptr);
 bool allPathsLookLikeImages(const Data& data);

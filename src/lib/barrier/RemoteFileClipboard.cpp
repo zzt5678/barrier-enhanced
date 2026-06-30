@@ -19,7 +19,6 @@
 namespace {
 
 constexpr std::array<char, 8> kRemoteClipboardMagic{{'W', 'F', 'C', 'L', 'I', 'P', '1', 0}};
-constexpr UInt32 kMaxRemoteClipboardPaths = 4096;
 
 void writeUInt32(std::string& output, UInt32 value)
 {
@@ -45,16 +44,53 @@ UInt32 readUInt32(const std::string& input, size_t& offset, bool& ok)
            static_cast<UInt32>(bytes[3]);
 }
 
-bool isSafePathList(const std::vector<barrier::fs::path>& paths)
+bool setPathValidationError(std::string* error, const char* message)
 {
-    if (paths.empty()) {
-        return false;
+    if (error != nullptr) {
+        *error = message;
+    }
+    return false;
+}
+
+bool validatePathUtf8ForAppendImpl(std::size_t currentPathCount,
+                                   std::size_t currentTotalBytes,
+                                   const std::string& pathUtf8,
+                                   std::string* error)
+{
+    if (currentPathCount >= RemoteFileClipboard::kMaxClipboardPathCount) {
+        return setPathValidationError(error, "remote file clipboard path count is too large");
+    }
+    if (pathUtf8.empty()) {
+        return setPathValidationError(error, "remote file clipboard path entry is invalid");
+    }
+    if (pathUtf8.size() > RemoteFileClipboard::kMaxClipboardPathBytes) {
+        return setPathValidationError(error, "remote file clipboard path entry is too large");
+    }
+    if (pathUtf8.size() > RemoteFileClipboard::kMaxClipboardTotalPathBytes ||
+        currentTotalBytes > RemoteFileClipboard::kMaxClipboardTotalPathBytes - pathUtf8.size()) {
+        return setPathValidationError(error, "remote file clipboard path list is too large");
     }
 
+    return true;
+}
+
+bool validatePathListImpl(const std::vector<barrier::fs::path>& paths,
+                          std::string* error)
+{
+    if (paths.empty()) {
+        return setPathValidationError(error, "remote file clipboard path list is empty");
+    }
+    if (paths.size() > RemoteFileClipboard::kMaxClipboardPathCount) {
+        return setPathValidationError(error, "remote file clipboard path count is too large");
+    }
+
+    std::size_t totalBytes = 0;
     for (size_t i = 0; i < paths.size(); ++i) {
-        if (paths[i].empty()) {
+        const std::string pathUtf8 = paths[i].u8string();
+        if (!validatePathUtf8ForAppendImpl(i, totalBytes, pathUtf8, error)) {
             return false;
         }
+        totalBytes += pathUtf8.size();
     }
 
     return true;
@@ -257,6 +293,20 @@ bool collectMaterializedRoots(const barrier::fs::path& destinationRoot,
                               std::vector<barrier::fs::path>& roots,
                               std::string& error);
 
+bool validatePathList(const std::vector<barrier::fs::path>& paths,
+                      std::string* error)
+{
+    return validatePathListImpl(paths, error);
+}
+
+bool validatePathUtf8ForAppend(std::size_t currentPathCount,
+                               std::size_t currentTotalBytes,
+                               const std::string& pathUtf8,
+                               std::string* error)
+{
+    return validatePathUtf8ForAppendImpl(currentPathCount, currentTotalBytes, pathUtf8, error);
+}
+
 std::string createSessionId()
 {
     return uniqueToken();
@@ -318,24 +368,32 @@ bool parse(const std::string& payload, Data& data, std::string* error)
     if (!ok) {
         return fail("remote file clipboard path count is invalid");
     }
-    if (pathCount > kMaxRemoteClipboardPaths ||
+    if (pathCount > kMaxClipboardPathCount ||
         pathCount > (payload.size() - offset) / sizeof(UInt32)) {
         return fail("remote file clipboard path count is too large");
     }
 
     data.paths.reserve(pathCount);
+    std::size_t totalPathBytes = 0;
     for (UInt32 i = 0; i < pathCount; ++i) {
         const UInt32 size = readUInt32(payload, offset, ok);
         if (!ok || offset + size > payload.size()) {
             return fail("remote file clipboard path entry is invalid");
         }
 
-        data.paths.push_back(barrier::fs::u8path(payload.substr(offset, size)));
+        const std::string pathUtf8(payload.data() + offset, payload.data() + offset + size);
+        std::string validationError;
+        if (!validatePathUtf8ForAppend(data.paths.size(), totalPathBytes, pathUtf8, &validationError)) {
+            return fail(validationError.c_str());
+        }
+
+        data.paths.push_back(barrier::fs::u8path(pathUtf8));
+        totalPathBytes += pathUtf8.size();
         offset += size;
     }
 
-    if (!isSafePathList(data.paths)) {
-        return fail("remote file clipboard path list is empty");
+    if (!validatePathList(data.paths, error)) {
+        return false;
     }
 
     return true;
@@ -518,7 +576,7 @@ bool buildMaterializedClipboard(const std::vector<barrier::fs::path>& paths,
     data.mode = Mode::MaterializedPaths;
     data.sessionId = sessionId;
     data.paths = paths;
-    if (!isSafePathList(data.paths)) {
+    if (!validatePathList(data.paths)) {
         return false;
     }
 
@@ -539,8 +597,7 @@ barrier::fs::path materializedSessionRoot(const barrier::fs::path& cacheRoot,
 
 bool createPackage(const Data& data, barrier::fs::path& packagePath, std::string& error)
 {
-    if (!isSafePathList(data.paths)) {
-        error = "remote file clipboard path list is empty";
+    if (!validatePathList(data.paths, &error)) {
         return false;
     }
 

@@ -421,7 +421,7 @@ TransferArchive::extractPackage(const std::string& packageData,
 
         std::uint64_t fileSize = 0;
         if (!readUInt64(packageData, offset, fileSize) ||
-            offset + static_cast<size_t>(fileSize) > packageData.size()) {
+            fileSize > static_cast<std::uint64_t>(packageData.size() - offset)) {
             error = "invalid transfer package file payload";
             return false;
         }

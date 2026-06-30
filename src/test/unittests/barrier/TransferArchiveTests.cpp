@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <thread>
 
@@ -224,6 +225,28 @@ TEST(TransferArchiveTests, extractPackageFile_rejectsDeclaredPayloadPastPackageE
     EXPECT_FALSE(TransferArchive::extractPackageFile(packagePath, root / "destination", error));
     EXPECT_EQ("invalid transfer package file payload", error);
     EXPECT_FALSE(barrier::fs::exists(root / "destination" / "alpha.txt"));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, extractPackage_rejectsDeclaredPayloadSizeThatWouldOverflowBoundsCheck)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-memory-overflow-payload-" + uniqueToken());
+    const barrier::fs::path destination = root / "destination";
+    barrier::fs::create_directories(destination);
+
+    std::string packageData("BDIRPKG1", 8);
+    packageData.push_back('F');
+    appendUInt32(packageData, 9);
+    packageData.append("alpha.txt", 9);
+    appendUInt64(packageData, std::numeric_limits<std::uint64_t>::max());
+    packageData.append("short", 5);
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(packageData, destination, error));
+    EXPECT_EQ("invalid transfer package file payload", error);
+    EXPECT_FALSE(barrier::fs::exists(destination / "alpha.txt"));
 
     barrier::fs::remove_all(root);
 }

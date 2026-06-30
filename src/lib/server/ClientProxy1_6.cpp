@@ -73,6 +73,9 @@ ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard* clipboard)
                 id, getName().c_str()));
             return;
         }
+        if (!m_clipboard[id].m_dirty) {
+            return;
+        }
 
         Clipboard::copy(&m_clipboard[id].m_clipboard, clipboard);
 

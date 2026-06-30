@@ -91,6 +91,7 @@ bool parseUriList(const std::string& data,
     std::istringstream lines(data);
     std::string line;
     bool firstLine = true;
+    std::size_t totalPathBytes = 0;
     while (std::getline(lines, line)) {
         line = trimLine(line);
         if (line.empty()) {
@@ -122,7 +123,14 @@ bool parseUriList(const std::string& data,
             continue;
         }
 
-        payload.paths.push_back(barrier::fs::u8path(percentDecode(path)));
+        const std::string decodedPath = percentDecode(path);
+        if (!RemoteFileClipboard::validatePathUtf8ForAppend(payload.paths.size(),
+                                                            totalPathBytes,
+                                                            decodedPath)) {
+            return false;
+        }
+        payload.paths.push_back(barrier::fs::u8path(decodedPath));
+        totalPathBytes += decodedPath.size();
     }
 
     return !payload.paths.empty();
@@ -192,6 +200,10 @@ XWindowsClipboardFileListConverter::fromIClipboard(const std::string& data) cons
 std::string
 XWindowsClipboardFileListConverter::toIClipboard(const std::string& data) const
 {
+    if (data.size() > RemoteFileClipboard::kMaxNativeFileSelectionBytes) {
+        return std::string();
+    }
+
     RemoteFileClipboard::Data payload;
     return parseUriList(data, m_gnomeCopiedFiles, payload)
         ? RemoteFileClipboard::serialize(payload)

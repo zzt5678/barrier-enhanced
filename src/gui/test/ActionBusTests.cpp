@@ -85,6 +85,19 @@ TEST(ActionBusTests, pruneManagedInbox_removesMarkedFoldersOverByteBudgetWithout
     EXPECT_TRUE(QFileInfo::exists(unmanagedFolder));
 }
 
+TEST(ActionBusTests, pathIsInside_handlesWindowsStyleSeparatorsBeforePrefixCheck)
+{
+    EXPECT_TRUE(ActionBus::testPathIsInside(
+        QStringLiteral("C:\\Users\\weave\\AppData\\Roaming\\Weave\\workflow\\inbox"),
+        QStringLiteral("C:/Users/weave/AppData/Roaming/Weave/workflow/inbox/item.txt")));
+    EXPECT_TRUE(ActionBus::testPathIsInside(
+        QStringLiteral("C:/Users/weave/AppData/Roaming/Weave/workflow/inbox"),
+        QStringLiteral("C:\\Users\\weave\\AppData\\Roaming\\Weave\\workflow\\inbox\\folder\\item.txt")));
+    EXPECT_FALSE(ActionBus::testPathIsInside(
+        QStringLiteral("C:\\Users\\weave\\AppData\\Roaming\\Weave\\workflow\\inbox"),
+        QStringLiteral("C:\\Users\\weave\\AppData\\Roaming\\Weave\\workflow\\inbox-other\\item.txt")));
+}
+
 #if defined(Q_OS_UNIX)
 TEST(ActionBusTests, copyRecursively_refusesSymbolicLinks)
 {

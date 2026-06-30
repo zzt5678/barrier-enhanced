@@ -56,6 +56,7 @@
 #include <QRegularExpression>
 #include <QBoxLayout>
 #include <QScrollArea>
+#include <QStyle>
 
 #if defined(Q_OS_MAC)
 #include <ApplicationServices/ApplicationServices.h>
@@ -119,6 +120,17 @@ void refreshDashboardScrollArea(QWidget* root)
     QWidget* dashboard = scrollArea->widget();
     dashboard->resize(dashboard->width(), dashboard->sizeHint().height());
 }
+
+void repolishWidget(QWidget* widget)
+{
+    if (widget == nullptr || widget->style() == nullptr) {
+        return;
+    }
+
+    widget->style()->unpolish(widget);
+    widget->style()->polish(widget);
+    widget->update();
+}
 }
 
 MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
@@ -164,56 +176,50 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     setupUi(this);
     setWindowIcon(QIcon(barrierLargeIcon));
 
-    gridLayout_dashboard->removeWidget(heroCard);
-    gridLayout_dashboard->removeWidget(overviewCard);
-    gridLayout_dashboard->removeWidget(m_pGroupServer);
-    gridLayout_dashboard->removeWidget(m_pGroupClient);
-    gridLayout_dashboard->removeWidget(m_pGroupExperience);
-    gridLayout_dashboard->removeWidget(workflowCard);
-    gridLayout_dashboard->removeWidget(footerCard);
-    int dashboardRow = 0;
-    gridLayout_dashboard->addWidget(overviewCard, dashboardRow++, 0, 1, 1);
-    gridLayout_dashboard->addWidget(footerCard, dashboardRow++, 0, 1, 1);
-    gridLayout_dashboard->addWidget(m_pGroupClient, dashboardRow++, 0, 1, 1);
-    gridLayout_dashboard->addWidget(m_pGroupServer, dashboardRow++, 0, 1, 1);
-    gridLayout_dashboard->addWidget(m_pGroupExperience, dashboardRow++, 0, 1, 1);
-    gridLayout_dashboard->addWidget(workflowCard, dashboardRow++, 0, 1, 1);
-    heroCard->hide();
+    m_pLabelHeroTitle->setText(tr("Weave"));
+    m_pLabelHeroSubtitle->setText(tr("Share one keyboard, mouse, clipboard, and files across your desk."));
+    m_pGroupClient->setTitle(tr("Join another computer"));
+    m_pGroupServer->setTitle(tr("Share this computer"));
+    m_pGroupExperience->setTitle(tr("Transfer and input"));
+    m_pLabelWorkflowSectionTitle->setText(tr("Recent activity"));
     gridLayout_dashboard->setColumnStretch(0, 1);
-    gridLayout_dashboard->setColumnStretch(1, 0);
-
-    gridLayout_overview->removeWidget(m_pLabelWorkflowRuntimeCaption);
-    gridLayout_overview->removeWidget(m_pLabelWorkflowRuntimeValue);
-    gridLayout_overview->addWidget(m_pLabelWorkflowRuntimeCaption, 2, 0, 1, 1);
-    gridLayout_overview->addWidget(m_pLabelWorkflowRuntimeValue, 3, 0, 1, 2);
-    gridLayout_overview->setHorizontalSpacing(10);
+    gridLayout_dashboard->setColumnStretch(1, 1);
+    gridLayout_dashboard->setRowStretch(3, 1);
+    gridLayout_overview->setHorizontalSpacing(18);
     gridLayout_overview->setColumnStretch(0, 1);
     gridLayout_overview->setColumnStretch(1, 1);
-    gridLayout_overview->setColumnStretch(2, 0);
+    gridLayout_overview->setColumnStretch(2, 1);
     m_pLabelPeerValue->setWordWrap(true);
     m_pLabelWorkflowRuntimeValue->setWordWrap(true);
+    m_pLineEditHostname->setPlaceholderText(tr("Server name or IP address"));
+    m_pLineEditConfigFile->setPlaceholderText(tr("Choose a .conf file"));
     m_pButtonWorkflowHub->setText(tr("Workflow Hub"));
-    m_pButtonShowLog->setText(tr("Live Log"));
-    horizontalLayout_overviewActions->setDirection(QBoxLayout::TopToBottom);
+    m_pButtonShowLog->setText(tr("Logs"));
+    m_pButtonWorkflowHub->setToolTip(tr("Open clipboard history, transfer receipts, and workflow actions."));
+    m_pButtonShowLog->setToolTip(tr("Open the live service log."));
     horizontalLayout_overviewActions->setSpacing(8);
+    m_pStatusLabel->setProperty("state", QStringLiteral("disconnected"));
+    m_pButtonToggleStart->setProperty("state", QStringLiteral("start"));
 
     QWidget* dashboard = takeCentralWidget();
     QScrollArea* scrollArea = new QScrollArea(this);
     scrollArea->setObjectName(QStringLiteral("m_pMainScrollArea"));
-    scrollArea->setWidgetResizable(false);
+    scrollArea->setWidgetResizable(true);
     scrollArea->setSizeAdjustPolicy(QAbstractScrollArea::AdjustIgnored);
-    scrollArea->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
+    scrollArea->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     scrollArea->setMinimumSize(QSize(0, 0));
     scrollArea->setFrameShape(QFrame::NoFrame);
-    scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    scrollArea->setAlignment(Qt::AlignHCenter | Qt::AlignTop);
+    scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     dashboard->setObjectName(QStringLiteral("dashboardContent"));
     dashboard->setMinimumSize(QSize(0, 0));
-    dashboard->setFixedWidth(560);
-    dashboard->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    dashboard->setMaximumWidth(1040);
+    dashboard->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     dashboard->adjustSize();
     scrollArea->setWidget(dashboard);
     setCentralWidget(scrollArea);
+    setMinimumSize(QSize(760, 620));
 
     // Apply modern dark theme from QSS resource file
     QFile styleFile(":/res/styles/dark.qss");
@@ -1087,11 +1093,14 @@ void MainWindow::setBarrierState(qBarrierState state)
     if (barrierState() == state)
         return;
 
+    QString visualState = QStringLiteral("disconnected");
+
     if (state == barrierConnected || state == barrierConnecting)
     {
         disconnect (m_pButtonToggleStart, SIGNAL(clicked()), m_pActionStartBarrier, SLOT(trigger()));
         connect (m_pButtonToggleStart, SIGNAL(clicked()), m_pActionStopBarrier, SLOT(trigger()));
         m_pButtonToggleStart->setText(tr("&Stop"));
+        m_pButtonToggleStart->setProperty("state", QStringLiteral("stop"));
         m_pButtonReload->setEnabled(true);
     }
     else if (state == barrierDisconnected)
@@ -1099,6 +1108,7 @@ void MainWindow::setBarrierState(qBarrierState state)
         disconnect (m_pButtonToggleStart, SIGNAL(clicked()), m_pActionStopBarrier, SLOT(trigger()));
         connect (m_pButtonToggleStart, SIGNAL(clicked()), m_pActionStartBarrier, SLOT(trigger()));
         m_pButtonToggleStart->setText(tr("&Start"));
+        m_pButtonToggleStart->setProperty("state", QStringLiteral("start"));
         m_pButtonReload->setEnabled(false);
     }
 
@@ -1111,6 +1121,7 @@ void MainWindow::setBarrierState(qBarrierState state)
     switch (state)
     {
     case barrierConnected: {
+        visualState = QStringLiteral("connected");
         if (m_AppConfig->getCryptoEnabled()) {
             m_pLabelPadlock->show();
         }
@@ -1123,16 +1134,23 @@ void MainWindow::setBarrierState(qBarrierState state)
         break;
     }
     case barrierConnecting:
+        visualState = QStringLiteral("connecting");
         m_pLabelPadlock->hide();
         setStatus(tr("Weave is starting."));
         break;
     case barrierDisconnected:
+        visualState = QStringLiteral("disconnected");
         m_pLabelPadlock->hide();
         setStatus(tr("Weave is not running."));
         break;
     case barrierTransfering:
+        visualState = QStringLiteral("transfering");
         break;
     }
+
+    m_pStatusLabel->setProperty("state", visualState);
+    repolishWidget(m_pStatusLabel);
+    repolishWidget(m_pButtonToggleStart);
 
     setIcon(state);
 

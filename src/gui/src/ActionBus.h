@@ -39,6 +39,7 @@ public:
     static bool testCopyRecursively(const QString& sourcePath,
                                     const QString& destinationPath,
                                     QString* errorMessage);
+    static bool testPathIsInside(const QString& rootPath, const QString& path);
 #endif
 
 signals:

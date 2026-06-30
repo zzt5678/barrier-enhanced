@@ -97,6 +97,26 @@ public:
     int cleanupCalls = 0;
 };
 
+class CleanupClearingClientProxy1_6 : public ClientProxy1_6 {
+public:
+    CleanupClearingClientProxy1_6(const std::string& name,
+                                  barrier::IStream* stream,
+                                  Server* server,
+                                  IEventQueue* events) :
+        ClientProxy1_6(name, stream, server, events)
+    {
+    }
+
+    bool cleanupClipboardSendThread(bool) override
+    {
+        ++cleanupCalls;
+        setClipboardDirty(kClipboardClipboard, false);
+        return true;
+    }
+
+    int cleanupCalls = 0;
+};
+
 }
 
 TEST(ClientProxyLifecycleTests, clientProxy16RemovesClipboardSendingHandlerOnDestruction)
@@ -200,6 +220,36 @@ TEST(ClientProxyLifecycleTests, clientProxy16CleanupFailureSkipsClipboardCopyAnd
 
     EXPECT_EQ(1, proxy.cleanupCalls);
     EXPECT_TRUE(proxy.testClipboardDirty(kClipboardClipboard));
+    EXPECT_EQ(0, clipboard.openCount);
+    EXPECT_EQ(0, clipboard.hasCount);
+    EXPECT_EQ(0, clipboard.getCount);
+    EXPECT_EQ(0, clipboard.closeCount);
+}
+
+TEST(ClientProxyLifecycleTests, clientProxy16CompletedAsyncSendDoesNotReplayClipboard)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents, fileEvents, nextType);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+
+    NiceMock<MockServer> server;
+    EXPECT_CALL(events, adoptHandler(_, _, _)).Times(AnyNumber());
+    EXPECT_CALL(events, removeHandler(_, _)).Times(AnyNumber());
+
+    CleanupClearingClientProxy1_6 proxy("client", stream, &server, &events);
+    CountingClipboard clipboard;
+
+    proxy.setClipboardDirty(kClipboardClipboard, true);
+    proxy.setClipboard(kClipboardClipboard, &clipboard);
+
+    EXPECT_EQ(1, proxy.cleanupCalls);
+    EXPECT_FALSE(proxy.testClipboardDirty(kClipboardClipboard));
     EXPECT_EQ(0, clipboard.openCount);
     EXPECT_EQ(0, clipboard.hasCount);
     EXPECT_EQ(0, clipboard.getCount);

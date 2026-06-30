@@ -190,9 +190,18 @@ struct ManagedInboxItem {
 
 bool pathIsInside(const QString& rootPath, const QString& path)
 {
-    const QString root = QDir::cleanPath(rootPath);
-    const QString candidate = QDir::cleanPath(path);
-    return candidate == root || candidate.startsWith(root + QDir::separator());
+    auto normalize = [](const QString& value) {
+        QString normalized = QDir::cleanPath(value);
+        normalized.replace(QLatin1Char('\\'), QLatin1Char('/'));
+#if defined(Q_OS_WIN)
+        normalized = normalized.toCaseFolded();
+#endif
+        return normalized;
+    };
+
+    const QString root = normalize(rootPath);
+    const QString candidate = normalize(path);
+    return candidate == root || candidate.startsWith(root + QLatin1Char('/'));
 }
 
 QString explorerArgumentForPath(const QString& path)
@@ -216,6 +225,11 @@ bool ActionBus::testCopyRecursively(const QString& sourcePath,
                                     QString* errorMessage)
 {
     return copyRecursively(sourcePath, destinationPath, errorMessage);
+}
+
+bool ActionBus::testPathIsInside(const QString& rootPath, const QString& path)
+{
+    return pathIsInside(rootPath, path);
 }
 #endif
 

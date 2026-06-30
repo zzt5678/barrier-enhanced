@@ -275,3 +275,37 @@ TEST(IpcClientTests, SendCommandWritesElevateModeByte)
         EXPECT_EQ(static_cast<unsigned char>(frame[8 + commandLength]), testCase.expected);
     }
 }
+
+TEST(IpcClientTests, QueuesOneCommandUntilSocketConnectsAfterHello)
+{
+    ensureCoreApplication();
+
+    QTcpServer server;
+    ASSERT_TRUE(server.listen(QHostAddress::LocalHost));
+
+    QTcpSocket* rawClient = new QTcpSocket();
+    IpcClient commandClient(rawClient);
+
+    commandClient.sendCommand("first-command", ElevateAlways);
+    commandClient.sendCommand("second-command", ElevateNever);
+
+    rawClient->connectToHost(QHostAddress::LocalHost, server.serverPort());
+    ASSERT_TRUE(rawClient->waitForConnected(1000));
+    ASSERT_TRUE(server.waitForNewConnection(1000));
+
+    std::unique_ptr<QTcpSocket> serverSocket(server.nextPendingConnection());
+    ASSERT_NE(serverSocket, nullptr);
+    EXPECT_TRUE(commandClient.waitForBytesWrittenForTest(1000));
+
+    const QByteArray expectedCommand("second-command");
+    const int expectedBytes = 9 + 8 + expectedCommand.size() + 1;
+    ASSERT_TRUE(waitForAvailableBytes(*serverSocket, expectedBytes));
+
+    const QByteArray bytes = serverSocket->read(expectedBytes);
+    EXPECT_EQ(QByteArray(bytes.constData(), 4), QByteArray(kIpcMsgHello, 4));
+    EXPECT_EQ(static_cast<unsigned char>(bytes[4]), static_cast<unsigned char>(kIpcClientGui));
+    EXPECT_EQ(QByteArray(bytes.constData() + 9, 4), QByteArray(kIpcMsgCommand, 4));
+    EXPECT_EQ(readBigEndianInt(bytes, 13), expectedCommand.size());
+    EXPECT_EQ(QByteArray(bytes.constData() + 17, expectedCommand.size()), expectedCommand);
+    EXPECT_EQ(static_cast<unsigned char>(bytes[17 + expectedCommand.size()]), 2);
+}

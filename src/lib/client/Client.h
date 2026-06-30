@@ -275,6 +275,12 @@ public:
     void                testCleanupConnection() { cleanupConnection(); }
     void                testCleanupScreen() { cleanupScreen(); }
     void                testSetStreamOnly(barrier::IStream* stream) { m_stream = stream; }
+    void                testSetupConnecting(barrier::IStream* stream)
+    {
+        m_stream = stream;
+        setupConnecting();
+    }
+    void                testCleanupConnecting() { cleanupConnecting(); }
     void                testSetServerProxy(ServerProxy* server) { m_server = server; }
     void                testHandleClipboardGrabbed(ClipboardID id, UInt32 sequenceNumber = 1)
     {

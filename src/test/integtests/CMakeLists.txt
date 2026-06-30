@@ -80,4 +80,8 @@ add_executable(integtests ${sources})
 target_link_libraries(integtests
     arch base client common io ipc mt net platform server synlib ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES} ${libs} ${OPENSSL_LIBS})
 
-add_test(NAME integtests COMMAND $<TARGET_FILE:integtests>)
+option(BARRIER_RUN_INTEGRATION_TESTS "Register display/network integration tests with CTest" OFF)
+if (BARRIER_RUN_INTEGRATION_TESTS)
+    add_test(NAME integtests COMMAND $<TARGET_FILE:integtests>)
+    set_tests_properties(integtests PROPERTIES LABELS "integration")
+endif()
