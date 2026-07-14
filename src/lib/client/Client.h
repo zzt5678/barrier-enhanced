@@ -21,6 +21,7 @@
 #include "barrier/IClient.h"
 
 #include "barrier/Clipboard.h"
+#include "barrier/ClipboardRevision.h"
 #include "barrier/DragInformation.h"
 #include "barrier/FileReceiveSession.h"
 #include "base/Event.h"
@@ -58,6 +59,7 @@ public:
 
 		std::string m_sessionId;
 		std::vector<std::string> m_paths;
+		barrier::ClipboardRevision m_revision;
 		bool m_publishClipboard;
 	};
 
@@ -140,6 +142,7 @@ public:
     bool                isReceivedFileSizeValid();
 
     FileReceiveSession& getFileReceiveSession() { return m_fileReceiveSession; }
+    void                bindFileReceiveClipboardRevision();
 
     //! Return drag file list
     DragFileList        getDragFileList() { return m_dragFileList; }
@@ -178,11 +181,12 @@ public:
 private:
     struct CompletedFileTransfer {
         std::size_t expectedSize;
-		std::string data;
-		barrier::fs::path spoolPath;
-		std::string dropTarget;
-		DragFileList dragFileList;
-		std::string remoteFileClipboardSession;
+        std::string data;
+        barrier::fs::path spoolPath;
+        std::string dropTarget;
+        DragFileList dragFileList;
+        std::string remoteFileClipboardSession;
+        barrier::ClipboardRevision clipboardRevision;
 
         CompletedFileTransfer() : expectedSize(0) { }
     };
@@ -249,6 +253,7 @@ private:
     void                onFileRecieveCompleted(std::uint64_t generation);
     void                scheduleFileReceiveCompletionPoll(std::uint64_t generation);
     void                cleanupFileReceiveCompletionPoll();
+    void                supersedeFileClipboard(const char* reason);
     void                publishMaterializedFileClipboard(const std::vector<std::string>& paths,
                                                          const std::string& sessionId);
     void                sendClipboardThread(void*);
@@ -343,11 +348,18 @@ public:
                                                      const std::string& readySession,
                                                      const std::vector<std::string>& readyPaths)
     {
+        m_clipboardRevision.advance();
         m_remoteFileClipboardSession = remoteSession;
+        m_remoteFileClipboardRevision = m_clipboardRevision;
         m_readyFileClipboardSession = readySession;
         m_readyFileClipboardPaths = readyPaths;
+        m_readyFileClipboardRevision = m_clipboardRevision;
     }
     const std::string&  testRemoteFileClipboardSession() const { return m_remoteFileClipboardSession; }
+    std::uint64_t       testClipboardRevisionSequence() const
+    {
+        return m_clipboardRevision.sequence();
+    }
     const std::string&  testReadyFileClipboardSession() const { return m_readyFileClipboardSession; }
     const std::vector<std::string>& testReadyFileClipboardPaths() const { return m_readyFileClipboardPaths; }
     void                testHandleFileClipboardReady(const std::string& sessionId,
@@ -357,6 +369,8 @@ public:
         FileClipboardReadyInfo info;
         info.m_sessionId = sessionId;
         info.m_paths = paths;
+        info.m_revision = publishClipboard ? m_clipboardRevision :
+            m_remoteFileClipboardRevision;
         info.m_publishClipboard = publishClipboard;
         Event event(Event::kUnknown, getEventTarget(), &info, Event::kDontFreeData);
         handleFileClipboardReady(event, NULL);
@@ -368,6 +382,8 @@ public:
         transfer->expectedSize = data.size();
         transfer->data = data;
         transfer->remoteFileClipboardSession = sessionId;
+        m_clipboardRevision.advance();
+        transfer->clipboardRevision = m_clipboardRevision;
         write_to_drop_dir_thread(transfer);
     }
 #endif
@@ -412,7 +428,13 @@ private:
     bool                m_useSecureNetwork;
     ClientArgs            m_args;
     bool                m_enableClipboard;
+    barrier::ClipboardRevision m_clipboardRevision;
     std::string         m_remoteFileClipboardSession;
+    barrier::ClipboardRevision m_remoteFileClipboardRevision;
     std::string         m_readyFileClipboardSession;
     std::vector<std::string> m_readyFileClipboardPaths;
+    barrier::ClipboardRevision m_readyFileClipboardRevision;
+    std::uint64_t       m_fileReceiveClipboardGeneration;
+    std::string         m_fileReceiveRemoteFileClipboardSession;
+    barrier::ClipboardRevision m_fileReceiveClipboardRevision;
 };

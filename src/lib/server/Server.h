@@ -21,6 +21,7 @@
 #include "server/Config.h"
 #include "barrier/clipboard_types.h"
 #include "barrier/Clipboard.h"
+#include "barrier/ClipboardRevision.h"
 #include "barrier/key_types.h"
 #include "barrier/mouse_types.h"
 #include "barrier/INode.h"
@@ -64,6 +65,7 @@ public:
 
 		std::string m_sessionId;
 		std::vector<std::string> m_paths;
+		barrier::ClipboardRevision m_revision;
 		bool m_publishClipboard;
 	};
 
@@ -189,6 +191,11 @@ public:
         m_sendFileCleanupPending(false),
         m_sendFileIsClipboardPrefetch(false),
         m_writeToDropDirThread(NULL),
+        m_clipboardRevision(),
+        m_remoteFileClipboardRevision(),
+        m_readyFileClipboardRevision(),
+        m_fileReceiveClipboardGeneration(0),
+        m_fileReceiveClipboardRevision(),
         m_ignoreFileTransfer(false),
         m_enableClipboard(false),
         m_localShortcutMode(false),
@@ -268,6 +275,7 @@ public:
     bool                isReceivedFileSizeValid();
 
     FileReceiveSession& getFileReceiveSession() { return m_fileReceiveSession; }
+    void                bindFileReceiveClipboardRevision();
 
     //! Return fake drag file list
     DragFileList        getFakeDragFileList() { return m_fakeDragFileList; }
@@ -281,11 +289,12 @@ private:
 #endif
     struct CompletedFileTransfer {
         size_t expectedSize;
-		std::string data;
-		barrier::fs::path spoolPath;
-		std::string dropTarget;
-		DragFileList dragFileList;
-		std::string remoteFileClipboardSession;
+        std::string data;
+        barrier::fs::path spoolPath;
+        std::string dropTarget;
+        DragFileList dragFileList;
+        std::string remoteFileClipboardSession;
+        barrier::ClipboardRevision clipboardRevision;
 
         CompletedFileTransfer() : expectedSize(0) { }
     };
@@ -474,6 +483,7 @@ private:
     void                onFileRecieveCompleted(std::uint64_t generation);
     void                scheduleFileReceiveCompletionPoll(std::uint64_t generation);
     void                cleanupFileReceiveCompletionPoll();
+    void                supersedeFileClipboard(const char* reason);
     void                publishMaterializedFileClipboard(const std::vector<std::string>& paths,
                                                          const std::string& sessionId);
     void                sendClipboardSelectionToClient(BaseClientProxy* target,
@@ -548,6 +558,8 @@ public:
 		transfer->expectedSize = data.size();
 		transfer->data = data;
 		transfer->remoteFileClipboardSession = sessionId;
+		m_clipboardRevision.advance();
+		transfer->clipboardRevision = m_clipboardRevision;
 		write_to_drop_dir_thread(transfer);
 	}
 	void testQueueDropDirTransfer(const std::string& data)
@@ -701,9 +713,15 @@ private:
     ClientSet              m_deferredDeleteClients;
     Thread*                m_writeToDropDirThread;
 	std::deque<std::shared_ptr<CompletedFileTransfer> > m_pendingDropDirTransfers;
+	barrier::ClipboardRevision m_clipboardRevision;
     std::string         m_remoteFileClipboardSession;
+	barrier::ClipboardRevision m_remoteFileClipboardRevision;
     std::string         m_readyFileClipboardSession;
     std::vector<std::string> m_readyFileClipboardPaths;
+	barrier::ClipboardRevision m_readyFileClipboardRevision;
+	std::uint64_t       m_fileReceiveClipboardGeneration;
+	std::string         m_fileReceiveRemoteFileClipboardSession;
+	barrier::ClipboardRevision m_fileReceiveClipboardRevision;
     std::string m_dragFileExt;
     bool                m_ignoreFileTransfer;
     bool                m_enableClipboard;

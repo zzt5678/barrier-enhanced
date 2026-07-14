@@ -94,6 +94,7 @@ ClientProxy1_5::fileChunkReceived()
         m_events->addEvent(completed);
     }
     else if (result == kStart) {
+        server->bindFileReceiveClipboardRevision();
         if (server->getFakeDragFileList().size() > 0) {
             std::string filename = server->getFakeDragFileList().at(0).getFilename();
             LOG((CLOG_DEBUG "start receiving %s", filename.c_str()));

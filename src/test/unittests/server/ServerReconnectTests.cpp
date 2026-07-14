@@ -916,7 +916,11 @@ TEST(ServerReconnectTests, completedTransferSnapshotOwnsSpoolBeforeNextReceive)
     Server server;
     initializeServer(server, config, primary, events, active);
 
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = "session-1";
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
     ASSERT_TRUE(server.m_fileReceiveSession.begin(7, 0, 0));
+    server.bindFileReceiveClipboardRevision();
     ASSERT_TRUE(server.m_fileReceiveSession.append("payload"));
     ASSERT_TRUE(server.m_fileReceiveSession.finish());
     for (int i = 0; i < 500 && !server.m_fileReceiveSession.isComplete(); ++i) {
@@ -930,7 +934,6 @@ TEST(ServerReconnectTests, completedTransferSnapshotOwnsSpoolBeforeNextReceive)
     entry.setFilename(filename);
 
     server.m_fakeDragFileList.push_back(entry);
-    server.m_remoteFileClipboardSession = "session-1";
 
     auto transfer = server.testTakeCompletedFileTransfer();
 
@@ -949,6 +952,66 @@ TEST(ServerReconnectTests, completedTransferSnapshotOwnsSpoolBeforeNextReceive)
 
     FileChunk::releaseReceiveBuffer(transfer->data, transfer->expectedSize, &transfer->spoolPath);
     EXPECT_FALSE(barrier::fs::exists(spoolPath));
+}
+
+TEST(ServerReconnectTests, completedTransferKeepsClipboardRevisionBoundAtStart)
+{
+    Config config;
+    config.addScreen("primary");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient active("primary");
+    Server server;
+    initializeServer(server, config, primary, events, active);
+
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = "session-a";
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+    const barrier::ClipboardRevision revisionA = server.m_clipboardRevision;
+
+    ASSERT_TRUE(server.m_fileReceiveSession.begin(7, 1024, 1024));
+    server.bindFileReceiveClipboardRevision();
+    ASSERT_TRUE(server.m_fileReceiveSession.append("payload"));
+    ASSERT_TRUE(server.m_fileReceiveSession.finish());
+
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = "session-b";
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+
+    std::shared_ptr<Server::CompletedFileTransfer> transfer =
+        server.testTakeCompletedFileTransfer();
+
+    ASSERT_TRUE(transfer);
+    EXPECT_EQ("session-a", transfer->remoteFileClipboardSession);
+    EXPECT_EQ(revisionA, transfer->clipboardRevision);
+    EXPECT_NE(server.m_clipboardRevision, transfer->clipboardRevision);
+    EXPECT_EQ("session-b", server.m_remoteFileClipboardSession);
+}
+
+TEST(ServerReconnectTests, firstFileTransferGetsValidClipboardRevision)
+{
+    Server server;
+
+    ASSERT_FALSE(server.m_clipboardRevision.valid());
+    ASSERT_TRUE(server.m_fileReceiveSession.begin(7, 1024, 1024));
+    server.bindFileReceiveClipboardRevision();
+    ASSERT_TRUE(server.m_fileReceiveSession.append("payload"));
+    ASSERT_TRUE(server.m_fileReceiveSession.finish());
+
+    std::shared_ptr<Server::CompletedFileTransfer> transfer =
+        server.testTakeCompletedFileTransfer();
+
+    ASSERT_TRUE(transfer);
+    EXPECT_TRUE(transfer->clipboardRevision.valid());
+    EXPECT_EQ(server.m_clipboardRevision, transfer->clipboardRevision);
 }
 
 TEST(ServerReconnectTests, fileReceiveCompleteDoesNotBlockOnBusyDropDirWriter)
@@ -2872,4 +2935,86 @@ TEST(ServerReconnectTests, staleFileClipboardReadyDoesNotReplacePendingSession)
     ASSERT_EQ(1u, server.m_readyFileClipboardPaths.size());
     EXPECT_EQ("/tmp/current-ready.txt", server.m_readyFileClipboardPaths[0]);
     EXPECT_EQ(0u, publishedEvents);
+}
+
+TEST(ServerReconnectTests, primaryClipboardGrabSupersedesPendingRemoteFileClipboard)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = "remote-file-a";
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+
+    IScreen::ClipboardInfo grabbed;
+    grabbed.m_id = kClipboardClipboard;
+    grabbed.m_sequenceNumber = 11;
+    server.handleClipboardGrabbed(
+        Event(Event::kUnknown, NULL, &grabbed, Event::kDontFreeData),
+        &primary);
+
+    Server::FileClipboardReadyInfo ready;
+    ready.m_sessionId = "remote-file-a";
+    ready.m_paths.push_back("/tmp/materialized-a.txt");
+    Event readyEvent(Event::kUnknown, &server, &ready, Event::kDontFreeData);
+    server.handleFileClipboardReadyEvent(readyEvent, NULL);
+
+    EXPECT_TRUE(server.m_remoteFileClipboardSession.empty());
+    EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
+    EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
+    EXPECT_EQ(0u, primary.setClipboardCount);
+}
+
+TEST(ServerReconnectTests, newerClipboardRevisionRejectsOlderFileCompletion)
+{
+    Config config;
+    config.addScreen("primary");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient active("primary");
+    Server server;
+    initializeServer(server, config, primary, events, active);
+
+    server.m_clipboardRevision.advance();
+    const barrier::ClipboardRevision fileRevision = server.m_clipboardRevision;
+    server.m_remoteFileClipboardSession = "remote-file-a";
+    server.m_remoteFileClipboardRevision = fileRevision;
+
+    server.supersedeFileClipboard("newer text clipboard");
+
+    Server::FileClipboardReadyInfo ready;
+    ready.m_sessionId = "remote-file-a";
+    ready.m_paths.push_back("/tmp/materialized-a.txt");
+    ready.m_revision = fileRevision;
+    Event readyEvent(Event::kUnknown, &server, &ready, Event::kDontFreeData);
+    server.handleFileClipboardReadyEvent(readyEvent, NULL);
+
+    EXPECT_NE(fileRevision, server.m_clipboardRevision);
+    EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
+    EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
+    EXPECT_EQ(0u, primary.setClipboardCount);
 }

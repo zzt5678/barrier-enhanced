@@ -1194,6 +1194,7 @@ ServerProxy::fileChunkReceived()
         m_events->addEvent(completed);
     }
     else if (result == kStart) {
+        m_client->bindFileReceiveClipboardRevision();
         if (m_client->getDragFileList().size() > 0) {
             std::string filename = m_client->getDragFileList().at(0).getFilename();
             LOG((CLOG_DEBUG "start receiving %s", filename.c_str()));

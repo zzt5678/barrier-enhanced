@@ -294,9 +294,15 @@ Server::Server(
 	m_sendFileIsClipboardPrefetch(false),
 	m_writeToDropDirThread(NULL),
 	m_pendingDropDirTransfers(),
+	m_clipboardRevision(),
 	m_remoteFileClipboardSession(),
+	m_remoteFileClipboardRevision(),
 	m_readyFileClipboardSession(),
 	m_readyFileClipboardPaths(),
+	m_readyFileClipboardRevision(),
+	m_fileReceiveClipboardGeneration(0),
+	m_fileReceiveRemoteFileClipboardSession(),
+	m_fileReceiveClipboardRevision(),
 	m_ignoreFileTransfer(false),
 	m_enableClipboard(true),
 	m_localShortcutMode(false),
@@ -1004,6 +1010,7 @@ Server::fetchPendingPrimaryClipboards()
             RemoteFileClipboard::Data observedFileClipboard;
             const bool materializedFileEcho =
                 !m_readyFileClipboardSession.empty() &&
+                m_readyFileClipboardRevision == m_clipboardRevision &&
                 RemoteFileClipboard::normalizeClipboard(
                     observedClipboard, &observedFileClipboard) &&
                 observedFileClipboard.mode ==
@@ -1020,6 +1027,7 @@ Server::fetchPendingPrimaryClipboards()
                 clipboard.m_pendingPrimaryFetch = false;
                 m_readyFileClipboardSession.clear();
                 m_readyFileClipboardPaths.clear();
+                m_readyFileClipboardRevision.reset();
                 continue;
             }
 
@@ -2121,6 +2129,9 @@ Server::handleClipboardGrabbed(const Event& event, void* vclient)
 		LOG((CLOG_INFO "ignored screen \"%s\" grab of clipboard %d", getName(grabber).c_str(), info->m_id));
 		return;
 	}
+	if (info->m_id == kClipboardClipboard) {
+		supersedeFileClipboard("clipboard grab");
+	}
 
 	// mark screen as owning clipboard
 	LOG((CLOG_INFO "screen \"%s\" grabbed clipboard %d from \"%s\"", getName(grabber).c_str(), info->m_id, clipboard.m_clipboardOwner.c_str()));
@@ -2456,9 +2467,19 @@ Server::handleFileClipboardReadyEvent(const Event& event, void*)
 		return;
 	}
 
+	if (!info->m_revision.valid() || info->m_revision != m_clipboardRevision) {
+		LOG((CLOG_WARN
+			"ignoring superseded file clipboard ready event: session=%s revision=%llu current=%llu",
+			info->m_sessionId.c_str(),
+			static_cast<unsigned long long>(info->m_revision.sequence()),
+			static_cast<unsigned long long>(m_clipboardRevision.sequence())));
+		return;
+	}
+
 	if (!info->m_publishClipboard &&
 		(m_remoteFileClipboardSession.empty() ||
-		 m_remoteFileClipboardSession != info->m_sessionId)) {
+		 m_remoteFileClipboardSession != info->m_sessionId ||
+		 m_remoteFileClipboardRevision != info->m_revision)) {
 		LOG((CLOG_WARN "ignoring stale remote clipboard ready event: session=%s current=%s",
 			info->m_sessionId.c_str(), m_remoteFileClipboardSession.c_str()));
 		return;
@@ -2466,6 +2487,7 @@ Server::handleFileClipboardReadyEvent(const Event& event, void*)
 
 	m_readyFileClipboardSession = info->m_sessionId;
 	m_readyFileClipboardPaths = info->m_paths;
+	m_readyFileClipboardRevision = info->m_revision;
 	if (info->m_publishClipboard) {
 		publishMaterializedFileClipboard(m_readyFileClipboardPaths,
 			m_readyFileClipboardSession);
@@ -2511,7 +2533,6 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 	if (!readClipboardWithRetry(sender, id, clipboard.m_clipboard)) {
 		return false;
 	}
-
 	RemoteFileClipboard::AutomaticSharingStatus clipboardSharingStatus =
 		RemoteFileClipboard::AutomaticSharingStatus::Safe;
 	if (id == kClipboardClipboard) {
@@ -2520,12 +2541,6 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 		if (clipboardSharingStatus ==
 			RemoteFileClipboard::AutomaticSharingStatus::SafeAfterRemovingImageFileMetadata) {
 			LOG((CLOG_INFO "stripped image file-transfer metadata before forwarding clipboard"));
-		}
-		else if (clipboardSharingStatus ==
-			RemoteFileClipboard::AutomaticSharingStatus::Safe) {
-			m_remoteFileClipboardSession.clear();
-			m_readyFileClipboardSession.clear();
-			m_readyFileClipboardPaths.clear();
 		}
 	}
 
@@ -2537,6 +2552,9 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 			clipboard.m_pendingPrimaryFetch = false;
 		}
 		return true;
+	}
+	if (id == kClipboardClipboard) {
+		supersedeFileClipboard("clipboard data update");
 	}
 
 	// got new data
@@ -2558,8 +2576,10 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 		data = clipboard.m_clipboard.marshall();
 		m_readyFileClipboardSession.clear();
 		m_readyFileClipboardPaths.clear();
+		m_readyFileClipboardRevision.reset();
 		if (sender == m_primaryClient) {
 			m_remoteFileClipboardSession.clear();
+			m_remoteFileClipboardRevision.reset();
 			LOG((CLOG_INFO
 				"cached local file clipboard for transfer on the active remote screen: session=%s items=%lu",
 				sourceFileClipboard.sessionId.c_str(),
@@ -2567,6 +2587,7 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 		}
 		else {
 			m_remoteFileClipboardSession = sourceFileClipboard.sessionId;
+			m_remoteFileClipboardRevision = m_clipboardRevision;
 			LOG((CLOG_INFO
 				"awaiting remote file clipboard package: session=%s items=%lu source=%s",
 				m_remoteFileClipboardSession.c_str(),
@@ -2600,6 +2621,39 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 	// send the new clipboard to the active screen
 	m_active->setClipboard(id, &clipboard.m_clipboard);
 	return true;
+}
+
+void
+Server::supersedeFileClipboard(const char* reason)
+{
+	m_clipboardRevision.advance();
+	if (!m_remoteFileClipboardSession.empty()) {
+		LOG((CLOG_INFO
+			"superseding pending remote file clipboard: session=%s revision=%llu reason=%s",
+			m_remoteFileClipboardSession.c_str(),
+			static_cast<unsigned long long>(m_remoteFileClipboardRevision.sequence()),
+			reason));
+	}
+	m_remoteFileClipboardSession.clear();
+	m_remoteFileClipboardRevision.reset();
+	m_readyFileClipboardSession.clear();
+	m_readyFileClipboardPaths.clear();
+	m_readyFileClipboardRevision.reset();
+}
+
+void
+Server::bindFileReceiveClipboardRevision()
+{
+	if (!m_clipboardRevision.valid()) {
+		m_clipboardRevision.advance();
+	}
+	m_fileReceiveClipboardGeneration = m_fileReceiveSession.generation();
+	m_fileReceiveClipboardRevision = m_clipboardRevision;
+	m_fileReceiveRemoteFileClipboardSession.clear();
+	if (!m_remoteFileClipboardSession.empty() &&
+		m_remoteFileClipboardRevision == m_clipboardRevision) {
+		m_fileReceiveRemoteFileClipboardSession = m_remoteFileClipboardSession;
+	}
 }
 
 void
@@ -3477,6 +3531,7 @@ void Server::write_to_drop_dir_thread(std::shared_ptr<CompletedFileTransfer> tra
 				static_cast<unsigned long>(roots.size())));
 			FileClipboardReadyInfo* info = new FileClipboardReadyInfo();
 			info->m_sessionId = transfer->remoteFileClipboardSession;
+			info->m_revision = transfer->clipboardRevision;
 			for (size_t i = 0; i < roots.size(); ++i) {
 				info->m_paths.push_back(roots[i].u8string());
 			}
@@ -3501,6 +3556,7 @@ void Server::write_to_drop_dir_thread(std::shared_ptr<CompletedFileTransfer> tra
 		const std::string sessionId = RemoteFileClipboard::createSessionId();
 		FileClipboardReadyInfo* info = new FileClipboardReadyInfo();
 		info->m_sessionId = sessionId;
+		info->m_revision = transfer->clipboardRevision;
 		info->m_publishClipboard = true;
 		for (size_t i = 0; i < droppedPaths.size(); ++i) {
 			info->m_paths.push_back(droppedPaths[i]);
@@ -3544,7 +3600,11 @@ Server::publishMaterializedFileClipboard(const std::vector<std::string>& paths,
 	LOG((CLOG_INFO "remote clipboard published locally: session=%s items=%lu",
 		sessionId.c_str(),
 		static_cast<unsigned long>(paths.size())));
-	m_remoteFileClipboardSession.clear();
+	if (m_remoteFileClipboardSession == sessionId &&
+		m_remoteFileClipboardRevision == m_clipboardRevision) {
+		m_remoteFileClipboardSession.clear();
+		m_remoteFileClipboardRevision.reset();
+	}
 }
 
 void
@@ -4199,13 +4259,21 @@ std::shared_ptr<Server::CompletedFileTransfer>
 Server::takeCompletedFileTransfer()
 {
 	std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
+	const std::uint64_t receiveGeneration = m_fileReceiveSession.generation();
+	if (m_fileReceiveClipboardGeneration == receiveGeneration) {
+		transfer->remoteFileClipboardSession =
+			m_fileReceiveRemoteFileClipboardSession;
+		transfer->clipboardRevision = m_fileReceiveClipboardRevision;
+	}
 	m_fileReceiveSession.takeCompleted(
 		transfer->data, transfer->expectedSize, transfer->spoolPath);
 	if (m_screen != NULL) {
 		transfer->dropTarget = m_screen->getDropTarget();
 	}
 	transfer->dragFileList.swap(m_fakeDragFileList);
-	transfer->remoteFileClipboardSession = m_remoteFileClipboardSession;
+	m_fileReceiveClipboardGeneration = 0;
+	m_fileReceiveRemoteFileClipboardSession.clear();
+	m_fileReceiveClipboardRevision.reset();
 	return transfer;
 }
 

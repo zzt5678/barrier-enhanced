@@ -557,6 +557,41 @@ TEST(ClientDisconnectTests, setClipboardDoesNotPublishSourcePathsToSystemClipboa
     EXPECT_EQ("remote-source-session", client.testRemoteFileClipboardSession());
 }
 
+TEST(ClientDisconnectTests, repeatedSourcePathsMetadataKeepsClipboardRevision)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    setClientEventDefaults(events, clientEvents, screenEvents, fileEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    RemoteFileClipboard::Data payload;
+    payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+    payload.sessionId = "remote-source-session";
+    payload.paths.push_back(barrier::fs::u8path("/tmp/remote-source.txt"));
+
+    Clipboard clipboard;
+    ASSERT_TRUE(clipboard.open(0));
+    clipboard.empty();
+    clipboard.add(IClipboard::kFileList, RemoteFileClipboard::serialize(payload));
+    clipboard.close();
+
+    client.setClipboard(kClipboardClipboard, &clipboard);
+    const std::uint64_t firstRevision = client.testClipboardRevisionSequence();
+    client.setClipboard(kClipboardClipboard, &clipboard);
+
+    EXPECT_NE(0u, firstRevision);
+    EXPECT_EQ(firstRevision, client.testClipboardRevisionSequence());
+    EXPECT_EQ("remote-source-session", client.testRemoteFileClipboardSession());
+    EXPECT_EQ(0u, platform->setClipboardCount);
+}
+
 TEST(ClientDisconnectTests, setClipboardStillPublishesPlainText)
 {
     NiceMock<MockEventQueue> events;
@@ -1335,6 +1370,56 @@ TEST(ClientDisconnectTests, staleFileClipboardReadyDoesNotReplacePendingSession)
     EXPECT_EQ("ready-session", client.testReadyFileClipboardSession());
     ASSERT_EQ(1u, client.testReadyFileClipboardPaths().size());
     EXPECT_EQ("/tmp/current-ready.txt", client.testReadyFileClipboardPaths()[0]);
+}
+
+TEST(ClientDisconnectTests, localClipboardGrabSupersedesPendingRemoteFileClipboard)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+
+    RemoteFileClipboard::Data payload;
+    payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+    payload.sessionId = "remote-file-a";
+    payload.paths.push_back(barrier::fs::u8path("/tmp/remote-file-a.txt"));
+    Clipboard remoteClipboard;
+    ASSERT_TRUE(remoteClipboard.open(0));
+    remoteClipboard.empty();
+    remoteClipboard.add(IClipboard::kFileList,
+                        RemoteFileClipboard::serialize(payload));
+    remoteClipboard.close();
+    client.setClipboard(kClipboardClipboard, &remoteClipboard);
+
+    client.testHandleClipboardGrabbed(kClipboardClipboard);
+
+    std::vector<std::string> readyPaths(1, "/tmp/materialized-a.txt");
+    client.testHandleFileClipboardReady("remote-file-a", readyPaths, false);
+
+    EXPECT_TRUE(client.testRemoteFileClipboardSession().empty());
+    EXPECT_TRUE(client.testReadyFileClipboardSession().empty());
+    EXPECT_TRUE(client.testReadyFileClipboardPaths().empty());
+    EXPECT_EQ(0u, platform->setClipboardCount);
 }
 
 TEST(ClientDisconnectTests, localFileListClipboardStartsMetadataAndPackageTransfer)
