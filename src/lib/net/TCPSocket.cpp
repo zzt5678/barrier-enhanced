@@ -195,7 +195,10 @@ TCPSocket::write(const void* buffer, UInt32 n)
 void
 TCPSocket::writeLowPriority(const void* buffer, UInt32 n)
 {
-    writeToBuffer(m_lowPriorityOutputBuffer, buffer, n);
+    // Raw byte priority cannot preserve message boundaries across partial
+    // writes.  Use the primary FIFO so reliable data is never interleaved or
+    // silently discarded when the low-priority budget is exhausted.
+    writeToBuffer(m_outputBuffer, buffer, n);
 }
 
 void

@@ -124,6 +124,44 @@ TEST(StreamChunkerTests, sendFileThrottlesQueuedBulkEvents)
     barrier::fs::remove(path);
 }
 
+TEST(StreamChunkerTests, largeFileChunksDoNotExceedAtomicityFallbackSize)
+{
+    NiceMock<MockEventQueue> events;
+    FileEvents fileEvents;
+    fileEvents.setEvents(&events);
+    size_t largestDataChunk = 0;
+    Event::Type nextType = Event::kLast;
+
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    ON_CALL(events, registerTypeOnce(_, _))
+        .WillByDefault(Invoke([&nextType](Event::Type& type, const char*) {
+            if (type == Event::kUnknown) {
+                type = nextType++;
+            }
+            return type;
+        }));
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&fileEvents, &largestDataChunk](const Event& event) {
+            if (event.getType() == fileEvents.fileChunkSending() &&
+                event.getData() != nullptr) {
+                const auto* chunk = static_cast<const FileChunk*>(event.getData());
+                if (chunk->m_chunk[0] == kDataChunk) {
+                    largestDataChunk = std::max(largestDataChunk, chunk->m_dataSize);
+                }
+            }
+            Event::deleteData(event);
+        }));
+
+    const barrier::fs::path path = writeSparseTempFile(40 * 1024 * 1024);
+    StreamChunker chunker;
+    chunker.sendFile(path.u8string().c_str(), &events, &events);
+
+    EXPECT_GT(largestDataChunk, 0u);
+    EXPECT_LE(largestDataChunk, 64u * 1024u);
+
+    barrier::fs::remove(path);
+}
+
 TEST(StreamChunkerTests, sendFileQueuesFinalKeepAliveAfterCompletion)
 {
     NiceMock<MockEventQueue> events;

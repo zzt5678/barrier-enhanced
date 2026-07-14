@@ -135,22 +135,10 @@ PacketStreamFilter::write(const void* buffer, UInt32 count)
 void
 PacketStreamFilter::writeLowPriority(const void* buffer, UInt32 count)
 {
-    if (rejectOversizedOutputPacket(m_events, getEventTarget(), count)) {
-        return;
-    }
-
-    UInt8 length[4];
-    length[0] = (UInt8)((count >> 24) & 0xff);
-    length[1] = (UInt8)((count >> 16) & 0xff);
-    length[2] = (UInt8)((count >>  8) & 0xff);
-    length[3] = (UInt8)( count        & 0xff);
-
-    std::vector<UInt8> packet(static_cast<size_t>(count) + sizeof(length));
-    std::memcpy(packet.data(), length, sizeof(length));
-    if (count > 0) {
-        std::memcpy(packet.data() + sizeof(length), buffer, count);
-    }
-    getStream()->writeLowPriority(packet.data(), count + sizeof(length));
+    // The transport only sees bytes, not packet boundaries.  A separate
+    // priority buffer can therefore splice control bytes into a partially
+    // written packet.  Keep one FIFO until scheduling is frame-aware.
+    write(buffer, count);
 }
 
 void

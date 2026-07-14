@@ -150,34 +150,34 @@ TEST(TCPSocketTests, serviceConnectedRetriesWriteTimeoutWithoutDisconnecting)
     EXPECT_TRUE(socket.connected());
 }
 
-TEST(TCPSocketTests, lowPriorityWriteOverOutputBudgetDropsPayloadWithoutDisconnecting)
+TEST(TCPSocketTests, lowPriorityWriteOverOutputBudgetDisconnectsInsteadOfDropping)
 {
     TestEventQueue events;
     SocketMultiplexer multiplexer;
     TimeoutTCPSocket socket(&events, &multiplexer, TimeoutTCPSocket::kTimeoutOnWrite);
-    const std::string payload(8 * 1024 * 1024 + 1, 'x');
+    const std::string payload(16 * 1024 * 1024 + 1, 'x');
 
     socket.writeLowPriority(payload.data(), payload.size());
 
     EXPECT_EQ(0u, socket.getBufferedOutputSize());
-    EXPECT_TRUE(socket.connected());
+    EXPECT_FALSE(socket.connected());
 }
 
-TEST(TCPSocketTests, lowPriorityWriteOverOutputBudgetPreservesExistingBuffer)
+TEST(TCPSocketTests, lowPriorityWritesSharePrimaryFifoBudget)
 {
     TestEventQueue events;
     SocketMultiplexer multiplexer;
     TimeoutTCPSocket socket(&events, &multiplexer, TimeoutTCPSocket::kTimeoutOnWrite);
-    const std::string acceptedPayload(8 * 1024 * 1024, 'x');
-    const std::string rejectedPayload(1, 'y');
+    const std::string acceptedPayload(16 * 1024 * 1024, 'x');
+    const std::string overflowPayload(1, 'y');
 
     socket.writeLowPriority(acceptedPayload.data(), acceptedPayload.size());
-    ASSERT_EQ(8u * 1024u * 1024u, socket.getBufferedOutputSize());
+    ASSERT_EQ(16u * 1024u * 1024u, socket.getBufferedOutputSize());
 
-    socket.writeLowPriority(rejectedPayload.data(), rejectedPayload.size());
+    socket.writeLowPriority(overflowPayload.data(), overflowPayload.size());
 
-    EXPECT_EQ(8u * 1024u * 1024u, socket.getBufferedOutputSize());
-    EXPECT_TRUE(socket.connected());
+    EXPECT_EQ(0u, socket.getBufferedOutputSize());
+    EXPECT_FALSE(socket.connected());
 }
 
 TEST(TCPSocketTests, highPriorityWriteOverOutputBudgetStillDisconnects)
@@ -193,7 +193,7 @@ TEST(TCPSocketTests, highPriorityWriteOverOutputBudgetStillDisconnects)
     EXPECT_FALSE(socket.connected());
 }
 
-TEST(TCPSocketTests, lowPriorityOutputWriteSizeIsCappedToWindow)
+TEST(TCPSocketTests, lowPriorityOutputUsesPrimaryFifo)
 {
     TestEventQueue events;
     SocketMultiplexer multiplexer;
@@ -202,7 +202,8 @@ TEST(TCPSocketTests, lowPriorityOutputWriteSizeIsCappedToWindow)
 
     socket.writeLowPriority(payload.data(), payload.size());
 
-    EXPECT_EQ(128u * 1024u, socket.lowPriorityWriteSize());
+    EXPECT_EQ(512u * 1024u, socket.highPriorityWriteSize());
+    EXPECT_EQ(0u, socket.lowPriorityWriteSize());
     EXPECT_TRUE(socket.connected());
 }
 

@@ -86,12 +86,6 @@ private:
 
 size_t getChunkSize(size_t totalSize)
 {
-    if (totalSize >= 256 * 1024 * 1024) {
-        return 256 * 1024;
-    }
-    if (totalSize >= 32 * 1024 * 1024) {
-        return 128 * 1024;
-    }
     if (totalSize >= 4 * 1024 * 1024) {
         return 64 * 1024;
     }

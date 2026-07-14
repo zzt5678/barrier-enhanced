@@ -67,8 +67,9 @@ public:
 
     //! Write to stream with low priority
     /*!
-    Writes bulk data that may be deferred behind latency-sensitive
-    keyboard, mouse, and control traffic.
+    Writes bulk data with a scheduling hint.  Implementations must preserve
+    global write order: bytes from a later write must never be inserted into
+    a partially written earlier message.
     */
     virtual void        writeLowPriority(const void* buffer, UInt32 n) = 0;
 
