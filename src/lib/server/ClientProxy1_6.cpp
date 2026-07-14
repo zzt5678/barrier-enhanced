@@ -129,17 +129,13 @@ ClientProxy1_6::cleanupClipboardSendThread(bool cancel)
     }
 
     if (m_clipboardSendThread != NULL) {
-        if (cancel && !m_clipboardSendThread->wait(0.5)) {
-            LOG((CLOG_WARN "clipboard send thread did not stop after interrupt; cancelling"));
-            m_clipboardSendThread->cancel();
-            m_clipboardSendThread->unblockPollSocket();
-            if (!m_clipboardSendThread->wait(2.0)) {
-                LOG((CLOG_ERR "clipboard send thread still running after cancellation; cleanup deferred"));
-                return false;
+        if (!m_clipboardSendThread->wait(0.0)) {
+            if (cancel) {
+                LOG((CLOG_DEBUG "requesting asynchronous clipboard sender cancellation for \"%s\"",
+                    getName().c_str()));
+                m_clipboardSendThread->cancel();
+                m_clipboardSendThread->unblockPollSocket();
             }
-        }
-        else if (!cancel && !m_clipboardSendThread->wait(2.0)) {
-            LOG((CLOG_ERR "clipboard send thread still running; cleanup deferred"));
             return false;
         }
         if (m_clipboardSendResultAvailable && m_clipboardSendId < kClipboardEnd) {

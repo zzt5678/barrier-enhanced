@@ -289,6 +289,10 @@ public:
         info.m_sequenceNumber = sequenceNumber;
         handleClipboardGrabbed(Event(Event::kUnknown, NULL, &info, Event::kDontFreeData), NULL);
     }
+    void                testHandleClipboardRetry()
+    {
+        handleClipboardRetry(Event(), NULL);
+    }
     void                testReleaseDetachedServerProxies() { releaseDetachedServerProxies(); }
     std::size_t         testDetachedServerProxyCount() const { return m_detachedServerProxies.size(); }
     std::size_t         testDetachedSendFileStreamCount() const { return m_detachedSendFileStreams.size(); }

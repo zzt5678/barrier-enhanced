@@ -159,6 +159,8 @@ public:
         m_switchWaitTimer(NULL),
         m_primaryKeyStateTimer(NULL),
         m_mouseMoveTimer(NULL),
+        m_clipboardSyncTimer(NULL),
+        m_clipboardFetchPending(false),
         m_pendingMouseMoveTarget(NULL),
         m_pendingMouseMove(false),
         m_mouseMoveSent(false),
@@ -183,6 +185,7 @@ public:
         m_sendFileTarget(NULL),
         m_sendFileTransferId(0),
         m_sendFileCompletionPending(false),
+        m_sendFileCleanupPending(false),
         m_sendFileIsClipboardPrefetch(false),
         m_writeToDropDirThread(NULL),
         m_ignoreFileTransfer(false),
@@ -200,6 +203,7 @@ public:
         m_sendFileTarget = target;
         m_sendFileTransferId = transferId;
         m_sendFileCompletionPending = false;
+        m_sendFileCleanupPending = false;
     }
     static void addDefaultConnectionOptionsForTest(OptionsList& optionsList)
     {
@@ -427,6 +431,7 @@ private:
     void                handleSwitchWaitTimeout(const Event&, void*);
     void                handlePrimaryKeyStateSync(const Event&, void*);
     void                handleMouseMoveFlush(const Event&, void*);
+    void                handleClipboardSync(const Event&, void*);
     void                handleClientDisconnected(const Event&, void*);
     void                handleClientCloseTimeout(const Event&, void*);
     void                handleSwitchToScreenEvent(const Event&, void*);
@@ -449,6 +454,7 @@ private:
     void                reanchorActiveAfterFailedSwitch(BaseClientProxy* dst);
     void                fetchPendingPrimaryClipboards();
     void                replayClipboardsToActive();
+    void                scheduleClipboardSync(bool fetchPrimary);
     bool                onClipboardChanged(BaseClientProxy* sender,
                             ClipboardID id, UInt32 seqNum);
     void                onScreensaver(bool activated);
@@ -636,6 +642,8 @@ private:
     EventQueueTimer*    m_switchWaitTimer;
     EventQueueTimer*    m_primaryKeyStateTimer;
     EventQueueTimer*    m_mouseMoveTimer;
+    EventQueueTimer*    m_clipboardSyncTimer;
+    bool                m_clipboardFetchPending;
     BaseClientProxy*    m_pendingMouseMoveTarget;
     bool                m_pendingMouseMove;
     bool                m_mouseMoveSent;
@@ -683,6 +691,7 @@ private:
     BaseClientProxy*       m_sendFileTarget;
     UInt32                 m_sendFileTransferId;
     bool                   m_sendFileCompletionPending;
+    bool                   m_sendFileCleanupPending;
     bool                   m_sendFileIsClipboardPrefetch;
     ClientSet              m_deferredDeleteClients;
     Thread*                m_writeToDropDirThread;

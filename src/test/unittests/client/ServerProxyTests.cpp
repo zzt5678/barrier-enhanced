@@ -10,6 +10,9 @@
 #include "barrier/option_types.h"
 #include "barrier/protocol_types.h"
 #include "barrier/Screen.h"
+#include "arch/Arch.h"
+#include "base/Stopwatch.h"
+#include "mt/Thread.h"
 #include "net/ISocketFactory.h"
 #include "net/NetworkAddress.h"
 
@@ -19,10 +22,13 @@
 #include "test/mock/io/MockStream.h"
 
 #include <chrono>
+#include <atomic>
+#include <cstring>
 #include <thread>
 #include <vector>
 
 using ::testing::_;
+using ::testing::AnyNumber;
 using ::testing::AtLeast;
 using ::testing::DoubleEq;
 using ::testing::Invoke;
@@ -155,6 +161,90 @@ TEST(ServerProxyTests, hasCompleteOptionPairs_rejectsOddSizedOptions)
     malformed.push_back(kOptionHeartbeat);
 
     EXPECT_FALSE(ServerProxy::hasCompleteOptionPairs(malformed));
+}
+
+TEST(ServerProxyTests, inputParserYieldsAndReschedulesAfterBoundedBatch)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    setServerProxyEventDefaults(events, streamEvents, clipboardEvents, fileEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Return(&stream));
+
+    const std::vector<UInt8> messages(65 * 4, 0);
+    std::vector<UInt8> codes = messages;
+    for (size_t i = 0; i < 65; ++i) {
+        std::memcpy(&codes[i * 4], kMsgCNoop, 4);
+    }
+    size_t offset = 0;
+    ON_CALL(stream, read(_, _)).WillByDefault(
+        Invoke([&](void* buffer, UInt32 count) -> UInt32 {
+            if (offset >= codes.size() || count < 4) {
+                return 0;
+            }
+            std::memcpy(buffer, &codes[offset], 4);
+            offset += 4;
+            return 4;
+        }));
+    ON_CALL(stream, getSize()).WillByDefault(
+        Invoke([&]() -> UInt32 { return offset < codes.size() ? 4 : 0; }));
+
+    int rescheduled = 0;
+    EXPECT_CALL(events, addEvent(_)).Times(AnyNumber()).WillRepeatedly(
+        Invoke([&](const Event& event) {
+            if (event.getType() == streamEvents.inputReady()) {
+                ++rescheduled;
+            }
+        }));
+
+    ServerProxy proxy(reinterpret_cast<Client*>(1), &stream, &events);
+    proxy.handleDataForTest();
+
+    EXPECT_GT(offset, 0u);
+    EXPECT_LE(offset, 64u * 4u);
+    EXPECT_LT(offset, codes.size());
+    EXPECT_EQ(1, rescheduled);
+
+    proxy.handleDataForTest();
+    EXPECT_EQ(codes.size(), offset);
+}
+
+TEST(ServerProxyTests, clipboardCleanupRequestsCancelWithoutWaiting)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    setServerProxyEventDefaults(events, streamEvents, clipboardEvents, fileEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Return(&stream));
+    ServerProxy proxy(reinterpret_cast<Client*>(1), &stream, &events);
+
+    std::atomic<bool> started(false);
+    std::atomic<bool> release(false);
+    proxy.m_clipboardSendThread = new Thread([&started, &release]() {
+        started.store(true);
+        while (!release.load()) {
+        }
+    });
+    while (!started.load()) {
+        ARCH->sleep(0.001);
+    }
+
+    Stopwatch elapsed;
+    EXPECT_FALSE(proxy.cleanupClipboardSendThread(true));
+    EXPECT_LT(elapsed.getTime(), 0.1);
+
+    release.store(true);
+    for (int i = 0; i < 100 && proxy.m_clipboardSendThread != NULL; ++i) {
+        proxy.cleanupClipboardSendThread(false);
+        ARCH->sleep(0.001);
+    }
+    EXPECT_EQ(NULL, proxy.m_clipboardSendThread);
 }
 
 TEST(ServerProxyTests, setKeepAliveRateAllowsTransientSchedulingPause)

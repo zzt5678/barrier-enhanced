@@ -12,6 +12,7 @@
 #include "barrier/protocol_types.h"
 #include "barrier/Screen.h"
 #include "arch/Arch.h"
+#include "base/Stopwatch.h"
 #include "base/EventTypes.h"
 #include "io/filesystem.h"
 #include "mt/Thread.h"
@@ -81,6 +82,7 @@ public:
         enterCount(0),
         mouseMoveCount(0),
         setClipboardCount(0),
+        getClipboardCount(0),
         lastSetClipboardWasNull(false),
         clipboardAvailable(false),
         clipboardContainsFileList(false),
@@ -113,6 +115,7 @@ public:
     void* getEventTarget() const override { return const_cast<EnterPlatformScreen*>(this); }
     bool getClipboard(ClipboardID id, IClipboard* clipboard) const override
     {
+        ++getClipboardCount;
         if (!clipboardAvailable || id != kClipboardClipboard) {
             return false;
         }
@@ -187,6 +190,7 @@ public:
     UInt32 enterCount;
     UInt32 mouseMoveCount;
     UInt32 setClipboardCount;
+    mutable UInt32 getClipboardCount;
     bool lastSetClipboardWasNull;
     Clipboard lastSetClipboard;
     bool clipboardAvailable;
@@ -772,6 +776,42 @@ TEST(ClientDisconnectTests, cleanupSendFileThreadReleasesDetachedStream)
     EXPECT_EQ(2u, deletedCount);
 }
 
+TEST(ClientDisconnectTests, cleanupSendFileThreadRequestsCancelWithoutWaiting)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    setClientEventDefaults(events, clientEvents, screenEvents, fileEvents);
+
+    TestScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    std::atomic<bool> started(false);
+    std::atomic<bool> release(false);
+    client.testSetSendFileThread(new Thread([&started, &release]() {
+        started.store(true);
+        while (!release.load()) {
+        }
+    }));
+    while (!started.load()) {
+        ARCH->sleep(0.001);
+    }
+
+    Stopwatch elapsed;
+    EXPECT_FALSE(client.testCleanupSendFileThread(true));
+    EXPECT_LT(elapsed.getTime(), 0.1);
+
+    release.store(true);
+    for (int i = 0; i < 100 && client.testHasSendFileThread(); ++i) {
+        client.testCleanupSendFileThread(false);
+        ARCH->sleep(0.001);
+    }
+    EXPECT_FALSE(client.testHasSendFileThread());
+}
+
 TEST(ClientDisconnectTests, fileReceiveCompleteDoesNotBlockOnBusyDropDirWriter)
 {
     NiceMock<MockEventQueue> events;
@@ -807,11 +847,18 @@ TEST(ClientDisconnectTests, fileReceiveCompleteDoesNotBlockOnBusyDropDirWriter)
     EXPECT_EQ(1u, client.testPendingDropDirTransferCount());
 
     releaseWriter.store(true);
-    EXPECT_TRUE(client.testCleanupWriteToDropDirThread());
+    for (int i = 0; i < 200 && client.testHasWriteToDropDirThread(); ++i) {
+        client.testCleanupWriteToDropDirThread();
+        ARCH->sleep(0.001);
+    }
+    ASSERT_FALSE(client.testHasWriteToDropDirThread());
     client.testDrainDropDirTransferQueue();
     EXPECT_EQ(0u, client.testPendingDropDirTransferCount());
     EXPECT_TRUE(client.testHasWriteToDropDirThread());
-    EXPECT_TRUE(client.testCleanupWriteToDropDirThread());
+    for (int i = 0; i < 200 && client.testHasWriteToDropDirThread(); ++i) {
+        client.testCleanupWriteToDropDirThread();
+        ARCH->sleep(0.001);
+    }
     EXPECT_FALSE(client.testHasWriteToDropDirThread());
 }
 
@@ -1411,7 +1458,7 @@ TEST(ClientDisconnectTests, blockedLocalFileListCannotBeOverwrittenByRemoteClipb
     EXPECT_EQ(0u, platform->setClipboardCount);
 }
 
-TEST(ClientDisconnectTests, leaveDoesNotRetryUnsupportedSelectionClipboard)
+TEST(ClientDisconnectTests, leaveDefersClipboardReadAndDoesNotRetryUnsupportedSelection)
 {
     NiceMock<MockEventQueue> events;
     ClientEvents clientEvents;
@@ -1442,8 +1489,17 @@ TEST(ClientDisconnectTests, leaveDoesNotRetryUnsupportedSelectionClipboard)
     client.enter(0, 0, 0, 0, false);
     EXPECT_TRUE(client.leave());
 
-    EXPECT_EQ(1u, proxy->sendCalls);
+    EXPECT_EQ(0u, platform->getClipboardCount);
+    EXPECT_EQ(0u, proxy->sendCalls);
+    EXPECT_TRUE(client.testClipboardRetryPending(kClipboardClipboard));
     EXPECT_FALSE(client.testClipboardRetryPending(kClipboardSelection));
+
+    proxy->result = ServerProxy::kClipboardSendQueued;
+    client.testHandleClipboardRetry();
+
+    EXPECT_EQ(1u, platform->getClipboardCount);
+    EXPECT_EQ(1u, proxy->sendCalls);
+    EXPECT_FALSE(client.testClipboardRetryPending(kClipboardClipboard));
 }
 
 TEST(ClientDisconnectTests, imageFileListClipboardIsNotDowngradedToPngAndSent)

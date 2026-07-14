@@ -328,11 +328,35 @@ public:
     bool enterForScreensaver;
 };
 
+class LeavingFailsPrimaryClient : public EnterablePrimaryClient
+{
+public:
+    explicit LeavingFailsPrimaryClient(barrier::Screen* screen) :
+        EnterablePrimaryClient(screen),
+        mouseMoveCount(0),
+        mouseMoveX(0),
+        mouseMoveY(0)
+    {
+    }
+
+    bool leave() override { return false; }
+    void mouseMove(SInt32 x, SInt32 y) override
+    {
+        ++mouseMoveCount;
+        mouseMoveX = x;
+        mouseMoveY = y;
+    }
+
+    UInt32 mouseMoveCount;
+    SInt32 mouseMoveX;
+    SInt32 mouseMoveY;
+};
+
 class ClipboardPrimaryClient : public PrimaryClient
 {
 public:
-    ClipboardPrimaryClient() :
-        PrimaryClient("primary", NULL),
+    explicit ClipboardPrimaryClient(barrier::Screen* screen = NULL) :
+        PrimaryClient("primary", screen),
         clipboardAvailable(false),
         getClipboardCount(0),
         clipboardDirtyCount(0),
@@ -721,6 +745,9 @@ TEST(ServerReconnectTests, replayClipboardsToActivePrefetchesPrimarySourcePaths)
     EXPECT_EQ(0u, client.fileChunkCount);
     EXPECT_TRUE(server.m_sendFileThread != NULL);
     EXPECT_EQ(&client, server.m_sendFileTarget);
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
     EXPECT_TRUE(server.cleanupSendFileThread(true));
 }
 
@@ -774,6 +801,9 @@ TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotWaitForExistingFileSen
     EXPECT_EQ(&client, server.m_sendFileTarget);
 
     releaseSender.store(true);
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(false); ++i) {
+        ARCH->sleep(0.001);
+    }
     EXPECT_TRUE(server.cleanupSendFileThread(false));
 }
 
@@ -975,11 +1005,18 @@ TEST(ServerReconnectTests, fileReceiveCompleteDoesNotBlockOnBusyDropDirWriter)
     EXPECT_TRUE(server.m_receivedFileSpoolPath.empty());
 
     releaseWriter.store(true);
-    EXPECT_TRUE(server.testCleanupWriteToDropDirThread());
+    for (int i = 0; i < 200 && server.testHasWriteToDropDirThread(); ++i) {
+        server.testCleanupWriteToDropDirThread();
+        ARCH->sleep(0.001);
+    }
+    ASSERT_FALSE(server.testHasWriteToDropDirThread());
     server.testDrainDropDirTransferQueue();
     EXPECT_EQ(0u, server.testPendingDropDirTransferCount());
     EXPECT_TRUE(server.testHasWriteToDropDirThread());
-    EXPECT_TRUE(server.testCleanupWriteToDropDirThread());
+    for (int i = 0; i < 200 && server.testHasWriteToDropDirThread(); ++i) {
+        server.testCleanupWriteToDropDirThread();
+        ARCH->sleep(0.001);
+    }
     EXPECT_FALSE(server.testHasWriteToDropDirThread());
 }
 
@@ -1985,6 +2022,89 @@ TEST(ServerReconnectTests, secondaryMotion_reanchorsActiveClientWhenLeaveFails)
     EXPECT_EQ(server.m_x, client.mouseMoveX);
     EXPECT_EQ(server.m_y, client.mouseMoveY);
     EXPECT_EQ(0u, other.enterCount);
+}
+
+TEST(ServerReconnectTests, failedPrimaryLeaveRecoversNearAttemptedRightEdge)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    LeavingFailsPrimaryClient primary(&screen);
+
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    EXPECT_FALSE(server.switchScreen(&client, 0, 137, false, kRight));
+
+    EXPECT_EQ(1u, primary.mouseMoveCount);
+    EXPECT_EQ(1007, primary.mouseMoveX);
+    EXPECT_EQ(137, primary.mouseMoveY);
+    EXPECT_EQ(primary.mouseMoveX, server.m_x);
+    EXPECT_EQ(primary.mouseMoveY, server.m_y);
+    EXPECT_EQ(&primary, server.m_active);
+}
+
+TEST(ServerReconnectTests, switchScreenDefersPrimaryClipboardReadAndReplay)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    ClipboardPrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_enableClipboard = true;
+    server.m_x = 1023;
+    server.m_y = 100;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = primary.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_pendingPrimaryFetch = true;
+    primary.sourceClipboard = makeTextClipboard("clipboard read must be deferred");
+    primary.clipboardAvailable = true;
+
+    EXPECT_TRUE(server.switchScreen(&client, 0, 100, false, kRight));
+
+    EXPECT_EQ(0u, primary.getClipboardCount);
+    EXPECT_EQ(0u, client.setClipboardCount);
+    EXPECT_EQ(&client, server.m_active);
+
+    server.handleClipboardSync(Event(), NULL);
+
+    EXPECT_GT(primary.getClipboardCount, 0u);
+    EXPECT_GT(client.setClipboardCount, 0u);
 }
 
 TEST(ServerReconnectTests, fileChunkSendingUsesTransferTargetWhenActiveChanges)

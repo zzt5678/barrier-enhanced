@@ -16,6 +16,7 @@
 #include <vector>
 
 using ::testing::_;
+using ::testing::AnyNumber;
 using ::testing::Invoke;
 using ::testing::Mock;
 using ::testing::NiceMock;
@@ -94,6 +95,53 @@ TEST(ClientProxyDisconnectTests, disconnect_isIdempotent)
 
     proxy.disconnect();
     proxy.disconnect();
+}
+
+TEST(ClientProxyDisconnectTests, inputParserYieldsAndReschedulesAfterBoundedBatch)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClientProxyEvents clientProxyEvents;
+    setClientProxyEventDefaults(events, streamEvents, clientProxyEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+
+    std::vector<UInt8> codes(65 * 4, 0);
+    for (size_t i = 0; i < 65; ++i) {
+        std::memcpy(&codes[i * 4], kMsgCNoop, 4);
+    }
+    size_t offset = 0;
+    ON_CALL(*stream, read(_, _)).WillByDefault(
+        Invoke([&](void* buffer, UInt32 count) -> UInt32 {
+            if (offset >= codes.size() || count < 4) {
+                return 0;
+            }
+            std::memcpy(buffer, &codes[offset], 4);
+            offset += 4;
+            return 4;
+        }));
+    ON_CALL(*stream, getSize()).WillByDefault(
+        Invoke([&]() -> UInt32 { return offset < codes.size() ? 4 : 0; }));
+
+    int rescheduled = 0;
+    EXPECT_CALL(events, addEvent(_)).Times(AnyNumber()).WillRepeatedly(
+        Invoke([&](const Event& event) {
+            if (event.getType() == streamEvents.inputReady()) {
+                ++rescheduled;
+            }
+        }));
+
+    ClientProxy1_0 proxy("client", stream, &events);
+    proxy.handleData(Event(), NULL);
+
+    EXPECT_GT(offset, 0u);
+    EXPECT_LE(offset, 64u * 4u);
+    EXPECT_LT(offset, codes.size());
+    EXPECT_EQ(1, rescheduled);
+
+    proxy.handleData(Event(), NULL);
+    EXPECT_EQ(codes.size(), offset);
 }
 
 TEST(ClientProxyDisconnectTests, closeDoesNotSynchronouslyFlushStream)

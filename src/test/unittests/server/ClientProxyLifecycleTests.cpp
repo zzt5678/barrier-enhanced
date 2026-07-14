@@ -2,11 +2,16 @@
 #include "server/ClientProxy1_6.h"
 
 #include "barrier/Clipboard.h"
+#include "arch/Arch.h"
+#include "base/Stopwatch.h"
+#include "mt/Thread.h"
 #include "test/global/gmock.h"
 #include "test/global/gtest.h"
 #include "test/mock/barrier/MockEventQueue.h"
 #include "test/mock/io/MockStream.h"
 #include "test/mock/server/MockServer.h"
+
+#include <atomic>
 
 using ::testing::_;
 using ::testing::AnyNumber;
@@ -142,6 +147,42 @@ TEST(ClientProxyLifecycleTests, clientProxy16RemovesClipboardSendingHandlerOnDes
     }
 }
 
+TEST(ClientProxyLifecycleTests, clientProxy16CleanupRequestsCancelWithoutWaiting)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents, fileEvents, nextType);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    NiceMock<MockServer> server;
+    ClientProxy1_6 proxy("client", stream, &server, &events);
+
+    std::atomic<bool> started(false);
+    std::atomic<bool> release(false);
+    proxy.testSetClipboardSendThread(new Thread([&started, &release]() {
+        started.store(true);
+        while (!release.load()) {
+        }
+    }));
+    while (!started.load()) {
+        ARCH->sleep(0.001);
+    }
+
+    Stopwatch elapsed;
+    EXPECT_FALSE(proxy.cleanupClipboardSendThread(true));
+    EXPECT_LT(elapsed.getTime(), 0.1);
+
+    release.store(true);
+    for (int i = 0; i < 100 && !proxy.cleanupClipboardSendThread(false); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(proxy.cleanupClipboardSendThread(false));
+}
+
 TEST(ClientProxyLifecycleTests, clientProxy16KeepsClipboardDirtyWhileAsyncSendIsPending)
 {
     NiceMock<MockEventQueue> events;
@@ -166,6 +207,9 @@ TEST(ClientProxyLifecycleTests, clientProxy16KeepsClipboardDirtyWhileAsyncSendIs
     proxy.setClipboard(kClipboardClipboard, &clipboard);
 
     EXPECT_TRUE(proxy.testClipboardDirty(kClipboardClipboard));
+    for (int i = 0; i < 200 && !proxy.cleanupClipboardSendThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
     EXPECT_TRUE(proxy.cleanupClipboardSendThread(true));
 }
 
@@ -191,6 +235,9 @@ TEST(ClientProxyLifecycleTests, clientProxy16ClearsClipboardDirtyAfterAsyncSendC
 
     proxy.setClipboardDirty(kClipboardClipboard, true);
     proxy.setClipboard(kClipboardClipboard, &clipboard);
+    for (int i = 0; i < 200 && !proxy.cleanupClipboardSendThread(false); ++i) {
+        ARCH->sleep(0.001);
+    }
     EXPECT_TRUE(proxy.cleanupClipboardSendThread(false));
 
     EXPECT_FALSE(proxy.testClipboardDirty(kClipboardClipboard));

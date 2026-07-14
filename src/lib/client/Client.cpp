@@ -347,14 +347,12 @@ Client::leave()
     m_screen->leave();
 
     if (m_enableClipboard && m_server != NULL) {
-        // Re-read clipboards on leave instead of relying only on the
-        // earlier ownership flag. On Windows the clipboard-viewer
-        // notification can be missed and checkClipboards() only detects
-        // the new owner during Screen::leave(), so gating on
-        // m_ownClipboard here can drop a just-copied clipboard update.
+        // Windows can miss the clipboard-viewer notification and only
+        // discover the new owner during Screen::leave(). Defer the snapshot
+        // so clipboard providers cannot block the input handoff.
         for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
             if (id == kClipboardClipboard || m_ownClipboard[id]) {
-                sendClipboard(id);
+                scheduleClipboardRetry(id);
             }
         }
     }
@@ -1645,17 +1643,12 @@ Client::cleanupSendFileThread(bool cancel)
     }
 
     if (m_sendFileThread != NULL) {
-        if (cancel && !m_sendFileThread->wait(2.0)) {
-            LOG((CLOG_WARN "file send thread did not stop after interrupt; cancelling"));
-            m_sendFileThread->cancel();
-            m_sendFileThread->unblockPollSocket();
-            if (!m_sendFileThread->wait(5.0)) {
-                LOG((CLOG_ERR "file send thread still running after cancellation; cleanup deferred"));
-                return false;
+        if (!m_sendFileThread->wait(0.0)) {
+            if (cancel) {
+                LOG((CLOG_DEBUG "requesting asynchronous file sender cancellation"));
+                m_sendFileThread->cancel();
+                m_sendFileThread->unblockPollSocket();
             }
-        }
-        else if (!cancel && !m_sendFileThread->wait(5.0)) {
-            LOG((CLOG_ERR "file send thread still running; cleanup deferred"));
             return false;
         }
 		delete m_sendFileThread;
@@ -1690,14 +1683,11 @@ bool
 Client::cleanupWriteToDropDirThread()
 {
     if (m_writeToDropDirThread != NULL) {
-        if (!m_writeToDropDirThread->wait(2.0)) {
-            LOG((CLOG_WARN "drop-dir writer thread did not stop; cancelling"));
+        if (!m_writeToDropDirThread->wait(0.0)) {
+            LOG((CLOG_DEBUG "requesting asynchronous drop-dir writer cancellation"));
             m_writeToDropDirThread->cancel();
             m_writeToDropDirThread->unblockPollSocket();
-            if (!m_writeToDropDirThread->wait(5.0)) {
-                LOG((CLOG_ERR "drop-dir writer thread still running after cancellation; cleanup deferred"));
-                return false;
-            }
+            return false;
         }
         delete m_writeToDropDirThread;
         m_writeToDropDirThread = NULL;

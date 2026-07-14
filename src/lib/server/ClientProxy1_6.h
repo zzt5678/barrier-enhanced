@@ -41,6 +41,7 @@ public:
 
 #ifdef BARRIER_TEST_ENV
     bool                testClipboardDirty(ClipboardID id) const { return m_clipboard[id].m_dirty; }
+    void                testSetClipboardSendThread(Thread* thread) { m_clipboardSendThread = thread; }
 #endif
 
 private:

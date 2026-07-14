@@ -32,6 +32,9 @@ namespace {
 
 const UInt32 kMaxHeartbeatDeferrals = 8;
 const UInt32 kMaxMissedHeartbeatsBeforeDisconnect = 3;
+const size_t kMaxFramesPerInputBatch = 64;
+const size_t kMaxBytesPerInputBatch = 256 * 1024;
+const double kMaxSecondsPerInputBatch = 0.002;
 
 }
 
@@ -167,11 +170,20 @@ ClientProxy1_0::setHeartbeatRate(double, double alarm)
 void
 ClientProxy1_0::handleData(const Event&, void*)
 {
-    // handle messages until there are no more.  first read message code.
-    UInt8 code[4];
-    UInt32 n = getStream()->read(code, 4);
     bool receivedMessage = false;
-    while (n != 0) {
+    size_t parsedFrames = 0;
+    size_t parsedBytes = 0;
+    Stopwatch parseTimer;
+
+    while (true) {
+        barrier::IStream* stream = getStream();
+        const UInt32 frameSize = stream->getSize();
+        UInt8 code[4];
+        const UInt32 n = stream->read(code, 4);
+        if (n == 0) {
+            break;
+        }
+
         // verify we got an entire code
         if (n != 4) {
             LOG((CLOG_ERR "incomplete message from \"%s\": %d bytes", getName().c_str(), n));
@@ -197,8 +209,19 @@ ClientProxy1_0::handleData(const Event&, void*)
             return;
         }
 
-        // next message
-        n = getStream()->read(code, 4);
+        ++parsedFrames;
+        parsedBytes += frameSize >= 4 ? frameSize : 4;
+        const bool budgetExhausted =
+            parsedFrames >= kMaxFramesPerInputBatch ||
+            parsedBytes >= kMaxBytesPerInputBatch ||
+            parseTimer.getTime() >= kMaxSecondsPerInputBatch;
+        if (budgetExhausted) {
+            if (stream->getSize() != 0) {
+                m_events->addEvent(Event(m_events->forIStream().inputReady(),
+                    stream->getEventTarget()));
+            }
+            break;
+        }
     }
 
     // restart heartbeat timer

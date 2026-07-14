@@ -69,6 +69,7 @@ const SInt32 kSwitchReverseClearDistance = 96;
 const double kSwitchReverseGuardMaxSeconds = 2.0;
 const int kClipboardReadAttempts = 8;
 const double kClipboardReadRetrySeconds = 0.025;
+const double kClipboardSyncDelaySeconds = 0.01;
 const UInt32 kDefaultHeartbeatMilliseconds = 10000;
 const double kMouseMoveIntervalSeconds = 1.0 / 240.0;
 const size_t kMaxPendingDropDirTransfers = 4;
@@ -262,6 +263,8 @@ Server::Server(
 	m_switchWaitTimer(NULL),
 	m_primaryKeyStateTimer(NULL),
 	m_mouseMoveTimer(NULL),
+	m_clipboardSyncTimer(NULL),
+	m_clipboardFetchPending(false),
 	m_pendingMouseMoveTarget(NULL),
 	m_pendingMouseMove(false),
 	m_mouseMoveSent(false),
@@ -286,6 +289,7 @@ Server::Server(
 	m_sendFileTarget(NULL),
 	m_sendFileTransferId(0),
 	m_sendFileCompletionPending(false),
+	m_sendFileCleanupPending(false),
 	m_sendFileIsClipboardPrefetch(false),
 	m_writeToDropDirThread(NULL),
 	m_pendingDropDirTransfers(),
@@ -500,6 +504,11 @@ Server::~Server()
 		m_events->removeHandler(Event::kTimer, m_primaryKeyStateTimer);
 		m_events->deleteTimer(m_primaryKeyStateTimer);
 		m_primaryKeyStateTimer = NULL;
+	}
+	if (m_clipboardSyncTimer != NULL) {
+		m_events->removeHandler(Event::kTimer, m_clipboardSyncTimer);
+		m_events->deleteTimer(m_clipboardSyncTimer);
+		m_clipboardSyncTimer = NULL;
 	}
 	m_events->removeHandler(Event::kTimer, this);
 	stopSwitch();
@@ -835,9 +844,8 @@ Server::switchScreen(BaseClientProxy* dst,
 		m_xDelta2 = 0;
 		m_yDelta2 = 0;
 
-		if (m_active == m_primaryClient && m_enableClipboard) {
-			fetchPendingPrimaryClipboards();
-		}
+		const bool fetchPrimaryClipboard =
+			m_active == m_primaryClient && m_enableClipboard;
 
 		// cut over
 		m_active = dst;
@@ -853,7 +861,9 @@ Server::switchScreen(BaseClientProxy* dst,
 			m_primaryClient->refreshKeyState();
 		}
 
-		replayClipboardsToActive();
+		if (m_enableClipboard) {
+			scheduleClipboardSync(fetchPrimaryClipboard);
+		}
 
 		Server::SwitchToScreenInfo* info =
 			Server::SwitchToScreenInfo::alloc(m_active->getName());
@@ -908,13 +918,21 @@ Server::recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y)
 
 	const SInt32 zone = getJumpZoneSize(m_primaryClient);
 	const SInt32 margin = std::max<SInt32>(zone + 8, 16);
+	const SInt32 insetX = std::min<SInt32>(margin, (aw - 1) / 2);
+	const SInt32 insetY = std::min<SInt32>(margin, (ah - 1) / 2);
 	SInt32 safeX = x;
 	SInt32 safeY = y;
-	if (safeX < ax + margin || safeX >= ax + aw - margin) {
-		safeX = ax + aw / 2;
+	if (safeX < ax + insetX) {
+		safeX = ax + insetX;
 	}
-	if (safeY < ay + margin || safeY >= ay + ah - margin) {
-		safeY = ay + ah / 2;
+	else if (safeX >= ax + aw - insetX) {
+		safeX = ax + aw - insetX - 1;
+	}
+	if (safeY < ay + insetY) {
+		safeY = ay + insetY;
+	}
+	else if (safeY >= ay + ah - insetY) {
+		safeY = ay + ah - insetY - 1;
 	}
 
 	LOG((CLOG_WARN "reanchoring primary at %d,%d after failed leave", safeX, safeY));
@@ -1018,6 +1036,42 @@ Server::fetchPendingPrimaryClipboards()
             }
         }
     }
+}
+
+void
+Server::scheduleClipboardSync(bool fetchPrimary)
+{
+	m_clipboardFetchPending = m_clipboardFetchPending || fetchPrimary;
+	if (m_clipboardSyncTimer != NULL) {
+		return;
+	}
+
+	m_clipboardSyncTimer =
+		m_events->newOneShotTimer(kClipboardSyncDelaySeconds, NULL);
+	m_events->adoptHandler(Event::kTimer, m_clipboardSyncTimer,
+		new TMethodEventJob<Server>(this, &Server::handleClipboardSync));
+}
+
+void
+Server::handleClipboardSync(const Event&, void*)
+{
+	EventQueueTimer* timer = m_clipboardSyncTimer;
+	m_clipboardSyncTimer = NULL;
+	if (timer != NULL) {
+		m_events->removeHandler(Event::kTimer, timer);
+		m_events->deleteTimer(timer);
+	}
+
+	const bool fetchPrimary = m_clipboardFetchPending;
+	m_clipboardFetchPending = false;
+	if (!m_enableClipboard) {
+		return;
+	}
+
+	if (fetchPrimary) {
+		fetchPendingPrimaryClipboards();
+	}
+	replayClipboardsToActive();
 }
 
 void
@@ -3462,6 +3516,7 @@ Server::sendClipboardSelectionToClient(BaseClientProxy* target,
 	m_sendFileChunker = chunker;
 	m_sendFileTarget = target;
 	m_sendFileCompletionPending = false;
+	m_sendFileCleanupPending = false;
 	m_sendFileIsClipboardPrefetch = true;
 	m_sendFileTransferId++;
 	if (m_sendFileTransferId == 0) {
@@ -3848,6 +3903,7 @@ Server::sendFileToClient(const std::string& filename)
 	m_sendFileChunker = chunker;
 	m_sendFileTarget = target;
 	m_sendFileCompletionPending = false;
+	m_sendFileCleanupPending = false;
 	m_sendFileIsClipboardPrefetch = false;
 	m_sendFileTransferId++;
 	if (m_sendFileTransferId == 0) {
@@ -3905,17 +3961,13 @@ Server::cleanupSendFileThread(bool cancel)
 	}
 
 	if (m_sendFileThread != NULL) {
-		if (cancel && !m_sendFileThread->wait(2.0)) {
-			LOG((CLOG_WARN "file send thread did not stop after interrupt; cancelling"));
-			m_sendFileThread->cancel();
-			m_sendFileThread->unblockPollSocket();
-			if (!m_sendFileThread->wait(5.0)) {
-				LOG((CLOG_ERR "file send thread still running after cancellation; cleanup deferred"));
-				return false;
+		if (!m_sendFileThread->wait(0.0)) {
+			if (cancel) {
+				LOG((CLOG_DEBUG "requesting asynchronous file sender cancellation"));
+				m_sendFileCleanupPending = true;
+				m_sendFileThread->cancel();
+				m_sendFileThread->unblockPollSocket();
 			}
-		}
-		else if (!cancel && !m_sendFileThread->wait(5.0)) {
-			LOG((CLOG_ERR "file send thread still running; cleanup deferred"));
 			return false;
 		}
 		delete m_sendFileThread;
@@ -3925,6 +3977,7 @@ Server::cleanupSendFileThread(bool cancel)
 	m_sendFileChunker.reset();
 	m_sendFileTarget = NULL;
 	m_sendFileCompletionPending = false;
+	m_sendFileCleanupPending = false;
 	m_sendFileIsClipboardPrefetch = false;
 	deleteDeferredClient(target);
 	deleteDeferredClients();
@@ -3944,6 +3997,15 @@ Server::reapSendFileThreadIfReady()
 	delete m_sendFileThread;
 	m_sendFileThread = NULL;
 	m_sendFileChunker.reset();
+	if (m_sendFileCleanupPending) {
+		BaseClientProxy* target = m_sendFileTarget;
+		m_sendFileTarget = NULL;
+		m_sendFileCompletionPending = false;
+		m_sendFileCleanupPending = false;
+		m_sendFileIsClipboardPrefetch = false;
+		deleteDeferredClient(target);
+		deleteDeferredClients();
+	}
 	return true;
 }
 
@@ -3964,6 +4026,7 @@ Server::finishCompletedSendFileIfReady()
 
 	m_sendFileTarget = NULL;
 	m_sendFileCompletionPending = false;
+	m_sendFileCleanupPending = false;
 	m_sendFileIsClipboardPrefetch = false;
 	deleteDeferredClient(target);
 	deleteDeferredClients();
@@ -3974,14 +4037,11 @@ bool
 Server::cleanupWriteToDropDirThread()
 {
 	if (m_writeToDropDirThread != NULL) {
-		if (!m_writeToDropDirThread->wait(2.0)) {
-			LOG((CLOG_WARN "drop-dir writer thread did not stop; cancelling"));
+		if (!m_writeToDropDirThread->wait(0.0)) {
+			LOG((CLOG_DEBUG "requesting asynchronous drop-dir writer cancellation"));
 			m_writeToDropDirThread->cancel();
 			m_writeToDropDirThread->unblockPollSocket();
-			if (!m_writeToDropDirThread->wait(5.0)) {
-				LOG((CLOG_ERR "drop-dir writer thread still running after cancellation; cleanup deferred"));
-				return false;
-			}
+			return false;
 		}
 		delete m_writeToDropDirThread;
 			m_writeToDropDirThread = NULL;

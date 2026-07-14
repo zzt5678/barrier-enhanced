@@ -40,6 +40,9 @@ namespace {
 
 const UInt32 kMaxKeepAliveAlarmDeferrals = 8;
 const size_t kSynchronousClipboardSendLimit = 256 * 1024;
+const size_t kMaxFramesPerInputBatch = 64;
+const size_t kMaxBytesPerInputBatch = 256 * 1024;
+const double kMaxSecondsPerInputBatch = 0.002;
 
 }
 
@@ -153,11 +156,19 @@ ServerProxy::setKeepAliveRate(double rate)
 void
 ServerProxy::handleData(const Event&, void*)
 {
-    // handle messages until there are no more.  first read message code.
-    UInt8 code[4];
-    UInt32 n = m_stream->read(code, 4);
     bool receivedMessage = false;
-    while (n != 0) {
+    size_t parsedFrames = 0;
+    size_t parsedBytes = 0;
+    Stopwatch parseTimer;
+
+    while (true) {
+        const UInt32 frameSize = m_stream->getSize();
+        UInt8 code[4];
+        const UInt32 n = m_stream->read(code, 4);
+        if (n == 0) {
+            break;
+        }
+
         // verify we got an entire code
         if (n != 4) {
             LOG((CLOG_ERR "incomplete message from server: %d bytes", n));
@@ -191,8 +202,19 @@ ServerProxy::handleData(const Event&, void*)
             return;
         }
 
-        // next message
-        n = m_stream->read(code, 4);
+        ++parsedFrames;
+        parsedBytes += frameSize >= 4 ? frameSize : 4;
+        const bool budgetExhausted =
+            parsedFrames >= kMaxFramesPerInputBatch ||
+            parsedBytes >= kMaxBytesPerInputBatch ||
+            parseTimer.getTime() >= kMaxSecondsPerInputBatch;
+        if (budgetExhausted) {
+            if (m_stream->getSize() != 0) {
+                m_events->addEvent(Event(m_events->forIStream().inputReady(),
+                    m_stream->getEventTarget()));
+            }
+            break;
+        }
     }
 
     if (receivedMessage) {
@@ -590,17 +612,12 @@ ServerProxy::cleanupClipboardSendThread(bool cancel)
     }
 
     if (m_clipboardSendThread != NULL) {
-        if (cancel && !m_clipboardSendThread->wait(0.5)) {
-            LOG((CLOG_WARN "clipboard send thread did not stop after interrupt; cancelling"));
-            m_clipboardSendThread->cancel();
-            m_clipboardSendThread->unblockPollSocket();
-            if (!m_clipboardSendThread->wait(2.0)) {
-                LOG((CLOG_ERR "clipboard send thread still running after cancellation; cleanup deferred"));
-                return false;
+        if (!m_clipboardSendThread->wait(0.0)) {
+            if (cancel) {
+                LOG((CLOG_DEBUG "requesting asynchronous clipboard sender cancellation"));
+                m_clipboardSendThread->cancel();
+                m_clipboardSendThread->unblockPollSocket();
             }
-        }
-        else if (!cancel && !m_clipboardSendThread->wait(2.0)) {
-            LOG((CLOG_ERR "clipboard send thread still running; cleanup deferred"));
             return false;
         }
         delete m_clipboardSendThread;
