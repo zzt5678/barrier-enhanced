@@ -36,6 +36,7 @@
 #include <sstream>
 #include <UserEnv.h>
 #include <Shellapi.h>
+#include <Tlhelp32.h>
 #include <vector>
 
 #define MAXIMUM_WAIT_TIME 3
@@ -518,7 +519,8 @@ void MSWindowsWatchdog::main_loop()
 
             state = commandState();
             bool desktopChanged = false;
-            if (!state.command.empty()) {
+            if (!state.command.empty() &&
+                ElevationPolicy::shouldRelaunchOnDesktopSwitch(state.elevateMode)) {
                 std::string desktopName = activeDesktopName();
                 if (!desktopName.empty() &&
                     !state.lastDesktopName.empty() &&
@@ -637,7 +639,18 @@ MSWindowsWatchdog::startProcess()
 
     m_session.updateActiveSession();
 
-    std::string desktopName = activeDesktopNameWithRetry(m_monitoring);
+    DWORD desktopError = ERROR_SUCCESS;
+    const std::string observedDesktopName = m_daemonized
+        ? activeDesktopName(false, &desktopError)
+        : activeDesktopNameWithRetry(m_monitoring);
+    std::string desktopName = DesktopSwitchPolicy::launchDesktopName(
+        observedDesktopName, m_daemonized);
+    if (observedDesktopName.empty() && !desktopName.empty()) {
+        LOG((CLOG_WARN
+            "active input desktop is unavailable to the service, error=%lu; "
+            "launching on %s",
+            desktopError, desktopName.c_str()));
+    }
     if (desktopName.empty()) {
         throw XMSWindowsWatchdogError(
             "active input desktop is unavailable; delaying relaunch");
@@ -995,12 +1008,12 @@ MSWindowsWatchdog::shutdownExistingProcesses()
     }
     ScopedHandle snapshotHandle(snapshot);
 
-    PROCESSENTRY32A entry;
-    entry.dwSize = sizeof(PROCESSENTRY32A);
+    PROCESSENTRY32 entry;
+    entry.dwSize = sizeof(PROCESSENTRY32);
 
     // get the first process, and if we can't do that then it's
     // unlikely we can go any further
-    BOOL gotEntry = Process32FirstA(snapshot, &entry);
+    BOOL gotEntry = Process32First(snapshot, &entry);
     if (!gotEntry) {
         LOG((CLOG_ERR "could not get first process entry"));
         throw XArch(new XArchEvalWindows);
@@ -1027,7 +1040,7 @@ MSWindowsWatchdog::shutdownExistingProcesses()
         }
 
         // now move on to the next entry (if we're not at the end)
-        gotEntry = Process32NextA(snapshot, &entry);
+        gotEntry = Process32Next(snapshot, &entry);
         if (!gotEntry) {
 
             DWORD err = GetLastError();

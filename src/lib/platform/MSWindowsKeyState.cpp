@@ -60,8 +60,8 @@ const KeyID				MSWindowsKeyState::s_virtualKey[] =
 	/* 0x012 */ { kKeyAlt_L },		// VK_MENU
 	/* 0x013 */ { kKeyPause },		// VK_PAUSE
 	/* 0x014 */ { kKeyCapsLock },	// VK_CAPITAL
-	/* 0x015 */ { kKeyNone },		// undefined
-	/* 0x016 */ { kKeyKana },		// VK_HANGUL, VK_KANA, VK_IME_ON
+	/* 0x015 */ { kKeyKana },		// VK_HANGUL, VK_KANA
+	/* 0x016 */ { kKeyNone },		// VK_IME_ON
 	/* 0x017 */ { kKeyNone },		// VK_JUNJA
 	/* 0x018 */ { kKeyNone },		// VK_FINAL
 	/* 0x019 */ { kKeyKanzi },		// VK_HANJA, VK_KANJI
@@ -1384,4 +1384,3 @@ MSWindowsKeyState::addKeyEntry(barrier::KeyMap& keyMap, barrier::KeyMap::KeyItem
 		m_keyToVKMap[item.m_id] = static_cast<UINT>(item.m_client);
 	}
 }
-

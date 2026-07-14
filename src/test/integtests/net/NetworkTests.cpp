@@ -67,6 +67,7 @@ const UInt16 kMockDataChunkIncrement = 1024; // 1KB
 const char* kMockFilename = "NetworkTests.mock";
 const size_t kMockFileSize = 1024 * 1024 * 10; // 10MB
 const int kRepeatedMockDataTransfers = 8;
+const size_t kRepeatedMockDataSize = 1024 * 1024; // 1MB per connection-reuse cycle
 
 int getFreeTestPort();
 void getScreenShape(SInt32& x, SInt32& y, SInt32& w, SInt32& h);
@@ -96,7 +97,8 @@ public:
         delete[] m_mockData;
     }
 
-    void                sendMockData(void* eventTarget, UInt32 transferId = 0);
+    void                sendMockData(void* eventTarget, UInt32 transferId = 0,
+                                     size_t dataSize = kMockDataSize);
 
     void                sendToClient_mockData_handleClientConnected(const Event&, void* vlistener);
     void                sendToClient_mockData_fileRecieveCompleted(const Event&, void*);
@@ -153,7 +155,6 @@ TEST_F(NetworkTests, sendToClient_mockData)
     ServerArgs serverArgs;
     serverArgs.m_enableDragDrop = true;
     Server server(serverConfig, &primaryClient, &serverScreen, &m_events, serverArgs);
-    server.m_mock = true;
     listener.setServer(&server);
 
     // client
@@ -179,6 +180,7 @@ TEST_F(NetworkTests, sendToClient_mockData)
 
     m_events.initQuitTimeout(10);
     m_events.loop();
+    server.setActive(&primaryClient);
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
     m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &client);
     m_events.cleanupQuitTimeout();
@@ -212,7 +214,6 @@ TEST_F(NetworkTests, sendToClient_mockFile)
     ServerArgs serverArgs;
     serverArgs.m_enableDragDrop = true;
     Server server(serverConfig, &primaryClient, &serverScreen, &m_events, serverArgs);
-    server.m_mock = true;
     listener.setServer(&server);
 
     // client
@@ -238,6 +239,7 @@ TEST_F(NetworkTests, sendToClient_mockFile)
 
     m_events.initQuitTimeout(30);
     m_events.loop();
+    server.setActive(&primaryClient);
     EXPECT_TRUE(server.testCleanupSendFileThread(false));
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
     m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &client);
@@ -266,7 +268,6 @@ TEST_F(NetworkTests, sendToServer_mockData)
     ServerArgs serverArgs;
     serverArgs.m_enableDragDrop = true;
     Server server(serverConfig, &primaryClient, &serverScreen, &m_events, serverArgs);
-    server.m_mock = true;
     listener.setServer(&server);
 
     // client
@@ -296,6 +297,7 @@ TEST_F(NetworkTests, sendToServer_mockData)
 
     m_events.initQuitTimeout(10);
     m_events.loop();
+    server.setActive(&primaryClient);
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
     m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &server);
     m_events.cleanupQuitTimeout();
@@ -324,7 +326,6 @@ TEST_F(NetworkTests, sendToServer_mockFile)
     ServerArgs serverArgs;
     serverArgs.m_enableDragDrop = true;
     Server server(serverConfig, &primaryClient, &serverScreen, &m_events, serverArgs);
-    server.m_mock = true;
     listener.setServer(&server);
 
     // client
@@ -354,6 +355,7 @@ TEST_F(NetworkTests, sendToServer_mockFile)
 
     m_events.initQuitTimeout(30);
     m_events.loop();
+    server.setActive(&primaryClient);
     EXPECT_TRUE(client.testCleanupSendFileThread(false));
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
     m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &server);
@@ -386,7 +388,6 @@ TEST_F(NetworkTests, repeatedSendToClient_mockDataReusesConnection)
     ServerArgs serverArgs;
     serverArgs.m_enableDragDrop = true;
     Server server(serverConfig, &primaryClient, &serverScreen, &m_events, serverArgs);
-    server.m_mock = true;
     listener.setServer(&server);
 
     NiceMock<MockScreen> clientScreen;
@@ -410,6 +411,7 @@ TEST_F(NetworkTests, repeatedSendToClient_mockDataReusesConnection)
 
     m_events.initQuitTimeout(30);
     m_events.loop();
+    server.setActive(&primaryClient);
     EXPECT_EQ(kRepeatedMockDataTransfers, m_repeatedCompleted);
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
     m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &client);
@@ -465,7 +467,7 @@ NetworkTests::repeatedSendToClient_mockData_handleClientConnected(const Event&, 
     m_repeatedCompleted = 0;
 
     server->setFileTransferForTest(bcp, m_repeatedTransferId);
-    sendMockData(server, m_repeatedTransferId);
+    sendMockData(server, m_repeatedTransferId, kRepeatedMockDataSize);
 }
 
 void
@@ -484,7 +486,7 @@ NetworkTests::repeatedSendToClient_mockData_fileRecieveCompleted(const Event& ev
     ASSERT_TRUE(m_repeatedClient != NULL);
     ++m_repeatedTransferId;
     m_repeatedServer->setFileTransferForTest(m_repeatedClient, m_repeatedTransferId);
-    sendMockData(m_repeatedServer, m_repeatedTransferId);
+    sendMockData(m_repeatedServer, m_repeatedTransferId, kRepeatedMockDataSize);
 }
 
 void
@@ -547,10 +549,10 @@ NetworkTests::sendToServer_mockFile_fileRecieveCompleted(const Event& event, voi
 }
 
 void
-NetworkTests::sendMockData(void* eventTarget, UInt32 transferId)
+NetworkTests::sendMockData(void* eventTarget, UInt32 transferId, size_t mockDataSize)
 {
     // send first message (file size)
-    String size = barrier::string::sizeTypeToString(kMockDataSize);
+    String size = barrier::string::sizeTypeToString(mockDataSize);
     FileChunk* sizeMessage = FileChunk::start(size);
     sizeMessage->m_transferId = transferId;
 
@@ -565,8 +567,8 @@ NetworkTests::sendMockData(void* eventTarget, UInt32 transferId)
         size_t dataSize = lastSize + kMockDataChunkIncrement;
 
         // make sure we don't read too much from the mock data.
-        if (sentLength + dataSize > kMockDataSize) {
-            dataSize = kMockDataSize - sentLength;
+        if (sentLength + dataSize > mockDataSize) {
+            dataSize = mockDataSize - sentLength;
         }
 
         // first byte is the chunk mark, last is \0
@@ -579,7 +581,7 @@ NetworkTests::sendMockData(void* eventTarget, UInt32 transferId)
         sentLength += dataSize;
         lastSize = dataSize;
 
-        if (sentLength == kMockDataSize) {
+        if (sentLength == mockDataSize) {
             break;
         }
 

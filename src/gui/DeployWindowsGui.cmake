@@ -31,39 +31,55 @@ else()
     message(WARNING "windeployqt was not found; falling back to direct Qt runtime copy")
 endif()
 
-if (NOT QT_DEPLOYED)
-    if (NOT DEFINED QT_BIN_DIR OR NOT IS_DIRECTORY "${QT_BIN_DIR}")
-        message(FATAL_ERROR "QT_BIN_DIR is missing; cannot deploy Qt runtime")
-    endif()
-
-    get_filename_component(QT_ROOT_DIR "${QT_BIN_DIR}" DIRECTORY)
-    set(QT_PLUGINS_DIR "${QT_ROOT_DIR}/plugins")
-
-    foreach(qt_dll IN ITEMS Qt5Core.dll Qt5Gui.dll Qt5Network.dll Qt5Svg.dll Qt5Widgets.dll Qt5WinExtras.dll)
-        if (EXISTS "${QT_BIN_DIR}/${qt_dll}")
-            file(COPY "${QT_BIN_DIR}/${qt_dll}" DESTINATION "${OUTPUT_DIR}")
-        else()
-            message(FATAL_ERROR "Required Qt runtime not found: ${QT_BIN_DIR}/${qt_dll}")
-        endif()
-    endforeach()
-
-    foreach(plugin_entry IN ITEMS
-            "platforms/qwindows.dll"
-            "styles/qwindowsvistastyle.dll"
-            "iconengines/qsvgicon.dll"
-            "imageformats/qico.dll"
-            "imageformats/qjpeg.dll"
-            "imageformats/qsvg.dll")
-        get_filename_component(plugin_dir "${plugin_entry}" DIRECTORY)
-        get_filename_component(plugin_name "${plugin_entry}" NAME)
-        if (EXISTS "${QT_PLUGINS_DIR}/${plugin_entry}")
-            file(MAKE_DIRECTORY "${OUTPUT_DIR}/${plugin_dir}")
-            file(COPY "${QT_PLUGINS_DIR}/${plugin_entry}" DESTINATION "${OUTPUT_DIR}/${plugin_dir}")
-        else()
-            message(WARNING "Optional Qt plugin not found: ${QT_PLUGINS_DIR}/${plugin_entry}")
-        endif()
-    endforeach()
+if (NOT DEFINED QT_BIN_DIR OR NOT IS_DIRECTORY "${QT_BIN_DIR}")
+    message(FATAL_ERROR "QT_BIN_DIR is missing; cannot deploy Qt runtime")
 endif()
+
+get_filename_component(QT_ROOT_DIR "${QT_BIN_DIR}" DIRECTORY)
+set(QT_PLUGINS_DIR "${QT_ROOT_DIR}/plugins")
+
+foreach(qt_dll IN ITEMS
+        Qt5Core.dll Qt5Gui.dll Qt5Network.dll Qt5Svg.dll Qt5Widgets.dll
+        Qt5WinExtras.dll libEGL.dll libGLESv2.dll)
+    if (EXISTS "${QT_BIN_DIR}/${qt_dll}")
+        file(REMOVE "${OUTPUT_DIR}/${qt_dll}")
+        file(COPY "${QT_BIN_DIR}/${qt_dll}" DESTINATION "${OUTPUT_DIR}")
+    else()
+        message(FATAL_ERROR "Required Qt runtime not found: ${QT_BIN_DIR}/${qt_dll}")
+    endif()
+endforeach()
+
+foreach(plugin_dir IN ITEMS bearer iconengines imageformats platforms styles)
+    file(REMOVE_RECURSE "${OUTPUT_DIR}/${plugin_dir}")
+endforeach()
+
+foreach(plugin_entry IN ITEMS
+        "bearer/qgenericbearer.dll"
+        "platforms/qwindows.dll"
+        "styles/qwindowsvistastyle.dll"
+        "iconengines/qsvgicon.dll"
+        "imageformats/qgif.dll"
+        "imageformats/qicns.dll"
+        "imageformats/qico.dll"
+        "imageformats/qjpeg.dll"
+        "imageformats/qsvg.dll"
+        "imageformats/qtga.dll"
+        "imageformats/qtiff.dll"
+        "imageformats/qwbmp.dll"
+        "imageformats/qwebp.dll")
+    get_filename_component(plugin_dir "${plugin_entry}" DIRECTORY)
+    get_filename_component(plugin_name "${plugin_entry}" NAME)
+    if (EXISTS "${QT_PLUGINS_DIR}/${plugin_entry}")
+        file(MAKE_DIRECTORY "${OUTPUT_DIR}/${plugin_dir}")
+        file(COPY "${QT_PLUGINS_DIR}/${plugin_entry}" DESTINATION "${OUTPUT_DIR}/${plugin_dir}")
+    else()
+        message(WARNING "Optional Qt plugin not found: ${QT_PLUGINS_DIR}/${plugin_entry}")
+    endif()
+endforeach()
+
+foreach(stale_qt_dll IN ITEMS icuin58.dll icuuc58.dll icudt58.dll)
+    file(REMOVE "${OUTPUT_DIR}/${stale_qt_dll}")
+endforeach()
 
 if (DEFINED OPENSSL_ROOT_HINT AND OPENSSL_ROOT_HINT)
     set(OPENSSL_BIN_DIR "${OPENSSL_ROOT_HINT}/bin")

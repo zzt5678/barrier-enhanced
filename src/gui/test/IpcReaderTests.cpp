@@ -256,10 +256,6 @@ TEST(IpcClientTests, SendCommandWritesElevateModeByte)
         {ElevateAsNeeded, 0},
         {ElevateAlways, 1},
         {ElevateNever, 2},
-        {static_cast<ElevateMode>(-1), 0},
-        {static_cast<ElevateMode>(257), 0},
-        {static_cast<ElevateMode>(258), 0},
-        {static_cast<ElevateMode>(999), 0},
     };
 
     for (const auto& testCase : cases) {

@@ -52,7 +52,8 @@ IClipboard::unmarshall(IClipboard* clipboard, const String& data, Time time)
             // save the data if it's a known format.  if either the client
             // or server supports more clipboard formats than the other
             // then one of them will get a format >= kNumFormats here.
-            if (format <IClipboard::kNumFormats) {
+            if (format < IClipboard::kNumFormats &&
+                (size != 0 || format == IClipboard::kText)) {
                 clipboard->add(format, String(index, size));
             }
             index += size;
@@ -79,6 +80,7 @@ IClipboard::marshall(const IClipboard* clipboard)
 
     std::vector<String> formatData;
     formatData.resize(IClipboard::kNumFormats);
+    std::vector<bool> includedFormats(IClipboard::kNumFormats, false);
     // FIXME -- use current time
     if (clipboard->open(0)) {
 
@@ -87,9 +89,14 @@ IClipboard::marshall(const IClipboard* clipboard)
         UInt32 numFormats = 0;
         for (UInt32 format = 0; format != IClipboard::kNumFormats; ++format) {
             if (clipboard->has(static_cast<IClipboard::EFormat>(format))) {
-                ++numFormats;
                 formatData[format] =
                     clipboard->get(static_cast<IClipboard::EFormat>(format));
+                if (formatData[format].empty() &&
+                    format != static_cast<UInt32>(IClipboard::kText)) {
+                    continue;
+                }
+                includedFormats[format] = true;
+                ++numFormats;
                 size += 4 + 4 + (UInt32)formatData[format].size();
             }
         }
@@ -100,7 +107,7 @@ IClipboard::marshall(const IClipboard* clipboard)
         // marshall the data
         writeUInt32(&data, numFormats);
         for (UInt32 format = 0; format != IClipboard::kNumFormats; ++format) {
-            if (clipboard->has(static_cast<IClipboard::EFormat>(format))) {
+            if (includedFormats[format]) {
                 writeUInt32(&data, format);
                 writeUInt32(&data, (UInt32)formatData[format].size());
                 data += formatData[format];

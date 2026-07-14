@@ -63,7 +63,7 @@ void readPayloadFromStream(MockStream& stream, const std::vector<UInt8>& payload
 {
     size_t offset = 0;
     ON_CALL(stream, read(_, _))
-        .WillByDefault(Invoke([&payload, &offset](void* buffer, UInt32 n) -> UInt32 {
+        .WillByDefault(Invoke([&payload, offset](void* buffer, UInt32 n) mutable -> UInt32 {
             if (offset >= payload.size()) {
                 return 0;
             }

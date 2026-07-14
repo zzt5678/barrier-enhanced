@@ -9,6 +9,7 @@
 #include "barrier/RemoteFileClipboard.h"
 #include "arch/Arch.h"
 #include "base/IEventJob.h"
+#include "base/Stopwatch.h"
 #include "io/filesystem.h"
 #include "mt/Thread.h"
 #include "mt/XThread.h"
@@ -619,6 +620,13 @@ Clipboard makeTextClipboard(const std::string& text)
 
 }
 
+TEST(ServerReconnectTests, defaultMockConfigHasNoLockToScreenAction)
+{
+    NiceMock<MockConfig> config;
+
+    EXPECT_FALSE(config.hasLockToScreenAction());
+}
+
 TEST(ServerReconnectTests, constructorInitializesTransferAndCursorState)
 {
     TestEventQueue events;
@@ -678,7 +686,7 @@ TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotPublishForeignSourcePa
                         kClipboardClipboard));
 }
 
-TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotPrefetchPrimarySourcePaths)
+TEST(ServerReconnectTests, replayClipboardsToActivePrefetchesPrimarySourcePaths)
 {
     Config config;
     config.addScreen("primary");
@@ -706,13 +714,67 @@ TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotPrefetchPrimarySourceP
 
     server.replayClipboardsToActive();
 
-    EXPECT_EQ(client.setClipboardIds.end(),
+    EXPECT_NE(client.setClipboardIds.end(),
               std::find(client.setClipboardIds.begin(),
                         client.setClipboardIds.end(),
                         kClipboardClipboard));
     EXPECT_EQ(0u, client.fileChunkCount);
-    EXPECT_EQ(NULL, server.m_sendFileThread);
-    EXPECT_EQ(NULL, server.m_sendFileTarget);
+    EXPECT_TRUE(server.m_sendFileThread != NULL);
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_TRUE(server.cleanupSendFileThread(true));
+}
+
+TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotWaitForExistingFileSender)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &client;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = primary.getName();
+    clipboard.m_clipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/primary-file.txt"));
+
+    std::atomic<bool> releaseSender(false);
+    std::atomic<bool> senderCancelled(false);
+    server.m_sendFileTarget = &client;
+    server.m_sendFileThread = new Thread([&releaseSender, &senderCancelled]() {
+        try {
+            while (!releaseSender.load()) {
+                ARCH->sleep(0.01);
+                Thread::testCancel();
+            }
+        }
+        catch (XThread&) {
+            senderCancelled.store(true);
+        }
+    });
+
+    Stopwatch elapsed;
+    server.replayClipboardsToActive();
+
+    EXPECT_LT(elapsed.getTime(), 0.5);
+    EXPECT_FALSE(senderCancelled.load());
+    EXPECT_TRUE(server.m_sendFileThread != NULL);
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+
+    releaseSender.store(true);
+    EXPECT_TRUE(server.cleanupSendFileThread(false));
 }
 
 TEST(ServerReconnectTests, sendDragInfoUsesSynchronousPathAndClearsState)
@@ -1403,6 +1465,19 @@ TEST(ServerReconnectTests, adoptClient_replacesActiveSameNameClient_entersNewCli
     ServerEvents serverEvents;
     setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
 
+    bool connectedEventOwnsData = false;
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&connectedEventOwnsData](const Event& event) {
+            if (event.getDataObject() != NULL) {
+                const Server::ScreenConnectedInfo* info =
+                    static_cast<const Server::ScreenConnectedInfo*>(event.getDataObject());
+                connectedEventOwnsData = true;
+                EXPECT_EQ(event.getData(), event.getDataObject());
+                EXPECT_EQ("client", info->m_screen);
+            }
+            Event::deleteData(event);
+        }));
+
     NiceMock<MockPrimaryClient> primary;
     ON_CALL(primary, getToggleMask()).WillByDefault(Return(KeyModifierCapsLock));
     ON_CALL(primary, getEventTarget()).WillByDefault(Return(&primary));
@@ -1421,6 +1496,7 @@ TEST(ServerReconnectTests, adoptClient_replacesActiveSameNameClient_entersNewCli
     EXPECT_EQ(8u, newClient.enterSeqNum);
     EXPECT_EQ(KeyModifierCapsLock, newClient.enterMask);
     EXPECT_FALSE(newClient.enterForScreensaver);
+    EXPECT_TRUE(connectedEventOwnsData);
 }
 
 TEST(ServerReconnectTests, adoptClientReplacingSameNameInterruptsOldSendTarget)
@@ -1538,8 +1614,74 @@ TEST(ServerReconnectTests, secondaryMotion_repeatedEdgePressureKeepsCursorInside
     EXPECT_LT(server.m_x, client.shapeX + client.shapeW);
     EXPECT_EQ(100, server.m_y);
     EXPECT_EQ(NULL, server.m_switchScreen);
+    server.flushPendingMouseMove();
     EXPECT_EQ(server.m_x, client.mouseMoveX);
     EXPECT_EQ(server.m_y, client.mouseMoveY);
+}
+
+TEST(ServerReconnectTests, secondaryMotion_coalescesBurstAndFlushesBeforeMouseButton)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_x = 100;
+    server.m_y = 100;
+
+    server.onMouseMoveSecondary(1, 0);
+    server.onMouseMoveSecondary(1, 0);
+
+    EXPECT_EQ(1u, client.mouseMoveCount);
+
+    server.onMouseDown(1);
+
+    EXPECT_EQ(2u, client.mouseMoveCount);
+    EXPECT_EQ(102, client.mouseMoveX);
+    EXPECT_EQ(100, client.mouseMoveY);
+}
+
+TEST(ServerReconnectTests, secondaryMotion_timerFlushesLatestBurstPosition)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_x = 100;
+    server.m_y = 100;
+
+    server.onMouseMoveSecondary(1, 0);
+    server.onMouseMoveSecondary(2, 0);
+    ASSERT_EQ(1u, client.mouseMoveCount);
+
+    server.handleMouseMoveFlush(Event(), NULL);
+
+    EXPECT_EQ(2u, client.mouseMoveCount);
+    EXPECT_EQ(103, client.mouseMoveX);
+    EXPECT_EQ(100, client.mouseMoveY);
+    EXPECT_EQ(NULL, server.m_mouseMoveTimer);
+    EXPECT_FALSE(server.m_pendingMouseMove);
 }
 
 TEST(ServerReconnectTests, avoidJumpZoneIgnoresConfiguredButUnavailableNeighbor)
@@ -1973,7 +2115,7 @@ TEST(ServerReconnectTests, fileChunkSendingDropsChunkWhenTransferTargetDisconnec
     delete chunk;
 }
 
-TEST(ServerReconnectTests, onClipboardChangedBlocksLocalFileListWithoutDirtyingOtherClients)
+TEST(ServerReconnectTests, onClipboardChangedCachesLocalFileListForActiveReplay)
 {
     Config config;
     config.addScreen("primary");
@@ -1996,7 +2138,8 @@ TEST(ServerReconnectTests, onClipboardChangedBlocksLocalFileListWithoutDirtyingO
     server.m_active = &client;
     server.m_remoteFileClipboardSession = "stale-session";
     server.m_readyFileClipboardSession = "ready-session";
-    server.m_readyFileClipboardPaths.push_back(barrier::fs::u8path("/tmp/stale"));
+    server.m_readyFileClipboardPaths.push_back(
+        barrier::fs::u8path("/tmp/stale").u8string());
 
     Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
     clipboard.m_clipboardOwner = primary.getName();
@@ -2011,9 +2154,10 @@ TEST(ServerReconnectTests, onClipboardChangedBlocksLocalFileListWithoutDirtyingO
     EXPECT_TRUE(server.m_remoteFileClipboardSession.empty());
     EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
     EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
-    EXPECT_EQ(0u, client.clipboardDirtyCount);
+    EXPECT_EQ(1u, client.clipboardDirtyCount);
+    EXPECT_TRUE(client.lastClipboardDirty);
     EXPECT_EQ(0u, client.setClipboardCount);
-    EXPECT_EQ(0u, primary.clipboardDirtyCount);
+    EXPECT_EQ(1u, primary.clipboardDirtyCount);
     EXPECT_EQ(0u, primary.setClipboardCount);
 
 	RemoteFileClipboard::Data remoteFileClipboard;
@@ -2047,7 +2191,8 @@ TEST(ServerReconnectTests, handleClipboardGrabbedDefersReadAndDoesNotPreGrabOthe
     server.m_active = &client;
     server.m_remoteFileClipboardSession = "stale-session";
     server.m_readyFileClipboardSession = "ready-session";
-    server.m_readyFileClipboardPaths.push_back(barrier::fs::u8path("/tmp/stale"));
+    server.m_readyFileClipboardPaths.push_back(
+        barrier::fs::u8path("/tmp/stale").u8string());
     primary.sourceClipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/local-file.txt"));
     primary.clipboardAvailable = true;
 
@@ -2112,6 +2257,141 @@ TEST(ServerReconnectTests, handleClipboardGrabbedOnActivePrimaryDefersReadAndBro
     EXPECT_EQ(0u, client.setClipboardCount);
 }
 
+TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsCapturesTextWithoutGrabEvent)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clients.insert(std::make_pair(client.getName(), &client));
+    server.m_clientSet.insert(&primary);
+    server.m_clientSet.insert(&client);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_pendingPrimaryFetch = false;
+    clipboard.m_clipboard = makeTextClipboard("stale remote text");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+    primary.sourceClipboard = makeTextClipboard("fresh primary text");
+    primary.clipboardAvailable = true;
+
+    server.fetchPendingPrimaryClipboards();
+
+    EXPECT_GT(primary.getClipboardCount, 0u);
+    EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
+    EXPECT_FALSE(clipboard.m_pendingPrimaryFetch);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("fresh primary text", clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
+    EXPECT_EQ(1u, client.clipboardDirtyCount);
+    EXPECT_TRUE(client.lastClipboardDirty);
+}
+
+TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsPreservesRemoteOwnerForEmptyFallback)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clients.insert(std::make_pair(client.getName(), &client));
+    server.m_clientSet.insert(&primary);
+    server.m_clientSet.insert(&client);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_pendingPrimaryFetch = false;
+    clipboard.m_clipboard = makeTextClipboard("last synchronized text");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+    primary.sourceClipboard = Clipboard();
+    primary.clipboardAvailable = true;
+
+    server.fetchPendingPrimaryClipboards();
+
+    EXPECT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    EXPECT_FALSE(clipboard.m_pendingPrimaryFetch);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("last synchronized text", clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
+    EXPECT_EQ(0u, client.clipboardDirtyCount);
+}
+
+TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsDoesNotEchoMaterializedRemoteFile)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    const barrier::fs::path cachedPath =
+        barrier::fs::u8path("/tmp/clipboard-cache/remote-copy.txt");
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_pendingPrimaryFetch = false;
+    clipboard.m_clipboard = makeSourcePathsClipboard(cachedPath);
+    Clipboard materializedClipboard = makeMaterializedPathsClipboard(cachedPath);
+    clipboard.m_clipboardData.set(materializedClipboard.marshall());
+    primary.sourceClipboard = makeSourcePathsClipboard(cachedPath);
+    primary.clipboardAvailable = true;
+    server.m_readyFileClipboardSession = "remote-ready-session";
+    server.m_readyFileClipboardPaths.push_back(cachedPath.u8string());
+
+    server.fetchPendingPrimaryClipboards();
+
+    EXPECT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    EXPECT_FALSE(clipboard.m_pendingPrimaryFetch);
+    EXPECT_EQ(0u, client.clipboardDirtyCount);
+    EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
+    EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
+}
+
 TEST(ServerReconnectTests, onClipboardChangedForwardsTextAfterBlockingLocalFileList)
 {
     Config config;
@@ -2135,7 +2415,8 @@ TEST(ServerReconnectTests, onClipboardChangedForwardsTextAfterBlockingLocalFileL
     server.m_active = &client;
     server.m_remoteFileClipboardSession = "stale-session";
     server.m_readyFileClipboardSession = "ready-session";
-    server.m_readyFileClipboardPaths.push_back(barrier::fs::u8path("/tmp/stale"));
+    server.m_readyFileClipboardPaths.push_back(
+        barrier::fs::u8path("/tmp/stale").u8string());
 
     Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
     clipboard.m_clipboardOwner = primary.getName();
@@ -2150,7 +2431,8 @@ TEST(ServerReconnectTests, onClipboardChangedForwardsTextAfterBlockingLocalFileL
     EXPECT_TRUE(server.m_remoteFileClipboardSession.empty());
     EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
     EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
-    EXPECT_EQ(0u, client.clipboardDirtyCount);
+    EXPECT_EQ(1u, client.clipboardDirtyCount);
+    EXPECT_TRUE(client.lastClipboardDirty);
     EXPECT_EQ(0u, client.setClipboardCount);
 
     clipboard.m_pendingPrimaryFetch = true;
@@ -2159,14 +2441,18 @@ TEST(ServerReconnectTests, onClipboardChangedForwardsTextAfterBlockingLocalFileL
     server.onClipboardChanged(&primary, kClipboardClipboard, 11);
 
     EXPECT_FALSE(clipboard.m_pendingPrimaryFetch);
-    EXPECT_EQ(1u, client.clipboardDirtyCount);
+    EXPECT_EQ(2u, client.clipboardDirtyCount);
     EXPECT_TRUE(client.lastClipboardDirty);
     EXPECT_EQ(1u, client.setClipboardCount);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
     ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
     EXPECT_EQ("plain text after local file copy", clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
+    ASSERT_TRUE(client.lastSetClipboard.open(0));
     ASSERT_TRUE(client.lastSetClipboard.has(IClipboard::kText));
     EXPECT_EQ("plain text after local file copy", client.lastSetClipboard.get(IClipboard::kText));
     EXPECT_FALSE(client.lastSetClipboard.has(IClipboard::kFileList));
+    client.lastSetClipboard.close();
 }
 
 TEST(ServerReconnectTests, onClipboardChangedForwardsMaterializedFileList)
@@ -2251,12 +2537,16 @@ TEST(ServerReconnectTests, onClipboardChangedStripsImageFileListMetadataBeforeFo
     EXPECT_EQ(1u, client.clipboardDirtyCount);
     EXPECT_TRUE(client.lastClipboardDirty);
     EXPECT_EQ(1u, client.setClipboardCount);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
     EXPECT_TRUE(clipboard.m_clipboard.has(IClipboard::kPNG));
     EXPECT_FALSE(clipboard.m_clipboard.has(IClipboard::kFileList));
     EXPECT_FALSE(clipboard.m_clipboard.has(IClipboard::kText));
+    clipboard.m_clipboard.close();
+    ASSERT_TRUE(client.lastSetClipboard.open(0));
     ASSERT_TRUE(client.lastSetClipboard.has(IClipboard::kPNG));
     EXPECT_FALSE(client.lastSetClipboard.has(IClipboard::kFileList));
     EXPECT_FALSE(client.lastSetClipboard.has(IClipboard::kText));
+    client.lastSetClipboard.close();
 }
 
 TEST(ServerReconnectTests, delayedSwitchReanchorsActiveWhenPrimaryCannotBeEntered)
@@ -2434,15 +2724,13 @@ TEST(ServerReconnectTests, staleFileClipboardReadyDoesNotReplacePendingSession)
     server.m_readyFileClipboardSession = "ready-session";
     server.m_readyFileClipboardPaths.push_back("/tmp/current-ready.txt");
 
-    Server::FileClipboardReadyInfo* info = new Server::FileClipboardReadyInfo();
-    info->m_sessionId = "stale-session";
-    info->m_paths.push_back("/tmp/stale-ready.txt");
-    info->m_publishClipboard = false;
-    Event event(Event::kUnknown, &server, info);
-    event.setDataObject(info);
+    Server::FileClipboardReadyInfo info;
+    info.m_sessionId = "stale-session";
+    info.m_paths.push_back("/tmp/stale-ready.txt");
+    info.m_publishClipboard = false;
+    Event event(Event::kUnknown, &server, &info, Event::kDontFreeData);
 
     server.handleFileClipboardReadyEvent(event, NULL);
-    Event::deleteData(event);
 
     EXPECT_EQ("current-session", server.m_remoteFileClipboardSession);
     EXPECT_EQ("ready-session", server.m_readyFileClipboardSession);

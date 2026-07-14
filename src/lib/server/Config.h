@@ -175,7 +175,7 @@ public:
     virtual ~Config();
 
 #ifdef BARRIER_TEST_ENV
-    Config() : m_inputFilter(NULL) { }
+    Config() : Config(NULL) { }
 #endif
 
     //! @name manipulators

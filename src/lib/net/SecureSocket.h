@@ -61,7 +61,9 @@ public:
     bool load_certificates(const barrier::fs::path& path);
 
 #if defined(BARRIER_TEST_ENV)
-    void testDisconnectTLSFailureNoLock() { disconnect(); }
+    void testDisconnectTLSFailureNoLock() { disconnect(false); }
+    void testDisconnectPermanentTLSFailureNoLock() { disconnect(true); }
+    void testSecureConnectRetryExhaustedNoLock() { handleSecureConnectRetryExhaustion(); }
 #endif
 
 private:
@@ -73,10 +75,11 @@ private:
     bool ensure_peer_certificate(); // may only be called with ssl_mutex_ acquired
 
     void checkResult(int n, int& retry); // may only be called with m_ssl_mutex_ acquired.
+    void handleSecureConnectRetryExhaustion();
 
     void                showError(const std::string& reason);
     std::string getError();
-    void                disconnect();
+    void                disconnect(bool stopRetry);
 
     // may only be called with ssl_mutex_ acquired
     bool verify_cert_fingerprint(const barrier::fs::path& fingerprint_db_path);
@@ -104,6 +107,7 @@ private:
     bool                m_secureReady;
     bool                m_fatal;
     bool                m_tlsFailureNotified = false;
+    bool                m_stopRetryNotified = false;
     ConnectionSecurityLevel security_level_ = ConnectionSecurityLevel::ENCRYPTED;
 
     int secure_accept_retry_ = 0; // used only in secureAccept()

@@ -423,6 +423,12 @@ bool SecureSocket::load_certificates(const barrier::fs::path& path)
 // This replaces the previous cert_verify_ignore_callback which bypassed all verification.
 static thread_local barrier::fs::path g_verify_fingerprint_path;
 
+static int reject_certificate(X509_STORE_CTX* ctx)
+{
+    X509_STORE_CTX_set_error(ctx, X509_V_ERR_CERT_REJECTED);
+    return 0;
+}
+
 // Certificate verification callback: accepts only certificates whose fingerprint
 // matches the user-configured fingerprint database. This prevents MITM attacks
 // by verifying identity at the TLS handshake level (not post-handshake).
@@ -430,7 +436,7 @@ static int cert_verify_fingerprint_callback(X509_STORE_CTX* ctx, void*)
 {
     X509* cert = X509_STORE_CTX_get0_cert(ctx);
     if (cert == nullptr) {
-        return 0;
+        return reject_certificate(ctx);
     }
 
     // Compute SHA256 fingerprint of peer's certificate
@@ -439,7 +445,7 @@ static int cert_verify_fingerprint_callback(X509_STORE_CTX* ctx, void*)
     const EVP_MD* sha256 = EVP_sha256();
     if (sha256 == nullptr || X509_digest(cert, sha256, hash, &hash_len) != 1) {
         LOG((CLOG_ERR "failed to compute certificate fingerprint"));
-        return 0;
+        return reject_certificate(ctx);
     }
 
     // Load and check against fingerprint database
@@ -450,7 +456,7 @@ static int cert_verify_fingerprint_callback(X509_STORE_CTX* ctx, void*)
         // ENCRYPTED_AUTHENTICATED mode demands a fingerprint database.
         // Refuse rather than silently accepting any certificate (MITM risk).
         LOG((CLOG_ERR "no trusted fingerprints configured; rejecting unauthenticated connection"));
-        return 0;
+        return reject_certificate(ctx);
     }
 
     // Check if the fingerprint matches any trusted fingerprint
@@ -460,12 +466,13 @@ static int cert_verify_fingerprint_callback(X509_STORE_CTX* ctx, void*)
     peer_fingerprint.data.assign(hash, hash + hash_len);
     for (const auto& fp : db.fingerprints()) {
         if (peer_fingerprint == fp) {
+            X509_STORE_CTX_set_error(ctx, X509_V_OK);
             return 1;  // Trusted
         }
     }
 
     LOG((CLOG_ERR "peer certificate fingerprint does not match any trusted fingerprint"));
-    return 0;  // Not trusted — reject the connection during handshake
+    return reject_certificate(ctx);
 }
 
 void
@@ -575,14 +582,14 @@ SecureSocket::secureAccept(int socket)
                 LOG((CLOG_INFO "accepted secure socket"));
                 if (!ensure_peer_certificate()) {
                     secure_accept_retry_ = 0;
-                    disconnect();
+                    disconnect(true);
                     return -1;// Cert fail, error
                 }
             }
             else {
                 LOG((CLOG_ERR "failed to verify client certificate fingerprint"));
                 secure_accept_retry_ = 0;
-                disconnect();
+                disconnect(true);
                 return -1; // Fingerprint failed, error
             }
         }
@@ -639,7 +646,7 @@ SecureSocket::secureConnect(int socket)
     if (!isFatal() && secure_connect_retry_ > kMaxSecureConnectRetries) {
         LOG((CLOG_WARN "timed out connecting secure socket after %d retries",
             secure_connect_retry_));
-        isFatal(true);
+        handleSecureConnectRetryExhaustion();
     }
 
     if (isFatal()) {
@@ -678,6 +685,15 @@ SecureSocket::secureConnect(int socket)
     }
     showSecureConnectInfo();
     return 1;
+}
+
+void
+SecureSocket::handleSecureConnectRetryExhaustion()
+{
+    isFatal(true);
+    // A peer that stops progressing during the handshake is a transport
+    // failure. Close this attempt while allowing ClientApp to reconnect.
+    disconnect(false);
 }
 
 bool
@@ -782,8 +798,11 @@ SecureSocket::checkResult(int status, int& retry)
 
     if (isFatal()) {
         retry = 0;
+        const bool certificateRejected =
+            security_level_ == ConnectionSecurityLevel::ENCRYPTED_AUTHENTICATED &&
+            SSL_get_verify_result(m_ssl->m_ssl) != X509_V_OK;
         showError("");
-        disconnect();
+        disconnect(certificateRejected);
     }
 }
 
@@ -814,8 +833,13 @@ std::string SecureSocket::getError()
 }
 
 void
-SecureSocket::disconnect()
+SecureSocket::disconnect(bool stopRetry)
 {
+    if (stopRetry && !m_stopRetryNotified) {
+        m_stopRetryNotified = true;
+        sendEvent(getEvents()->forISocket().stopRetry());
+    }
+
     if (m_tlsFailureNotified) {
         return;
     }
@@ -824,8 +848,10 @@ SecureSocket::disconnect()
     m_secureReady = false;
     isFatal(true);
     removeTCPConnectedHandler();
-    removeJob();
-    sendEvent(getEvents()->forISocket().stopRetry());
+    // TLS failures are detected while the socket multiplexer owns and runs
+    // this job. Removing it synchronously here would wait on the job-list lock
+    // already held by the current thread. Returning from the callback retires
+    // the job; the destructor still removes jobs during external shutdown.
     disconnectSocketNoLock(true);
 }
 
@@ -890,7 +916,11 @@ MultiplexerJobStatus SecureSocket::serviceConnect(ISocketMultiplexerJob* job,
 
     // If status < 0, error happened
     if (status < 0) {
-        disconnect();
+        // Direct certificate/configuration failures are permanent. Transport
+        // failures were already classified and disconnected by checkResult().
+        if (!m_tlsFailureNotified) {
+            disconnect(true);
+        }
         sendTLSConnectionFailedEvent("TLS handshake failed");
         return {false, {}};
     }
@@ -925,7 +955,9 @@ MultiplexerJobStatus SecureSocket::serviceAccept(ISocketMultiplexerJob* job,
 #endif
     // If status < 0, error happened
     if (status < 0) {
-        disconnect();
+        // Authentication failures notify permanently inside secureAccept().
+        // Ordinary handshake transport failures remain retryable.
+        disconnect(false);
         return {false, {}};
     }
 

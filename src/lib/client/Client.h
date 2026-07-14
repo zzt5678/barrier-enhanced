@@ -304,6 +304,7 @@ public:
     bool                testOwnClipboard(ClipboardID id) const { return m_ownClipboard[id]; }
     bool                testClipboardSent(ClipboardID id) const { return m_sentClipboard[id]; }
     bool                testClipboardSendPending(ClipboardID id) const { return m_clipboardSendPending[id]; }
+    bool                testClipboardRetryPending(ClipboardID id) const { return m_clipboardRetryPending[id]; }
     void                testStartDropDirTransfer(const std::string& data)
     {
         std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
@@ -345,14 +346,12 @@ public:
                                                      const std::vector<std::string>& paths,
                                                      bool publishClipboard)
     {
-        FileClipboardReadyInfo* info = new FileClipboardReadyInfo();
-        info->m_sessionId = sessionId;
-        info->m_paths = paths;
-        info->m_publishClipboard = publishClipboard;
-        Event event(Event::kUnknown, getEventTarget(), info);
-        event.setDataObject(info);
+        FileClipboardReadyInfo info;
+        info.m_sessionId = sessionId;
+        info.m_paths = paths;
+        info.m_publishClipboard = publishClipboard;
+        Event event(Event::kUnknown, getEventTarget(), &info, Event::kDontFreeData);
         handleFileClipboardReady(event, NULL);
-        Event::deleteData(event);
     }
     void                testWriteRemoteClipboardTransfer(const std::string& data,
                                                          const std::string& sessionId)
@@ -388,6 +387,7 @@ private:
     IClipboard::Time    m_timeClipboard[kClipboardEnd];
     ClipboardDataSnapshot m_dataClipboard[kClipboardEnd];
     ClipboardDataSnapshot m_pendingClipboardData[kClipboardEnd];
+    std::vector<barrier::fs::path> m_pendingFileClipboardPaths[kClipboardEnd];
     IEventQueue*        m_events;
     std::size_t            m_expectedFileSize;
     std::string m_receivedFileData;
@@ -397,6 +397,7 @@ private:
     Thread*                m_sendFileThread;
     std::shared_ptr<StreamChunker> m_sendFileChunker;
     UInt32              m_sendFileTransferId;
+    bool                m_sendFileIsClipboardPrefetch;
     Thread*                m_writeToDropDirThread;
     std::deque<std::shared_ptr<CompletedFileTransfer> > m_pendingDropDirTransfers;
     TCPSocket*            m_socket;

@@ -140,6 +140,7 @@ public:
                              Bool owner_events, unsigned int event_mask,
                              int  pointer_mode, int keyboard_mode,
                              Window confine_to, Cursor cursor, Time time);
+    virtual int XUngrabPointer(Display* display, Time time);
     virtual int XUngrabKeyboard(Display* display, Time time);
     virtual int XPending(Display* display);
     virtual int XPeekEvent(Display* display, XEvent* event_return);

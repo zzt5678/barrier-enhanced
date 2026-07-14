@@ -484,6 +484,25 @@ bool normalizeClipboard(Clipboard& clipboard, Data* normalized, std::string* err
     return true;
 }
 
+bool pathsMatch(const Data& data, const std::vector<std::string>& paths)
+{
+    if (data.paths.size() != paths.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < data.paths.size(); ++i) {
+        barrier::fs::path actual = data.paths[i].lexically_normal();
+        barrier::fs::path expected = barrier::fs::u8path(paths[i]).lexically_normal();
+        actual.make_preferred();
+        expected.make_preferred();
+        if (actual != expected) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool allPathsLookLikeImages(const Data& data)
 {
     if (data.paths.empty()) {

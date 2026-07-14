@@ -1,13 +1,17 @@
 #define BARRIER_TEST_ENV
 #include "net/SecureSocket.h"
 
+#include "arch/Arch.h"
 #include "base/EventTypes.h"
+#include "net/ISocketMultiplexerJob.h"
 #include "net/SocketMultiplexer.h"
 #include "mt/Lock.h"
 #include "test/global/gmock.h"
 #include "test/global/gtest.h"
 #include "test/mock/barrier/MockEventQueue.h"
 
+#include <atomic>
+#include <functional>
 #include <memory>
 
 using ::testing::_;
@@ -17,6 +21,38 @@ using ::testing::Return;
 using ::testing::ReturnRef;
 
 namespace {
+
+class CallbackMultiplexerJob : public ISocketMultiplexerJob {
+public:
+    CallbackMultiplexerJob(ArchSocket socket,
+                           std::function<void()> callback,
+                           std::atomic<int>& destructionCount) :
+        m_socket(socket),
+        m_callback(std::move(callback)),
+        m_destructionCount(destructionCount)
+    {
+    }
+
+    ~CallbackMultiplexerJob() override
+    {
+        m_destructionCount.fetch_add(1, std::memory_order_release);
+    }
+
+    MultiplexerJobStatus run(bool, bool, bool) override
+    {
+        m_callback();
+        return {false, {}};
+    }
+
+    ArchSocket getSocket() const override { return m_socket; }
+    bool isReadable() const override { return false; }
+    bool isWritable() const override { return false; }
+
+private:
+    ArchSocket m_socket;
+    std::function<void()> m_callback;
+    std::atomic<int>& m_destructionCount;
+};
 
 class TestableSecureSocket : public SecureSocket {
 public:
@@ -38,6 +74,30 @@ public:
     {
         Lock lock(&getMutex());
         testDisconnectTLSFailureNoLock();
+    }
+
+    void failPermanentTLSWithLock()
+    {
+        Lock lock(&getMutex());
+        testDisconnectPermanentTLSFailureNoLock();
+    }
+
+    void exhaustSecureConnectRetriesWithLock()
+    {
+        Lock lock(&getMutex());
+        testSecureConnectRetryExhaustedNoLock();
+    }
+
+    void installFailingJob(std::atomic<bool>& invoked,
+                           std::atomic<int>& destructionCount)
+    {
+        setJob(std::make_unique<CallbackMultiplexerJob>(
+            rawSocket(),
+            [this, &invoked]() {
+                failTLSWithLock();
+                invoked.store(true, std::memory_order_release);
+            },
+            destructionCount));
     }
 
     bool connected() const { return m_connected; }
@@ -100,7 +160,7 @@ void countEvent(EventCounts& counts,
 
 }
 
-TEST(SecureSocketTests, tlsFailureClosesTransportAndNotifiesOnce)
+TEST(SecureSocketTests, transientTlsFailureClosesTransportAndAllowsRetry)
 {
     NiceMock<MockEventQueue> events;
     ISocketEvents socketEvents;
@@ -132,11 +192,142 @@ TEST(SecureSocketTests, tlsFailureClosesTransportAndNotifiesOnce)
     EXPECT_FALSE(socket.writable());
     EXPECT_EQ(nullptr, socket.rawSocket());
     EXPECT_EQ(nullptr, socket.newJob().get());
-    EXPECT_EQ(1, counts.stopRetry);
+    EXPECT_EQ(0, counts.stopRetry);
     EXPECT_EQ(1, counts.disconnected);
     EXPECT_EQ(1, counts.inputShutdown);
 
     socket.failTLSWithLock();
+
+    EXPECT_EQ(0, counts.stopRetry);
+    EXPECT_EQ(1, counts.disconnected);
+    EXPECT_EQ(1, counts.inputShutdown);
+}
+
+TEST(SecureSocketTests, tlsFailureLetsMultiplexerRetireCurrentJob)
+{
+    NiceMock<MockEventQueue> events;
+    ISocketEvents socketEvents;
+    IStreamEvents streamEvents;
+    IDataSocketEvents dataSocketEvents;
+    SocketMultiplexer multiplexer;
+    std::atomic<bool> invoked(false);
+    std::atomic<int> jobDestructions(0);
+
+    setEventDefaults(events, socketEvents, streamEvents, dataSocketEvents);
+
+    {
+        TestableSecureSocket socket(&events, &multiplexer);
+        socket.markConnected();
+        socket.installFailingJob(invoked, jobDestructions);
+
+        const double deadline = ARCH->time() + 2.0;
+        while ((!invoked.load(std::memory_order_acquire) ||
+                jobDestructions.load(std::memory_order_acquire) == 0) &&
+               ARCH->time() < deadline) {
+            ARCH->sleep(0.001);
+        }
+
+        EXPECT_TRUE(invoked.load(std::memory_order_acquire));
+        EXPECT_EQ(1, jobDestructions.load(std::memory_order_acquire));
+    }
+
+    EXPECT_EQ(1, jobDestructions.load(std::memory_order_acquire));
+}
+
+TEST(SecureSocketTests, secureConnectRetryExhaustionAllowsReconnect)
+{
+    NiceMock<MockEventQueue> events;
+    ISocketEvents socketEvents;
+    IStreamEvents streamEvents;
+    IDataSocketEvents dataSocketEvents;
+    SocketMultiplexer multiplexer;
+    EventCounts counts;
+
+    setEventDefaults(events, socketEvents, streamEvents, dataSocketEvents);
+
+    TestableSecureSocket socket(&events, &multiplexer);
+    const Event::Type stopRetryType = socketEvents.stopRetry();
+    const Event::Type disconnectedType = socketEvents.disconnected();
+    const Event::Type inputShutdownType = streamEvents.inputShutdown();
+
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&](const Event& event) {
+            countEvent(counts, stopRetryType, disconnectedType, inputShutdownType,
+                       socket.getEventTarget(), event);
+        }));
+
+    socket.markConnected();
+    socket.exhaustSecureConnectRetriesWithLock();
+
+    EXPECT_EQ(0, counts.stopRetry);
+    EXPECT_EQ(1, counts.disconnected);
+    EXPECT_EQ(1, counts.inputShutdown);
+    EXPECT_FALSE(socket.connected());
+    EXPECT_EQ(nullptr, socket.rawSocket());
+}
+
+TEST(SecureSocketTests, permanentTlsFailureStopsRetryOnce)
+{
+    NiceMock<MockEventQueue> events;
+    ISocketEvents socketEvents;
+    IStreamEvents streamEvents;
+    IDataSocketEvents dataSocketEvents;
+    SocketMultiplexer multiplexer;
+    EventCounts counts;
+
+    setEventDefaults(events, socketEvents, streamEvents, dataSocketEvents);
+
+    TestableSecureSocket socket(&events, &multiplexer);
+    const Event::Type stopRetryType = socketEvents.stopRetry();
+    const Event::Type disconnectedType = socketEvents.disconnected();
+    const Event::Type inputShutdownType = streamEvents.inputShutdown();
+
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&](const Event& event) {
+            countEvent(counts, stopRetryType, disconnectedType, inputShutdownType,
+                       socket.getEventTarget(), event);
+        }));
+
+    socket.markConnected();
+    socket.failPermanentTLSWithLock();
+
+    EXPECT_EQ(1, counts.stopRetry);
+    EXPECT_EQ(1, counts.disconnected);
+    EXPECT_EQ(1, counts.inputShutdown);
+
+    socket.failPermanentTLSWithLock();
+
+    EXPECT_EQ(1, counts.stopRetry);
+    EXPECT_EQ(1, counts.disconnected);
+    EXPECT_EQ(1, counts.inputShutdown);
+}
+
+TEST(SecureSocketTests, permanentFailureAfterTransportFailureStillStopsRetry)
+{
+    NiceMock<MockEventQueue> events;
+    ISocketEvents socketEvents;
+    IStreamEvents streamEvents;
+    IDataSocketEvents dataSocketEvents;
+    SocketMultiplexer multiplexer;
+    EventCounts counts;
+
+    setEventDefaults(events, socketEvents, streamEvents, dataSocketEvents);
+
+    TestableSecureSocket socket(&events, &multiplexer);
+    const Event::Type stopRetryType = socketEvents.stopRetry();
+    const Event::Type disconnectedType = socketEvents.disconnected();
+    const Event::Type inputShutdownType = streamEvents.inputShutdown();
+
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&](const Event& event) {
+            countEvent(counts, stopRetryType, disconnectedType, inputShutdownType,
+                       socket.getEventTarget(), event);
+        }));
+
+    socket.markConnected();
+    socket.failTLSWithLock();
+    socket.failPermanentTLSWithLock();
+    socket.failPermanentTLSWithLock();
 
     EXPECT_EQ(1, counts.stopRetry);
     EXPECT_EQ(1, counts.disconnected);

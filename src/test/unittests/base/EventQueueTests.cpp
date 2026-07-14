@@ -11,9 +11,12 @@
 
 #include "base/IEventJob.h"
 #include "base/EventTypes.h"
+#include "base/SimpleEventQueueBuffer.h"
+#include "arch/Arch.h"
 #include "mt/Thread.h"
 
 #include "test/global/gtest.h"
+#include "test/mock/barrier/MockEventQueue.h"
 
 #include <vector>
 
@@ -52,6 +55,76 @@ public:
 private:
     EventQueue* m_events;
     int* m_dispatchCount;
+};
+
+class CountingEventJob : public IEventJob {
+public:
+    explicit CountingEventJob(int* deletedCount) :
+        m_deletedCount(deletedCount)
+    {
+    }
+
+    ~CountingEventJob()
+    {
+        ++(*m_deletedCount);
+    }
+
+    void run(const Event&) override
+    {
+    }
+
+private:
+    int* m_deletedCount;
+};
+
+class CountingTimerBuffer : public SimpleEventQueueBuffer {
+public:
+    explicit CountingTimerBuffer(int* deletedCount) :
+        m_deletedCount(deletedCount)
+    {
+    }
+
+    EventQueueTimer* newTimer(double, bool) const override
+    {
+        return reinterpret_cast<EventQueueTimer*>(new char);
+    }
+
+    void deleteTimer(EventQueueTimer* timer) const override
+    {
+        ++(*m_deletedCount);
+        delete reinterpret_cast<char*>(timer);
+    }
+
+private:
+    int* m_deletedCount;
+};
+
+class AlwaysReadySystemBuffer : public SimpleEventQueueBuffer {
+public:
+    AlwaysReadySystemBuffer() :
+        m_getEventCalls(0)
+    {
+    }
+
+    bool isEmpty() const override
+    {
+        return false;
+    }
+
+    Type getEvent(Event& event, UInt32&) override
+    {
+        ++m_getEventCalls;
+        event = Event(Event::kSystem);
+        return kSystem;
+    }
+
+    int getEventCalls() const
+    {
+        return m_getEventCalls;
+    }
+
+private:
+    int m_getEventCalls;
 };
 
 class RecordOrderJob : public IEventJob {
@@ -97,6 +170,102 @@ TEST(EventQueueTests, destructorDeletesPendingEventData)
     }
 
     EXPECT_EQ(1, deletedCount);
+}
+
+TEST(EventQueueTests, destructorDeletesAdoptedHandlers)
+{
+    int deletedCount = 0;
+
+    {
+        EventQueue events;
+        Event::Type type = Event::kUnknown;
+        int firstTarget = 0;
+        int secondTarget = 0;
+        events.registerTypeOnce(type, "testDestructorHandler");
+        events.adoptHandler(type, &firstTarget, new CountingEventJob(&deletedCount));
+        events.adoptHandler(type, &secondTarget, new CountingEventJob(&deletedCount));
+    }
+
+    EXPECT_EQ(2, deletedCount);
+}
+
+TEST(MockEventQueueTests, defaultActionsReleaseTransferredOwnership)
+{
+    int deletedDataCount = 0;
+    int deletedHandlerCount = 0;
+
+    {
+        ::testing::NiceMock<MockEventQueue> events;
+        int target = 0;
+        events.adoptHandler(Event::kLast, &target,
+                            new CountingEventJob(&deletedHandlerCount));
+
+        Event event(Event::kLast, &target);
+        event.setDataObject(new CountingEventData(&deletedDataCount));
+        events.addEvent(event);
+    }
+
+    EXPECT_EQ(1, deletedDataCount);
+    EXPECT_EQ(1, deletedHandlerCount);
+}
+
+TEST(MockEventQueueTests, defaultRemoveHandlerReleasesAdoptedJobImmediately)
+{
+    int deletedHandlerCount = 0;
+    ::testing::NiceMock<MockEventQueue> events;
+    int target = 0;
+    events.adoptHandler(Event::kLast, &target,
+                        new CountingEventJob(&deletedHandlerCount));
+
+    events.removeHandler(Event::kLast, &target);
+
+    EXPECT_EQ(1, deletedHandlerCount);
+}
+
+TEST(MockEventQueueTests, defaultRegisterTypeOnceReturnsStableUsableType)
+{
+    ::testing::NiceMock<MockEventQueue> events;
+    Event::Type type = Event::kUnknown;
+
+    const Event::Type first = events.registerTypeOnce(type, "mockEventType");
+    const Event::Type second = events.registerTypeOnce(type, "mockEventType");
+
+    EXPECT_GE(first, static_cast<Event::Type>(Event::kLast));
+    EXPECT_EQ(first, type);
+    EXPECT_EQ(first, second);
+}
+
+TEST(EventQueueTests, destructorDeletesOutstandingTimersThroughTheirBuffer)
+{
+    int deletedCount = 0;
+
+    {
+        EventQueue events;
+        events.adoptBuffer(new CountingTimerBuffer(&deletedCount));
+        events.newTimer(1.0, NULL);
+        events.newOneShotTimer(1.0, NULL);
+    }
+
+    EXPECT_EQ(2, deletedCount);
+}
+
+TEST(EventQueueTests, expiredTimerPreemptsContinuouslyReadySystemBuffer)
+{
+    EventQueue events;
+    AlwaysReadySystemBuffer* buffer = new AlwaysReadySystemBuffer;
+    events.adoptBuffer(buffer);
+
+    int timerTarget = 0;
+    EventQueueTimer* timer = events.newOneShotTimer(0.001, &timerTarget);
+    ARCH->sleep(0.01);
+
+    Event event;
+    ASSERT_TRUE(events.getEvent(event, 0.0));
+    EXPECT_EQ(Event::kTimer, event.getType());
+    EXPECT_EQ(&timerTarget, event.getTarget());
+    EXPECT_EQ(0, buffer->getEventCalls());
+
+    events.deleteTimer(timer);
 }
 
 TEST(EventQueueTests, loopDispatchesEventsQueuedBeforeReady)

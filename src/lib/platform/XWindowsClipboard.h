@@ -93,6 +93,8 @@ public:
     virtual bool        has(EFormat) const;
     virtual std::string get(EFormat) const;
 
+    static bool shouldSuppressPngTextFallbackForTest(const std::string& text);
+
 private:
     // remove all converters from our list
     void                clearConverters();

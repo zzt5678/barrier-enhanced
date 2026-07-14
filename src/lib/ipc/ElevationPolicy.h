@@ -20,5 +20,6 @@ UInt8 modeFromSettings(const std::string& elevateModeSetting,
                        const std::string& legacyElevateSetting);
 bool shouldElevateProcess(UInt8 mode);
 bool shouldAutoElevate(UInt8 mode, const std::string& desktopName);
+bool shouldRelaunchOnDesktopSwitch(UInt8 mode);
 
 } // namespace ElevationPolicy

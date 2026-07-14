@@ -48,6 +48,17 @@ TEST(ElevationPolicyTests, autoElevationFollowsDesktopAndNeverMode)
     EXPECT_TRUE(ElevationPolicy::shouldAutoElevate(99, "Winlogon"));
 }
 
+TEST(ElevationPolicyTests, onlyAsNeededModeRelaunchesOnDesktopSwitch)
+{
+    EXPECT_TRUE(ElevationPolicy::shouldRelaunchOnDesktopSwitch(
+        IpcCommandMessage::kElevateAsNeeded));
+    EXPECT_FALSE(ElevationPolicy::shouldRelaunchOnDesktopSwitch(
+        IpcCommandMessage::kElevateAlways));
+    EXPECT_FALSE(ElevationPolicy::shouldRelaunchOnDesktopSwitch(
+        IpcCommandMessage::kElevateNever));
+    EXPECT_TRUE(ElevationPolicy::shouldRelaunchOnDesktopSwitch(99));
+}
+
 TEST(ElevationPolicyTests, modeSettingOverridesLegacyElevateFlag)
 {
     EXPECT_EQ(IpcCommandMessage::kElevateNever,
@@ -87,6 +98,22 @@ TEST(DesktopSwitchPolicyTests, firstDesktopObservationIsRememberedWithoutRelaunc
     EXPECT_TRUE(decision.rememberDesktop);
     EXPECT_FALSE(decision.settling);
     EXPECT_FALSE(decision.debounced);
+}
+
+TEST(DesktopSwitchPolicyTests, observedDesktopIsUsedForProcessLaunch)
+{
+    EXPECT_EQ("Winlogon",
+              DesktopSwitchPolicy::launchDesktopName("Winlogon", true));
+}
+
+TEST(DesktopSwitchPolicyTests, daemonLaunchFallsBackWhenInputDesktopIsUnavailable)
+{
+    EXPECT_EQ("Default", DesktopSwitchPolicy::launchDesktopName("", true));
+}
+
+TEST(DesktopSwitchPolicyTests, foregroundLaunchDoesNotHideDesktopLookupFailure)
+{
+    EXPECT_TRUE(DesktopSwitchPolicy::launchDesktopName("", false).empty());
 }
 
 TEST(DesktopSwitchPolicyTests, transientDesktopChangeMustSettleBeforeRelaunch)

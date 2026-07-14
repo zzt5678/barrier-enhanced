@@ -335,11 +335,10 @@ ArchNetworkBSD::pollSocket(PollEntry pe[], int num, double timeout)
     if (n > 0 && unblockPipe != NULL && (pfd[num].revents & POLLIN) != 0) {
         // the unblock event was signalled.  flush the pipe.
         char dummy[100];
-        int ignore;
-
+        ssize_t bytesRead;
         do {
-            ignore = read(unblockPipe[0], dummy, sizeof(dummy));
-        } while (errno != EAGAIN);
+            bytesRead = read(unblockPipe[0], dummy, sizeof(dummy));
+        } while (bytesRead > 0 || (bytesRead == -1 && errno == EINTR));
 
         // don't count this unblock pipe in return value
         --n;
@@ -467,9 +466,10 @@ ArchNetworkBSD::pollSocket(PollEntry pe[], int num, double timeout)
     if (n > 0 && unblockPipe != NULL && FD_ISSET(unblockPipe[0], &readSet)) {
         // the unblock event was signalled.  flush the pipe.
         char dummy[100];
+        ssize_t bytesRead;
         do {
-            read(unblockPipe[0], dummy, sizeof(dummy));
-        } while (errno != EAGAIN);
+            bytesRead = read(unblockPipe[0], dummy, sizeof(dummy));
+        } while (bytesRead > 0 || (bytesRead == -1 && errno == EINTR));
     }
 
     // handle results
@@ -507,12 +507,13 @@ ArchNetworkBSD::pollSocket(PollEntry pe[], int num, double timeout)
 void
 ArchNetworkBSD::unblockPollSocket(ArchThread thread)
 {
-    const int* unblockPipe = getUnblockPipeForThread(thread);
+    ArchMultithreadPosix* mt = ArchMultithreadPosix::getInstance();
+    const int* unblockPipe = static_cast<const int*>(
+        mt->getNetworkDataForThreadAndMarkUnblock(thread));
     if (unblockPipe != NULL) {
         char dummy = 0;
-        int ignore;
-
-        ignore = write(unblockPipe[1], &dummy, 1);
+        const ssize_t ignored = write(unblockPipe[1], &dummy, 1);
+        (void)ignored;
     }
 }
 
@@ -879,34 +880,43 @@ ArchNetworkBSD::getUnblockPipe()
 {
     ArchMultithreadPosix* mt = ArchMultithreadPosix::getInstance();
     ArchThread thread        = mt->newCurrentThread();
-    const int* p              = getUnblockPipeForThread(thread);
+    int* unblockPipe = NULL;
+    try {
+        unblockPipe = static_cast<int*>(mt->getNetworkDataForThread(thread));
+        if (unblockPipe == NULL) {
+            unblockPipe = new int[2];
+            if (pipe(unblockPipe) == -1) {
+                delete[] unblockPipe;
+                unblockPipe = NULL;
+            }
+            else {
+                try {
+                    setBlockingOnSocket(unblockPipe[0], false);
+                    setBlockingOnSocket(unblockPipe[1], false);
+                    mt->setNetworkDataForCurrentThread(unblockPipe);
+                }
+                catch (...) {
+                    close(unblockPipe[0]);
+                    close(unblockPipe[1]);
+                    delete[] unblockPipe;
+                    unblockPipe = NULL;
+                }
+            }
+        }
+    }
+    catch (...) {
+        ARCH->closeThread(thread);
+        throw;
+    }
     ARCH->closeThread(thread);
-    return p;
+    return unblockPipe;
 }
 
 const int*
 ArchNetworkBSD::getUnblockPipeForThread(ArchThread thread)
 {
     ArchMultithreadPosix* mt = ArchMultithreadPosix::getInstance();
-    int* unblockPipe          = (int*)mt->getNetworkDataForThread(thread);
-    if (unblockPipe == NULL) {
-        unblockPipe = new int[2];
-        if (pipe(unblockPipe) != -1) {
-            try {
-                setBlockingOnSocket(unblockPipe[0], false);
-                mt->setNetworkDataForCurrentThread(unblockPipe);
-            }
-            catch (...) {
-                delete[] unblockPipe;
-                unblockPipe = NULL;
-            }
-        }
-        else {
-            delete[] unblockPipe;
-            unblockPipe = NULL;
-        }
-    }
-    return unblockPipe;
+    return static_cast<const int*>(mt->getNetworkDataForThread(thread));
 }
 
 void

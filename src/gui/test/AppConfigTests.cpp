@@ -80,6 +80,23 @@ TEST(AppConfigTests, InvalidPersistedProcessModeFallsBackToPlatformDefault)
 #endif
 }
 
+TEST(AppConfigTests, InvalidPersistedElevateModeFallsBackToPlatformDefault)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+
+    const int invalidModes[] = {-1, 3, 257, 999};
+    const QString settingsPath = dir.filePath("weave.ini");
+    for (const int invalidMode : invalidModes) {
+        QSettings settings(settingsPath, QSettings::IniFormat);
+        settings.setValue("elevateModeEnum", invalidMode);
+        settings.sync();
+
+        AppConfig config(&settings);
+        EXPECT_EQ(defaultElevateMode, config.elevateMode());
+    }
+}
+
 TEST(AppConfigTests, SavesLoadedProcessMode)
 {
     QTemporaryDir dir;
@@ -155,4 +172,24 @@ TEST(AppConfigTests, SetAutoConfigMarksSettingAsExplicit)
     QSettings settings(settingsPath, QSettings::IniFormat);
     EXPECT_TRUE(settings.value("autoConfig").toBool());
     EXPECT_TRUE(settings.value("autoConfigUserSet").toBool());
+}
+
+TEST(AppConfigTests, SavingSettingsDoesNotMarkCancelledWizardComplete)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+
+    const QString settingsPath = dir.filePath("weave.ini");
+    {
+        QSettings settings(settingsPath, QSettings::IniFormat);
+        settings.setValue("wizardLastRun", 0);
+        settings.sync();
+
+        AppConfig config(&settings);
+        EXPECT_TRUE(config.wizardShouldRun());
+        config.saveSettings();
+    }
+
+    QSettings settings(settingsPath, QSettings::IniFormat);
+    EXPECT_EQ(0, settings.value("wizardLastRun").toInt());
 }

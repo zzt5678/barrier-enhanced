@@ -52,6 +52,7 @@ public:
     //@{
 
     void*                getNetworkDataForThread(ArchThread);
+    void*                getNetworkDataForThreadAndMarkUnblock(ArchThread);
 
     static ArchMultithreadPosix*    getInstance();
 

@@ -26,6 +26,8 @@
 #include "base/Log.h"
 #include "mt/Thread.h"
 
+#include <cstdlib>
+
 namespace {
 
 const size_t kSynchronousClipboardSendLimit = 256 * 1024;
@@ -182,7 +184,7 @@ ClientProxy1_6::recvClipboard()
         m_clipboardReceiveBuffer.release();
 
         // notify
-        ClipboardInfo* info = new ClipboardInfo;
+        ClipboardInfo* info = (ClipboardInfo*)malloc(sizeof(ClipboardInfo));
         info->m_id = id;
         info->m_sequenceNumber = seq;
         m_events->addEvent(Event(m_events->forClipboard().clipboardChanged(),

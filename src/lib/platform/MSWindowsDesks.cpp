@@ -69,6 +69,13 @@
 #define VK_XBUTTON2            0x06
 #endif
 
+namespace {
+
+const double kNormalDeskPollInterval = 0.2;
+const double kLowLatencyDeskPollInterval = 0.05;
+
+}
+
 // <unused>; <unused>
 #define BARRIER_MSG_SWITCH            BARRIER_HOOK_LAST_MSG + 1
 // <unused>; <unused>
@@ -249,7 +256,7 @@ MSWindowsDesks::resetOptions()
     m_lowLatencyMode = false;
     m_nestedRemoteMode = false;
     endLowLatencyRelativeMoves();
-    updateDeskTimer(0.2);
+    updateDeskTimer(kNormalDeskPollInterval);
 }
 
 void
@@ -275,7 +282,8 @@ MSWindowsDesks::setOptions(const OptionsList& options)
     if (!m_lowLatencyMode && !m_nestedRemoteMode) {
         endLowLatencyRelativeMoves();
     }
-    updateDeskTimer((m_lowLatencyMode || m_nestedRemoteMode) ? 0.05 : 0.2);
+    updateDeskTimer((m_lowLatencyMode || m_nestedRemoteMode) ?
+        kLowLatencyDeskPollInterval : kNormalDeskPollInterval);
 }
 
 void

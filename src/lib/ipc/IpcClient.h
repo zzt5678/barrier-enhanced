@@ -65,4 +65,5 @@ private:
     IpcServerProxy*    m_server;
     IEventQueue*        m_events;
     EIpcClientType      m_clientType;
+    bool                m_connectAttempted;
 };

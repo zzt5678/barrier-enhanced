@@ -70,6 +70,7 @@ const double kSwitchReverseGuardMaxSeconds = 2.0;
 const int kClipboardReadAttempts = 8;
 const double kClipboardReadRetrySeconds = 0.025;
 const UInt32 kDefaultHeartbeatMilliseconds = 10000;
+const double kMouseMoveIntervalSeconds = 1.0 / 240.0;
 const size_t kMaxPendingDropDirTransfers = 4;
 const size_t kMaxPendingDropDirTransferMemoryBytes = 32 * 1024 * 1024;
 
@@ -260,6 +261,12 @@ Server::Server(
 	m_switchWaitDelay(0.0),
 	m_switchWaitTimer(NULL),
 	m_primaryKeyStateTimer(NULL),
+	m_mouseMoveTimer(NULL),
+	m_pendingMouseMoveTarget(NULL),
+	m_pendingMouseMove(false),
+	m_mouseMoveSent(false),
+	m_pendingMouseX(0),
+	m_pendingMouseY(0),
 	m_switchTwoTapDelay(0.0),
 	m_switchTwoTapEngaged(false),
 	m_switchTwoTapArmed(false),
@@ -279,6 +286,7 @@ Server::Server(
 	m_sendFileTarget(NULL),
 	m_sendFileTransferId(0),
 	m_sendFileCompletionPending(false),
+	m_sendFileIsClipboardPrefetch(false),
 	m_writeToDropDirThread(NULL),
 	m_pendingDropDirTransfers(),
 	m_remoteFileClipboardSession(),
@@ -437,6 +445,8 @@ Server::~Server()
 	if (m_mock) {
 		return;
 	}
+
+	discardPendingMouseMove();
 
 	if (!cleanupSendFileThread(true) && m_sendFileThread != NULL) {
 		LOG((CLOG_ERR "waiting for file sender before destroying server state"));
@@ -628,8 +638,10 @@ Server::adoptClient(BaseClientProxy* client)
 	// send notification
 	Server::ScreenConnectedInfo* info =
 		new Server::ScreenConnectedInfo(getName(client));
-	m_events->addEvent(Event(m_events->forServer().connected(),
-								m_primaryClient->getEventTarget(), info));
+	Event connectedEvent(m_events->forServer().connected(),
+					 m_primaryClient->getEventTarget(), info);
+	connectedEvent.setDataObject(info);
+	m_events->addEvent(connectedEvent);
 }
 
 void
@@ -786,6 +798,7 @@ Server::switchScreen(BaseClientProxy* dst,
 	// since that's a waste of time we skip that and just warp the
 	// mouse.
 	if (m_active != dst) {
+		flushPendingMouseMove();
 		BaseClientProxy* oldActive = m_active;
 		const SInt32 oldX = m_x;
 		const SInt32 oldY = m_y;
@@ -856,6 +869,7 @@ Server::switchScreen(BaseClientProxy* dst,
 			m_yDelta  = 0;
 			m_xDelta2 = 0;
 			m_yDelta2 = 0;
+			flushPendingMouseMove();
 			m_active->mouseMove(x, y);
 		}
 
@@ -906,6 +920,7 @@ Server::recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y)
 	LOG((CLOG_WARN "reanchoring primary at %d,%d after failed leave", safeX, safeY));
 	m_x = safeX;
 	m_y = safeY;
+	discardPendingMouseMove();
 	m_primaryClient->mouseMove(m_x, m_y);
 	m_primaryClient->refreshKeyState();
 	noSwitch(m_x, m_y);
@@ -931,6 +946,7 @@ Server::reanchorActiveAfterFailedSwitch(BaseClientProxy* dst)
 		m_xDelta2 = 0;
 		m_yDelta2 = 0;
 		noSwitch(m_x, m_y);
+		discardPendingMouseMove();
 		m_active->mouseMove(m_x, m_y);
 	}
 }
@@ -945,9 +961,61 @@ Server::fetchPendingPrimaryClipboards()
     const std::string primaryName = getName(m_primaryClient);
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         ClipboardInfo& clipboard = m_clipboards[id];
-        if (clipboard.m_clipboardOwner == primaryName &&
-            clipboard.m_pendingPrimaryFetch) {
+        const bool pendingFetch = clipboard.m_clipboardOwner == primaryName &&
+            clipboard.m_pendingPrimaryFetch;
+        if (pendingFetch) {
             onClipboardChanged(m_primaryClient, id, clipboard.m_clipboardSeqNum);
+            continue;
+        }
+
+        // X11 only reports SelectionClear after Weave has owned a selection.
+        // Snapshot the regular clipboard on every primary leave so the first
+        // local copy after startup is not missed. PRIMARY selection remains
+        // event-driven to avoid unnecessary reads and switch latency.
+        if (id == kClipboardClipboard) {
+            const std::string previousOwner = clipboard.m_clipboardOwner;
+            const bool previousPendingFetch = clipboard.m_pendingPrimaryFetch;
+
+            Clipboard observedClipboard;
+            if (!readClipboardWithRetry(m_primaryClient, id, observedClipboard)) {
+                continue;
+            }
+
+            RemoteFileClipboard::Data observedFileClipboard;
+            const bool materializedFileEcho =
+                !m_readyFileClipboardSession.empty() &&
+                RemoteFileClipboard::normalizeClipboard(
+                    observedClipboard, &observedFileClipboard) &&
+                observedFileClipboard.mode ==
+                    RemoteFileClipboard::Mode::SourcePaths &&
+                RemoteFileClipboard::pathsMatch(
+                    observedFileClipboard, m_readyFileClipboardPaths);
+            if (materializedFileEcho) {
+                LOG((CLOG_INFO
+                    "suppressed remote file clipboard echo: session=%s items=%lu",
+                    m_readyFileClipboardSession.c_str(),
+                    static_cast<unsigned long>(m_readyFileClipboardPaths.size())));
+                clipboard.m_clipboard = observedClipboard;
+                clipboard.m_clipboardData.set(observedClipboard.marshall());
+                clipboard.m_pendingPrimaryFetch = false;
+                m_readyFileClipboardSession.clear();
+                m_readyFileClipboardPaths.clear();
+                continue;
+            }
+
+            const std::string observedData = observedClipboard.marshall();
+            const bool observedEmpty = observedData.size() == sizeof(UInt32);
+            if (clipboard.m_clipboardData.matches(observedData) ||
+                (previousOwner != primaryName && observedEmpty)) {
+                continue;
+            }
+
+            clipboard.m_clipboardOwner = primaryName;
+            clipboard.m_pendingPrimaryFetch = true;
+            if (!onClipboardChanged(m_primaryClient, id, clipboard.m_clipboardSeqNum)) {
+                clipboard.m_clipboardOwner = previousOwner;
+                clipboard.m_pendingPrimaryFetch = previousPendingFetch;
+            }
         }
     }
 }
@@ -960,17 +1028,25 @@ Server::replayClipboardsToActive()
     }
 
     const std::string activeName = getName(m_active);
+    const std::string primaryName = getName(m_primaryClient);
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         ClipboardInfo& clipboard = m_clipboards[id];
         if (id == kClipboardClipboard) {
             RemoteFileClipboard::Data remoteFileClipboard;
             if (RemoteFileClipboard::readFromClipboard(clipboard.m_clipboard, remoteFileClipboard) &&
-                remoteFileClipboard.mode == RemoteFileClipboard::Mode::SourcePaths &&
-                clipboard.m_clipboardOwner != activeName) {
-                LOG((CLOG_INFO
-                    "not replaying source-path file clipboard from \"%s\" directly to \"%s\"",
-                    clipboard.m_clipboardOwner.c_str(),
-                    activeName.c_str()));
+                remoteFileClipboard.mode == RemoteFileClipboard::Mode::SourcePaths) {
+                if (clipboard.m_clipboardOwner == primaryName &&
+                    m_active != m_primaryClient) {
+                    m_active->setClipboard(id, &clipboard.m_clipboard);
+                    sendClipboardSelectionToClient(
+                        m_active, remoteFileClipboard.paths);
+                }
+                else {
+                    LOG((CLOG_INFO
+                        "not replaying source-path file clipboard from \"%s\" directly to \"%s\"",
+                        clipboard.m_clipboardOwner.c_str(),
+                        activeName.c_str()));
+                }
                 continue;
             }
         }
@@ -1733,6 +1809,7 @@ Server::stopRelativeMoves()
 		m_xDelta2 = 0;
 		m_yDelta2 = 0;
 		LOG((CLOG_DEBUG2 "synchronize move on %s by %d,%d", getName(m_active).c_str(), m_x, m_y));
+		discardPendingMouseMove();
 		m_active->mouseMove(m_x, m_y);
 	}
 }
@@ -1947,6 +2024,7 @@ Server::handleShapeChanged(const Event&, void* vclient)
 		if (client != m_primaryClient) {
 			LOG((CLOG_DEBUG "reanchoring active screen \"%s\" at %d,%d after shape change",
 				getName(client).c_str(), m_x, m_y));
+			discardPendingMouseMove();
 			client->mouseMove(m_x, m_y);
 		}
 	}
@@ -2116,6 +2194,18 @@ Server::handlePrimaryKeyStateSync(const Event&, void*)
 	if (m_active == m_primaryClient) {
 		m_primaryClient->refreshKeyState();
 	}
+}
+
+void
+Server::handleMouseMoveFlush(const Event&, void*)
+{
+	EventQueueTimer* timer = m_mouseMoveTimer;
+	m_mouseMoveTimer = NULL;
+	if (timer != NULL) {
+		m_events->removeHandler(Event::kTimer, timer);
+		m_events->deleteTimer(timer);
+	}
+	flushPendingMouseMove();
 }
 
 void
@@ -2340,16 +2430,16 @@ Server::handleFileKeepAliveEvent(const Event&, void*)
 	ProtocolUtil::writef(target->getStream(), kMsgCKeepAlive);
 }
 
-void
+bool
 Server::onClipboardChanged(BaseClientProxy* sender,
-				ClipboardID id, UInt32 seqNum)
+					ClipboardID id, UInt32 seqNum)
 {
 	ClipboardInfo& clipboard = m_clipboards[id];
 
 	// ignore update if sequence number is old
 	if (seqNum < clipboard.m_clipboardSeqNum) {
 		LOG((CLOG_INFO "ignored screen \"%s\" update of clipboard %d (missequenced)", getName(sender).c_str(), id));
-		return;
+		return false;
 	}
 
 	// should be the expected client
@@ -2357,7 +2447,7 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 
 	// get data
 	if (!readClipboardWithRetry(sender, id, clipboard.m_clipboard)) {
-		return;
+		return false;
 	}
 
 	RemoteFileClipboard::AutomaticSharingStatus clipboardSharingStatus =
@@ -2384,22 +2474,53 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 		if (sender == m_primaryClient) {
 			clipboard.m_pendingPrimaryFetch = false;
 		}
-		return;
+		return true;
 	}
 
 	// got new data
 	LOG((CLOG_INFO "screen \"%s\" updated clipboard %d", clipboard.m_clipboardOwner.c_str(), id));
 	if (clipboardSharingStatus ==
 		RemoteFileClipboard::AutomaticSharingStatus::ContainsFileList) {
-		LOG((CLOG_INFO "local file clipboard is not forwarded automatically"));
-		m_remoteFileClipboardSession.clear();
+		RemoteFileClipboard::Data sourceFileClipboard;
+		std::string error;
+		if (!RemoteFileClipboard::normalizeClipboard(
+				clipboard.m_clipboard, &sourceFileClipboard, &error)) {
+			LOG((CLOG_WARN "file clipboard metadata could not be normalized: %s",
+				error.c_str()));
+			if (sender == m_primaryClient) {
+				clipboard.m_pendingPrimaryFetch = false;
+			}
+			return false;
+		}
+
+		data = clipboard.m_clipboard.marshall();
 		m_readyFileClipboardSession.clear();
 		m_readyFileClipboardPaths.clear();
+		if (sender == m_primaryClient) {
+			m_remoteFileClipboardSession.clear();
+			LOG((CLOG_INFO
+				"cached local file clipboard for transfer on the active remote screen: session=%s items=%lu",
+				sourceFileClipboard.sessionId.c_str(),
+				static_cast<unsigned long>(sourceFileClipboard.paths.size())));
+		}
+		else {
+			m_remoteFileClipboardSession = sourceFileClipboard.sessionId;
+			LOG((CLOG_INFO
+				"awaiting remote file clipboard package: session=%s items=%lu source=%s",
+				m_remoteFileClipboardSession.c_str(),
+				static_cast<unsigned long>(sourceFileClipboard.paths.size()),
+				getName(sender).c_str()));
+		}
 		clipboard.m_clipboardData.set(data);
+		for (ClientList::const_iterator index = m_clients.begin();
+									index != m_clients.end(); ++index) {
+			BaseClientProxy* client = index->second;
+			client->setClipboardDirty(id, client != sender);
+		}
 		if (sender == m_primaryClient) {
 			clipboard.m_pendingPrimaryFetch = false;
 		}
-		return;
+		return true;
 	}
 
 	clipboard.m_clipboardData.set(data);
@@ -2416,6 +2537,7 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 
 	// send the new clipboard to the active screen
 	m_active->setClipboard(id, &clipboard.m_clipboard);
+	return true;
 }
 
 void
@@ -2487,6 +2609,7 @@ Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button,
 {
 	LOG((CLOG_DEBUG1 "onKeyDown id=%d mask=0x%04x button=0x%04x", id, mask, button));
 	assert(m_active != NULL);
+	flushPendingMouseMove();
 
 	if (m_active != m_primaryClient && isReturnToPrimaryHotKey(id, mask)) {
 		LOG((CLOG_WARN "emergency return to primary from \"%s\"", getName(m_active).c_str()));
@@ -2553,6 +2676,7 @@ Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button,
 {
 	LOG((CLOG_DEBUG1 "onKeyUp id=%d mask=0x%04x button=0x%04x", id, mask, button));
 	assert(m_active != NULL);
+	flushPendingMouseMove();
 
 	// relay
 	if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
@@ -2599,6 +2723,7 @@ Server::onKeyRepeat(KeyID id, KeyModifierMask mask,
 {
 	LOG((CLOG_DEBUG1 "onKeyRepeat id=%d mask=0x%04x count=%d button=0x%04x", id, mask, count, button));
 	assert(m_active != NULL);
+	flushPendingMouseMove();
 
 	// relay
 	m_active->keyRepeat(id, mask, count, button);
@@ -2609,6 +2734,7 @@ Server::onMouseDown(ButtonID id)
 {
 	LOG((CLOG_DEBUG1 "onMouseDown id=%d", id));
 	assert(m_active != NULL);
+	flushPendingMouseMove();
 
 	// relay
 	m_active->mouseDown(id);
@@ -2619,6 +2745,7 @@ Server::onMouseUp(ButtonID id)
 {
 	LOG((CLOG_DEBUG1 "onMouseUp id=%d", id));
 	assert(m_active != NULL);
+	flushPendingMouseMove();
 
 	// relay
 	m_active->mouseUp(id);
@@ -2812,6 +2939,7 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 	// have no idea where it really is.
 	if (m_relativeMoves && isLockedToScreenServer()) {
 		LOG((CLOG_DEBUG2 "relative move on %s by %d,%d", getName(m_active).c_str(), dx, dy));
+		flushPendingMouseMove();
 		m_active->mouseRelativeMove(dx, dy);
 		return;
 	}
@@ -2930,7 +3058,7 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 	} while (false);
 
 	if (jump) {
-		if (m_sendFileChunker) {
+		if (m_sendFileChunker && !m_sendFileIsClipboardPrefetch) {
 			m_sendFileChunker->interruptFile();
 		}
 
@@ -2947,6 +3075,7 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 				m_xDelta2 = 0;
 				m_yDelta2 = 0;
 				noSwitch(m_x, m_y);
+				discardPendingMouseMove();
 				m_active->mouseMove(m_x, m_y);
 			}
 		}
@@ -2974,9 +3103,83 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 		// warp cursor if it moved.
 		if (m_x != xOld || m_y != yOld) {
 			LOG((CLOG_DEBUG2 "move on %s to %d,%d", getName(m_active).c_str(), m_x, m_y));
-			m_active->mouseMove(m_x, m_y);
+			queueMouseMove(m_active, m_x, m_y);
 		}
 	}
+}
+
+void
+Server::queueMouseMove(BaseClientProxy* target, SInt32 x, SInt32 y)
+{
+	if (target == NULL) {
+		return;
+	}
+
+	if (m_pendingMouseMove && m_pendingMouseMoveTarget != target) {
+		flushPendingMouseMove();
+	}
+
+	const double elapsed = m_mouseMoveRateTimer.getTime();
+	if (!m_mouseMoveSent || elapsed >= kMouseMoveIntervalSeconds) {
+		discardPendingMouseMove();
+		target->mouseMove(x, y);
+		m_mouseMoveSent = true;
+		m_mouseMoveRateTimer.reset();
+		return;
+	}
+
+	m_pendingMouseMove = true;
+	m_pendingMouseMoveTarget = target;
+	m_pendingMouseX = x;
+	m_pendingMouseY = y;
+	if (m_mouseMoveTimer == NULL && m_events != NULL) {
+		const double delay = kMouseMoveIntervalSeconds - elapsed;
+		m_mouseMoveTimer = m_events->newOneShotTimer(delay, NULL);
+		m_events->adoptHandler(Event::kTimer, m_mouseMoveTimer,
+							new TMethodEventJob<Server>(this,
+								&Server::handleMouseMoveFlush));
+	}
+}
+
+void
+Server::flushPendingMouseMove()
+{
+	if (!m_pendingMouseMove) {
+		return;
+	}
+
+	if (m_mouseMoveTimer != NULL) {
+		m_events->removeHandler(Event::kTimer, m_mouseMoveTimer);
+		m_events->deleteTimer(m_mouseMoveTimer);
+		m_mouseMoveTimer = NULL;
+	}
+
+	BaseClientProxy* target = m_pendingMouseMoveTarget;
+	const SInt32 x = m_pendingMouseX;
+	const SInt32 y = m_pendingMouseY;
+	m_pendingMouseMove = false;
+	m_pendingMouseMoveTarget = NULL;
+	if (target != NULL && target == m_active && m_clientSet.count(target) != 0) {
+		target->mouseMove(x, y);
+		m_mouseMoveSent = true;
+		m_mouseMoveRateTimer.reset();
+	}
+}
+
+void
+Server::discardPendingMouseMove(BaseClientProxy* target)
+{
+	if (target != NULL && m_pendingMouseMoveTarget != target) {
+		return;
+	}
+
+	if (m_mouseMoveTimer != NULL) {
+		m_events->removeHandler(Event::kTimer, m_mouseMoveTimer);
+		m_events->deleteTimer(m_mouseMoveTimer);
+		m_mouseMoveTimer = NULL;
+	}
+	m_pendingMouseMove = false;
+	m_pendingMouseMoveTarget = NULL;
 }
 
 void
@@ -2984,6 +3187,7 @@ Server::onMouseWheel(SInt32 xDelta, SInt32 yDelta)
 {
 	LOG((CLOG_DEBUG1 "onMouseWheel %+d,%+d", xDelta, yDelta));
 	assert(m_active != NULL);
+	flushPendingMouseMove();
 
 	// relay
 	m_active->mouseWheel(xDelta, yDelta);
@@ -3244,8 +3448,13 @@ Server::sendClipboardSelectionToClient(BaseClientProxy* target,
 		return;
 	}
 
-	if (!cleanupSendFileThread(true)) {
-		LOG((CLOG_WARN "remote clipboard prefetch skipped because previous file sender is still stopping"));
+	if (!reapSendFileThreadIfReady()) {
+		LOG((CLOG_DEBUG "remote clipboard prefetch already active; keeping the current sender"));
+		return;
+	}
+	finishCompletedSendFileIfReady();
+	if (m_sendFileTarget != NULL) {
+		LOG((CLOG_DEBUG "remote clipboard prefetch deferred until queued file output is flushed"));
 		return;
 	}
 
@@ -3253,6 +3462,7 @@ Server::sendClipboardSelectionToClient(BaseClientProxy* target,
 	m_sendFileChunker = chunker;
 	m_sendFileTarget = target;
 	m_sendFileCompletionPending = false;
+	m_sendFileIsClipboardPrefetch = true;
 	m_sendFileTransferId++;
 	if (m_sendFileTransferId == 0) {
 		m_sendFileTransferId++;
@@ -3351,6 +3561,7 @@ Server::removeClient(BaseClientProxy* client)
 	if (i == m_clientSet.end()) {
 		return false;
 	}
+	discardPendingMouseMove(client);
 
 	// remove event handlers
 	m_events->removeHandler(m_events->forIScreen().shapeChanged(),
@@ -3637,6 +3848,7 @@ Server::sendFileToClient(const std::string& filename)
 	m_sendFileChunker = chunker;
 	m_sendFileTarget = target;
 	m_sendFileCompletionPending = false;
+	m_sendFileIsClipboardPrefetch = false;
 	m_sendFileTransferId++;
 	if (m_sendFileTransferId == 0) {
 		m_sendFileTransferId++;
@@ -3713,6 +3925,7 @@ Server::cleanupSendFileThread(bool cancel)
 	m_sendFileChunker.reset();
 	m_sendFileTarget = NULL;
 	m_sendFileCompletionPending = false;
+	m_sendFileIsClipboardPrefetch = false;
 	deleteDeferredClient(target);
 	deleteDeferredClients();
 	return true;
@@ -3751,6 +3964,7 @@ Server::finishCompletedSendFileIfReady()
 
 	m_sendFileTarget = NULL;
 	m_sendFileCompletionPending = false;
+	m_sendFileIsClipboardPrefetch = false;
 	deleteDeferredClient(target);
 	deleteDeferredClients();
 	return true;

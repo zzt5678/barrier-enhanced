@@ -459,6 +459,11 @@ int XWindowsImpl::XGrabPointer(Display* display, Window grab_window,
                           time);
 }
 
+int XWindowsImpl::XUngrabPointer(Display* display, Time time)
+{
+    return ::XUngrabPointer(display, time);
+}
+
 int XWindowsImpl::XUngrabKeyboard(Display* display, Time time)
 {
     return ::XUngrabKeyboard(display, time);

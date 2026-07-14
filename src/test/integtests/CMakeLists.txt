@@ -18,6 +18,7 @@ set(headers
 )
 set(sources
     arch/ArchInternetTests.cpp
+    arch/ArchNetworkTests.cpp
     ipc/IpcTests.cpp
     net/NetworkTests.cpp
     Main.cpp

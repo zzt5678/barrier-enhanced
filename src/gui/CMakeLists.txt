@@ -10,15 +10,19 @@ set (CMAKE_INCLUDE_CURRENT_DIR ON)
 set(GUI_COMMON_SOURCE_FILES
     src/Action.cpp
     src/CommandLine.cpp
+    src/ElidingLabel.cpp
     src/Hotkey.cpp
     src/KeySequence.cpp
+    src/WindowLifecyclePolicy.cpp
 )
 
 set(GUI_COMMON_HEADER_FILES
     src/Action.h
     src/CommandLine.h
+    src/ElidingLabel.h
     src/Hotkey.h
     src/KeySequence.h
+    src/WindowLifecyclePolicy.h
 )
 
 set(GUI_SOURCE_FILES
@@ -205,13 +209,20 @@ if (BARRIER_BUILD_TESTS)
         test/HotkeyTests.cpp
         test/IpcReaderTests.cpp
         test/AppConfigTests.cpp
+        test/ElidingLabelTests.cpp
+        test/SettingsDialogTests.cpp
+        test/WindowLifecyclePolicyTests.cpp
         test/main.cpp
         src/AppConfig.cpp
         src/ActionBus.cpp
+        src/BarrierLocale.cpp
         src/Ipc.cpp
         src/IpcClient.cpp
         src/IpcReader.cpp
+        src/SettingsDialog.cpp
         src/WorkflowStore.cpp
+        src/SettingsDialogBase.ui
+        res/Barrier.qrc
     )
 
     add_executable(guiunittests

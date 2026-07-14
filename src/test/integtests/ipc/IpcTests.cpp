@@ -92,6 +92,67 @@ TEST_F(IpcTests, connectToServer)
     EXPECT_EQ(true, m_connectToServer_hasClientNode);
 }
 
+TEST_F(IpcTests, disconnectWithoutConnectingIsIdempotent)
+{
+    SocketMultiplexer socketMultiplexer;
+    IpcClient client(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+
+    client.disconnect();
+    client.disconnect();
+}
+
+TEST_F(IpcTests, disconnectAfterConnectingIsIdempotent)
+{
+    SocketMultiplexer socketMultiplexer;
+    IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+    server.listen();
+    m_connectToServer_server = &server;
+
+    m_events.adoptHandler(
+        m_events.forIpcServer().messageReceived(), &server,
+        new TMethodEventJob<IpcTests>(
+        this, &IpcTests::connectToServer_handleMessageReceived));
+
+    IpcClient client(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+    client.connect();
+
+    m_events.initQuitTimeout(5);
+    m_events.loop();
+    m_events.removeHandler(m_events.forIpcServer().messageReceived(), &server);
+    m_events.cleanupQuitTimeout();
+
+    ASSERT_TRUE(m_connectToServer_helloMessageReceived);
+    ASSERT_TRUE(m_connectToServer_hasClientNode);
+
+    client.disconnect();
+    client.disconnect();
+}
+
+TEST_F(IpcTests, repeatedConnectIsNoOp)
+{
+    SocketMultiplexer socketMultiplexer;
+    IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+    server.listen();
+    m_connectToServer_server = &server;
+
+    m_events.adoptHandler(
+        m_events.forIpcServer().messageReceived(), &server,
+        new TMethodEventJob<IpcTests>(
+        this, &IpcTests::connectToServer_handleMessageReceived));
+
+    IpcClient client(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+    client.connect();
+    client.connect();
+
+    m_events.initQuitTimeout(5);
+    m_events.loop();
+    m_events.removeHandler(m_events.forIpcServer().messageReceived(), &server);
+    m_events.cleanupQuitTimeout();
+
+    EXPECT_TRUE(m_connectToServer_helloMessageReceived);
+    EXPECT_TRUE(m_connectToServer_hasClientNode);
+}
+
 TEST_F(IpcTests, sendMessageToServer)
 {
     runCommandRoundTrip(IpcCommandMessage::kElevateAlways);

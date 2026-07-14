@@ -100,6 +100,11 @@ public:
     int cleanupCalls = 0;
 };
 
+void consumeClientFailureEvent(const Event& event)
+{
+    delete static_cast<Client::FailInfo*>(event.getData());
+}
+
 void setServerProxyEventDefaults(MockEventQueue& events,
                                  IStreamEvents& streamEvents,
                                  ClipboardEvents& clipboardEvents,
@@ -152,7 +157,7 @@ TEST(ServerProxyTests, hasCompleteOptionPairs_rejectsOddSizedOptions)
     EXPECT_FALSE(ServerProxy::hasCompleteOptionPairs(malformed));
 }
 
-TEST(ServerProxyTests, setKeepAliveRateUsesShortIdleDeathWindow)
+TEST(ServerProxyTests, setKeepAliveRateAllowsTransientSchedulingPause)
 {
     NiceMock<MockEventQueue> events;
     IStreamEvents streamEvents;
@@ -168,10 +173,30 @@ TEST(ServerProxyTests, setKeepAliveRateUsesShortIdleDeathWindow)
     ServerProxy proxy(reinterpret_cast<Client*>(1), &stream, &events);
     Mock::VerifyAndClearExpectations(&events);
 
-    EXPECT_CALL(events, newOneShotTimer(DoubleEq(2.0), _))
+    EXPECT_CALL(events, newOneShotTimer(DoubleEq(5.0), _))
         .WillOnce(Return(reinterpret_cast<EventQueueTimer*>(2)));
 
     proxy.setKeepAliveRate(1.0);
+}
+
+TEST(ServerProxyTests, backloggedMouseMovesCompressInLowLatencyNestedRemoteMode)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    setServerProxyEventDefaults(events, streamEvents, clipboardEvents, fileEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Return(&stream));
+    ON_CALL(stream, isReady()).WillByDefault(Return(true));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0));
+
+    ServerProxy proxy(reinterpret_cast<Client*>(1), &stream, &events);
+    proxy.m_lowLatencyMode = true;
+    proxy.m_nestedRemoteMode = true;
+
+    EXPECT_TRUE(proxy.shouldCompressMouseMoves());
 }
 
 TEST(ServerProxyTests, ordinaryMessageResetsKeepAliveAlarm)
@@ -199,6 +224,7 @@ TEST(ServerProxyTests, ordinaryMessageResetsKeepAliveAlarm)
 
     ServerProxy proxy(reinterpret_cast<Client*>(1), &stream, &events);
     proxy.m_keepAliveAlarmDeferrals = 2;
+    proxy.m_keepAliveMissedAlarms = 2;
     Mock::VerifyAndClearExpectations(&events);
 
     EXPECT_CALL(events, deleteTimer(_)).Times(0);
@@ -207,6 +233,7 @@ TEST(ServerProxyTests, ordinaryMessageResetsKeepAliveAlarm)
     proxy.handleData(Event(), NULL);
 
     EXPECT_EQ(0u, proxy.m_keepAliveAlarmDeferrals);
+    EXPECT_EQ(0u, proxy.m_keepAliveMissedAlarms);
     Mock::VerifyAndClearExpectations(&events);
 }
 
@@ -353,14 +380,16 @@ TEST(ServerProxyTests, keepAliveAlarmDisconnectsWhenPendingOutputStallsAtDeferra
     proxy.m_lastKeepAliveBufferedOutput = 4096;
     Mock::VerifyAndClearExpectations(&events);
 
-    EXPECT_CALL(events, addEvent(_)).Times(AtLeast(1));
+    EXPECT_CALL(events, addEvent(_))
+        .Times(AtLeast(1))
+        .WillRepeatedly(Invoke(consumeClientFailureEvent));
 
     proxy.handleKeepAliveAlarm(Event(), NULL);
 
     EXPECT_EQ(8u, proxy.m_keepAliveAlarmDeferrals);
 }
 
-TEST(ServerProxyTests, keepAliveAlarmDisconnectsIdleServerImmediately)
+TEST(ServerProxyTests, keepAliveAlarmProbesIdleServerBeforeDisconnecting)
 {
     NiceMock<MockEventQueue> events;
     IStreamEvents streamEvents;
@@ -384,7 +413,46 @@ TEST(ServerProxyTests, keepAliveAlarmDisconnectsIdleServerImmediately)
     proxy.m_keepAliveAlarm = 0.0;
     Mock::VerifyAndClearExpectations(&events);
 
-    EXPECT_CALL(events, addEvent(_)).Times(AtLeast(1));
+    EXPECT_CALL(events, addEvent(_)).Times(0);
+    EXPECT_CALL(stream, write(_, _))
+        .WillOnce(Invoke([](const void* buffer, UInt32 size) {
+            EXPECT_EQ(4u, size);
+            EXPECT_EQ(0, memcmp(buffer, kMsgCKeepAlive, 4));
+        }));
+
+    proxy.handleKeepAliveAlarm(Event(), NULL);
+
+    EXPECT_EQ(1u, proxy.m_keepAliveMissedAlarms);
+}
+
+TEST(ServerProxyTests, keepAliveAlarmDisconnectsAfterRepeatedIdleMisses)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents, clientEvents, screenEvents);
+
+    TestScreen screen;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, ClientArgs());
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Return(&stream));
+    ON_CALL(stream, isReady()).WillByDefault(Return(false));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0));
+
+    ServerProxy proxy(&client, &stream, &events);
+    proxy.m_keepAliveAlarm = 0.0;
+    proxy.m_keepAliveMissedAlarms = 3;
+    Mock::VerifyAndClearExpectations(&events);
+
+    EXPECT_CALL(events, addEvent(_))
+        .Times(AtLeast(1))
+        .WillRepeatedly(Invoke(consumeClientFailureEvent));
     EXPECT_CALL(stream, write(_, _)).Times(0);
 
     proxy.handleKeepAliveAlarm(Event(), NULL);

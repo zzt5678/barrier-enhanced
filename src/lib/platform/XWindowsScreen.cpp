@@ -106,7 +106,41 @@ visibleAreaEquals(const XWindowsScreen::VisibleArea& a,
 	const XWindowsScreen::VisibleArea& b)
 {
 	return a.x == b.x && a.y == b.y &&
-		a.width == b.width && a.height == b.height;
+			a.width == b.width && a.height == b.height;
+}
+
+bool
+visibleAreaTopologyEquals(const XWindowsScreen::VisibleArea& a,
+	const XWindowsScreen::VisibleArea& b)
+{
+	return visibleAreaEquals(a, b) && a.primary == b.primary;
+}
+
+bool
+visibleAreaTopologiesEqual(const XWindowsScreen::VisibleAreas& first,
+	const XWindowsScreen::VisibleAreas& second)
+{
+	if (first.size() != second.size()) {
+		return false;
+	}
+
+	std::vector<bool> matched(second.size(), false);
+	for (XWindowsScreen::VisibleAreas::const_iterator i = first.begin();
+		i != first.end(); ++i) {
+		bool found = false;
+		for (std::size_t j = 0; j < second.size(); ++j) {
+			if (!matched[j] && visibleAreaTopologyEquals(*i, second[j])) {
+				matched[j] = true;
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 long long
@@ -384,7 +418,9 @@ XWindowsScreen::XWindowsScreen(
 		bool disableXInitThreads,
 		int mouseScrollDelta,
 		IEventQueue* events) :
-	m_isPrimary(isPrimary),
+		PlatformScreen(events),
+		m_impl(impl),
+		m_isPrimary(isPrimary),
 	m_mouseScrollDelta(mouseScrollDelta),
     m_x_accumulatedScroll(0),
     m_y_accumulatedScroll(0),
@@ -408,33 +444,48 @@ XWindowsScreen::XWindowsScreen(
     m_dropTargetPath(),
 	m_screensaver(NULL),
 	m_screensaverNotify(false),
+	m_autoRepeat(false),
 	m_xtestIsXineramaUnaware(true),
+	m_xinerama(false),
 	m_preserveFocus(false),
 	m_xkb(false),
+	m_xkbEventBase(0),
 	m_xi2detected(false),
-	m_xrandr(false),
 	m_lowLatencyMode(false),
-	m_events(events),
-	PlatformScreen(events)
+	m_xrandr(false),
+	m_xrandrEventBase(0),
+	m_events(events)
 {
-    m_impl = impl;
+	for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+		m_clipboard[id] = NULL;
+	}
+
 	assert(s_screen == NULL);
 
 	if (mouseScrollDelta==0) m_mouseScrollDelta=120;
+	XWindowsScreen* const previousScreen = s_screen;
+	XIOErrorHandler previousIOErrorHandler = NULL;
+	bool ioErrorHandlerInstalled = false;
+	bool systemHandlerInstalled = false;
+	bool eventBufferInstalled = false;
 	s_screen = this;
 
-	if (!disableXInitThreads) {
-	  // initializes Xlib support for concurrent threads.
-      if (m_impl->XInitThreads() == 0)
-	    throw XArch("XInitThreads() returned zero");
-	} else {
-		LOG((CLOG_DEBUG "skipping XInitThreads()"));
-	}
-
-	// set the X I/O error handler so we catch the display disconnecting
-    m_impl->XSetIOErrorHandler(&XWindowsScreen::ioErrorHandler);
-
 	try {
+		if (!disableXInitThreads) {
+			// initializes Xlib support for concurrent threads.
+			if (m_impl->XInitThreads() == 0) {
+				throw XArch("XInitThreads() returned zero");
+			}
+		}
+		else {
+			LOG((CLOG_DEBUG "skipping XInitThreads()"));
+		}
+
+		// set the X I/O error handler so we catch the display disconnecting
+		previousIOErrorHandler =
+			m_impl->XSetIOErrorHandler(&XWindowsScreen::ioErrorHandler);
+		ioErrorHandlerInstalled = true;
+
 		m_display     = openDisplay(displayName);
         m_root        = m_impl->do_DefaultRootWindow(m_display);
 		saveShape();
@@ -445,48 +496,55 @@ XWindowsScreen::XWindowsScreen(
                                              m_keyMap);
 		LOG((CLOG_DEBUG "screen shape: %d,%d %dx%d %s", m_x, m_y, m_w, m_h, m_xinerama ? "(xinerama)" : ""));
 		LOG((CLOG_DEBUG "window is 0x%08x", m_window));
+
+		// primary/secondary screen only initialization
+		if (m_isPrimary) {
+#ifdef HAVE_XI2
+			m_xi2detected = detectXI2();
+			if (m_xi2detected) {
+				selectXIRawMotion();
+			} else
+#endif
+			{
+				// start watching for events on other windows
+				selectEvents(m_root);
+			}
+
+			// prepare to use input methods
+			openIM();
+		}
+		else {
+			// become impervious to server grabs
+			m_impl->XTestGrabControl(m_display, True);
+		}
+
+		// initialize the clipboards
+		for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+			m_clipboard[id] = new XWindowsClipboard(m_impl, m_display,
+				m_window, id);
+		}
+
+		// install event handlers
+		m_events->adoptHandler(Event::kSystem, m_events->getSystemTarget(),
+			new TMethodEventJob<XWindowsScreen>(this,
+				&XWindowsScreen::handleSystemEvent));
+		systemHandlerInstalled = true;
+
+		// install the platform event queue
+		m_events->adoptBuffer(new XWindowsEventQueueBuffer(m_impl,
+			m_display, m_window, m_events));
+		eventBufferInstalled = true;
 	}
 	catch (...) {
-		if (m_display != NULL) {
-            m_impl->XCloseDisplay(m_display);
+		releaseResources(eventBufferInstalled, systemHandlerInstalled);
+		if (ioErrorHandlerInstalled) {
+			m_impl->XSetIOErrorHandler(previousIOErrorHandler);
 		}
+		s_screen = previousScreen;
+		delete m_impl;
+		m_impl = NULL;
 		throw;
-    }
-
-	// primary/secondary screen only initialization
-	if (m_isPrimary) {
-#ifdef HAVE_XI2
-		m_xi2detected = detectXI2();
-		if (m_xi2detected) {
-			selectXIRawMotion();
-		} else
-#endif
-		{
-			// start watching for events on other windows
-			selectEvents(m_root);
-		}
-
-		// prepare to use input methods
-		openIM();
 	}
-	else {
-		// become impervious to server grabs
-        m_impl->XTestGrabControl(m_display, True);
-	}
-
-	// initialize the clipboards
-	for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-        m_clipboard[id] = new XWindowsClipboard(m_impl, m_display, m_window, id);
-	}
-
-	// install event handlers
-	m_events->adoptHandler(Event::kSystem, m_events->getSystemTarget(),
-							new TMethodEventJob<XWindowsScreen>(this,
-								&XWindowsScreen::handleSystemEvent));
-
-	// install the platform event queue
-    m_events->adoptBuffer(new XWindowsEventQueueBuffer(m_impl,
-		m_display, m_window, m_events));
 }
 
 XWindowsScreen::~XWindowsScreen()
@@ -494,10 +552,27 @@ XWindowsScreen::~XWindowsScreen()
 	assert(s_screen  != NULL);
 	assert(m_display != NULL);
 
-	m_events->adoptBuffer(NULL);
-	m_events->removeHandler(Event::kSystem, m_events->getSystemTarget());
+	releaseResources(true, true);
+    m_impl->XSetIOErrorHandler(NULL);
+
+	s_screen = NULL;
+    delete m_impl;
+}
+
+void
+XWindowsScreen::releaseResources(bool eventBufferInstalled,
+	bool systemHandlerInstalled)
+{
+	if (eventBufferInstalled) {
+		m_events->adoptBuffer(NULL);
+	}
+	if (systemHandlerInstalled) {
+		m_events->removeHandler(Event::kSystem,
+			m_events->getSystemTarget());
+	}
 	for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
 		delete m_clipboard[id];
+		m_clipboard[id] = NULL;
 	}
     delete m_keyState;
 	delete m_screensaver;
@@ -511,13 +586,13 @@ XWindowsScreen::~XWindowsScreen()
 		if (m_im != NULL) {
             m_impl->XCloseIM(m_im);
 		}
-        m_impl->XDestroyWindow(m_display, m_window);
+		if (m_window != None) {
+			m_impl->XDestroyWindow(m_display, m_window);
+		}
         m_impl->XCloseDisplay(m_display);
+		m_display = NULL;
+		m_window = None;
 	}
-    m_impl->XSetIOErrorHandler(NULL);
-
-	s_screen = NULL;
-    delete m_impl;
 }
 
 void
@@ -550,9 +625,14 @@ XWindowsScreen::disable()
         m_impl->XUnsetICFocus(m_ic);
 	}
 
-	// unmap the hider/grab window.  this also ungrabs the mouse and
-	// keyboard if they're grabbed.
+	// Release grabs explicitly before hiding the grab window. Confirm the
+	// server processed the requests before reporting that local input is
+	// active again; otherwise a disconnect during a transition can leave the
+	// pointer or keyboard captured by the now-local server.
+	m_impl->XUngrabPointer(m_display, CurrentTime);
+	m_impl->XUngrabKeyboard(m_display, CurrentTime);
     m_impl->XUnmapWindow(m_display, m_window);
+	m_impl->XSync(m_display, False);
 
 	// restore auto-repeat state
 	if (!m_isPrimary && m_autoRepeat) {
@@ -579,9 +659,14 @@ XWindowsScreen::enter()
 
 	wakeDisplayFromPowerSave();
 
-	// unmap the hider/grab window.  this also ungrabs the mouse and
-	// keyboard if they're grabbed.
+	// Release grabs explicitly before hiding the grab window. Confirm the
+	// server processed the requests before reporting that local input is
+	// active again; otherwise a disconnect during a transition can leave the
+	// pointer or keyboard captured by the now-local server.
+	m_impl->XUngrabPointer(m_display, CurrentTime);
+	m_impl->XUngrabKeyboard(m_display, CurrentTime);
     m_impl->XUnmapWindow(m_display, m_window);
+	m_impl->XSync(m_display, False);
 
 /* maybe call this if entering for the screensaver
 	// set keyboard focus to root window.  the screensaver should then
@@ -630,7 +715,10 @@ XWindowsScreen::leave()
 
 	// grab the mouse and keyboard, if primary and possible
 	if (m_isPrimary && !grabMouseAndKeyboard()) {
+		m_impl->XUngrabPointer(m_display, CurrentTime);
+		m_impl->XUngrabKeyboard(m_display, CurrentTime);
         m_impl->XUnmapWindow(m_display, m_window);
+		m_impl->XSync(m_display, False);
 		return false;
 	}
 
@@ -891,6 +979,30 @@ XWindowsScreen::adjustPointToVisibleAreaNearAnchorForTest(
 	return adjustPointToVisibleAreasNearAnchor("test point", areas,
 		anchorX, anchorY, x, y);
 }
+
+bool
+XWindowsScreen::visibleAreaTopologiesEqualForTest(
+	const VisibleAreas& first, const VisibleAreas& second)
+{
+	return visibleAreaTopologiesEqual(first, second);
+}
+
+#ifdef HAVE_XI2
+bool
+XWindowsScreen::xInputCookieUsableForTest(
+	const XGenericEventCookie& cookie, int expectedExtension)
+{
+	return cookie.type == GenericEvent &&
+		cookie.extension == expectedExtension && cookie.data != NULL;
+}
+
+bool
+XWindowsScreen::xInputEventNeedsPayloadForTest(int eventType)
+{
+	return eventType == XI_RawButtonPress ||
+		eventType == XI_RawButtonRelease;
+}
+#endif
 
 void*
 XWindowsScreen::getEventTarget() const
@@ -1833,62 +1945,64 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 	}
 
 #ifdef HAVE_XI2
-	if (m_xi2detected) {
-		// Process RawMotion
-		XGenericEventCookie *cookie = (XGenericEventCookie*)&xevent->xcookie;
-            if (m_impl->XGetEventData(m_display, cookie) &&
-				cookie->type == GenericEvent &&
-				cookie->extension == xi_opcode) {
-			if (cookie->evtype == XI_RawButtonPress || cookie->evtype == XI_RawButtonRelease) {
-				XIRawButtonEvent* btn = (XIRawButtonEvent*)cookie->data;
-				// Only handle side buttons (8/9) via raw path. Regular buttons
-				// (1-7) are forwarded through the standard ButtonPress/Release
-				// path below, avoiding duplicate events in XI2 environments.
-				if (btn->detail == 8 || btn->detail == 9) {
-					handleXIRawButtonEvent(btn);
-					m_impl->XFreeEventData(m_display, cookie);
-					return;
+	if (m_xi2detected && xevent->type == GenericEvent &&
+		xevent->xcookie.extension == xi_opcode) {
+		XGenericEventCookie* cookie = &xevent->xcookie;
+		if (cookie->evtype == XI_RawMotion) {
+			// Relative movement only needs the current pointer position. Avoid
+			// depending on cookie payloads that some X servers omit for
+			// synthetic or coalesced raw-motion notifications.
+			XMotionEvent xmotion = {};
+			xmotion.type = MotionNotify;
+			xmotion.send_event = False;
+			xmotion.display = m_display;
+			xmotion.window = m_window;
+			unsigned int msk;
+			xmotion.same_screen = m_impl->XQueryPointer(
+				m_display, m_root, &xmotion.root, &xmotion.subwindow,
+				&xmotion.x_root, &xmotion.y_root, &xmotion.x, &xmotion.y,
+				&msk);
+			if (!xmotion.same_screen) {
+				LOG((CLOG_WARN "resynchronizing XI2 raw motion after XQueryPointer failed"));
+				m_xCursor = m_xCenter;
+				m_yCursor = m_yCenter;
+				if (!m_isOnScreen) {
+					m_impl->XMoveWindow(m_display, m_window, m_xCenter, m_yCenter);
+					fakeMouseMove(m_xCenter, m_yCenter);
 				}
-				// fall through to let standard event path handle this button
 			}
-			else if (cookie->evtype == XI_RawMotion) {
-				// Get current pointer's position
-				XMotionEvent xmotion = {};
-				xmotion.type = MotionNotify;
-				xmotion.send_event = False; // Raw motion
-				xmotion.display = m_display;
-				xmotion.window = m_window;
-				/* xmotion's time, state and is_hint are not used */
-				unsigned int msk;
-				xmotion.same_screen = m_impl->XQueryPointer(
-						m_display, m_root, &xmotion.root, &xmotion.subwindow,
-						&xmotion.x_root,
-						&xmotion.y_root,
-						&xmotion.x,
-						&xmotion.y,
-						&msk);
-				if (!xmotion.same_screen) {
-					LOG((CLOG_WARN "resynchronizing XI2 raw motion after XQueryPointer failed"));
-					m_xCursor = m_xCenter;
-					m_yCursor = m_yCenter;
-					if (!m_isOnScreen) {
-						m_impl->XMoveWindow(m_display, m_window, m_xCenter, m_yCenter);
-						fakeMouseMove(m_xCenter, m_yCenter);
-					}
-					m_impl->XFreeEventData(m_display, cookie);
-					return;
-				}
-				if (!normalizeToScreenShape("XI2 raw motion",
-						m_x, m_y, m_w, m_h, xmotion.x_root, xmotion.y_root)) {
-					m_impl->XFreeEventData(m_display, cookie);
-					return;
-				}
-					onMouseMove(xmotion);
-                    m_impl->XFreeEventData(m_display, cookie);
-					return;
+			else if (normalizeToScreenShape("XI2 raw motion",
+				m_x, m_y, m_w, m_h, xmotion.x_root, xmotion.y_root)) {
+				onMouseMove(xmotion);
 			}
-                m_impl->XFreeEventData(m_display, cookie);
+			return;
 		}
+
+		if (!xInputEventNeedsPayloadForTest(cookie->evtype)) {
+			return;
+		}
+
+		if (!m_impl->XGetEventData(m_display, cookie)) {
+			LOG((CLOG_WARN "failed to acquire XI2 event data (type=%d)",
+				cookie->evtype));
+			return;
+		}
+		if (!xInputCookieUsableForTest(*cookie, xi_opcode)) {
+			LOG((CLOG_WARN "ignoring XI2 event with invalid data (type=%d)",
+				cookie->evtype));
+			m_impl->XFreeEventData(m_display, cookie);
+			return;
+		}
+
+		XIRawButtonEvent* btn = static_cast<XIRawButtonEvent*>(cookie->data);
+		// Core ButtonPress/Release events handle buttons 1-7. XI2 is used
+		// only for side buttons that core events do not reliably expose.
+		if (btn->detail == 8 || btn->detail == 9) {
+			handleXIRawButtonEvent(btn);
+		}
+
+		m_impl->XFreeEventData(m_display, cookie);
+		return;
 	}
 #endif
 
@@ -2028,20 +2142,34 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 					subtype == RRNotify_ResourceChange);
 			}
 			if (topologyChanged) {
-				LOG((CLOG_INFO "XRandR screen topology change received"));
-
 				// we're required to call back into XLib so XLib can update its internal state
 				XRRUpdateConfiguration(xevent);
 
+				const SInt32 oldX = m_x;
+				const SInt32 oldY = m_y;
+				const SInt32 oldWidth = m_w;
+				const SInt32 oldHeight = m_h;
+				const VisibleAreas oldVisibleAreas = m_visibleAreas;
+
 				// requery/recalculate the screen shape
 				saveShape();
+				const bool shapeChanged = oldX != m_x || oldY != m_y ||
+					oldWidth != m_w || oldHeight != m_h ||
+					!visibleAreaTopologiesEqual(oldVisibleAreas, m_visibleAreas);
+				if (!shapeChanged) {
+					LOG((CLOG_DEBUG2 "ignoring duplicate XRandR topology notification"));
+					return;
+				}
+
+				LOG((CLOG_INFO "XRandR screen topology changed from %d,%d %dx%d to %d,%d %dx%d",
+					oldX, oldY, oldWidth, oldHeight, m_x, m_y, m_w, m_h));
 
 				// we need to resize m_window, otherwise we'll get a weird problem where moving
 				// off the server onto the client causes the pointer to warp to the
 				// center of the server (so you can't move the pointer off the server)
 				if (m_isPrimary) {
-                    m_impl->XMoveWindow(m_display, m_window, m_x, m_y);
-                    m_impl->XResizeWindow(m_display, m_window, m_w, m_h);
+					m_impl->XMoveWindow(m_display, m_window, m_x, m_y);
+					m_impl->XResizeWindow(m_display, m_window, m_w, m_h);
 					if (!m_isOnScreen) {
 						LOG((CLOG_DEBUG "reparking hidden cursor at %d,%d after screen shape change",
 							m_xCenter, m_yCenter));

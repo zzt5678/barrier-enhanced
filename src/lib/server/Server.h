@@ -97,7 +97,7 @@ public:
     };
 
     //! Screen connected data
-    class ScreenConnectedInfo {
+    class ScreenConnectedInfo : public EventData {
     public:
         ScreenConnectedInfo(std::string screen) : m_screen(screen) { }
 
@@ -158,6 +158,12 @@ public:
         m_switchWaitDelay(0.0),
         m_switchWaitTimer(NULL),
         m_primaryKeyStateTimer(NULL),
+        m_mouseMoveTimer(NULL),
+        m_pendingMouseMoveTarget(NULL),
+        m_pendingMouseMove(false),
+        m_mouseMoveSent(false),
+        m_pendingMouseX(0),
+        m_pendingMouseY(0),
         m_switchWaitX(0),
         m_switchWaitY(0),
         m_switchTwoTapDelay(0.0),
@@ -177,6 +183,7 @@ public:
         m_sendFileTarget(NULL),
         m_sendFileTransferId(0),
         m_sendFileCompletionPending(false),
+        m_sendFileIsClipboardPrefetch(false),
         m_writeToDropDirThread(NULL),
         m_ignoreFileTransfer(false),
         m_enableClipboard(false),
@@ -419,6 +426,7 @@ private:
     void                handleScreensaverDeactivatedEvent(const Event&, void*);
     void                handleSwitchWaitTimeout(const Event&, void*);
     void                handlePrimaryKeyStateSync(const Event&, void*);
+    void                handleMouseMoveFlush(const Event&, void*);
     void                handleClientDisconnected(const Event&, void*);
     void                handleClientCloseTimeout(const Event&, void*);
     void                handleSwitchToScreenEvent(const Event&, void*);
@@ -441,7 +449,7 @@ private:
     void                reanchorActiveAfterFailedSwitch(BaseClientProxy* dst);
     void                fetchPendingPrimaryClipboards();
     void                replayClipboardsToActive();
-    void                onClipboardChanged(BaseClientProxy* sender,
+    bool                onClipboardChanged(BaseClientProxy* sender,
                             ClipboardID id, UInt32 seqNum);
     void                onScreensaver(bool activated);
     void                onKeyDown(KeyID, KeyModifierMask, KeyButton,
@@ -454,6 +462,9 @@ private:
     bool                onMouseMovePrimary(SInt32 x, SInt32 y);
     void                onMouseMoveSecondary(SInt32 dx, SInt32 dy);
     void                onMouseWheel(SInt32 xDelta, SInt32 yDelta);
+    void                queueMouseMove(BaseClientProxy*, SInt32 x, SInt32 y);
+    void                flushPendingMouseMove();
+    void                discardPendingMouseMove(BaseClientProxy* target = NULL);
     void                onFileChunkSending(const void* data);
     void                onFileRecieveCompleted();
     void                publishMaterializedFileClipboard(const std::vector<std::string>& paths,
@@ -624,6 +635,13 @@ private:
     double                m_switchWaitDelay;
     EventQueueTimer*    m_switchWaitTimer;
     EventQueueTimer*    m_primaryKeyStateTimer;
+    EventQueueTimer*    m_mouseMoveTimer;
+    BaseClientProxy*    m_pendingMouseMoveTarget;
+    bool                m_pendingMouseMove;
+    bool                m_mouseMoveSent;
+    SInt32              m_pendingMouseX;
+    SInt32              m_pendingMouseY;
+    Stopwatch           m_mouseMoveRateTimer;
     SInt32                m_switchWaitX, m_switchWaitY;
 
     // state for double-tap screen switching
@@ -665,6 +683,7 @@ private:
     BaseClientProxy*       m_sendFileTarget;
     UInt32                 m_sendFileTransferId;
     bool                   m_sendFileCompletionPending;
+    bool                   m_sendFileIsClipboardPrefetch;
     ClientSet              m_deferredDeleteClients;
     Thread*                m_writeToDropDirThread;
 	std::deque<std::shared_ptr<CompletedFileTransfer> > m_pendingDropDirTransfers;

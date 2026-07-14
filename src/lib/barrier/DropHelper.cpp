@@ -124,7 +124,7 @@ bool write_memory_payload(std::ofstream& output, const String& data)
     std::size_t offset = 0;
     while (offset < data.size()) {
         Thread::testCancel();
-        const std::size_t count = std::min(kBufferSize, data.size() - offset);
+        const std::size_t count = (std::min)(kBufferSize, data.size() - offset);
         output.write(data.data() + offset, static_cast<std::streamsize>(count));
         if (output.fail()) {
             return false;

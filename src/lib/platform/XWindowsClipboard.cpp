@@ -101,6 +101,16 @@ bool looksLikeImagePathOrUri(const std::string& text)
     return false;
 }
 
+bool looksLikePngPayload(const std::string& data)
+{
+    return data.size() >= 8 &&
+           static_cast<unsigned char>(data[0]) == 0x89u &&
+           data[1] == 'P' && data[2] == 'N' && data[3] == 'G' &&
+           data[4] == '\r' && data[5] == '\n' &&
+           static_cast<unsigned char>(data[6]) == 0x1au &&
+           data[7] == '\n';
+}
+
 bool isTextUriListTarget(Display* display, Atom atom)
 {
     return atom == XInternAtom(display, "x-special/gnome-copied-files", False) ||
@@ -110,8 +120,9 @@ bool isTextUriListTarget(Display* display, Atom atom)
 void suppressImagePathTextFallback(bool* added, std::string* data)
 {
     if (added[IClipboard::kPNG] && added[IClipboard::kText] &&
-        looksLikeImagePathOrUri(data[IClipboard::kText])) {
-        LOG((CLOG_DEBUG "suppressing text clipboard path because PNG payload is available"));
+        (looksLikeImagePathOrUri(data[IClipboard::kText]) ||
+         looksLikePngPayload(data[IClipboard::kText]))) {
+        LOG((CLOG_DEBUG "suppressing image-derived text because PNG payload is available"));
         added[IClipboard::kText] = false;
         data[IClipboard::kText].clear();
     }
@@ -207,6 +218,12 @@ XWindowsClipboard::~XWindowsClipboard()
 {
     clearReplies();
     clearConverters();
+}
+
+bool
+XWindowsClipboard::shouldSuppressPngTextFallbackForTest(const std::string& text)
+{
+    return looksLikeImagePathOrUri(text) || looksLikePngPayload(text);
 }
 
 void

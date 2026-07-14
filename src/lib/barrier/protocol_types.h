@@ -47,9 +47,11 @@ static const UInt32        kMaxHelloLength = 1024;
 static const double        kKeepAliveRate = 3.0;
 
 // number of skipped kMsgCKeepAlive messages that indicates a problem.
-// Pending stream input/output gets a separate deferral budget, so idle stale
-// sockets should be retired quickly enough for hands-off reconnects.
-static const double        kKeepAlivesUntilDeath = 2.0;
+// Desktop switches and secure-desktop transitions can briefly stall the
+// event loop even while the connection remains healthy. Pending stream work
+// has its own progress checks, so tolerate five missed idle keepalives before
+// retiring the socket.
+static const double        kKeepAlivesUntilDeath = 5.0;
 
 // obsolete heartbeat stuff
 static const double        kHeartRate = -1.0;

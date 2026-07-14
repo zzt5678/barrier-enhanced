@@ -31,6 +31,7 @@
 #include "ext/lodepng/lodepng.h"
 
 #include <shellapi.h>
+#include <objidl.h>
 
 static std::string convertBMPToPNG(const std::string& dibData);
 static std::string convertPNGToDIB(const std::string& pngData);
@@ -100,6 +101,38 @@ std::string utf8FromWide(const std::wstring& value)
     std::string result(static_cast<size_t>(size - 1), '\0');
     WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, &result[0], size, NULL, NULL);
     return result;
+}
+
+UInt16 readLE16(const UInt8* data)
+{
+    return static_cast<UInt16>(data[0]) |
+           (static_cast<UInt16>(data[1]) << 8);
+}
+
+UInt32 readLE32(const UInt8* data)
+{
+    return static_cast<UInt32>(data[0]) |
+           (static_cast<UInt32>(data[1]) << 8) |
+           (static_cast<UInt32>(data[2]) << 16) |
+           (static_cast<UInt32>(data[3]) << 24);
+}
+
+unsigned char channelFromMask(UInt32 pixel, UInt32 mask)
+{
+    if (mask == 0) {
+        return 0;
+    }
+
+    UInt32 shiftedMask = mask;
+    UInt32 shift = 0;
+    while ((shiftedMask & 1u) == 0u) {
+        shiftedMask >>= 1;
+        ++shift;
+    }
+
+    const UInt32 value = (pixel & mask) >> shift;
+    return static_cast<unsigned char>((value * 255u + shiftedMask / 2u) /
+                                      shiftedMask);
 }
 
 } // namespace
@@ -460,6 +493,12 @@ MSWindowsClipboard::getOwnershipFormat()
     return s_ownershipFormat;
 }
 
+std::string
+MSWindowsClipboard::convertDIBToPNGForTest(const std::string& dibData)
+{
+    return convertBMPToPNG(dibData);
+}
+
 //
 // Helper function to convert Windows BMP (DIB) data to PNG
 //
@@ -476,16 +515,16 @@ static std::string convertBMPToPNG(const std::string& dibData)
     const UInt8* header = reinterpret_cast<const UInt8*>(dibData.data());
 
     // Get dimensions (BITMAPINFOHEADER is 40 bytes)
-    UInt32 headerSize = *reinterpret_cast<const UInt32*>(header + 0);
+    UInt32 headerSize = readLE32(header + 0);
     if (headerSize != 40) {
         LOG((CLOG_WARN "Unsupported DIB header size: %u", headerSize));
         return {};
     }
 
-    SInt32 width = *reinterpret_cast<const SInt32*>(header + 4);
-    SInt32 height = *reinterpret_cast<const SInt32*>(header + 8);
-    UInt16 bitCount = *reinterpret_cast<const UInt16*>(header + 14);
-    UInt32 compression = *reinterpret_cast<const UInt32*>(header + 16);
+    SInt32 width = static_cast<SInt32>(readLE32(header + 4));
+    SInt32 height = static_cast<SInt32>(readLE32(header + 8));
+    UInt16 bitCount = readLE16(header + 14);
+    UInt32 compression = readLE32(header + 16);
 
     // Height can be negative for top-down DIB
     bool topDown = (height < 0);
@@ -502,8 +541,8 @@ static std::string convertBMPToPNG(const std::string& dibData)
         return {};
     }
 
-    // Only support uncompressed 24-bit or 32-bit DIB
-    if (compression != 0) {  // BI_RGB = 0
+    const bool usesBitfields = compression == BI_BITFIELDS && bitCount == 32;
+    if (compression != BI_RGB && !usesBitfields) {
         LOG((CLOG_WARN "Compressed DIB not supported"));
         return {};
     }
@@ -514,10 +553,30 @@ static std::string convertBMPToPNG(const std::string& dibData)
     }
 
     UInt32 bytesPerPixel = bitCount / 8;
+    size_t pixelOffset = headerSize;
+    UInt32 redMask = 0;
+    UInt32 greenMask = 0;
+    UInt32 blueMask = 0;
+    if (usesBitfields) {
+        const size_t maskBytes = 3 * sizeof(UInt32);
+        if (dibData.size() < pixelOffset + maskBytes) {
+            LOG((CLOG_WARN "DIB bitfield masks are truncated"));
+            return {};
+        }
+        redMask = readLE32(header + pixelOffset);
+        greenMask = readLE32(header + pixelOffset + sizeof(UInt32));
+        blueMask = readLE32(header + pixelOffset + 2 * sizeof(UInt32));
+        if (redMask == 0 || greenMask == 0 || blueMask == 0) {
+            LOG((CLOG_WARN "DIB bitfield masks are invalid"));
+            return {};
+        }
+        pixelOffset += maskBytes;
+    }
+
     const unsigned long long rowSize =
         ((static_cast<unsigned long long>(width) * bitCount + 31) / 32) * 4;
     const unsigned long long expectedDataSize =
-        40 + rowSize * static_cast<unsigned long long>(height);
+        pixelOffset + rowSize * static_cast<unsigned long long>(height);
 
     if (dibData.size() < expectedDataSize) {
         LOG((CLOG_WARN "DIB data size mismatch: expected %u, got %u",
@@ -525,7 +584,7 @@ static std::string convertBMPToPNG(const std::string& dibData)
         return {};
     }
 
-    const UInt8* pixelData = header + 40;
+    const UInt8* pixelData = header + pixelOffset;
 
     // Convert to RGBA for lodepng
     std::vector<unsigned char> rgba;
@@ -538,11 +597,23 @@ static std::string convertBMPToPNG(const std::string& dibData)
         for (SInt32 x = 0; x < width; ++x) {
             UInt32 offset = x * bytesPerPixel;
 
-            // DIB is usually BGR/BGRA format
-            unsigned char b = row[offset + 0];
-            unsigned char g = row[offset + 1];
-            unsigned char r = row[offset + 2];
-            unsigned char a = (bitCount == 32) ? row[offset + 3] : 255;
+            unsigned char r;
+            unsigned char g;
+            unsigned char b;
+            unsigned char a = 255;
+            if (usesBitfields) {
+                const UInt32 pixel = readLE32(row + offset);
+                r = channelFromMask(pixel, redMask);
+                g = channelFromMask(pixel, greenMask);
+                b = channelFromMask(pixel, blueMask);
+            }
+            else {
+                b = row[offset + 0];
+                g = row[offset + 1];
+                r = row[offset + 2];
+                a = (bitCount == 32 && row[offset + 3] != 0) ?
+                    row[offset + 3] : 255;
+            }
 
             // Convert to RGBA for lodepng
             rgba.push_back(r);

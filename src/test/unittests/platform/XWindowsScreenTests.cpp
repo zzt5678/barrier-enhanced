@@ -2,6 +2,53 @@
 
 #include "platform/XWindowsScreen.h"
 
+#ifdef HAVE_XI2
+TEST(XWindowsScreenTests, xInputCookieUsableForTest_rejectsNullEventData)
+{
+	XGenericEventCookie cookie = {};
+	cookie.type = GenericEvent;
+	cookie.extension = 23;
+	cookie.data = NULL;
+
+	EXPECT_FALSE(XWindowsScreen::xInputCookieUsableForTest(cookie, 23));
+}
+
+TEST(XWindowsScreenTests, xInputCookieUsableForTest_rejectsUnrelatedEvents)
+{
+	int eventData = 0;
+	XGenericEventCookie cookie = {};
+	cookie.type = ButtonPress;
+	cookie.extension = 23;
+	cookie.data = &eventData;
+	EXPECT_FALSE(XWindowsScreen::xInputCookieUsableForTest(cookie, 23));
+
+	cookie.type = GenericEvent;
+	cookie.extension = 24;
+	EXPECT_FALSE(XWindowsScreen::xInputCookieUsableForTest(cookie, 23));
+}
+
+TEST(XWindowsScreenTests, xInputCookieUsableForTest_acceptsMatchingCookieWithData)
+{
+	int eventData = 0;
+	XGenericEventCookie cookie = {};
+	cookie.type = GenericEvent;
+	cookie.extension = 23;
+	cookie.data = &eventData;
+
+	EXPECT_TRUE(XWindowsScreen::xInputCookieUsableForTest(cookie, 23));
+}
+
+TEST(XWindowsScreenTests, xInputEventPayload_rawMotionDoesNotNeedCookieData)
+{
+	EXPECT_FALSE(
+		XWindowsScreen::xInputEventNeedsPayloadForTest(XI_RawMotion));
+	EXPECT_TRUE(
+		XWindowsScreen::xInputEventNeedsPayloadForTest(XI_RawButtonPress));
+	EXPECT_TRUE(
+		XWindowsScreen::xInputEventNeedsPayloadForTest(XI_RawButtonRelease));
+}
+#endif
+
 TEST(XWindowsScreenTests, clampPointToRectForTest_insideRect_keepsPoint)
 {
 	SInt32 x = 5200;
@@ -107,4 +154,38 @@ TEST(XWindowsScreenTests, adjustPointToVisibleAreaNearAnchorForTest_closedAnchor
 		areas, 100, 1200, x, y));
 	EXPECT_EQ(5120, x);
 	EXPECT_EQ(900, y);
+}
+
+TEST(XWindowsScreenTests, visibleAreaTopologiesEqualForTest_ignoresOutputOrder)
+{
+	XWindowsScreen::VisibleAreas first;
+	first.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1080, true));
+	first.push_back(XWindowsScreen::VisibleArea(1920, 0, 2560, 1440, false));
+	XWindowsScreen::VisibleAreas second;
+	second.push_back(XWindowsScreen::VisibleArea(1920, 0, 2560, 1440, false));
+	second.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1080, true));
+
+	EXPECT_TRUE(XWindowsScreen::visibleAreaTopologiesEqualForTest(first, second));
+}
+
+TEST(XWindowsScreenTests, visibleAreaTopologiesEqualForTest_detectsPrimaryOutputChange)
+{
+	XWindowsScreen::VisibleAreas first;
+	first.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1080, true));
+	first.push_back(XWindowsScreen::VisibleArea(1920, 0, 1920, 1080, false));
+	XWindowsScreen::VisibleAreas second;
+	second.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1080, false));
+	second.push_back(XWindowsScreen::VisibleArea(1920, 0, 1920, 1080, true));
+
+	EXPECT_FALSE(XWindowsScreen::visibleAreaTopologiesEqualForTest(first, second));
+}
+
+TEST(XWindowsScreenTests, visibleAreaTopologiesEqualForTest_detectsGeometryChange)
+{
+	XWindowsScreen::VisibleAreas first;
+	first.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1080, true));
+	XWindowsScreen::VisibleAreas second;
+	second.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1200, true));
+
+	EXPECT_FALSE(XWindowsScreen::visibleAreaTopologiesEqualForTest(first, second));
 }

@@ -50,6 +50,10 @@ if (WIN32 OR UNIX)
     target_link_libraries(platform lodepng)
 endif()
 
+if (WIN32)
+    target_link_libraries(platform ipc)
+endif()
+
 if (UNIX)
     target_link_libraries(platform lodepng io net ipc synlib client ${libs})
 endif()

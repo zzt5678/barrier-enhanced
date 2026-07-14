@@ -95,7 +95,7 @@ TEST_P(KeySequenceLoadSaveTestFixture, SupportsSpecialSymbols)
     auto filename = getTemporaryFilename();
 
     {
-        QSettings settings(filename, QSettings::NativeFormat);
+        QSettings settings(filename, QSettings::IniFormat);
         KeySequence sequence;
 
         sequence.appendKey(key, 0);
@@ -105,7 +105,7 @@ TEST_P(KeySequenceLoadSaveTestFixture, SupportsSpecialSymbols)
         settings.endGroup();
     }
     {
-        QSettings settings(filename, QSettings::NativeFormat);
+        QSettings settings(filename, QSettings::IniFormat);
         KeySequence sequence;
 
         settings.beginGroup("test");

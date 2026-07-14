@@ -24,6 +24,7 @@
 #include "arch/Arch.h"
 #include "arch/XArch.h"
 
+#include <atomic>
 #include <process.h>
 
 //
@@ -46,7 +47,7 @@ public:
     ~ArchThreadImpl();
 
 public:
-    int                    m_refCount;
+    std::atomic<int>       m_refCount;
     HANDLE                m_thread;
     DWORD                m_id;
     std::function<void()> func_;
@@ -54,6 +55,7 @@ public:
     bool                m_cancelling;
     HANDLE                m_exit;
     void*                m_networkData;
+    bool                 m_networkDataUnblockPending;
 };
 
 ArchThreadImpl::ArchThreadImpl() :
@@ -61,7 +63,8 @@ ArchThreadImpl::ArchThreadImpl() :
     m_thread(NULL),
     m_id(0),
     m_cancelling(false),
-    m_networkData(NULL)
+    m_networkData(NULL),
+    m_networkDataUnblockPending(false)
 {
     m_exit   = CreateEvent(NULL, TRUE, FALSE, NULL);
     m_cancel = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -69,6 +72,9 @@ ArchThreadImpl::ArchThreadImpl() :
 
 ArchThreadImpl::~ArchThreadImpl()
 {
+    if (m_networkData != NULL) {
+        CloseHandle(static_cast<HANDLE>(m_networkData));
+    }
     CloseHandle(m_exit);
     CloseHandle(m_cancel);
 }
@@ -122,13 +128,31 @@ ArchMultithreadWindows::setNetworkDataForCurrentThread(void* data)
     lockMutex(m_threadMutex);
     ArchThreadImpl* thread = findNoRef(GetCurrentThreadId());
     thread->m_networkData = data;
+    const bool unblockPending = thread->m_networkDataUnblockPending;
+    thread->m_networkDataUnblockPending = false;
     unlockMutex(m_threadMutex);
+
+    if (unblockPending && data != NULL) {
+        SetEvent(static_cast<HANDLE>(data));
+    }
 }
 
 void*
 ArchMultithreadWindows::getNetworkDataForThread(ArchThread thread)
 {
     lockMutex(m_threadMutex);
+    void* data = thread->m_networkData;
+    unlockMutex(m_threadMutex);
+    return data;
+}
+
+void*
+ArchMultithreadWindows::getNetworkDataForThreadAndMarkUnblock(ArchThread thread)
+{
+    lockMutex(m_threadMutex);
+    if (thread->m_networkData == NULL) {
+        thread->m_networkDataUnblockPending = true;
+    }
     void* data = thread->m_networkData;
     unlockMutex(m_threadMutex);
     return data;
@@ -337,7 +361,7 @@ ArchMultithreadWindows::closeThread(ArchThread thread)
     assert(thread != NULL);
 
     // decrement ref count and clean up thread if no more references
-    if (--thread->m_refCount == 0) {
+    if (thread->m_refCount.fetch_sub(1) == 1) {
         // close the handle (main thread has a NULL handle)
         if (thread->m_thread != NULL) {
             CloseHandle(thread->m_thread);
@@ -615,7 +639,7 @@ ArchMultithreadWindows::refThread(ArchThreadImpl* thread)
 {
     assert(thread != NULL);
     assert(findNoRefOrCreate(thread->m_id) != NULL);
-    ++thread->m_refCount;
+    thread->m_refCount.fetch_add(1);
 }
 
 void

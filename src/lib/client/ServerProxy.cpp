@@ -64,6 +64,7 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_keepAliveAlarm(0.0),
     m_keepAliveAlarmTimer(NULL),
     m_keepAliveAlarmDeferrals(0),
+    m_keepAliveMissedAlarms(0),
     m_lastKeepAlivePendingInput(false),
     m_lastKeepAliveBufferedOutput(0),
     m_keepAliveActivityTimer(true),
@@ -141,6 +142,7 @@ ServerProxy::setKeepAliveRate(double rate)
 {
     m_keepAliveAlarm = rate * kKeepAlivesUntilDeath;
     m_keepAliveAlarmDeferrals = 0;
+    m_keepAliveMissedAlarms = 0;
     m_lastKeepAlivePendingInput = false;
     m_lastKeepAliveBufferedOutput = 0;
     m_keepAliveActivityTimer.start();
@@ -195,6 +197,7 @@ ServerProxy::handleData(const Event&, void*)
 
     if (receivedMessage) {
         m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
         m_lastKeepAlivePendingInput = false;
         m_lastKeepAliveBufferedOutput = 0;
         m_keepAliveActivityTimer.reset();
@@ -229,6 +232,7 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
         // echo keep alives and reset alarm
         ProtocolUtil::writef(m_stream, kMsgCKeepAlive);
         m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
         resetKeepAliveAlarm();
     }
 
@@ -315,6 +319,7 @@ ServerProxy::parseMessage(const UInt8* code)
         // echo keep alives and reset alarm
         ProtocolUtil::writef(m_stream, kMsgCKeepAlive);
         m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
         resetKeepAliveAlarm();
     }
 
@@ -413,6 +418,7 @@ ServerProxy::handleKeepAliveAlarm(const Event&, void*)
         (m_lastKeepAliveBufferedOutput > 0 &&
          bufferedOutput < m_lastKeepAliveBufferedOutput)) {
         m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
     }
     m_lastKeepAlivePendingInput = hasPendingInput;
     m_lastKeepAliveBufferedOutput = bufferedOutput;
@@ -430,6 +436,7 @@ ServerProxy::handleKeepAliveAlarm(const Event&, void*)
         }
 
         ++m_keepAliveAlarmDeferrals;
+        m_keepAliveMissedAlarms = 0;
         LOG((CLOG_WARN
              "server keepalive delayed while stream has pending work; deferring disconnect (%u/%u), "
              "pendingInput=%d bufferedOutput=%u idle=%.3fs",
@@ -444,6 +451,20 @@ ServerProxy::handleKeepAliveAlarm(const Event&, void*)
 
     if (m_keepAliveAlarm > 0.0 &&
         m_keepAliveActivityTimer.getTime() < m_keepAliveAlarm) {
+        m_keepAliveMissedAlarms = 0;
+        resetKeepAliveAlarm();
+        return;
+    }
+
+    static const UInt32 kMaxMissedKeepAlivesBeforeDisconnect = 3;
+    if (m_keepAliveMissedAlarms < kMaxMissedKeepAlivesBeforeDisconnect) {
+        ++m_keepAliveMissedAlarms;
+        LOG((CLOG_WARN
+             "server keepalive missed; probing before disconnect (%u/%u), idle=%.3fs",
+             m_keepAliveMissedAlarms,
+             kMaxMissedKeepAlivesBeforeDisconnect,
+             m_keepAliveActivityTimer.getTime()));
+        keepAlive();
         resetKeepAliveAlarm();
         return;
     }
@@ -623,7 +644,10 @@ ServerProxy::flushCompressedMouse()
 bool
 ServerProxy::shouldCompressMouseMoves() const
 {
-    return !m_lowLatencyMode && !m_nestedRemoteMode;
+    // Callers also require a complete message to be waiting. Coalescing only
+    // after input is already backlogged preserves immediate delivery while
+    // preventing motion floods from delaying control and keepalive messages.
+    return true;
 }
 
 void
@@ -1110,10 +1134,10 @@ ServerProxy::setOptions()
     }
 
     if (m_lowLatencyMode) {
-        LOG((CLOG_NOTE "server requested low latency mode - mouse motion compression disabled"));
+        LOG((CLOG_NOTE "server requested low latency mode - immediate mouse delivery enabled while input is current"));
     }
     if (m_nestedRemoteMode) {
-        LOG((CLOG_NOTE "server requested nested remote mode - favoring immediate mouse delivery"));
+        LOG((CLOG_NOTE "server requested nested remote mode - adaptive backlog compression remains enabled"));
     }
 }
 

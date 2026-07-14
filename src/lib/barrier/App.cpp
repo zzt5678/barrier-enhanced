@@ -71,6 +71,7 @@ App::App(IEventQueue* events, CreateTaskBarReceiverFunc createTaskBarReceiver, A
 
 App::~App()
 {
+    cleanupIpcClient();
     s_instance = nullptr;
     delete m_args;
 }
@@ -213,9 +214,14 @@ App::initIpcClient()
 void
 App::cleanupIpcClient()
 {
-    m_ipcClient->disconnect();
-    m_events->removeHandler(m_events->forIpcClient().messageReceived(), m_ipcClient);
-    delete m_ipcClient;
+    IpcClient* client = m_ipcClient;
+    m_ipcClient = nullptr;
+    if (client == nullptr) {
+        return;
+    }
+
+    m_events->removeHandler(m_events->forIpcClient().messageReceived(), client);
+    delete client;
 }
 
 void

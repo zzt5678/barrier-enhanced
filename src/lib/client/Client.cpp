@@ -107,6 +107,7 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
     m_receivedFileSpoolPath(),
     m_sendFileThread(NULL),
     m_sendFileTransferId(0),
+    m_sendFileIsClipboardPrefetch(false),
     m_writeToDropDirThread(NULL),
     m_pendingDropDirTransfers(),
     m_socket(NULL),
@@ -124,6 +125,7 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
         m_clipboardRetryPending[id] = false;
         m_clipboardRetryCount[id] = 0;
         m_timeClipboard[id] = 0;
+        m_pendingFileClipboardPaths[id].clear();
     }
 
     // register suspend/resume event handlers
@@ -331,7 +333,7 @@ Client::enter(SInt32 xAbs, SInt32 yAbs, UInt32, KeyModifierMask mask, bool)
     m_screen->enter(mask);
     m_screen->mouseMove(xAbs, yAbs);
 
-    if (m_sendFileChunker) {
+    if (m_sendFileChunker && !m_sendFileIsClipboardPrefetch) {
         m_sendFileChunker->interruptFile();
         reapSendFileThreadIfReady();
     }
@@ -344,14 +346,16 @@ Client::leave()
 
     m_screen->leave();
 
-    if (m_enableClipboard) {
+    if (m_enableClipboard && m_server != NULL) {
         // Re-read clipboards on leave instead of relying only on the
         // earlier ownership flag. On Windows the clipboard-viewer
         // notification can be missed and checkClipboards() only detects
         // the new owner during Screen::leave(), so gating on
         // m_ownClipboard here can drop a just-copied clipboard update.
         for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-            sendClipboard(id);
+            if (id == kClipboardClipboard || m_ownClipboard[id]) {
+                sendClipboard(id);
+            }
         }
     }
 
@@ -518,12 +522,26 @@ Client::sendClipboard(ClipboardID id)
 
     RemoteFileClipboard::AutomaticSharingStatus clipboardSharingStatus =
         RemoteFileClipboard::AutomaticSharingStatus::Safe;
+    RemoteFileClipboard::Data localFileClipboard;
     if (id == kClipboardClipboard) {
         clipboardSharingStatus =
             RemoteFileClipboard::prepareForAutomaticClipboardSharing(clipboard);
         if (clipboardSharingStatus ==
             RemoteFileClipboard::AutomaticSharingStatus::SafeAfterRemovingImageFileMetadata) {
             LOG((CLOG_INFO "stripped image file-transfer metadata before sending clipboard to server"));
+        }
+        else if (clipboardSharingStatus ==
+                 RemoteFileClipboard::AutomaticSharingStatus::ContainsFileList) {
+            std::string error;
+            if (!RemoteFileClipboard::normalizeClipboard(
+                    clipboard, &localFileClipboard, &error)) {
+                LOG((CLOG_WARN "local file clipboard could not be normalized: %s",
+                     error.c_str()));
+                m_sentClipboard[id] = false;
+                m_pendingFileClipboardPaths[id].clear();
+                scheduleClipboardRetry(id);
+                return;
+            }
         }
     }
 
@@ -539,17 +557,54 @@ Client::sendClipboard(ClipboardID id)
         m_timeClipboard[id] = clipboard.getTime();
     }
 
+    const bool materializedFileEcho =
+        clipboardSharingStatus ==
+            RemoteFileClipboard::AutomaticSharingStatus::ContainsFileList &&
+        !m_readyFileClipboardSession.empty() &&
+        RemoteFileClipboard::pathsMatch(localFileClipboard,
+                                        m_readyFileClipboardPaths);
+    if (materializedFileEcho) {
+        LOG((CLOG_INFO
+            "suppressed remote file clipboard echo: session=%s items=%lu",
+            m_readyFileClipboardSession.c_str(),
+            static_cast<unsigned long>(m_readyFileClipboardPaths.size())));
+        m_sentClipboard[id] = true;
+        m_clipboardSendPending[id] = false;
+        m_dataClipboard[id].set(data);
+        m_pendingFileClipboardPaths[id].clear();
+        m_readyFileClipboardSession.clear();
+        m_readyFileClipboardPaths.clear();
+        return;
+    }
+
     // save and send data if different or not yet sent
     if (clipboardTimeChanged || !m_sentClipboard[id] || !m_dataClipboard[id].matches(data)) {
         if (clipboardSharingStatus ==
             RemoteFileClipboard::AutomaticSharingStatus::ContainsFileList) {
-            LOG((CLOG_INFO "local file clipboard is not sent automatically"));
+            LOG((CLOG_INFO "sending local file clipboard metadata before package transfer"));
             m_remoteFileClipboardSession.clear();
             m_readyFileClipboardSession.clear();
             m_readyFileClipboardPaths.clear();
+            ServerProxy::ClipboardSendResult result =
+                m_server->onClipboardChanged(id, &clipboard);
+            if (result == ServerProxy::kClipboardSendFailed) {
+                m_pendingFileClipboardPaths[id].clear();
+                scheduleClipboardRetry(id);
+                return;
+            }
+            if (result == ServerProxy::kClipboardSendPending) {
+                m_sentClipboard[id] = false;
+                m_clipboardSendPending[id] = true;
+                m_pendingClipboardData[id].set(data);
+                m_pendingFileClipboardPaths[id] = localFileClipboard.paths;
+                scheduleClipboardRetry(id);
+                return;
+            }
             m_sentClipboard[id] = true;
             m_clipboardSendPending[id] = false;
             m_dataClipboard[id].set(data);
+            m_pendingFileClipboardPaths[id].clear();
+            sendClipboardSelectionToServer(localFileClipboard.paths);
             return;
         }
         ServerProxy::ClipboardSendResult result =
@@ -583,6 +638,7 @@ Client::finishPendingClipboardSend(ClipboardID id, const std::string& data)
             return false;
         }
         m_clipboardSendPending[id] = false;
+        m_pendingFileClipboardPaths[id].clear();
         return true;
     }
 
@@ -600,6 +656,12 @@ Client::finishPendingClipboardSend(ClipboardID id, const std::string& data)
 
     m_sentClipboard[id] = true;
     m_dataClipboard[id].set(data);
+    const std::vector<barrier::fs::path> filePaths =
+        m_pendingFileClipboardPaths[id];
+    m_pendingFileClipboardPaths[id].clear();
+    if (!filePaths.empty()) {
+        sendClipboardSelectionToServer(filePaths);
+    }
     return false;
 }
 
@@ -1438,13 +1500,14 @@ Client::sendClipboardSelectionToServer(const std::vector<barrier::fs::path>& sou
         return;
     }
 
-    if (!cleanupSendFileThread(true)) {
-        LOG((CLOG_WARN "remote clipboard prefetch skipped because previous file sender is still stopping"));
-        return;
-    }
+    if (!reapSendFileThreadIfReady()) {
+		LOG((CLOG_DEBUG "remote clipboard prefetch already active; keeping the current sender"));
+		return;
+	}
 
     auto chunker = std::make_shared<StreamChunker>();
     m_sendFileChunker = chunker;
+	m_sendFileIsClipboardPrefetch = true;
     barrier::IStream* stream = m_stream;
     ++m_sendFileTransferId;
     if (m_sendFileTransferId == 0) {
@@ -1528,6 +1591,7 @@ Client::sendFileToServer(const std::string& filename)
 
     auto chunker = std::make_shared<StreamChunker>();
     m_sendFileChunker = chunker;
+	m_sendFileIsClipboardPrefetch = false;
     barrier::IStream* stream = m_stream;
     ++m_sendFileTransferId;
     if (m_sendFileTransferId == 0) {
@@ -1599,6 +1663,7 @@ Client::cleanupSendFileThread(bool cancel)
 	}
 
 	m_sendFileChunker.reset();
+	m_sendFileIsClipboardPrefetch = false;
     releaseDetachedServerProxies();
     releaseDetachedSendFileStream();
 	return true;

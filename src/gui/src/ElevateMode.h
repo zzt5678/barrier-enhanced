@@ -19,14 +19,15 @@
 
 // The elevate mode tristate determines whether the Windows service asks
 // Barrierd to start Barrier with elevated privileges. In service mode the GUI
-// always passes switch-on-desk-switch separately so UAC/Winlogon desktop
-// changes can relaunch the process on the active input desktop.
+// passes switch-on-desk-switch only for as-needed elevation so UAC/Winlogon
+// changes can relaunch that process on the active input desktop. An always-
+// elevated process switches its input thread without restarting.
 //
 // The matrix for these two behaviours is as follows:
 //                          Service SodS      Elevate
 //                     _________________________________
 //  ElevateAsNeeded    |      true       |     false
-//  ElevateAlways      |      true       |     true
+//  ElevateAlways      |      false      |     true
 //  ElevateNever       |      false      |     false
 //
 enum ElevateMode {

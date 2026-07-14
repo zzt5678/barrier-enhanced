@@ -30,6 +30,10 @@ struct RelaunchDecision {
     bool debounced;
 };
 
+std::string launchDesktopName(
+    const std::string& observedDesktopName,
+    bool daemonized);
+
 RelaunchDecision observeDesktop(
     RelaunchState& state,
     const std::string& lastDesktopName,

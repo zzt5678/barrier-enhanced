@@ -120,6 +120,15 @@ public:
 	                            const VisibleAreas& areas,
 	                            SInt32 anchorX, SInt32 anchorY,
 	                            SInt32& x, SInt32& y);
+	static bool         visibleAreaTopologiesEqualForTest(
+	                            const VisibleAreas& first,
+	                            const VisibleAreas& second);
+#ifdef HAVE_XI2
+	static bool         xInputCookieUsableForTest(
+	                            const XGenericEventCookie& cookie,
+	                            int expectedExtension);
+	static bool         xInputEventNeedsPayloadForTest(int eventType);
+#endif
 	virtual bool        adjustPointToVisibleAreaNearAnchor(
 	                            SInt32 anchorX, SInt32 anchorY,
 	                            SInt32& x, SInt32& y) override;
@@ -169,6 +178,8 @@ private:
     void                saveShape();
     Window                openWindow() const;
     void                openIM();
+	void                releaseResources(bool eventBufferInstalled,
+	                            bool systemHandlerInstalled);
 
     void                wakeDisplayFromPowerSave();
     bool                updateVisibleAreasFromRandR();
@@ -191,7 +202,7 @@ private:
     int                 y_accumulateMouseScroll(SInt32 yDelta) const;
 
     bool                detectXI2();
-#ifdef HAVE_XI2
+	#ifdef HAVE_XI2
     void                selectXIRawMotion();
     void                handleXIRawButtonEvent(const XIRawButtonEvent* event);
 #endif

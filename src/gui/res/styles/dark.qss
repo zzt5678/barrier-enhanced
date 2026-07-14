@@ -20,6 +20,15 @@ QWidget#dashboardContent {
     background: #f3f5f8;
 }
 
+QWidget#controlCenterShell {
+    background: #f3f5f8;
+}
+
+QFrame#fixedControlBar {
+    background: #ffffff;
+    border-top: 1px solid #d9dee7;
+}
+
 QMenuBar, QMenu {
     background: #ffffff;
     color: #111827;
@@ -157,7 +166,7 @@ QLabel#m_pLabelReceiptSummary {
 QLabel#m_pLabelModeCaption,
 QLabel#m_pLabelPeerCaption,
 QLabel#m_pLabelWorkflowRuntimeCaption {
-    color: #94a3b8;
+    color: #64748b;
     font-size: 8.5pt;
     font-weight: 600;
 }
@@ -189,6 +198,11 @@ QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
 
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QComboBox:focus {
     border: 1px solid #2563eb;
+}
+
+QPushButton:focus, QToolButton:focus {
+    border: 1px solid #2563eb;
+    background: #eef2ff;
 }
 
 QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {
@@ -255,9 +269,24 @@ QPushButton#m_pButtonConfigureServer:hover {
     border: 1px solid #1f2937;
 }
 
+QPushButton#m_pButtonToggleStart:focus {
+    border: 2px solid #111827;
+    padding: 7px 12px;
+}
+
+QPushButton#m_pButtonConfigureServer:focus {
+    border: 2px solid #60a5fa;
+    padding: 7px 12px;
+}
+
 QCheckBox, QRadioButton {
     color: #334155;
     spacing: 8px;
+}
+
+QCheckBox:focus,
+QRadioButton:focus {
+    color: #1d4ed8;
 }
 
 QCheckBox::indicator,
@@ -298,8 +327,11 @@ QToolButton:hover {
 QListWidget {
     background: transparent;
     border: none;
-    outline: none;
     padding: 2px 0;
+}
+
+QListWidget:focus {
+    border: 1px solid #2563eb;
 }
 
 QListWidget::item {

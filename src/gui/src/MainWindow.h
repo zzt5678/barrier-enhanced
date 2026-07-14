@@ -53,6 +53,7 @@ class QRadioButton;
 class QTemporaryFile;
 class QMessageBox;
 class QAbstractButton;
+class QResizeEvent;
 
 class LogDialog;
 class QBarrierApplication;
@@ -166,9 +167,13 @@ public slots:
         void stopDesktop();
         void terminateDuplicateDesktopProcesses(const QString& app);
         void closeEvent(QCloseEvent* event);
+        void resizeEvent(QResizeEvent* event);
         void changeEvent(QEvent* event);
         bool event(QEvent* event);
         void retranslateMenuBar();
+        void retranslateDashboard();
+        void updateDashboardLayout(int windowWidth);
+        void updateControlBarMargins();
 #if defined(Q_OS_WIN)
         bool isServiceRunning(QString name);
 #else
@@ -231,6 +236,8 @@ public slots:
         QElapsedTimer m_ProcessLifetime;
         int m_UnexpectedExitCount;
         bool m_AllowApplicationQuit;
+        bool m_WindowGeometryInitialized;
+        bool m_DashboardSingleColumn;
 
         bool m_fingerprint_expanded = false;
 

@@ -16,7 +16,11 @@
  */
 
 #include "arch/Arch.h"
+#if !defined(_WIN32)
 #include "config.h"
+#else
+#define HAVE_LIBCURL 0
+#endif
 
 #include "test/global/gtest.h"
 

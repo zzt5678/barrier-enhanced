@@ -206,6 +206,7 @@ public:
                              Bool owner_events, unsigned int event_mask,
                              int  pointer_mode, int keyboard_mode,
                              Window confine_to, Cursor cursor, Time time) = 0;
+    virtual int XUngrabPointer(Display* display, Time time) = 0;
     virtual int XUngrabKeyboard(Display* display, Time time) = 0;
     virtual int XPending(Display* display) = 0;
     virtual int XPeekEvent(Display* display, XEvent* event_return) = 0;

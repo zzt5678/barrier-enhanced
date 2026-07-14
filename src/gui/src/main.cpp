@@ -16,9 +16,6 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define TRAY_RETRY_COUNT 5
-#define TRAY_RETRY_WAIT 2000
-
 #include "QBarrierApplication.h"
 #include "MainWindow.h"
 #include "AppConfig.h"
@@ -32,6 +29,15 @@
 #include <QLockFile>
 #include <QDir>
 #include <QFileInfo>
+#include <QSocketNotifier>
+
+#if defined(Q_OS_UNIX)
+#include <cerrno>
+#include <csignal>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #if defined(Q_OS_MAC)
 #include <Carbon/Carbon.h>
@@ -50,13 +56,62 @@ public:
 	}
 };
 
-int waitForTray();
-
 #if defined(Q_OS_MAC)
 bool checkMacAssistiveDevices();
 #endif
 
 namespace {
+
+#if defined(Q_OS_UNIX)
+int signalWriteFd = -1;
+
+void forwardUnixSignal(int)
+{
+    const int savedErrno = errno;
+    const char byte = 1;
+    if (signalWriteFd >= 0) {
+        const ssize_t result = ::write(signalWriteFd, &byte, sizeof(byte));
+        (void)result;
+    }
+    errno = savedErrno;
+}
+
+void installUnixSignalHandlers(QCoreApplication& app)
+{
+    int signalPipe[2];
+    if (::pipe(signalPipe) != 0) {
+        return;
+    }
+
+    for (const int fd : signalPipe) {
+        ::fcntl(fd, F_SETFD, ::fcntl(fd, F_GETFD) | FD_CLOEXEC);
+    }
+    ::fcntl(signalPipe[1], F_SETFL, ::fcntl(signalPipe[1], F_GETFL) | O_NONBLOCK);
+    signalWriteFd = signalPipe[1];
+
+    const int readFd = signalPipe[0];
+    auto* notifier = new QSocketNotifier(readFd, QSocketNotifier::Read, &app);
+    QObject::connect(
+        notifier,
+        &QSocketNotifier::activated,
+        &app,
+        [&app, notifier, readFd]() {
+            notifier->setEnabled(false);
+            char byte;
+            const ssize_t result = ::read(readFd, &byte, sizeof(byte));
+            (void)result;
+            app.quit();
+        });
+
+    struct sigaction action;
+    std::memset(&action, 0, sizeof(action));
+    action.sa_handler = forwardUnixSignal;
+    ::sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    ::sigaction(SIGTERM, &action, nullptr);
+    ::sigaction(SIGINT, &action, nullptr);
+}
+#endif
 
 void cleanupStartupArtifacts()
 {
@@ -100,6 +155,10 @@ int main(int argc, char* argv[])
 
 	QBarrierApplication app(argc, argv);
 
+#if defined(Q_OS_UNIX)
+    installUnixSignalHandlers(app);
+#endif
+
 	// Single instance lock - prevent multiple barrier GUI instances
 	// This fixes the tray icon duplication issue when restarting barrier
 	QLockFile lockFile(QDir::temp().absoluteFilePath("weave-gui.lock"));
@@ -140,8 +199,6 @@ int main(int argc, char* argv[])
 	}
 #endif
 
-	int trayAvailable = waitForTray();
-
 	QApplication::setQuitOnLastWindowClosed(false);
 
     if (QGuiApplication::platformName() == "wayland") {
@@ -152,13 +209,6 @@ int main(int argc, char* argv[])
 
 	QSettings settings;
 	AppConfig appConfig (&settings);
-
-	if (appConfig.getAutoHide() && !trayAvailable)
-	{
-		// force auto hide to false - otherwise there is no way to get the GUI back
-		fprintf(stdout, "System tray not available, force disabling auto hide!\n");
-		appConfig.setAutoHide(false);
-	}
 
 	app.switchTranslator(appConfig.language());
 
@@ -175,29 +225,6 @@ int main(int argc, char* argv[])
 	}
 
 	return app.exec();
-}
-
-int waitForTray()
-{
-	// on linux, the system tray may not be available immediately after logging in,
-	// so keep retrying but give up after a short time.
-	int trayAttempts = 0;
-	while (true)
-	{
-		if (QSystemTrayIcon::isSystemTrayAvailable())
-		{
-			break;
-		}
-
-		if (++trayAttempts > TRAY_RETRY_COUNT)
-		{
-			fprintf(stdout, "System tray is unavailable.\n");
-			return false;
-		}
-
-		QThreadImpl::msleep(TRAY_RETRY_WAIT);
-	}
-	return true;
 }
 
 #if defined(Q_OS_MAC)

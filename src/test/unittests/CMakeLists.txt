@@ -16,6 +16,7 @@
 
 file(GLOB_RECURSE headers "*.h")
 file(GLOB_RECURSE sources "*.cpp")
+list(REMOVE_ITEM sources "${CMAKE_CURRENT_SOURCE_DIR}/PolicyTestsMain.cpp")
 list(APPEND sources "barrier/PacketStreamFilterTests.cpp")
 list(APPEND sources "barrier/TransferArchiveTests.cpp")
 
@@ -70,3 +71,14 @@ add_executable(unittests ${sources})
 target_link_libraries(unittests
     arch base client server common io net platform server synlib mt ipc ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES} ${libs} ${OPENSSL_LIBS})
 add_test(NAME unittests COMMAND $<TARGET_FILE:unittests>)
+
+if (WIN32)
+    add_executable(policyunittests
+        PolicyTestsMain.cpp
+        ipc/ElevationPolicyTests.cpp
+        ../../lib/ipc/DesktopSwitchPolicy.cpp
+        ../../lib/ipc/ElevationPolicy.cpp
+    )
+    target_link_libraries(policyunittests ${GTEST_LIBRARIES})
+    add_test(NAME policyunittests COMMAND $<TARGET_FILE:policyunittests>)
+endif()

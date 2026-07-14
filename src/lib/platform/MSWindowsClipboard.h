@@ -64,6 +64,8 @@ public:
 
     void setFacade(IMSWindowsClipboardFacade& facade);
 
+    static std::string convertDIBToPNGForTest(const std::string& dibData);
+
 private:
     void                clearConverters();
 

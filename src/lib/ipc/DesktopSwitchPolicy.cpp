@@ -25,6 +25,15 @@ RelaunchDecision::RelaunchDecision() :
 {
 }
 
+std::string
+launchDesktopName(const std::string& observedDesktopName, bool daemonized)
+{
+    if (!observedDesktopName.empty()) {
+        return observedDesktopName;
+    }
+    return daemonized ? "Default" : std::string();
+}
+
 RelaunchDecision
 observeDesktop(
     RelaunchState& state,

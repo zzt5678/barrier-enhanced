@@ -36,6 +36,7 @@
 #include "SslCertificate.h"
 #include "ShutdownCh.h"
 #include "WorkflowHubDialog.h"
+#include "WindowLifecyclePolicy.h"
 #include "WorkflowStore.h"
 #include "base/String.h"
 #include "common/DataDirectories.h"
@@ -164,7 +165,9 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_pActionCommandPalette(NULL),
     m_RestartTimer(this),
     m_UnexpectedExitCount(0),
-    m_AllowApplicationQuit(false)
+    m_AllowApplicationQuit(false),
+    m_WindowGeometryInitialized(false),
+    m_DashboardSingleColumn(false)
 {
     // explicitly unset DeleteOnClose so the window can be show and hidden
     // repeatedly until Barrier is finished
@@ -176,27 +179,14 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     setupUi(this);
     setWindowIcon(QIcon(barrierLargeIcon));
 
-    m_pLabelHeroTitle->setText(tr("Weave"));
-    m_pLabelHeroSubtitle->setText(tr("Share one keyboard, mouse, clipboard, and files across your desk."));
-    m_pGroupClient->setTitle(tr("Join another computer"));
-    m_pGroupServer->setTitle(tr("Share this computer"));
-    m_pGroupExperience->setTitle(tr("Transfer and input"));
-    m_pLabelWorkflowSectionTitle->setText(tr("Recent activity"));
     gridLayout_dashboard->setColumnStretch(0, 1);
     gridLayout_dashboard->setColumnStretch(1, 1);
-    gridLayout_dashboard->setRowStretch(3, 1);
     gridLayout_overview->setHorizontalSpacing(18);
     gridLayout_overview->setColumnStretch(0, 1);
     gridLayout_overview->setColumnStretch(1, 1);
     gridLayout_overview->setColumnStretch(2, 1);
     m_pLabelPeerValue->setWordWrap(true);
     m_pLabelWorkflowRuntimeValue->setWordWrap(true);
-    m_pLineEditHostname->setPlaceholderText(tr("Server name or IP address"));
-    m_pLineEditConfigFile->setPlaceholderText(tr("Choose a .conf file"));
-    m_pButtonWorkflowHub->setText(tr("Workflow Hub"));
-    m_pButtonShowLog->setText(tr("Logs"));
-    m_pButtonWorkflowHub->setToolTip(tr("Open clipboard history, transfer receipts, and workflow actions."));
-    m_pButtonShowLog->setToolTip(tr("Open the live service log."));
     horizontalLayout_overviewActions->setSpacing(8);
     m_pStatusLabel->setProperty("state", QStringLiteral("disconnected"));
     m_pButtonToggleStart->setProperty("state", QStringLiteral("start"));
@@ -218,13 +208,30 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     dashboard->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     dashboard->adjustSize();
     scrollArea->setWidget(dashboard);
-    setCentralWidget(scrollArea);
-    setMinimumSize(QSize(760, 620));
+
+    verticalLayout_footerCard->removeItem(horizontalLayout);
+    QFrame* controlBar = new QFrame(this);
+    controlBar->setObjectName(QStringLiteral("fixedControlBar"));
+    QVBoxLayout* controlBarLayout = new QVBoxLayout(controlBar);
+    controlBarLayout->setContentsMargins(18, 10, 18, 10);
+    spacer->changeSize(0, 0, QSizePolicy::Minimum, QSizePolicy::Minimum);
+    m_pStatusLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    controlBarLayout->addLayout(horizontalLayout);
+
+    QWidget* controlCenter = new QWidget(this);
+    controlCenter->setObjectName(QStringLiteral("controlCenterShell"));
+    QVBoxLayout* controlCenterLayout = new QVBoxLayout(controlCenter);
+    controlCenterLayout->setContentsMargins(0, 0, 0, 0);
+    controlCenterLayout->setSpacing(0);
+    controlCenterLayout->addWidget(scrollArea, 1);
+    controlCenterLayout->addWidget(controlBar);
+    setCentralWidget(controlCenter);
+    setMinimumSize(QSize(560, 420));
 
     // Apply modern dark theme from QSS resource file
     QFile styleFile(":/res/styles/dark.qss");
     if (styleFile.open(QFile::ReadOnly)) {
-        setStyleSheet(QString::fromUtf8(styleFile.readAll()));
+        qApp->setStyleSheet(QString::fromUtf8(styleFile.readAll()));
     } else {
         qWarning() << "Failed to load stylesheet:" << styleFile.fileName();
     }
@@ -233,13 +240,12 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_pWorkflowStore->attachClipboard(QApplication::clipboard());
     m_pActionBus = new ActionBus(*m_pWorkflowStore, this);
 
-    m_pActionWorkflowHub = new QAction(tr("Workflow &Hub"), this);
-    m_pActionWorkflowHub->setToolTip(tr("Open clipboard history, task handoff, suggestions, and transfer receipts."));
+    m_pActionWorkflowHub = new QAction(this);
     m_pActionWorkflowHub->setShortcut(QKeySequence(Qt::CTRL + Qt::Key_H));
-    m_pActionCommandPalette = new QAction(tr("Command &Palette"), this);
-    m_pActionCommandPalette->setToolTip(tr("Run lightweight workflow commands."));
+    m_pActionCommandPalette = new QAction(this);
     m_pActionCommandPalette->setShortcut(QKeySequence(Qt::CTRL + Qt::SHIFT + Qt::Key_P));
     addAction(m_pActionCommandPalette);
+    retranslateDashboard();
 
     connect(m_pWorkflowStore, &WorkflowStore::notificationRequested,
             this, &MainWindow::handleWorkflowNotification);
@@ -271,17 +277,10 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_IpcClient.connectToHost();
 #endif
 
-    // change default size based on os
-#if defined(Q_OS_MAC)
-    resize(640, 560);
-    setMinimumSize(560, 420);
-#elif defined(Q_OS_LINUX)
-    resize(640, 560);
-    setMinimumSize(560, 420);
-#elif defined(Q_OS_WIN)
-    resize(640, 560);
-    setMinimumSize(560, 420);
-#endif
+    // Preserve restored geometry; only apply the compact default on first launch.
+    if (!m_WindowGeometryInitialized) {
+        resize(640, 560);
+    }
 
     m_SuppressAutoConfigWarning = true;
     m_pCheckBoxAutoConfig->setChecked(appConfig.autoConfig());
@@ -305,7 +304,6 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
             toolbutton_show_fingerprint->setArrowType(Qt::ArrowType::DownArrow);
         }
     });
-
     m_RestartTimer.setSingleShot(true);
     connect(&m_RestartTimer, &QTimer::timeout, this, &MainWindow::startBarrier);
 
@@ -315,6 +313,8 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
         qMax(availableGeometry.height() - 80, minimumHeight()))));
     updateWorkflowPeerHint();
     updateWorkflowIndicators();
+    updateDashboardLayout(width());
+    updateControlBarMargins();
     refreshDashboardScrollArea(this);
 }
 
@@ -344,7 +344,7 @@ void MainWindow::open()
 {
     createTrayIcon();
 
-    if (appConfig().getAutoHide()) {
+    if (appConfig().getAutoHide() && QSystemTrayIcon::isSystemTrayAvailable()) {
         hide();
     } else {
         showControlCenter();
@@ -406,6 +406,96 @@ void MainWindow::retranslateMenuBar()
     m_pMenuHelp->setTitle(tr("&Help"));
 }
 
+void MainWindow::retranslateDashboard()
+{
+    m_pLabelHeroTitle->setText(tr("Weave"));
+    m_pLabelHeroSubtitle->setText(tr("Share one keyboard, mouse, clipboard, and files across your desk."));
+    m_pGroupClient->setTitle(tr("Join another computer"));
+    m_pGroupServer->setTitle(tr("Share this computer"));
+    m_pGroupExperience->setTitle(tr("Transfer and input"));
+    m_pLabelWorkflowSectionTitle->setText(tr("Recent activity"));
+    m_pLineEditHostname->setPlaceholderText(tr("Server name or IP address"));
+    m_pLineEditConfigFile->setPlaceholderText(tr("Choose a .conf file"));
+    m_pButtonWorkflowHub->setText(tr("Workflow Hub"));
+    m_pButtonShowLog->setText(tr("Logs"));
+    m_pButtonWorkflowHub->setToolTip(tr("Open clipboard history, transfer receipts, and workflow actions."));
+    m_pButtonShowLog->setToolTip(tr("Open the live service log."));
+    toolbutton_show_fingerprint->setToolTip(tr("Show fingerprint details"));
+    toolbutton_show_fingerprint->setAccessibleName(tr("Show fingerprint details"));
+
+    if (m_pActionWorkflowHub != NULL) {
+        m_pActionWorkflowHub->setText(tr("Workflow &Hub"));
+        m_pActionWorkflowHub->setToolTip(
+            tr("Open clipboard history, task handoff, suggestions, and transfer receipts."));
+    }
+    if (m_pActionCommandPalette != NULL) {
+        m_pActionCommandPalette->setText(tr("Command &Palette"));
+        m_pActionCommandPalette->setToolTip(tr("Run lightweight workflow commands."));
+    }
+}
+
+void MainWindow::updateDashboardLayout(int windowWidth)
+{
+    const bool singleColumn = windowWidth < 760;
+    if (singleColumn == m_DashboardSingleColumn) {
+        return;
+    }
+
+    m_DashboardSingleColumn = singleColumn;
+    QWidget* const cards[] = {
+        heroCard,
+        overviewCard,
+        m_pGroupServer,
+        m_pGroupClient,
+        m_pGroupExperience,
+        workflowCard,
+        footerCard
+    };
+    for (QWidget* card : cards) {
+        gridLayout_dashboard->removeWidget(card);
+    }
+    for (int row = 0; row < 7; ++row) {
+        gridLayout_dashboard->setRowStretch(row, 0);
+    }
+
+    if (singleColumn) {
+        gridLayout_dashboard->addWidget(heroCard, 0, 0, 1, 2);
+        gridLayout_dashboard->addWidget(overviewCard, 1, 0, 1, 2);
+        gridLayout_dashboard->addWidget(m_pGroupServer, 2, 0, 1, 2);
+        gridLayout_dashboard->addWidget(m_pGroupClient, 3, 0, 1, 2);
+        gridLayout_dashboard->addWidget(m_pGroupExperience, 4, 0, 1, 2);
+        gridLayout_dashboard->addWidget(workflowCard, 5, 0, 1, 2);
+        gridLayout_dashboard->addWidget(footerCard, 6, 0, 1, 2);
+        gridLayout_dashboard->setColumnStretch(0, 1);
+        gridLayout_dashboard->setColumnStretch(1, 0);
+    }
+    else {
+        gridLayout_dashboard->addWidget(heroCard, 0, 0);
+        gridLayout_dashboard->addWidget(overviewCard, 0, 1);
+        gridLayout_dashboard->addWidget(m_pGroupServer, 1, 0);
+        gridLayout_dashboard->addWidget(m_pGroupClient, 1, 1);
+        gridLayout_dashboard->addWidget(m_pGroupExperience, 2, 0);
+        gridLayout_dashboard->addWidget(workflowCard, 2, 1);
+        gridLayout_dashboard->addWidget(footerCard, 3, 0, 1, 2);
+        gridLayout_dashboard->setColumnStretch(0, 1);
+        gridLayout_dashboard->setColumnStretch(1, 1);
+    }
+
+    refreshDashboardScrollArea(this);
+}
+
+void MainWindow::updateControlBarMargins()
+{
+    auto* controlBar = findChild<QFrame*>(QStringLiteral("fixedControlBar"));
+    if (controlBar == nullptr || controlBar->layout() == nullptr) {
+        return;
+    }
+
+    const int centeredInset = qMax(0, (controlBar->width() - 1040) / 2);
+    controlBar->layout()->setContentsMargins(
+        centeredInset + 18, 10, centeredInset + 18, 10);
+}
+
 void MainWindow::createMenuBar()
 {
     m_pMenuBar = new QMenuBar(this);
@@ -442,6 +532,10 @@ void MainWindow::loadSettings()
     m_pLineEditConfigFile->setText(settings().value("configFile", QDir::homePath() + "/" + barrierConfigName).toString());
     m_pGroupClient->setChecked(settings().value("groupClientChecked", true).toBool());
     m_pLineEditHostname->setText(settings().value("serverHostname").toString());
+    const QByteArray geometry = settings().value("mainWindowGeometry").toByteArray();
+    if (!geometry.isEmpty()) {
+        m_WindowGeometryInitialized = restoreGeometry(geometry);
+    }
 }
 
 void MainWindow::initConnections()
@@ -469,6 +563,7 @@ void MainWindow::saveSettings()
     settings().setValue("useInternalConfig", m_pRadioInternalConfig->isChecked());
     settings().setValue("groupClientChecked", m_pGroupClient->isChecked());
     settings().setValue("serverHostname", m_pLineEditHostname->text());
+    settings().setValue("mainWindowGeometry", saveGeometry());
     appConfig().setEnableDragDrop(m_pCheckBoxEnableDragDrop->isChecked());
     appConfig().setGameMode(m_pCheckBoxGameMode->isChecked());
     appConfig().saveSettings();
@@ -510,14 +605,17 @@ void MainWindow::showControlCenter()
     showNormal();
     refreshDashboardScrollArea(this);
 
-    const QRect availableGeometry = QApplication::desktop()->availableGeometry(this);
-    const QSize preferredSize(640, 560);
-    const QSize maxSize(
-        qMax(availableGeometry.width() - 80, minimumWidth()),
-        qMax(availableGeometry.height() - 80, minimumHeight()));
-    const QSize targetSize = preferredSize.boundedTo(maxSize).expandedTo(minimumSize());
-    resize(targetSize);
-    move(availableGeometry.center() - rect().center());
+    if (!m_WindowGeometryInitialized) {
+        const QRect availableGeometry = QApplication::desktop()->availableGeometry(this);
+        const QSize preferredSize(760, 680);
+        const QSize maxSize(
+            qMax(availableGeometry.width() - 80, minimumWidth()),
+            qMax(availableGeometry.height() - 80, minimumHeight()));
+        const QSize targetSize = preferredSize.boundedTo(maxSize).expandedTo(minimumSize());
+        resize(targetSize);
+        move(availableGeometry.center() - rect().center());
+        m_WindowGeometryInitialized = true;
+    }
 
     raise();
     activateWindow();
@@ -774,10 +872,9 @@ void MainWindow::startBarrier()
         args << "--ipc";
 
 #if defined(Q_OS_WIN)
-        // Service mode must relaunch on Windows desktop switches even when the
-        // child is already elevated. UAC/Winlogon input only stays reliable when
-        // the watchdog can bind the process to the active input desktop.
-        if (appConfig().elevateMode() != ElevateNever) {
+        // As-needed elevation must relaunch on a secure desktop. An always-
+        // elevated client can switch its input thread without dropping TCP.
+        if (appConfig().elevateMode() == ElevateAsNeeded) {
             args << "--stop-on-desk-switch";
         }
 #endif
@@ -1080,6 +1177,7 @@ void MainWindow::barrierFinished(int exitCode, QProcess::ExitStatus)
     }
 
     if (m_ExpectedRunningState == kStarted) {
+        setBarrierState(barrierConnecting);
         scheduleAutoRestart();
     }
     else {
@@ -1145,6 +1243,7 @@ void MainWindow::setBarrierState(qBarrierState state)
         break;
     case barrierTransfering:
         visualState = QStringLiteral("transfering");
+        setStatus(tr("Transferring data..."));
         break;
     }
 
@@ -1314,6 +1413,7 @@ void MainWindow::changeEvent(QEvent* event)
         {
             retranslateUi(this);
             retranslateMenuBar();
+            retranslateDashboard();
 
             proofreadInfo();
 
@@ -1336,19 +1436,32 @@ void MainWindow::changeEvent(QEvent* event)
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
-    const bool runningOrStarting =
-        barrierState() == barrierConnected || barrierState() == barrierConnecting ||
-        barrierState() == barrierTransfering;
+    const bool canRestoreFromTray =
+        QSystemTrayIcon::isSystemTrayAvailable() &&
+        m_pTrayIcon != NULL && m_pTrayIcon->isVisible();
 
-    if (!m_AllowApplicationQuit &&
-        ((m_pTrayIcon != NULL && m_pTrayIcon->isVisible()) ||
-         (barrier_type() == BarrierType::Client && runningOrStarting))) {
+    const WindowLifecyclePolicy::CloseAction action =
+        WindowLifecyclePolicy::closeAction(m_AllowApplicationQuit, canRestoreFromTray);
+    if (action == WindowLifecyclePolicy::CloseAction::Hide) {
         event->ignore();
         hide();
         return;
     }
 
+    if (action == WindowLifecyclePolicy::CloseAction::Minimize) {
+        event->ignore();
+        showMinimized();
+        return;
+    }
+
     QMainWindow::closeEvent(event);
+}
+
+void MainWindow::resizeEvent(QResizeEvent* event)
+{
+    QMainWindow::resizeEvent(event);
+    updateDashboardLayout(event->size().width());
+    updateControlBarMargins();
 }
 
 bool MainWindow::event(QEvent* event)
@@ -1761,8 +1874,13 @@ void MainWindow::bonjourInstallFinished()
 
 void MainWindow::windowStateChanged()
 {
-    if (windowState() == Qt::WindowMinimized && appConfig().getMinimizeToTray())
+    const bool canRestoreFromTray =
+        QSystemTrayIcon::isSystemTrayAvailable() &&
+        m_pTrayIcon != NULL && m_pTrayIcon->isVisible();
+    if (WindowLifecyclePolicy::shouldHideOnMinimize(
+            windowState(), appConfig().getMinimizeToTray(), canRestoreFromTray)) {
         hide();
+    }
 }
 
 void MainWindow::refreshControlState()
@@ -1900,7 +2018,7 @@ void MainWindow::updateOverviewCards()
     }
     else {
         peerText = serverMode
-            ? tr("Connected or awaiting a remote client")
+            ? tr("Ready for a remote client")
             : (hostname().isEmpty() ? tr("Connected server") : hostname());
     }
     m_pLabelPeerValue->setText(peerText);

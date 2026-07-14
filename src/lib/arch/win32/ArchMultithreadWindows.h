@@ -58,6 +58,7 @@ public:
     HANDLE                getCancelEventForCurrentThread();
 
     void*                getNetworkDataForThread(ArchThread);
+    void*                getNetworkDataForThreadAndMarkUnblock(ArchThread);
 
     static ArchMultithreadWindows*    getInstance();
 

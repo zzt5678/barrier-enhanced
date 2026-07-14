@@ -17,12 +17,28 @@
  */
 
 #include "test/mock/barrier/MockEventQueue.h"
+#include "barrier/XScreen.h"
+#include "base/IEventJob.h"
+#include "base/IEventQueueBuffer.h"
 #include "platform/XWindowsScreen.h"
 
 #include "test/global/gtest.h"
 #include <cstdlib>
+#include <memory>
+#include <vector>
 
 using ::testing::_;
+using ::testing::Invoke;
+
+namespace {
+
+int
+testIOErrorHandler(Display*)
+{
+	return 0;
+}
+
+}
 
 TEST(CXWindowsScreenTests, drmConnectorEnterable_allowsDpmsOffForWake)
 {
@@ -94,6 +110,27 @@ TEST(CXWindowsScreenTests, secondaryDisplayAdvertisable_rejectsInvalidShapeEvenW
 		true, 64, 64));
 }
 
+TEST(CXWindowsScreenTests, unavailableDisplay_canBeConstructedTwiceAfterFailure)
+{
+	const char* const invalidDisplay = ":65535";
+	MockEventQueue eventQueue;
+	XIOErrorHandler const previousIOErrorHandler =
+		XSetIOErrorHandler(&testIOErrorHandler);
+
+	EXPECT_THROW({
+		XWindowsScreen screen(new XWindowsImpl(), invalidDisplay, true, true,
+			0, &eventQueue);
+	}, XScreenUnavailable);
+	EXPECT_THROW({
+		XWindowsScreen screen(new XWindowsImpl(), invalidDisplay, true, true,
+			0, &eventQueue);
+	}, XScreenUnavailable);
+
+	XIOErrorHandler const restoredIOErrorHandler =
+		XSetIOErrorHandler(previousIOErrorHandler);
+	EXPECT_EQ(&testIOErrorHandler, restoredIOErrorHandler);
+}
+
 TEST(CXWindowsScreenTests, fakeMouseMove_nonPrimary_getCursorPosValuesCorrect)
 {
     const char* displayName = std::getenv("DISPLAY");
@@ -102,8 +139,18 @@ TEST(CXWindowsScreenTests, fakeMouseMove_nonPrimary_getCursorPosValuesCorrect)
     }
 
     MockEventQueue eventQueue;
-    EXPECT_CALL(eventQueue, adoptHandler(_, _, _)).Times(2);
-    EXPECT_CALL(eventQueue, adoptBuffer(_)).Times(2);
+    std::vector<std::unique_ptr<IEventJob> > handlers;
+    std::unique_ptr<IEventQueueBuffer> buffer;
+    EXPECT_CALL(eventQueue, adoptHandler(_, _, _))
+        .Times(2)
+        .WillRepeatedly(Invoke([&](Event::Type, void*, IEventJob* handler) {
+            handlers.emplace_back(handler);
+        }));
+    EXPECT_CALL(eventQueue, adoptBuffer(_))
+        .Times(2)
+        .WillRepeatedly(Invoke([&](IEventQueueBuffer* adoptedBuffer) {
+            buffer.reset(adoptedBuffer);
+        }));
     EXPECT_CALL(eventQueue, removeHandler(_, _)).Times(2);
     XWindowsScreen screen(new XWindowsImpl(), displayName, false, false, 0, &eventQueue);
 
@@ -113,4 +160,53 @@ TEST(CXWindowsScreenTests, fakeMouseMove_nonPrimary_getCursorPosValuesCorrect)
     screen.getCursorPos(x, y);
     ASSERT_EQ(10, x);
     ASSERT_EQ(20, y);
+}
+
+TEST(CXWindowsScreenTests, primaryEnter_releasesPointerGrabBeforeReturning)
+{
+    const char* displayName = std::getenv("DISPLAY");
+    if (displayName == NULL) {
+        displayName = ":0.0";
+    }
+
+    Display* probeDisplay = XOpenDisplay(displayName);
+    ASSERT_NE(static_cast<Display*>(NULL), probeDisplay);
+    const int baselineGrabResult = XGrabPointer(probeDisplay,
+        DefaultRootWindow(probeDisplay), False, PointerMotionMask,
+        GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+    if (baselineGrabResult == GrabSuccess) {
+        XUngrabPointer(probeDisplay, CurrentTime);
+        XSync(probeDisplay, False);
+    }
+    ASSERT_EQ(GrabSuccess, baselineGrabResult);
+
+    MockEventQueue eventQueue;
+    std::vector<std::unique_ptr<IEventJob> > handlers;
+    std::unique_ptr<IEventQueueBuffer> buffer;
+    EXPECT_CALL(eventQueue, adoptHandler(_, _, _))
+        .Times(2)
+        .WillRepeatedly(Invoke([&](Event::Type, void*, IEventJob* handler) {
+            handlers.emplace_back(handler);
+        }));
+    EXPECT_CALL(eventQueue, adoptBuffer(_))
+        .Times(2)
+        .WillRepeatedly(Invoke([&](IEventQueueBuffer* adoptedBuffer) {
+            buffer.reset(adoptedBuffer);
+        }));
+    EXPECT_CALL(eventQueue, removeHandler(_, _)).Times(2);
+    XWindowsScreen screen(new XWindowsImpl(), displayName, true, false, 0,
+        &eventQueue);
+
+    ASSERT_TRUE(screen.leave());
+    screen.enter();
+
+    const int grabResult = XGrabPointer(probeDisplay,
+        DefaultRootWindow(probeDisplay), False, PointerMotionMask,
+        GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+    if (grabResult == GrabSuccess) {
+        XUngrabPointer(probeDisplay, CurrentTime);
+    }
+    XCloseDisplay(probeDisplay);
+
+    EXPECT_EQ(GrabSuccess, grabResult);
 }

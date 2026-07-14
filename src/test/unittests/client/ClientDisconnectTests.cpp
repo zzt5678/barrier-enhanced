@@ -83,6 +83,7 @@ public:
         setClipboardCount(0),
         lastSetClipboardWasNull(false),
         clipboardAvailable(false),
+        clipboardContainsFileList(false),
         clipboardText("stable clipboard")
     {
     }
@@ -119,7 +120,16 @@ public:
             return false;
         }
         clipboard->empty();
-        clipboard->add(IClipboard::kText, clipboardText);
+        if (clipboardContainsFileList) {
+            RemoteFileClipboard::Data payload;
+            payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+            payload.sessionId = "local-source-session";
+            payload.paths.push_back(barrier::fs::u8path("C:/local-copy.txt"));
+            clipboard->add(IClipboard::kFileList, RemoteFileClipboard::serialize(payload));
+        }
+        else {
+            clipboard->add(IClipboard::kText, clipboardText);
+        }
         clipboard->close();
         return true;
     }
@@ -180,6 +190,7 @@ public:
     bool lastSetClipboardWasNull;
     Clipboard lastSetClipboard;
     bool clipboardAvailable;
+    bool clipboardContainsFileList;
     std::string clipboardText;
     String draggingFilename;
     String dropTarget;
@@ -258,9 +269,10 @@ public:
     {
     }
 
-    ClipboardSendResult onClipboardChanged(ClipboardID, const IClipboard*) override
+    ClipboardSendResult onClipboardChanged(ClipboardID, const IClipboard* clipboard) override
     {
         ++sendCalls;
+        lastClipboard.unmarshall(IClipboard::marshall(clipboard), 0);
         return result;
     }
 
@@ -284,6 +296,7 @@ public:
     bool reapSucceeded;
     UInt32 sendCalls;
     UInt32 reapCalls;
+    Clipboard lastClipboard;
 };
 
 class StableTextClipboardScreen : public TestScreen {
@@ -566,8 +579,10 @@ TEST(ClientDisconnectTests, setClipboardStillPublishesPlainText)
 
     EXPECT_EQ(1u, platform->setClipboardCount);
     EXPECT_FALSE(platform->lastSetClipboardWasNull);
+    ASSERT_TRUE(platform->lastSetClipboard.open(0));
     ASSERT_TRUE(platform->lastSetClipboard.has(IClipboard::kText));
     EXPECT_EQ("plain text", platform->lastSetClipboard.get(IClipboard::kText));
+    platform->lastSetClipboard.close();
     EXPECT_TRUE(client.testRemoteFileClipboardSession().empty());
     EXPECT_TRUE(client.testReadyFileClipboardSession().empty());
     EXPECT_TRUE(client.testReadyFileClipboardPaths().empty());
@@ -664,8 +679,10 @@ TEST(ClientDisconnectTests, remoteClipboardDoesNotOverwriteUnsentLocalClipboard)
 
     EXPECT_FALSE(client.testOwnClipboard(kClipboardClipboard));
     EXPECT_EQ(1u, platform->setClipboardCount);
+    ASSERT_TRUE(platform->lastSetClipboard.open(0));
     ASSERT_TRUE(platform->lastSetClipboard.has(IClipboard::kText));
     EXPECT_EQ("remote clipboard", platform->lastSetClipboard.get(IClipboard::kText));
+    platform->lastSetClipboard.close();
 }
 
 TEST(ClientDisconnectTests, invalidFileCompletionReleasesReceiveState)
@@ -1258,7 +1275,7 @@ TEST(ClientDisconnectTests, staleFileClipboardReadyDoesNotReplacePendingSession)
     EXPECT_EQ("/tmp/current-ready.txt", client.testReadyFileClipboardPaths()[0]);
 }
 
-TEST(ClientDisconnectTests, localFileListClipboardIsNotSentToServer)
+TEST(ClientDisconnectTests, localFileListClipboardStartsMetadataAndPackageTransfer)
 {
     NiceMock<MockEventQueue> events;
     ClientEvents clientEvents;
@@ -1272,20 +1289,161 @@ TEST(ClientDisconnectTests, localFileListClipboardIsNotSentToServer)
                                     streamEvents, clipboardEvents, dataSocketEvents,
                                     socketEvents);
 
-    FileListClipboardScreen screen;
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->clipboardAvailable = true;
+    platform->clipboardContainsFileList = true;
+    barrier::Screen screen(platform, &events);
     ClientArgs args;
     Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
                   &screen, args);
 
-    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
-    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
-    ON_CALL(*stream, getBufferedOutputSize()).WillByDefault(Return(0));
-    EXPECT_CALL(*stream, write(_, _)).Times(0);
-    EXPECT_CALL(*stream, writeLowPriority(_, _)).Times(0);
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    proxy->result = ServerProxy::kClipboardSendQueued;
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
 
-    client.testAttachStream(stream);
     client.testSendClipboard(kClipboardClipboard);
+
+    EXPECT_EQ(1u, proxy->sendCalls);
+    EXPECT_TRUE(client.testClipboardSent(kClipboardClipboard));
+    EXPECT_TRUE(client.testHasSendFileThread());
+
+    RemoteFileClipboard::Data metadata;
+    ASSERT_TRUE(RemoteFileClipboard::readFromClipboard(proxy->lastClipboard, metadata));
+    EXPECT_EQ(RemoteFileClipboard::Mode::SourcePaths, metadata.mode);
+    EXPECT_FALSE(metadata.sessionId.empty());
+    ASSERT_EQ(1u, metadata.paths.size());
+    EXPECT_EQ("C:/local-copy.txt", metadata.paths[0].u8string());
+}
+
+TEST(ClientDisconnectTests, materializedRemoteFileListIsNotEchoedAsLocalCopy)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->clipboardAvailable = true;
+    platform->clipboardContainsFileList = true;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    proxy->result = ServerProxy::kClipboardSendQueued;
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+
+    std::vector<std::string> readyPaths;
+    readyPaths.push_back("C:/local-copy.txt");
+    client.testSetFileClipboardSessions("remote-session", "remote-session", readyPaths);
+    client.testHandleFileClipboardReady("remote-session", readyPaths, true);
+
     client.testSendClipboard(kClipboardClipboard);
+
+    EXPECT_EQ(0u, proxy->sendCalls);
+    EXPECT_FALSE(client.testHasSendFileThread());
+    EXPECT_TRUE(client.testReadyFileClipboardSession().empty());
+    EXPECT_TRUE(client.testReadyFileClipboardPaths().empty());
+}
+
+TEST(ClientDisconnectTests, blockedLocalFileListCannotBeOverwrittenByRemoteClipboard)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->clipboardAvailable = true;
+    platform->clipboardContainsFileList = true;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+
+    client.testHandleClipboardGrabbed(kClipboardClipboard);
+    client.testSendClipboard(kClipboardClipboard);
+
+    EXPECT_TRUE(client.testOwnClipboard(kClipboardClipboard));
+    EXPECT_FALSE(client.testClipboardSent(kClipboardClipboard));
+    EXPECT_EQ(1u, proxy->sendCalls);
+
+    Clipboard remoteClipboard;
+    ASSERT_TRUE(remoteClipboard.open(0));
+    remoteClipboard.empty();
+    remoteClipboard.add(IClipboard::kText, "remote clipboard");
+    remoteClipboard.close();
+
+    client.setClipboard(kClipboardClipboard, &remoteClipboard);
+
+    EXPECT_TRUE(client.testOwnClipboard(kClipboardClipboard));
+    EXPECT_FALSE(client.testClipboardSent(kClipboardClipboard));
+    EXPECT_EQ(0u, platform->setClipboardCount);
+}
+
+TEST(ClientDisconnectTests, leaveDoesNotRetryUnsupportedSelectionClipboard)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->clipboardAvailable = true;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+
+    client.enter(0, 0, 0, 0, false);
+    EXPECT_TRUE(client.leave());
+
+    EXPECT_EQ(1u, proxy->sendCalls);
+    EXPECT_FALSE(client.testClipboardRetryPending(kClipboardSelection));
 }
 
 TEST(ClientDisconnectTests, imageFileListClipboardIsNotDowngradedToPngAndSent)
@@ -1317,7 +1475,7 @@ TEST(ClientDisconnectTests, imageFileListClipboardIsNotDowngradedToPngAndSent)
     client.testSendClipboard(kClipboardClipboard);
 }
 
-TEST(ClientDisconnectTests, blockedLocalFileListDoesNotPoisonNextPlainTextClipboard)
+TEST(ClientDisconnectTests, fileListTransferDoesNotPoisonNextPlainTextClipboard)
 {
     NiceMock<MockEventQueue> events;
     ClientEvents clientEvents;
@@ -1353,11 +1511,14 @@ TEST(ClientDisconnectTests, blockedLocalFileListDoesNotPoisonNextPlainTextClipbo
 
     client.testAttachStream(stream);
     client.testSendClipboard(kClipboardClipboard);
-    EXPECT_TRUE(clipboardMarks.empty());
-
-    client.testSendClipboard(kClipboardClipboard);
     ASSERT_GE(clipboardMarks.size(), 3u);
     EXPECT_EQ(kDataStart, clipboardMarks.front());
+    EXPECT_EQ(kDataEnd, clipboardMarks.back());
+    const std::size_t fileClipboardMarkCount = clipboardMarks.size();
+
+    client.testSendClipboard(kClipboardClipboard);
+    ASSERT_GE(clipboardMarks.size(), fileClipboardMarkCount + 3u);
+    EXPECT_EQ(kDataStart, clipboardMarks[fileClipboardMarkCount]);
     EXPECT_EQ(kDataEnd, clipboardMarks.back());
 }
 

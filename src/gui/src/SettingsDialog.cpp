@@ -22,11 +22,10 @@
 #include "QBarrierApplication.h"
 #include "QUtility.h"
 #include "AppConfig.h"
-#include "SslCertificate.h"
-#include "MainWindow.h"
 
 #include <QtCore>
 #include <QtGui>
+#include <QAbstractButton>
 #include <QMessageBox>
 #include <QFileDialog>
 #include <QDir>
@@ -34,6 +33,8 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QScrollArea>
+#include <QScreen>
 #include <QSpinBox>
 #include <QDesktopServices>
 #include <QUrl>
@@ -46,16 +47,31 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     QDialog(parent, Qt::Dialog | Qt::WindowTitleHint | Qt::WindowSystemMenuHint | Qt::WindowCloseButtonHint),
     Ui::SettingsDialogBase(),
     m_appConfig(config),
-    m_pCheckBoxWorkflowEnabled(new QCheckBox(tr("Enable lightweight workflow handoff"), this)),
-    m_pCheckBoxWorkflowSuggestions(new QCheckBox(tr("Enable suggestion cards"), this)),
-    m_pCheckBoxShowTrayNotifications(new QCheckBox(tr("Show desktop notifications"), this)),
+    m_pCheckBoxWorkflowEnabled(new QCheckBox(this)),
+    m_pCheckBoxWorkflowSuggestions(new QCheckBox(this)),
+    m_pCheckBoxShowTrayNotifications(new QCheckBox(this)),
     m_pSpinBoxWorkflowHistoryLimit(new QSpinBox(this)),
     m_pSpinBoxWorkflowDormantSeconds(new QSpinBox(this)),
+    m_pLabelWorkflowHistoryLimit(new QLabel(this)),
+    m_pLabelWorkflowDormantSeconds(new QLabel(this)),
+    m_pPlatformGroup(new QGroupBox(this)),
     m_pLabelPlatformStatus(new QLabel(this)),
     m_pLabelPlatformDetail(new QLabel(this)),
     m_pButtonPlatformAction(new QPushButton(this))
 {
     setupUi(this);
+
+    m_pCheckBoxWorkflowEnabled->setObjectName(QStringLiteral("m_pCheckBoxWorkflowEnabled"));
+    m_pCheckBoxWorkflowSuggestions->setObjectName(QStringLiteral("m_pCheckBoxWorkflowSuggestions"));
+    m_pCheckBoxShowTrayNotifications->setObjectName(QStringLiteral("m_pCheckBoxShowTrayNotifications"));
+    m_pSpinBoxWorkflowHistoryLimit->setObjectName(QStringLiteral("m_pSpinBoxWorkflowHistoryLimit"));
+    m_pSpinBoxWorkflowDormantSeconds->setObjectName(QStringLiteral("m_pSpinBoxWorkflowDormantSeconds"));
+    m_pLabelWorkflowHistoryLimit->setObjectName(QStringLiteral("m_pLabelWorkflowHistoryLimit"));
+    m_pLabelWorkflowDormantSeconds->setObjectName(QStringLiteral("m_pLabelWorkflowDormantSeconds"));
+    m_pPlatformGroup->setObjectName(QStringLiteral("m_pPlatformGroup"));
+    m_pLabelPlatformStatus->setObjectName(QStringLiteral("m_pLabelPlatformStatus"));
+    m_pLabelPlatformDetail->setObjectName(QStringLiteral("m_pLabelPlatformDetail"));
+    m_pButtonPlatformAction->setObjectName(QStringLiteral("m_pButtonPlatformAction"));
 
     m_Locale.fillLanguageComboBox(m_pComboLanguage);
 
@@ -76,8 +92,6 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     m_pCheckBoxWorkflowEnabled->setChecked(appConfig().getWorkflowEnabled());
     m_pCheckBoxWorkflowSuggestions->setChecked(appConfig().getSuggestionsEnabled());
     m_pCheckBoxShowTrayNotifications->setChecked(appConfig().getShowTrayNotifications());
-    m_pCheckBoxShowTrayNotifications->setToolTip(
-        tr("Show non-critical tray popups for connection, transfer receipts, and workflow events. Disabled by default."));
     m_pSpinBoxWorkflowHistoryLimit->setRange(10, 500);
     m_pSpinBoxWorkflowHistoryLimit->setValue(appConfig().getWorkflowHistoryLimit());
     m_pSpinBoxWorkflowDormantSeconds->setRange(10, 600);
@@ -86,14 +100,16 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     checkbox_require_client_certificate->setChecked(m_appConfig.getRequireClientCertificate());
 
     auto* historyRow = new QHBoxLayout;
-    historyRow->addWidget(new QLabel(tr("Workflow history limit:"), this));
+    historyRow->addWidget(m_pLabelWorkflowHistoryLimit);
     historyRow->addWidget(m_pSpinBoxWorkflowHistoryLimit);
     historyRow->addStretch();
+    m_pLabelWorkflowHistoryLimit->setBuddy(m_pSpinBoxWorkflowHistoryLimit);
 
     auto* dormantRow = new QHBoxLayout;
-    dormantRow->addWidget(new QLabel(tr("Dormant after seconds:"), this));
+    dormantRow->addWidget(m_pLabelWorkflowDormantSeconds);
     dormantRow->addWidget(m_pSpinBoxWorkflowDormantSeconds);
     dormantRow->addStretch();
+    m_pLabelWorkflowDormantSeconds->setBuddy(m_pSpinBoxWorkflowDormantSeconds);
 
     verticalLayout_2->addWidget(m_pCheckBoxWorkflowEnabled);
     verticalLayout_2->addWidget(m_pCheckBoxWorkflowSuggestions);
@@ -101,15 +117,16 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     verticalLayout_2->addLayout(historyRow);
     verticalLayout_2->addLayout(dormantRow);
 
-    auto* platformGroup = new QGroupBox(tr("Platform Readiness"), this);
-    auto* platformLayout = new QVBoxLayout(platformGroup);
+    auto* platformLayout = new QVBoxLayout(m_pPlatformGroup);
     m_pLabelPlatformDetail->setWordWrap(true);
     platformLayout->addWidget(m_pLabelPlatformStatus);
     platformLayout->addWidget(m_pLabelPlatformDetail);
     platformLayout->addWidget(m_pButtonPlatformAction, 0, Qt::AlignLeft);
-    verticalLayout->insertWidget(3, platformGroup);
+    verticalLayout->insertWidget(3, m_pPlatformGroup);
     connect(m_pButtonPlatformAction, &QPushButton::clicked, this, &SettingsDialog::onPlatformActionClicked);
-    updatePlatformReadiness();
+    configureResponsiveLayout();
+    configureTabOrder();
+    retranslateDynamicUi();
 
 #if defined(Q_OS_WIN)
     m_pComboElevate->setCurrentIndex(static_cast<int>(appConfig().elevateMode()));
@@ -118,6 +135,90 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     m_pLabelElevate->hide();
     m_pComboElevate->hide();
 #endif
+}
+
+void SettingsDialog::configureResponsiveLayout()
+{
+    auto* scrollContent = new QWidget(this);
+    scrollContent->setObjectName(QStringLiteral("settingsScrollContent"));
+    auto* contentLayout = new QVBoxLayout(scrollContent);
+    contentLayout->setContentsMargins(0, 0, 0, 0);
+    contentLayout->setSpacing(verticalLayout->spacing());
+
+    QWidget* const panels[] = {
+        m_pSettingsHeaderCard,
+        m_pGroupGeneral,
+        m_pGroupNetworking,
+        m_pPlatformGroup,
+        m_pGroupFeatures,
+        m_pGroupLog
+    };
+    for (QWidget* panel : panels) {
+        verticalLayout->removeWidget(panel);
+        contentLayout->addWidget(panel);
+    }
+
+    verticalLayout->removeItem(verticalSpacer);
+    contentLayout->addItem(verticalSpacer);
+
+    auto* scrollArea = new QScrollArea(this);
+    scrollArea->setObjectName(QStringLiteral("settingsScrollArea"));
+    scrollArea->setFrameShape(QFrame::NoFrame);
+    scrollArea->setWidgetResizable(true);
+    scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    scrollArea->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    scrollArea->setMinimumHeight(240);
+    scrollArea->setWidget(scrollContent);
+    verticalLayout->insertWidget(0, scrollArea, 1);
+
+    setMinimumSize(360, 360);
+    const QScreen* screen = QGuiApplication::primaryScreen();
+    const QRect available = screen != nullptr
+        ? screen->availableGeometry()
+        : QRect(0, 0, 800, 600);
+    resize(
+        qMin(440, qMax(360, available.width() - 40)),
+        qMin(680, qMax(360, available.height() - 80)));
+}
+
+void SettingsDialog::configureTabOrder()
+{
+    QList<QWidget*> order = {
+        m_pComboLanguage,
+        m_pLineEditScreenName,
+        m_pComboElevate,
+        m_pCheckBoxMinimizeToTray,
+        m_pCheckBoxAutoHide,
+        m_pCheckBoxAutoStart,
+        m_pSpinBoxPort,
+        m_pLineEditInterface,
+        m_pCheckBoxEnableCrypto,
+        checkbox_require_client_certificate,
+        m_pButtonPlatformAction,
+        m_pCheckBoxEnableDragDrop,
+        m_pCheckBoxGameMode,
+        m_pCheckBoxLowLatencyMode,
+        m_pCheckBoxNestedRemoteMode,
+        m_pCheckBoxWorkflowEnabled,
+        m_pCheckBoxWorkflowSuggestions,
+        m_pCheckBoxShowTrayNotifications,
+        m_pSpinBoxWorkflowHistoryLimit,
+        m_pSpinBoxWorkflowDormantSeconds,
+        m_pComboLogLevel,
+        m_pCheckBoxLogToFile,
+        m_pLineEditLogFilename,
+        m_pButtonBrowseLog
+    };
+
+    const QList<QAbstractButton*> dialogButtons = buttonBox->buttons();
+    for (QAbstractButton* button : dialogButtons) {
+        order.append(button);
+    }
+
+    for (int i = 1; i < order.size(); ++i) {
+        QWidget::setTabOrder(order.at(i - 1), order.at(i));
+    }
 }
 
 void SettingsDialog::accept()
@@ -171,6 +272,7 @@ void SettingsDialog::changeEvent(QEvent* event)
                 m_pComboLanguage->blockSignals(false);
 
                 m_pComboLogLevel->setCurrentIndex(logLevelIndex);
+                retranslateDynamicUi();
                 break;
             }
 
@@ -178,6 +280,19 @@ void SettingsDialog::changeEvent(QEvent* event)
             QDialog::changeEvent(event);
         }
     }
+}
+
+void SettingsDialog::retranslateDynamicUi()
+{
+    m_pCheckBoxWorkflowEnabled->setText(tr("Enable lightweight workflow handoff"));
+    m_pCheckBoxWorkflowSuggestions->setText(tr("Enable suggestion cards"));
+    m_pCheckBoxShowTrayNotifications->setText(tr("Show desktop notifications"));
+    m_pCheckBoxShowTrayNotifications->setToolTip(
+        tr("Show non-critical tray popups for connection, transfer receipts, and workflow events. Disabled by default."));
+    m_pLabelWorkflowHistoryLimit->setText(tr("Workflow history limit:"));
+    m_pLabelWorkflowDormantSeconds->setText(tr("Dormant after seconds:"));
+    m_pPlatformGroup->setTitle(tr("Platform Readiness"));
+    updatePlatformReadiness();
 }
 
 void SettingsDialog::on_m_pCheckBoxLogToFile_stateChanged(int i)

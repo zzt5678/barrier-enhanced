@@ -257,11 +257,11 @@
         </widget>
        </item>
        <item>
-        <layout class="QHBoxLayout" name="horizontalLayout_serverFile">
+        <layout class="QGridLayout" name="gridLayout_serverFile">
          <property name="spacing">
           <number>10</number>
          </property>
-         <item>
+         <item row="0" column="0" colspan="2">
           <widget class="QLabel" name="m_pLabelConfigurationFile">
            <property name="text">
             <string>&amp;Configuration file:</string>
@@ -271,14 +271,14 @@
            </property>
           </widget>
          </item>
-         <item>
+         <item row="1" column="0">
           <widget class="QLineEdit" name="m_pLineEditConfigFile">
            <property name="enabled">
             <bool>false</bool>
            </property>
           </widget>
          </item>
-         <item>
+         <item row="1" column="1">
           <widget class="QPushButton" name="m_pButtonBrowseConfigFile">
            <property name="enabled">
             <bool>false</bool>
@@ -392,6 +392,12 @@
     </item>
     <item row="2" column="0">
      <widget class="QGroupBox" name="m_pGroupExperience">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
+        <horstretch>0</horstretch>
+        <verstretch>0</verstretch>
+       </sizepolicy>
+      </property>
       <property name="title">
        <string>Experience</string>
       </property>
@@ -402,7 +408,7 @@
        <item>
         <widget class="QCheckBox" name="m_pCheckBoxEnableDragDrop">
          <property name="text">
-          <string>Enable file, folder, and image drag &amp; drop</string>
+          <string>Enable file, folder, and image drag and drop</string>
          </property>
         </widget>
        </item>
@@ -431,6 +437,12 @@
     </item>
     <item row="2" column="1">
      <widget class="QFrame" name="workflowCard">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
+        <horstretch>0</horstretch>
+        <verstretch>0</verstretch>
+       </sizepolicy>
+      </property>
       <property name="frameShape">
        <enum>QFrame::StyledPanel</enum>
       </property>
@@ -464,6 +476,12 @@
           <size>
            <width>0</width>
            <height>102</height>
+          </size>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>148</height>
           </size>
          </property>
          <property name="alternatingRowColors">
@@ -609,7 +627,7 @@
           </widget>
          </item>
          <item>
-          <widget class="QLabel" name="m_pStatusLabel">
+          <widget class="ElidingLabel" name="m_pStatusLabel">
            <property name="text">
             <string>Ready</string>
            </property>
@@ -759,6 +777,13 @@
    </property>
   </action>
  </widget>
+ <customwidgets>
+  <customwidget>
+   <class>ElidingLabel</class>
+   <extends>QLabel</extends>
+   <header>ElidingLabel.h</header>
+  </customwidget>
+ </customwidgets>
  <resources>
   <include location="../res/Barrier.qrc"/>
  </resources>

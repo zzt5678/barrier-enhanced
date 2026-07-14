@@ -78,7 +78,7 @@ XWindowsClipboardPNGConverter::toIClipboard(const std::string& pngData) const
     }
 
     // Verify PNG signature
-    if (pngData[0] != 0x89 || pngData[1] != 'P' ||
+    if (static_cast<UInt8>(pngData[0]) != 0x89u || pngData[1] != 'P' ||
         pngData[2] != 'N' || pngData[3] != 'G') {
         return {};
     }

@@ -25,6 +25,7 @@
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -583,7 +584,7 @@ ClientProxy1_0::recvGrabClipboard()
     }
 
     // notify
-    ClipboardInfo* info   = new ClipboardInfo;
+    ClipboardInfo* info   = (ClipboardInfo*)malloc(sizeof(ClipboardInfo));
     info->m_id             = id;
     info->m_sequenceNumber = seqNum;
     m_events->addEvent(Event(m_events->forClipboard().clipboardGrabbed(),

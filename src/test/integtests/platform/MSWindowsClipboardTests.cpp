@@ -227,3 +227,55 @@ TEST_F(MSWindowsClipboardTests, isOwnedByBarrier_defaultState_noError)
 
     EXPECT_EQ(true, actual);
 }
+
+TEST(MSWindowsClipboardConversionTests, bitfields32Dib_convertsToPng)
+{
+    const UInt32 width = 2;
+    const UInt32 height = 3;
+    const size_t pixelOffset = 40 + 3 * sizeof(UInt32);
+    std::string dib(pixelOffset + width * height * 4, '\0');
+
+    const auto writeLE16 = [&dib](size_t offset, UInt16 value) {
+        dib[offset] = static_cast<char>(value & 0xffu);
+        dib[offset + 1] = static_cast<char>((value >> 8) & 0xffu);
+    };
+    const auto writeLE32 = [&dib](size_t offset, UInt32 value) {
+        dib[offset] = static_cast<char>(value & 0xffu);
+        dib[offset + 1] = static_cast<char>((value >> 8) & 0xffu);
+        dib[offset + 2] = static_cast<char>((value >> 16) & 0xffu);
+        dib[offset + 3] = static_cast<char>((value >> 24) & 0xffu);
+    };
+
+    writeLE32(0, 40);
+    writeLE32(4, width);
+    writeLE32(8, height);
+    writeLE16(12, 1);
+    writeLE16(14, 32);
+    writeLE32(16, BI_BITFIELDS);
+    writeLE32(20, width * height * 4);
+    writeLE32(40, 0x00ff0000u);
+    writeLE32(44, 0x0000ff00u);
+    writeLE32(48, 0x000000ffu);
+
+    for (size_t offset = pixelOffset; offset < dib.size(); offset += 4) {
+        dib[offset] = static_cast<char>(143);
+        dib[offset + 1] = static_cast<char>(157);
+        dib[offset + 2] = static_cast<char>(42);
+        dib[offset + 3] = static_cast<char>(255);
+    }
+
+    const std::string png = MSWindowsClipboard::convertDIBToPNGForTest(dib);
+
+    ASSERT_GE(png.size(), 24u);
+    EXPECT_EQ(static_cast<unsigned char>(0x89),
+              static_cast<unsigned char>(png[0]));
+    EXPECT_EQ("PNG", png.substr(1, 3));
+    EXPECT_EQ(width, (static_cast<UInt32>(static_cast<unsigned char>(png[16])) << 24) |
+                     (static_cast<UInt32>(static_cast<unsigned char>(png[17])) << 16) |
+                     (static_cast<UInt32>(static_cast<unsigned char>(png[18])) << 8) |
+                     static_cast<UInt32>(static_cast<unsigned char>(png[19])));
+    EXPECT_EQ(height, (static_cast<UInt32>(static_cast<unsigned char>(png[20])) << 24) |
+                      (static_cast<UInt32>(static_cast<unsigned char>(png[21])) << 16) |
+                      (static_cast<UInt32>(static_cast<unsigned char>(png[22])) << 8) |
+                      static_cast<UInt32>(static_cast<unsigned char>(png[23])));
+}

@@ -33,17 +33,16 @@
 using ::testing::_;
 using ::testing::Return;
 using ::testing::Matcher;
-using ::testing::MatcherCast;
-using ::testing::Property;
-using ::testing::StrEq;
+using ::testing::Truly;
 using ::testing::AtLeast;
 
 using namespace barrier;
 
 inline const Matcher<const IpcMessage&> IpcLogLineMessageEq(const String& s) {
-    const Matcher<const IpcLogLineMessage&> m(
-        Property(&IpcLogLineMessage::logLine, StrEq(s)));
-    return MatcherCast<const IpcMessage&>(m);
+    return Truly([s](const IpcMessage& message) {
+        const auto* logMessage = dynamic_cast<const IpcLogLineMessage*>(&message);
+        return logMessage != nullptr && logMessage->logLine() == s;
+    });
 }
 
 TEST(IpcLogOutputterTests, write_threadingEnabled_bufferIsSent)

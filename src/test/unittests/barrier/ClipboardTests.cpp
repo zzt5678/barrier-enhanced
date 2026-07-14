@@ -310,6 +310,19 @@ TEST(ClipboardTests, marshall_withTextAdded_endsWithAdded)
     EXPECT_EQ("barrier rocks!", actual.substr(12));
 }
 
+TEST(ClipboardTests, marshall_withEmptyPng_omitsInvalidFormat)
+{
+    Clipboard clipboard;
+    clipboard.open(0);
+    clipboard.add(IClipboard::kPNG, "");
+    clipboard.close();
+
+    const String actual = clipboard.marshall();
+
+    ASSERT_EQ(4u, actual.size());
+    EXPECT_EQ(0, static_cast<int>(actual[3]));
+}
+
 TEST(ClipboardTests, unmarshall_emptyData_hasTextIsFalse)
 {
     Clipboard clipboard;
@@ -325,6 +338,29 @@ TEST(ClipboardTests, unmarshall_emptyData_hasTextIsFalse)
     clipboard.open(0);
     bool actual = clipboard.has(IClipboard::kText);
     EXPECT_FALSE(actual);
+}
+
+TEST(ClipboardTests, unmarshall_withEmptyPng_ignoresInvalidFormat)
+{
+    Clipboard clipboard;
+    String data;
+    data += (char)0;
+    data += (char)0;
+    data += (char)0;
+    data += (char)1;
+    data += (char)0;
+    data += (char)0;
+    data += (char)0;
+    data += (char)IClipboard::kPNG;
+    data += (char)0;
+    data += (char)0;
+    data += (char)0;
+    data += (char)0;
+
+    clipboard.unmarshall(data, 0);
+
+    clipboard.open(0);
+    EXPECT_FALSE(clipboard.has(IClipboard::kPNG));
 }
 
 TEST(ClipboardTests, unmarshall_withTextSize285_getTextIsValid)

@@ -46,6 +46,7 @@ bool validatePathUtf8ForAppend(std::size_t currentPathCount,
                                std::string* error = nullptr);
 bool readFromClipboard(const IClipboard& clipboard, Data& data, std::string* error = nullptr);
 bool normalizeClipboard(Clipboard& clipboard, Data* normalized = nullptr, std::string* error = nullptr);
+bool pathsMatch(const Data& data, const std::vector<std::string>& paths);
 bool allPathsLookLikeImages(const Data& data);
 bool stripImageFileTransferMetadata(Clipboard& clipboard);
 AutomaticSharingStatus prepareForAutomaticClipboardSharing(Clipboard& clipboard);
