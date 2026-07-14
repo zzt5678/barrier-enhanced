@@ -50,6 +50,10 @@ public:
                             barrier::IStream* stream = nullptr);
     void                   interruptFile();
 
+#if defined(BARRIER_TEST_ENV)
+    bool                   testShouldInterrupt() const { return shouldInterrupt(); }
+#endif
+
 private:
     bool                   shouldInterrupt() const;
 

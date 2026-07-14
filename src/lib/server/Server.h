@@ -188,8 +188,11 @@ public:
         m_sendFileTarget(NULL),
         m_sendFileTransferId(0),
         m_sendFileCompletionPending(false),
+        m_sendFileStarted(false),
         m_sendFileCleanupPending(false),
         m_sendFileIsClipboardPrefetch(false),
+        m_pendingFileClipboardPrefetchTarget(NULL),
+        m_pendingFileClipboardPrefetchPaths(),
         m_writeToDropDirThread(NULL),
         m_clipboardRevision(),
         m_remoteFileClipboardRevision(),
@@ -211,6 +214,7 @@ public:
         m_sendFileTarget = target;
         m_sendFileTransferId = transferId;
         m_sendFileCompletionPending = false;
+        m_sendFileStarted = false;
         m_sendFileCleanupPending = false;
     }
     static void addDefaultConnectionOptionsForTest(OptionsList& optionsList)
@@ -488,6 +492,7 @@ private:
                                                          const std::string& sessionId);
     void                sendClipboardSelectionToClient(BaseClientProxy* target,
                                                        const std::vector<barrier::fs::path>& sourcePaths);
+    void                startPendingFileClipboardPrefetch();
 
     // add client to list and attach event handlers for client
     bool                addClient(BaseClientProxy*);
@@ -708,8 +713,11 @@ private:
     BaseClientProxy*       m_sendFileTarget;
     UInt32                 m_sendFileTransferId;
     bool                   m_sendFileCompletionPending;
+    bool                   m_sendFileStarted;
     bool                   m_sendFileCleanupPending;
     bool                   m_sendFileIsClipboardPrefetch;
+    BaseClientProxy*       m_pendingFileClipboardPrefetchTarget;
+    std::vector<barrier::fs::path> m_pendingFileClipboardPrefetchPaths;
     ClientSet              m_deferredDeleteClients;
     Thread*                m_writeToDropDirThread;
 	std::deque<std::shared_ptr<CompletedFileTransfer> > m_pendingDropDirTransfers;

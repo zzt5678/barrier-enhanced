@@ -258,6 +258,7 @@ private:
                                                          const std::string& sessionId);
     void                sendClipboardThread(void*);
     void                sendClipboardSelectionToServer(const std::vector<barrier::fs::path>& sourcePaths);
+    void                startPendingFileClipboardPrefetch();
 
 public:
     bool                m_mock;
@@ -340,10 +341,30 @@ public:
     }
     void                testSetSendFileThread(Thread* thread) { m_sendFileThread = thread; }
     bool                testHasSendFileThread() const { return m_sendFileThread != NULL; }
+    UInt32              testSendFileTransferId() const { return m_sendFileTransferId; }
     void                testSetSendFileChunker(const std::shared_ptr<StreamChunker>& chunker)
     {
         m_sendFileChunker = chunker;
     }
+    void                testSetSendFileIsClipboardPrefetch(bool isClipboardPrefetch)
+    {
+        m_sendFileIsClipboardPrefetch = isClipboardPrefetch;
+    }
+    void                testSetSendFileProtocolState(bool started, bool completed)
+    {
+        m_sendFileStarted = started;
+        m_sendFileCompletionPending = completed;
+    }
+    void                testSendClipboardSelectionToServer(
+                            const std::vector<barrier::fs::path>& sourcePaths)
+    {
+        sendClipboardSelectionToServer(sourcePaths);
+    }
+    const std::vector<barrier::fs::path>& testPendingFileClipboardPrefetchPaths() const
+    {
+        return m_pendingFileClipboardPrefetchPaths;
+    }
+    void                testSupersedeFileClipboard() { supersedeFileClipboard("test"); }
     void                testSetFileClipboardSessions(const std::string& remoteSession,
                                                      const std::string& readySession,
                                                      const std::vector<std::string>& readyPaths)
@@ -422,6 +443,9 @@ private:
     std::shared_ptr<StreamChunker> m_sendFileChunker;
     UInt32              m_sendFileTransferId;
     bool                m_sendFileIsClipboardPrefetch;
+    bool                m_sendFileStarted;
+    bool                m_sendFileCompletionPending;
+    std::vector<barrier::fs::path> m_pendingFileClipboardPrefetchPaths;
     Thread*                m_writeToDropDirThread;
     std::deque<std::shared_ptr<CompletedFileTransfer> > m_pendingDropDirTransfers;
     TCPSocket*            m_socket;

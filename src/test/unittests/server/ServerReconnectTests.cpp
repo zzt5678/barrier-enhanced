@@ -7,6 +7,7 @@
 #include "barrier/FileChunk.h"
 #include "barrier/IPlatformScreen.h"
 #include "barrier/RemoteFileClipboard.h"
+#include "barrier/StreamChunker.h"
 #include "arch/Arch.h"
 #include "base/IEventJob.h"
 #include "base/Stopwatch.h"
@@ -775,7 +776,9 @@ TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotWaitForExistingFileSen
 
     std::atomic<bool> releaseSender(false);
     std::atomic<bool> senderCancelled(false);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
     server.m_sendFileTarget = &client;
+    server.m_sendFileChunker = chunker;
     server.m_sendFileThread = new Thread([&releaseSender, &senderCancelled]() {
         try {
             while (!releaseSender.load()) {
@@ -793,14 +796,161 @@ TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotWaitForExistingFileSen
 
     EXPECT_LT(elapsed.getTime(), 0.5);
     EXPECT_FALSE(senderCancelled.load());
+    EXPECT_FALSE(chunker->testShouldInterrupt());
     EXPECT_TRUE(server.m_sendFileThread != NULL);
     EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_EQ(std::vector<barrier::fs::path>(
+                  1, barrier::fs::u8path("/tmp/primary-file.txt")),
+              server.m_pendingFileClipboardPrefetchPaths);
+    EXPECT_EQ(&client, server.m_pendingFileClipboardPrefetchTarget);
 
     releaseSender.store(true);
     for (int i = 0; i < 200 && !server.cleanupSendFileThread(false); ++i) {
         ARCH->sleep(0.001);
     }
     EXPECT_TRUE(server.cleanupSendFileThread(false));
+}
+
+TEST(ServerReconnectTests, newestFileClipboardSupersedesActivePrefetchWithoutWaiting)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &client;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = primary.getName();
+    clipboard.m_clipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/first.txt"));
+
+    std::atomic<bool> releaseSender(false);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    server.m_sendFileTarget = &client;
+    server.m_sendFileChunker = chunker;
+    server.m_sendFileIsClipboardPrefetch = true;
+    server.m_sendFileThread = new Thread([&releaseSender]() {
+        while (!releaseSender.load()) {
+            ARCH->sleep(0.01);
+            Thread::testCancel();
+        }
+    });
+
+    server.replayClipboardsToActive();
+    clipboard.m_clipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/latest.txt"));
+    Stopwatch elapsed;
+    server.replayClipboardsToActive();
+
+    EXPECT_LT(elapsed.getTime(), 0.5);
+    EXPECT_TRUE(chunker->testShouldInterrupt());
+    EXPECT_EQ(&client, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_EQ(std::vector<barrier::fs::path>(
+                  1, barrier::fs::u8path("/tmp/latest.txt")),
+              server.m_pendingFileClipboardPrefetchPaths);
+
+    releaseSender.store(true);
+    for (int i = 0;
+         i < 200 && !server.m_pendingFileClipboardPrefetchPaths.empty(); ++i) {
+        server.handleFileKeepAliveEvent(Event(), NULL);
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.m_pendingFileClipboardPrefetchPaths.empty());
+    EXPECT_EQ(NULL, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_EQ(1u, server.m_sendFileTransferId);
+    EXPECT_TRUE(server.m_sendFileThread != NULL);
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(true));
+}
+
+TEST(ServerReconnectTests, newerTextClipboardCancelsPendingFilePrefetch)
+{
+    Server server;
+    RecordingClient client("client");
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    server.m_sendFileTarget = &client;
+    server.m_sendFileChunker = chunker;
+    server.m_sendFileIsClipboardPrefetch = true;
+    server.m_pendingFileClipboardPrefetchTarget = &client;
+    server.m_pendingFileClipboardPrefetchPaths.push_back(
+        barrier::fs::u8path("/tmp/stale.txt"));
+
+    server.supersedeFileClipboard("test text clipboard");
+
+    EXPECT_EQ(NULL, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_TRUE(server.m_pendingFileClipboardPrefetchPaths.empty());
+    EXPECT_TRUE(chunker->testShouldInterrupt());
+
+    server.m_sendFileTarget = NULL;
+    server.m_sendFileChunker.reset();
+    server.m_sendFileIsClipboardPrefetch = false;
+}
+
+TEST(ServerReconnectTests, pendingPrefetchWaitsForQueuedTransferTerminator)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_sendFileTarget = &client;
+    server.m_sendFileIsClipboardPrefetch = true;
+    server.m_sendFileStarted = true;
+    server.m_sendFileCompletionPending = false;
+    server.m_pendingFileClipboardPrefetchTarget = &client;
+    const std::vector<barrier::fs::path> latest(
+        1, barrier::fs::u8path("/tmp/latest.txt"));
+    server.m_pendingFileClipboardPrefetchPaths = latest;
+
+    server.handleFileKeepAliveEvent(Event(), NULL);
+
+    EXPECT_EQ(latest, server.m_pendingFileClipboardPrefetchPaths);
+    EXPECT_EQ(&client, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_EQ(0u, server.m_sendFileTransferId);
+    EXPECT_EQ(NULL, server.m_sendFileThread);
+
+    server.m_sendFileCompletionPending = true;
+    server.handleFileKeepAliveEvent(Event(), NULL);
+
+    EXPECT_TRUE(server.m_pendingFileClipboardPrefetchPaths.empty());
+    EXPECT_EQ(NULL, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_EQ(1u, server.m_sendFileTransferId);
+    EXPECT_TRUE(server.m_sendFileThread != NULL);
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(true));
 }
 
 TEST(ServerReconnectTests, sendDragInfoUsesSynchronousPathAndClearsState)

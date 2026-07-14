@@ -1101,6 +1101,225 @@ TEST(ClientDisconnectTests, enterInterruptsFileSenderWithoutLosingThreadHandle)
     EXPECT_TRUE(client.leave());
 }
 
+TEST(ClientDisconnectTests, newestFileClipboardSupersedesActivePrefetchWithoutWaiting)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    setClientEventDefaults(events, clientEvents, screenEvents, fileEvents);
+
+    TestScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    std::atomic<bool> releaseSender(false);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    client.testSetSendFileChunker(chunker);
+    client.testSetSendFileIsClipboardPrefetch(true);
+    client.testSetSendFileThread(new Thread([&releaseSender]() {
+        while (!releaseSender.load()) {
+            ARCH->sleep(0.01);
+            Thread::testCancel();
+        }
+    }));
+
+    std::vector<barrier::fs::path> first(1, barrier::fs::u8path("/tmp/first.txt"));
+    std::vector<barrier::fs::path> latest(1, barrier::fs::u8path("/tmp/latest.txt"));
+    Stopwatch elapsed;
+    client.testSendClipboardSelectionToServer(first);
+    client.testSendClipboardSelectionToServer(latest);
+
+    EXPECT_LT(elapsed.getTime(), 0.5);
+    EXPECT_TRUE(chunker->testShouldInterrupt());
+    EXPECT_EQ(latest, client.testPendingFileClipboardPrefetchPaths());
+
+    releaseSender.store(true);
+    for (int i = 0; i < 200 && !client.testCleanupSendFileThread(false); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(client.testCleanupSendFileThread(false));
+}
+
+TEST(ClientDisconnectTests, fileClipboardWaitsForManualSenderWithoutInterruptingIt)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    setClientEventDefaults(events, clientEvents, screenEvents, fileEvents);
+
+    TestScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    std::atomic<bool> releaseSender(false);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    client.testSetSendFileChunker(chunker);
+    client.testSetSendFileIsClipboardPrefetch(false);
+    client.testSetSendFileThread(new Thread([&releaseSender]() {
+        while (!releaseSender.load()) {
+            ARCH->sleep(0.01);
+            Thread::testCancel();
+        }
+    }));
+
+    std::vector<barrier::fs::path> latest(1, barrier::fs::u8path("/tmp/latest.txt"));
+    client.testSendClipboardSelectionToServer(latest);
+
+    EXPECT_FALSE(chunker->testShouldInterrupt());
+    EXPECT_EQ(latest, client.testPendingFileClipboardPrefetchPaths());
+
+    releaseSender.store(true);
+    for (int i = 0; i < 200 && !client.testCleanupSendFileThread(false); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(client.testCleanupSendFileThread(false));
+}
+
+TEST(ClientDisconnectTests, newerTextClipboardCancelsPendingFilePrefetch)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    setClientEventDefaults(events, clientEvents, screenEvents, fileEvents);
+
+    TestScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    std::atomic<bool> releaseSender(false);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    client.testSetSendFileChunker(chunker);
+    client.testSetSendFileIsClipboardPrefetch(true);
+    client.testSetSendFileThread(new Thread([&releaseSender]() {
+        while (!releaseSender.load()) {
+            ARCH->sleep(0.01);
+            Thread::testCancel();
+        }
+    }));
+    client.testSendClipboardSelectionToServer(
+        std::vector<barrier::fs::path>(1, barrier::fs::u8path("/tmp/stale.txt")));
+
+    client.testSupersedeFileClipboard();
+
+    EXPECT_TRUE(client.testPendingFileClipboardPrefetchPaths().empty());
+    EXPECT_TRUE(chunker->testShouldInterrupt());
+
+    releaseSender.store(true);
+    for (int i = 0; i < 200 && !client.testCleanupSendFileThread(false); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(client.testCleanupSendFileThread(false));
+}
+
+TEST(ClientDisconnectTests, fileKeepAliveStartsNewestPendingClipboardPrefetch)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    TestScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+
+    std::atomic<bool> releaseSender(false);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    client.testSetSendFileChunker(chunker);
+    client.testSetSendFileIsClipboardPrefetch(true);
+    client.testSetSendFileThread(new Thread([&releaseSender]() {
+        while (!releaseSender.load()) {
+            ARCH->sleep(0.01);
+            Thread::testCancel();
+        }
+    }));
+
+    std::vector<barrier::fs::path> latest(1, barrier::fs::u8path("/tmp/latest.txt"));
+    client.testSendClipboardSelectionToServer(latest);
+    releaseSender.store(true);
+    for (int i = 0;
+         i < 200 && !client.testPendingFileClipboardPrefetchPaths().empty(); ++i) {
+        client.testHandleFileKeepAlive();
+        ARCH->sleep(0.001);
+    }
+
+    EXPECT_TRUE(client.testPendingFileClipboardPrefetchPaths().empty());
+    EXPECT_EQ(1u, client.testSendFileTransferId());
+    EXPECT_TRUE(client.testHasSendFileThread());
+
+    for (int i = 0; i < 200 && !client.testCleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(client.testCleanupSendFileThread(true));
+}
+
+TEST(ClientDisconnectTests, pendingPrefetchWaitsForQueuedTransferTerminator)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    TestScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+    client.testSetSendFileIsClipboardPrefetch(true);
+    client.testSetSendFileProtocolState(true, false);
+
+    const std::vector<barrier::fs::path> latest(
+        1, barrier::fs::u8path("/tmp/latest.txt"));
+    client.testSendClipboardSelectionToServer(latest);
+
+    EXPECT_EQ(latest, client.testPendingFileClipboardPrefetchPaths());
+    EXPECT_EQ(0u, client.testSendFileTransferId());
+    EXPECT_FALSE(client.testHasSendFileThread());
+
+    client.testSetSendFileProtocolState(true, true);
+    client.testHandleFileKeepAlive();
+
+    EXPECT_TRUE(client.testPendingFileClipboardPrefetchPaths().empty());
+    EXPECT_EQ(1u, client.testSendFileTransferId());
+    EXPECT_TRUE(client.testHasSendFileThread());
+    for (int i = 0; i < 200 && !client.testCleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(client.testCleanupSendFileThread(true));
+}
+
 TEST(ClientDisconnectTests, pendingAsyncClipboardSendIsNotMarkedSentUntilReaped)
 {
     NiceMock<MockEventQueue> events;

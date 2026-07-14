@@ -109,6 +109,9 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
     m_sendFileThread(NULL),
     m_sendFileTransferId(0),
     m_sendFileIsClipboardPrefetch(false),
+    m_sendFileStarted(false),
+    m_sendFileCompletionPending(false),
+    m_pendingFileClipboardPrefetchPaths(),
     m_writeToDropDirThread(NULL),
     m_pendingDropDirTransfers(),
     m_socket(NULL),
@@ -410,6 +413,10 @@ void
 Client::supersedeFileClipboard(const char* reason)
 {
     m_clipboardRevision.advance();
+    m_pendingFileClipboardPrefetchPaths.clear();
+    if (m_sendFileIsClipboardPrefetch && m_sendFileChunker) {
+        m_sendFileChunker->interruptFile();
+    }
     if (!m_remoteFileClipboardSession.empty()) {
         LOG((CLOG_INFO
             "superseding pending remote file clipboard: session=%s revision=%llu reason=%s",
@@ -758,6 +765,13 @@ Client::sendFileChunk(const void* data)
 
     // relay
     m_server->fileChunkSending(chunk->m_chunk[0], &chunk->m_chunk[1], chunk->m_dataSize);
+    if (chunk->m_chunk[0] == kDataStart) {
+        m_sendFileStarted = true;
+        m_sendFileCompletionPending = false;
+    }
+    else if (chunk->m_chunk[0] == kDataEnd || chunk->m_chunk[0] == kDataCancel) {
+        m_sendFileCompletionPending = true;
+    }
 }
 
 void
@@ -868,11 +882,14 @@ Client::cleanupConnection()
 {
     cleanupFileReceiveCompletionPoll();
     FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
+    m_pendingFileClipboardPrefetchPaths.clear();
     ++m_sendFileTransferId;
     if (m_sendFileTransferId == 0) {
         ++m_sendFileTransferId;
     }
     const bool fileSenderStopped = cleanupSendFileThread(true);
+    m_sendFileStarted = false;
+    m_sendFileCompletionPending = false;
 
     if (m_stream != NULL) {
         m_events->removeHandler(m_events->forIStream().inputReady(),
@@ -1285,6 +1302,7 @@ Client::handleFileKeepAlive(const Event&, void*)
     if (m_server == NULL) {
         return;
     }
+    startPendingFileClipboardPrefetch();
     m_server->keepAlive();
 }
 
@@ -1614,14 +1632,42 @@ Client::sendClipboardSelectionToServer(const std::vector<barrier::fs::path>& sou
         return;
     }
 
+    m_pendingFileClipboardPrefetchPaths = sourcePaths;
     if (!reapSendFileThreadIfReady()) {
-		LOG((CLOG_DEBUG "remote clipboard prefetch already active; keeping the current sender"));
-		return;
-	}
+        if (m_sendFileIsClipboardPrefetch && m_sendFileChunker) {
+            m_sendFileChunker->interruptFile();
+            LOG((CLOG_DEBUG "remote clipboard prefetch superseded; stopping the previous sender"));
+        }
+        else {
+            LOG((CLOG_DEBUG "remote clipboard prefetch queued behind the active file sender"));
+        }
+        return;
+    }
+
+    startPendingFileClipboardPrefetch();
+}
+
+void
+Client::startPendingFileClipboardPrefetch()
+{
+    if (m_pendingFileClipboardPrefetchPaths.empty() ||
+        m_stream == NULL || m_server == NULL ||
+        !reapSendFileThreadIfReady()) {
+        return;
+    }
+    if (m_sendFileStarted && !m_sendFileCompletionPending) {
+        LOG((CLOG_DEBUG "remote clipboard prefetch waiting for the active transfer terminator"));
+        return;
+    }
+
+    std::vector<barrier::fs::path> sourcePaths;
+    sourcePaths.swap(m_pendingFileClipboardPrefetchPaths);
 
     auto chunker = std::make_shared<StreamChunker>();
     m_sendFileChunker = chunker;
-	m_sendFileIsClipboardPrefetch = true;
+    m_sendFileIsClipboardPrefetch = true;
+    m_sendFileStarted = false;
+    m_sendFileCompletionPending = false;
     barrier::IStream* stream = m_stream;
     ++m_sendFileTransferId;
     if (m_sendFileTransferId == 0) {
@@ -1642,6 +1688,7 @@ Client::send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourceP
                                    UInt32 transferId)
 {
     barrier::fs::path packagePath;
+    bool chunkerOwnsMaintenanceEvent = false;
     try {
         Thread::testCancel();
         RemoteFileClipboard::Data payload;
@@ -1654,6 +1701,7 @@ Client::send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourceP
         }
 
         Thread::testCancel();
+        chunkerOwnsMaintenanceEvent = true;
         chunker->sendFile(packagePath.u8string().c_str(), m_events, this, stream, transferId);
     }
     catch (XThread&) {
@@ -1664,6 +1712,10 @@ Client::send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourceP
     }
     catch (std::runtime_error& error) {
         LOG((CLOG_ERR "failed sending remote clipboard file package: %s", error.what()));
+    }
+
+    if (!chunkerOwnsMaintenanceEvent) {
+        m_events->addEvent(Event(m_events->forFile().keepAlive(), this));
     }
 
     if (!packagePath.empty()) {
@@ -1710,7 +1762,9 @@ Client::sendFileToServer(const std::string& filename)
 
     auto chunker = std::make_shared<StreamChunker>();
     m_sendFileChunker = chunker;
-	m_sendFileIsClipboardPrefetch = false;
+    m_sendFileIsClipboardPrefetch = false;
+    m_sendFileStarted = false;
+    m_sendFileCompletionPending = false;
     barrier::IStream* stream = m_stream;
     ++m_sendFileTransferId;
     if (m_sendFileTransferId == 0) {
@@ -1772,15 +1826,17 @@ Client::cleanupSendFileThread(bool cancel)
             }
             return false;
         }
-		delete m_sendFileThread;
-		m_sendFileThread = NULL;
-	}
+        delete m_sendFileThread;
+        m_sendFileThread = NULL;
+    }
 
-	m_sendFileChunker.reset();
-	m_sendFileIsClipboardPrefetch = false;
+    m_sendFileChunker.reset();
+    m_sendFileIsClipboardPrefetch = false;
+    m_sendFileStarted = false;
+    m_sendFileCompletionPending = false;
     releaseDetachedServerProxies();
     releaseDetachedSendFileStream();
-	return true;
+    return true;
 }
 
 bool
