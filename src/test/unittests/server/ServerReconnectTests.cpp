@@ -921,6 +921,10 @@ TEST(ServerReconnectTests, completedTransferSnapshotOwnsSpoolBeforeNextReceive)
     ASSERT_TRUE(server.m_fileReceiveSession.begin(7, 0, 0));
     ASSERT_TRUE(server.m_fileReceiveSession.append("payload"));
     ASSERT_TRUE(server.m_fileReceiveSession.finish());
+    for (int i = 0; i < 500 && !server.m_fileReceiveSession.isComplete(); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(server.m_fileReceiveSession.isComplete());
     const barrier::fs::path spoolPath = server.m_fileReceiveSession.spoolPath();
 
     DragInformation entry;
@@ -988,7 +992,7 @@ TEST(ServerReconnectTests, fileReceiveCompleteDoesNotBlockOnBusyDropDirWriter)
     ASSERT_TRUE(server.m_fileReceiveSession.append("data"));
     ASSERT_TRUE(server.m_fileReceiveSession.finish());
 
-    server.onFileRecieveCompleted();
+    server.onFileRecieveCompleted(server.m_fileReceiveSession.generation());
 
     EXPECT_FALSE(writerCancelled.load());
     EXPECT_TRUE(server.testHasWriteToDropDirThread());
@@ -2716,12 +2720,48 @@ TEST(ServerReconnectTests, invalidFileCompletionReleasesReceiveState)
     ASSERT_TRUE(server.getFileReceiveSession().append("partial"));
     const barrier::fs::path spoolPath = server.getFileReceiveSession().spoolPath();
 
-    server.onFileRecieveCompleted();
+    server.onFileRecieveCompleted(
+        server.getFileReceiveSession().generation());
 
     EXPECT_EQ(0u, server.getFileReceiveSession().expectedSize());
     EXPECT_TRUE(server.getFileReceiveSession().data().empty());
     EXPECT_TRUE(server.getFileReceiveSession().spoolPath().empty());
     EXPECT_FALSE(barrier::fs::exists(spoolPath));
+}
+
+TEST(ServerReconnectTests, staleFileCompletionDoesNotResetNewReceive)
+{
+    Config config;
+    config.addScreen("primary");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient active("primary");
+    Server server;
+    initializeServer(server, config, primary, events, active);
+
+    ASSERT_TRUE(server.getFileReceiveSession().begin(3, 1024, 1024));
+    const std::uint64_t staleGeneration =
+        server.getFileReceiveSession().generation();
+    ASSERT_TRUE(server.getFileReceiveSession().append("old"));
+    ASSERT_TRUE(server.getFileReceiveSession().finish());
+
+    ASSERT_TRUE(server.getFileReceiveSession().begin(4, 1024, 1024));
+    const std::uint64_t currentGeneration =
+        server.getFileReceiveSession().generation();
+    server.onFileRecieveCompleted(staleGeneration);
+
+    EXPECT_GT(currentGeneration, staleGeneration);
+    EXPECT_TRUE(server.getFileReceiveSession().matchesGeneration(currentGeneration));
+    EXPECT_EQ(FileReceiveSession::kReceiving,
+              server.getFileReceiveSession().state());
+    EXPECT_EQ(4u, server.getFileReceiveSession().expectedSize());
 }
 
 TEST(ServerReconnectTests, singleFileTransferRejectsSymlinkSource)

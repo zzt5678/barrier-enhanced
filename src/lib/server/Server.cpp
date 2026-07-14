@@ -70,6 +70,7 @@ const double kSwitchReverseGuardMaxSeconds = 2.0;
 const int kClipboardReadAttempts = 8;
 const double kClipboardReadRetrySeconds = 0.025;
 const double kClipboardSyncDelaySeconds = 0.01;
+const double kFileReceiveCompletionPollSeconds = 0.01;
 const UInt32 kDefaultHeartbeatMilliseconds = 10000;
 const double kMouseMoveIntervalSeconds = 1.0 / 240.0;
 const size_t kMaxPendingDropDirTransfers = 4;
@@ -264,6 +265,8 @@ Server::Server(
 	m_primaryKeyStateTimer(NULL),
 	m_mouseMoveTimer(NULL),
 	m_clipboardSyncTimer(NULL),
+	m_fileReceiveCompletionTimer(NULL),
+	m_fileReceiveCompletionGeneration(0),
 	m_clipboardFetchPending(false),
 	m_pendingMouseMoveTarget(NULL),
 	m_pendingMouseMove(false),
@@ -465,6 +468,7 @@ Server::~Server()
 		m_writeToDropDirThread = NULL;
 	}
 	deleteDeferredClients();
+	cleanupFileReceiveCompletionPoll();
 	FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
 	m_events->removeHandler(m_events->forFile().fileChunkSending(), this);
 	m_events->removeHandler(m_events->forFile().fileRecieveCompleted(), this);
@@ -2266,6 +2270,7 @@ Server::handleClientDisconnected(const Event&, void* vclient)
 	// client has disconnected.  it might be an old client or an
 	// active client.  we don't care so just handle it both ways.
 	BaseClientProxy* client = static_cast<BaseClientProxy*>(vclient);
+	cleanupFileReceiveCompletionPoll();
 	FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
 	removeActiveClient(client);
 	removeOldClient(client);
@@ -2282,6 +2287,7 @@ Server::handleClientCloseTimeout(const Event&, void* vclient)
 	// client took too long to disconnect.  just dump it.
 	BaseClientProxy* client = static_cast<BaseClientProxy*>(vclient);
 	LOG((CLOG_NOTE "forced disconnection of client \"%s\"", getName(client).c_str()));
+	cleanupFileReceiveCompletionPoll();
 	FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
 	removeOldClient(client);
 
@@ -2428,7 +2434,11 @@ Server::handleFileChunkSendingEvent(const Event& event, void*)
 void
 Server::handleFileRecieveCompletedEvent(const Event& event, void*)
 {
-	onFileRecieveCompleted();
+	FileReceiveCompletionInfo* info =
+		static_cast<FileReceiveCompletionInfo*>(event.getDataObject());
+	const std::uint64_t generation = info == NULL ?
+		m_fileReceiveSession.generation() : info->m_generation;
+	onFileRecieveCompleted(generation);
 }
 
 void
@@ -3285,9 +3295,57 @@ Server::onFileChunkSending(const void* data)
 }
 
 void
-Server::onFileRecieveCompleted()
+Server::handleFileReceiveCompletionPoll(const Event&, void*)
 {
+	const std::uint64_t generation = m_fileReceiveCompletionGeneration;
+	cleanupFileReceiveCompletionPoll();
+	onFileRecieveCompleted(generation);
+}
+
+void
+Server::scheduleFileReceiveCompletionPoll(std::uint64_t generation)
+{
+	if (m_fileReceiveCompletionTimer != NULL &&
+		m_fileReceiveCompletionGeneration == generation) {
+		return;
+	}
+	cleanupFileReceiveCompletionPoll();
+	m_fileReceiveCompletionGeneration = generation;
+	m_fileReceiveCompletionTimer =
+		m_events->newOneShotTimer(kFileReceiveCompletionPollSeconds, NULL);
+	if (m_fileReceiveCompletionTimer != NULL) {
+		m_events->adoptHandler(Event::kTimer, m_fileReceiveCompletionTimer,
+			new TMethodEventJob<Server>(this,
+				&Server::handleFileReceiveCompletionPoll));
+	}
+}
+
+void
+Server::cleanupFileReceiveCompletionPoll()
+{
+	if (m_fileReceiveCompletionTimer != NULL) {
+		m_events->removeHandler(Event::kTimer, m_fileReceiveCompletionTimer);
+		m_events->deleteTimer(m_fileReceiveCompletionTimer);
+		m_fileReceiveCompletionTimer = NULL;
+	}
+	m_fileReceiveCompletionGeneration = 0;
+}
+
+void
+Server::onFileRecieveCompleted(std::uint64_t generation)
+{
+	if (!m_fileReceiveSession.matchesGeneration(generation)) {
+		LOG((CLOG_DEBUG1 "ignoring stale file completion generation=%llu current=%llu",
+			static_cast<unsigned long long>(generation),
+			static_cast<unsigned long long>(m_fileReceiveSession.generation())));
+		return;
+	}
+	if (m_fileReceiveSession.isFinalizing()) {
+		scheduleFileReceiveCompletionPoll(generation);
+		return;
+	}
 	if (isReceivedFileSizeValid()) {
+		cleanupFileReceiveCompletionPoll();
 		std::shared_ptr<CompletedFileTransfer> transfer = takeCompletedFileTransfer();
 		startDropDirTransfer(transfer);
 		return;
@@ -3296,6 +3354,7 @@ Server::onFileRecieveCompleted()
 	LOG((CLOG_ERR "received file completion with invalid size, expected=%llu actual=%llu",
 		static_cast<unsigned long long>(m_fileReceiveSession.expectedSize()),
 		static_cast<unsigned long long>(m_fileReceiveSession.receivedSize())));
+	cleanupFileReceiveCompletionPoll();
 	FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
 }
 
@@ -3876,9 +3935,10 @@ Server::isReceivedFileSizeValid()
 	if (!m_fileReceiveSession.isComplete()) {
 		return false;
 	}
-	if (!m_fileReceiveSession.spoolPath().empty()) {
-		return barrier::fs::exists(m_fileReceiveSession.spoolPath()) &&
-			static_cast<size_t>(barrier::fs::file_size(m_fileReceiveSession.spoolPath())) ==
+	const barrier::fs::path spoolPath = m_fileReceiveSession.spoolPath();
+	if (!spoolPath.empty()) {
+		return barrier::fs::exists(spoolPath) &&
+			static_cast<size_t>(barrier::fs::file_size(spoolPath)) ==
 				m_fileReceiveSession.expectedSize();
 	}
 	return m_fileReceiveSession.expectedSize() == m_fileReceiveSession.data().size();

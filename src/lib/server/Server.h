@@ -437,6 +437,7 @@ private:
     void                handleFakeInputEndEvent(const Event&, void*);
     void                handleFileChunkSendingEvent(const Event&, void*);
     void                handleFileRecieveCompletedEvent(const Event&, void*);
+    void                handleFileReceiveCompletionPoll(const Event&, void*);
     void                handleFileClipboardReadyEvent(const Event&, void*);
     void                handleDropDirWriteFinishedEvent(const Event&, void*);
     void                handleFileKeepAliveEvent(const Event&, void*);
@@ -466,7 +467,9 @@ private:
     void                flushPendingMouseMove();
     void                discardPendingMouseMove(BaseClientProxy* target = NULL);
     void                onFileChunkSending(const void* data);
-    void                onFileRecieveCompleted();
+    void                onFileRecieveCompleted(std::uint64_t generation);
+    void                scheduleFileReceiveCompletionPoll(std::uint64_t generation);
+    void                cleanupFileReceiveCompletionPoll();
     void                publishMaterializedFileClipboard(const std::vector<std::string>& paths,
                                                          const std::string& sessionId);
     void                sendClipboardSelectionToClient(BaseClientProxy* target,
@@ -637,6 +640,8 @@ private:
     EventQueueTimer*    m_primaryKeyStateTimer;
     EventQueueTimer*    m_mouseMoveTimer;
     EventQueueTimer*    m_clipboardSyncTimer;
+    EventQueueTimer*    m_fileReceiveCompletionTimer;
+    std::uint64_t       m_fileReceiveCompletionGeneration;
     bool                m_clipboardFetchPending;
     BaseClientProxy*    m_pendingMouseMoveTarget;
     bool                m_pendingMouseMove;

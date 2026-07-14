@@ -1,5 +1,6 @@
 #include "barrier/FileChunk.h"
 #include "barrier/protocol_types.h"
+#include "arch/Arch.h"
 #include "base/Event.h"
 #include "io/IStream.h"
 #include "io/filesystem.h"
@@ -9,6 +10,45 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
+
+static bool
+waitForReceiveState(FileReceiveSession& session,
+                    FileReceiveSession::State state,
+                    int attempts = 500)
+{
+    for (int i = 0; i < attempts; ++i) {
+        if (session.state() == state) {
+            return true;
+        }
+        ARCH->sleep(0.001);
+    }
+    return session.state() == state;
+}
+
+static barrier::fs::path
+waitForSpoolPath(FileReceiveSession& session, int attempts = 500)
+{
+    barrier::fs::path path;
+    for (int i = 0; i < attempts && path.empty(); ++i) {
+        path = session.spoolPath();
+        if (path.empty()) {
+            ARCH->sleep(0.001);
+        }
+    }
+    return path;
+}
+
+static bool
+waitForPathRemoval(const barrier::fs::path& path, int attempts = 500)
+{
+    for (int i = 0; i < attempts; ++i) {
+        if (!barrier::fs::exists(path)) {
+            return true;
+        }
+        ARCH->sleep(0.001);
+    }
+    return !barrier::fs::exists(path);
+}
 
 class FileChunkTestStream : public barrier::IStream {
 public:
@@ -22,7 +62,7 @@ public:
     UInt32 read(void* buffer, UInt32 n) override
     {
         UInt32 remaining = static_cast<UInt32>(m_data.size() - m_offset);
-        UInt32 count = std::min(n, remaining);
+        UInt32 count = n < remaining ? n : remaining;
         if (count == 0) {
             return 0;
         }
@@ -280,10 +320,10 @@ TEST(FileChunkTests, assemble_largeTransferUsesSpoolFileAndKeepsMemoryEmpty)
 
     FileReceiveSession session;
     const String& received = session.data();
-    const barrier::fs::path& spoolPath = session.spoolPath();
 
     EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
     EXPECT_EQ(FileChunk::kMemoryReceiveLimit + 1, session.expectedSize());
+    const barrier::fs::path spoolPath = waitForSpoolPath(session);
     ASSERT_FALSE(spoolPath.empty());
     EXPECT_TRUE(barrier::fs::exists(spoolPath));
     EXPECT_TRUE(received.empty());
@@ -292,13 +332,12 @@ TEST(FileChunkTests, assemble_largeTransferUsesSpoolFileAndKeepsMemoryEmpty)
     EXPECT_TRUE(received.empty());
     EXPECT_EQ(3u, session.receivedSize());
 
-    const barrier::fs::path savedSpoolPath = spoolPath;
     FileChunk::releaseReceiveBuffer(session);
 
     EXPECT_TRUE(received.empty());
     EXPECT_EQ(0u, session.expectedSize());
-    EXPECT_TRUE(spoolPath.empty());
-    EXPECT_FALSE(barrier::fs::exists(savedSpoolPath));
+    EXPECT_TRUE(session.spoolPath().empty());
+    EXPECT_TRUE(waitForPathRemoval(spoolPath));
 }
 
 TEST(FileChunkTests, assemble_spooledMismatchRemovesSpool)
@@ -312,18 +351,18 @@ TEST(FileChunkTests, assemble_spooledMismatchRemovesSpool)
 
     FileReceiveSession session;
     const String& received = session.data();
-    const barrier::fs::path& spoolPath = session.spoolPath();
 
     EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
     EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
-    const barrier::fs::path savedSpoolPath = spoolPath;
-    ASSERT_TRUE(barrier::fs::exists(savedSpoolPath));
+    const barrier::fs::path spoolPath = waitForSpoolPath(session);
+    ASSERT_FALSE(spoolPath.empty());
+    ASSERT_TRUE(barrier::fs::exists(spoolPath));
 
     EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
     EXPECT_TRUE(received.empty());
     EXPECT_EQ(0u, session.expectedSize());
-    EXPECT_TRUE(spoolPath.empty());
-    EXPECT_FALSE(barrier::fs::exists(savedSpoolPath));
+    EXPECT_TRUE(session.spoolPath().empty());
+    EXPECT_TRUE(waitForPathRemoval(spoolPath));
 }
 
 TEST(FileChunkTests, assemble_releaseReceiveBufferClearsSpooledReceiveState)
@@ -338,26 +377,26 @@ TEST(FileChunkTests, assemble_releaseReceiveBufferClearsSpooledReceiveState)
 
     FileReceiveSession session;
     const String& received = session.data();
-    const barrier::fs::path& spoolPath = session.spoolPath();
 
     EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
     EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
-    const barrier::fs::path savedSpoolPath = spoolPath;
-    ASSERT_TRUE(barrier::fs::exists(savedSpoolPath));
+    const barrier::fs::path spoolPath = waitForSpoolPath(session);
+    ASSERT_FALSE(spoolPath.empty());
+    ASSERT_TRUE(barrier::fs::exists(spoolPath));
 
     FileChunk::releaseReceiveBuffer(session);
-    EXPECT_TRUE(spoolPath.empty());
-    EXPECT_FALSE(barrier::fs::exists(savedSpoolPath));
+    EXPECT_TRUE(session.spoolPath().empty());
+    EXPECT_TRUE(waitForPathRemoval(spoolPath));
 
     EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
     EXPECT_TRUE(received.empty());
     EXPECT_EQ(0u, session.expectedSize());
-    EXPECT_TRUE(spoolPath.empty());
+    EXPECT_TRUE(session.spoolPath().empty());
 
     EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
     EXPECT_TRUE(received.empty());
     EXPECT_EQ(0u, session.expectedSize());
-    EXPECT_TRUE(spoolPath.empty());
+    EXPECT_TRUE(session.spoolPath().empty());
 }
 
 TEST(FileChunkTests, receiveSessionKeepsOneSpoolHandleOpenUntilTransferEnds)
@@ -365,19 +404,54 @@ TEST(FileChunkTests, receiveSessionKeepsOneSpoolHandleOpenUntilTransferEnds)
     FileReceiveSession session;
 
     ASSERT_TRUE(session.begin(6, 0, 0));
-    EXPECT_TRUE(session.isSpoolOpen());
-    EXPECT_EQ(1u, session.spoolOpenCount());
+    const std::uint64_t generation = session.generation();
+    ASSERT_GT(generation, 0u);
 
     EXPECT_TRUE(session.append("abc"));
     EXPECT_TRUE(session.append("def"));
-    EXPECT_TRUE(session.isSpoolOpen());
-    EXPECT_EQ(1u, session.spoolOpenCount());
     EXPECT_EQ(6u, session.receivedSize());
 
     EXPECT_TRUE(session.finish());
+    EXPECT_TRUE(session.state() == FileReceiveSession::kFinalizing ||
+                session.state() == FileReceiveSession::kComplete);
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
     EXPECT_FALSE(session.isSpoolOpen());
     EXPECT_TRUE(session.isComplete());
+    EXPECT_EQ(generation, session.generation());
+    EXPECT_EQ(1u, session.spoolOpenCount());
     EXPECT_EQ(6u, barrier::fs::file_size(session.spoolPath()));
+}
+
+TEST(FileChunkTests, receiveSessionRejectsChunkLargerThanAsyncQueueBudget)
+{
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(8, 0, 0, 4));
+    EXPECT_FALSE(session.append("12345"));
+
+    session.fail();
+    EXPECT_EQ(FileReceiveSession::kFailed, session.state());
+}
+
+TEST(FileChunkTests, receiveSessionGenerationRejectsStaleCompletion)
+{
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(6, 0, 0));
+    const std::uint64_t firstGeneration = session.generation();
+    ASSERT_TRUE(session.append("old"));
+    session.reset();
+    EXPECT_FALSE(session.matchesGeneration(firstGeneration));
+
+    ASSERT_TRUE(session.begin(3, 0, 0));
+    const std::uint64_t secondGeneration = session.generation();
+    EXPECT_GT(secondGeneration, firstGeneration);
+    EXPECT_FALSE(session.matchesGeneration(firstGeneration));
+    EXPECT_TRUE(session.matchesGeneration(secondGeneration));
+    ASSERT_TRUE(session.append("new"));
+    ASSERT_TRUE(session.finish());
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+    EXPECT_EQ(3u, barrier::fs::file_size(session.spoolPath()));
 }
 
 TEST(FileChunkTests, receiveSessionDestructorRemovesPartialSpool)
@@ -393,12 +467,11 @@ TEST(FileChunkTests, receiveSessionDestructorRemovesPartialSpool)
         FileReceiveSession session;
         EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
         EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
-        spoolPath = session.spoolPath();
+        spoolPath = waitForSpoolPath(session);
         ASSERT_FALSE(spoolPath.empty());
-        ASSERT_TRUE(barrier::fs::exists(spoolPath));
     }
 
-    EXPECT_FALSE(barrier::fs::exists(spoolPath));
+    EXPECT_TRUE(waitForPathRemoval(spoolPath));
 }
 
 TEST(FileChunkTests, receiveSessionCanStartAgainAfterFailure)
@@ -407,13 +480,14 @@ TEST(FileChunkTests, receiveSessionCanStartAgainAfterFailure)
 
     ASSERT_TRUE(session.begin(6, 0, 0));
     ASSERT_TRUE(session.append("abc"));
-    const barrier::fs::path abandonedPath = session.spoolPath();
+    const barrier::fs::path abandonedPath = waitForSpoolPath(session);
     session.fail();
 
-    EXPECT_FALSE(barrier::fs::exists(abandonedPath));
+    EXPECT_TRUE(waitForPathRemoval(abandonedPath));
     ASSERT_TRUE(session.begin(3, 0, 0));
     ASSERT_TRUE(session.append("xyz"));
     ASSERT_TRUE(session.finish());
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
     EXPECT_EQ(3u, barrier::fs::file_size(session.spoolPath()));
     EXPECT_EQ(1u, session.spoolOpenCount());
 }

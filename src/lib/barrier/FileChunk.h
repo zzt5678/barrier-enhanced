@@ -19,6 +19,7 @@
 
 #include "barrier/Chunk.h"
 #include "barrier/FileReceiveSession.h"
+#include "base/Event.h"
 #include "base/String.h"
 #include "common/basic_types.h"
 #include "io/filesystem.h"
@@ -27,6 +28,16 @@
 
 namespace barrier {
 class IStream;
+};
+
+class FileReceiveCompletionInfo : public EventData {
+public:
+    explicit FileReceiveCompletionInfo(std::uint64_t generation) :
+        m_generation(generation)
+    {
+    }
+
+    std::uint64_t m_generation;
 };
 
 class FileChunk : public Chunk {

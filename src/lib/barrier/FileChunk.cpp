@@ -143,21 +143,24 @@ FileChunk::assemble(barrier::IStream* stream,
     }
 
     case kDataChunk:
+    {
+        const size_t contentSize = content.size();
         if (session.state() != FileReceiveSession::kReceiving) {
             LOG((CLOG_WARN "ignoring file chunk without an active receive"));
             return kError;
         }
-        if (!session.append(content)) {
+        if (!session.append(std::move(content))) {
             LOG((CLOG_ERR "failed to append file data, expected size=%llu current size=%llu chunk size=%llu",
                 static_cast<unsigned long long>(session.expectedSize()),
                 static_cast<unsigned long long>(session.receivedSize()),
-                static_cast<unsigned long long>(content.size())));
+                static_cast<unsigned long long>(contentSize)));
             session.fail();
             return kError;
         }
         LOG((CLOG_DEBUG2 "recv file chunk size=%llu",
-            static_cast<unsigned long long>(content.size())));
+            static_cast<unsigned long long>(contentSize)));
         return kNotFinish;
+    }
 
     case kDataEnd:
         if (session.state() != FileReceiveSession::kReceiving) {

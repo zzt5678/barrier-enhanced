@@ -239,13 +239,16 @@ private:
     void                handleResume(const Event& event, void*);
     void                handleFileChunkSending(const Event&, void*);
     void                handleFileRecieveCompleted(const Event&, void*);
+    void                handleFileReceiveCompletionPoll(const Event&, void*);
     void                handleFileKeepAlive(const Event&, void*);
     void                handleDropDirWriteFinished(const Event&, void*);
     void                handleStopRetry(const Event&, void*);
     void                cleanupClipboardRetryTimer();
     void                scheduleClipboardRetry(ClipboardID id);
     bool                hasPendingClipboardRetry() const;
-    void                onFileRecieveCompleted();
+    void                onFileRecieveCompleted(std::uint64_t generation);
+    void                scheduleFileReceiveCompletionPoll(std::uint64_t generation);
+    void                cleanupFileReceiveCompletionPoll();
     void                publishMaterializedFileClipboard(const std::vector<std::string>& paths,
                                                          const std::string& sessionId);
     void                sendClipboardThread(void*);
@@ -254,7 +257,14 @@ private:
 public:
     bool                m_mock;
 #if defined(BARRIER_TEST_ENV)
-    void                testOnFileRecieveCompleted() { onFileRecieveCompleted(); }
+    void                testOnFileRecieveCompleted()
+    {
+        onFileRecieveCompleted(m_fileReceiveSession.generation());
+    }
+    void                testOnFileRecieveCompleted(std::uint64_t generation)
+    {
+        onFileRecieveCompleted(generation);
+    }
     void                testAttachStream(barrier::IStream* stream)
     {
         m_stream = stream;
@@ -371,6 +381,8 @@ private:
     std::vector<ServerProxy*> m_detachedServerProxies;
     EventQueueTimer*    m_timer;
     EventQueueTimer*    m_clipboardRetryTimer;
+    EventQueueTimer*    m_fileReceiveCompletionTimer;
+    std::uint64_t       m_fileReceiveCompletionGeneration;
     ServerProxy*        m_server;
     bool                m_ready;
     bool                m_active;

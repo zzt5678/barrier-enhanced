@@ -1188,7 +1188,10 @@ ServerProxy::fileChunkReceived()
                     m_client->getFileReceiveSession());
 
     if (result == kFinish) {
-        m_events->addEvent(Event(m_events->forFile().fileRecieveCompleted(), m_client));
+        Event completed(m_events->forFile().fileRecieveCompleted(), m_client);
+        completed.setDataObject(new FileReceiveCompletionInfo(
+            m_client->getFileReceiveSession().generation()));
+        m_events->addEvent(completed);
     }
     else if (result == kStart) {
         if (m_client->getDragFileList().size() > 0) {

@@ -714,6 +714,37 @@ TEST(ClientDisconnectTests, invalidFileCompletionReleasesReceiveState)
     EXPECT_FALSE(barrier::fs::exists(spoolPath));
 }
 
+TEST(ClientDisconnectTests, staleFileCompletionDoesNotResetNewReceive)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    setClientEventDefaults(events, clientEvents, screenEvents, fileEvents);
+
+    TestScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    ASSERT_TRUE(client.getFileReceiveSession().begin(3, 1024, 1024));
+    const std::uint64_t staleGeneration =
+        client.getFileReceiveSession().generation();
+    ASSERT_TRUE(client.getFileReceiveSession().append("old"));
+    ASSERT_TRUE(client.getFileReceiveSession().finish());
+
+    ASSERT_TRUE(client.getFileReceiveSession().begin(4, 1024, 1024));
+    const std::uint64_t currentGeneration =
+        client.getFileReceiveSession().generation();
+    client.testOnFileRecieveCompleted(staleGeneration);
+
+    EXPECT_GT(currentGeneration, staleGeneration);
+    EXPECT_TRUE(client.getFileReceiveSession().matchesGeneration(currentGeneration));
+    EXPECT_EQ(FileReceiveSession::kReceiving,
+              client.getFileReceiveSession().state());
+    EXPECT_EQ(4u, client.getFileReceiveSession().expectedSize());
+}
+
 TEST(ClientDisconnectTests, cleanupConnectionReleasesPartialReceiveSpool)
 {
     NiceMock<MockEventQueue> events;
