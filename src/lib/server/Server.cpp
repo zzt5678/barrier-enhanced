@@ -282,9 +282,7 @@ Server::Server(
 	m_lockedToScreen(false),
 		m_screen(screen),
 		m_events(events),
-		m_expectedFileSize(0),
-		m_receivedFileData(),
-		m_receivedFileSpoolPath(),
+		m_fileReceiveSession(),
 	m_sendFileThread(NULL),
 	m_sendFileTarget(NULL),
 	m_sendFileTransferId(0),
@@ -467,7 +465,7 @@ Server::~Server()
 		m_writeToDropDirThread = NULL;
 	}
 	deleteDeferredClients();
-	FileChunk::releaseReceiveBuffer(m_receivedFileData, m_expectedFileSize, &m_receivedFileSpoolPath);
+	FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
 	m_events->removeHandler(m_events->forFile().fileChunkSending(), this);
 	m_events->removeHandler(m_events->forFile().fileRecieveCompleted(), this);
 	m_events->removeHandler(m_events->forFile().fileClipboardReady(), this);
@@ -2268,7 +2266,7 @@ Server::handleClientDisconnected(const Event&, void* vclient)
 	// client has disconnected.  it might be an old client or an
 	// active client.  we don't care so just handle it both ways.
 	BaseClientProxy* client = static_cast<BaseClientProxy*>(vclient);
-	FileChunk::releaseReceiveBuffer(m_receivedFileData, m_expectedFileSize, &m_receivedFileSpoolPath);
+	FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
 	removeActiveClient(client);
 	removeOldClient(client);
 
@@ -2284,7 +2282,7 @@ Server::handleClientCloseTimeout(const Event&, void* vclient)
 	// client took too long to disconnect.  just dump it.
 	BaseClientProxy* client = static_cast<BaseClientProxy*>(vclient);
 	LOG((CLOG_NOTE "forced disconnection of client \"%s\"", getName(client).c_str()));
-	FileChunk::releaseReceiveBuffer(m_receivedFileData, m_expectedFileSize, &m_receivedFileSpoolPath);
+	FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
 	removeOldClient(client);
 
 	if (deferDeleteIfSendingToClient(client)) {
@@ -3295,14 +3293,10 @@ Server::onFileRecieveCompleted()
 		return;
 	}
 
-	LOG((CLOG_ERR "received file completion with invalid size, expected=%d actual=%d",
-		m_expectedFileSize,
-		m_receivedFileSpoolPath.empty()
-			? m_receivedFileData.size()
-			: (barrier::fs::exists(m_receivedFileSpoolPath)
-				? static_cast<size_t>(barrier::fs::file_size(m_receivedFileSpoolPath))
-				: 0)));
-	FileChunk::releaseReceiveBuffer(m_receivedFileData, m_expectedFileSize, &m_receivedFileSpoolPath);
+	LOG((CLOG_ERR "received file completion with invalid size, expected=%llu actual=%llu",
+		static_cast<unsigned long long>(m_fileReceiveSession.expectedSize()),
+		static_cast<unsigned long long>(m_fileReceiveSession.receivedSize())));
+	FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
 }
 
 void
@@ -3879,11 +3873,15 @@ Server::KeyboardBroadcastInfo::alloc(State state, const std::string& screens)
 bool
 Server::isReceivedFileSizeValid()
 {
-	if (!m_receivedFileSpoolPath.empty()) {
-		return barrier::fs::exists(m_receivedFileSpoolPath) &&
-			static_cast<size_t>(barrier::fs::file_size(m_receivedFileSpoolPath)) == m_expectedFileSize;
+	if (!m_fileReceiveSession.isComplete()) {
+		return false;
 	}
-	return m_expectedFileSize == m_receivedFileData.size();
+	if (!m_fileReceiveSession.spoolPath().empty()) {
+		return barrier::fs::exists(m_fileReceiveSession.spoolPath()) &&
+			static_cast<size_t>(barrier::fs::file_size(m_fileReceiveSession.spoolPath())) ==
+				m_fileReceiveSession.expectedSize();
+	}
+	return m_fileReceiveSession.expectedSize() == m_fileReceiveSession.data().size();
 }
 
 void
@@ -4141,16 +4139,13 @@ std::shared_ptr<Server::CompletedFileTransfer>
 Server::takeCompletedFileTransfer()
 {
 	std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
-	transfer->expectedSize = m_expectedFileSize;
-	transfer->data.swap(m_receivedFileData);
-	transfer->spoolPath = m_receivedFileSpoolPath;
-	m_receivedFileSpoolPath.clear();
+	m_fileReceiveSession.takeCompleted(
+		transfer->data, transfer->expectedSize, transfer->spoolPath);
 	if (m_screen != NULL) {
 		transfer->dropTarget = m_screen->getDropTarget();
 	}
 	transfer->dragFileList.swap(m_fakeDragFileList);
 	transfer->remoteFileClipboardSession = m_remoteFileClipboardSession;
-	m_expectedFileSize = 0;
 	return transfer;
 }
 

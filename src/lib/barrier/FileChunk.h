@@ -18,6 +18,7 @@
 #pragma once
 
 #include "barrier/Chunk.h"
+#include "barrier/FileReceiveSession.h"
 #include "base/String.h"
 #include "common/basic_types.h"
 #include "io/filesystem.h"
@@ -42,9 +43,8 @@ public:
     static FileChunk*    cancel();
     static int            assemble(
                             barrier::IStream* stream,
-                            String& dataCached,
-                            size_t& expectedSize,
-                            barrier::fs::path* spoolPath = NULL);
+                            FileReceiveSession& session);
+    static void            releaseReceiveBuffer(FileReceiveSession& session);
     static void            releaseReceiveBuffer(
                             String& dataCached,
                             size_t& expectedSize,

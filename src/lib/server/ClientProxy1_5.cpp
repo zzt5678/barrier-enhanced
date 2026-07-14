@@ -84,9 +84,7 @@ ClientProxy1_5::fileChunkReceived()
     Server* server = getServer();
     int result = FileChunk::assemble(
                     getStream(),
-                    server->getReceivedFileData(),
-                    server->getExpectedFileSize(),
-                    &server->getReceivedFileSpoolPath());
+                    server->getFileReceiveSession());
 
 
     if (result == kFinish) {

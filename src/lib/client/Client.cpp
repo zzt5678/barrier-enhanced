@@ -102,9 +102,7 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
     m_connectOnResume(false),
 	    m_terminalEventSent(false),
 	    m_events(events),
-	    m_expectedFileSize(0),
-    m_receivedFileData(),
-    m_receivedFileSpoolPath(),
+	    m_fileReceiveSession(),
     m_sendFileThread(NULL),
     m_sendFileTransferId(0),
     m_sendFileIsClipboardPrefetch(false),
@@ -185,7 +183,7 @@ Client::~Client()
 		delete m_writeToDropDirThread;
 		m_writeToDropDirThread = NULL;
 	}
-	FileChunk::releaseReceiveBuffer(m_receivedFileData, m_expectedFileSize, &m_receivedFileSpoolPath);
+	FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
     m_events->removeHandler(m_events->forFile().fileChunkSending(), this);
     m_events->removeHandler(m_events->forFile().fileRecieveCompleted(), this);
     m_events->removeHandler(m_events->forFile().fileClipboardReady(), this);
@@ -820,7 +818,7 @@ Client::cleanupConnecting()
 void
 Client::cleanupConnection()
 {
-    FileChunk::releaseReceiveBuffer(m_receivedFileData, m_expectedFileSize, &m_receivedFileSpoolPath);
+    FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
     ++m_sendFileTransferId;
     if (m_sendFileTransferId == 0) {
         ++m_sendFileTransferId;
@@ -1253,14 +1251,10 @@ Client::onFileRecieveCompleted()
 	    return;
 	}
 
-    LOG((CLOG_ERR "received file completion with invalid size, expected=%d actual=%d",
-        m_expectedFileSize,
-        m_receivedFileSpoolPath.empty()
-            ? m_receivedFileData.size()
-            : (barrier::fs::exists(m_receivedFileSpoolPath)
-                ? static_cast<size_t>(barrier::fs::file_size(m_receivedFileSpoolPath))
-                : 0)));
-	FileChunk::releaseReceiveBuffer(m_receivedFileData, m_expectedFileSize, &m_receivedFileSpoolPath);
+	LOG((CLOG_ERR "received file completion with invalid size, expected=%llu actual=%llu",
+		static_cast<unsigned long long>(m_fileReceiveSession.expectedSize()),
+		static_cast<unsigned long long>(m_fileReceiveSession.receivedSize())));
+	FileChunk::releaseReceiveBuffer(m_fileReceiveSession);
 }
 
 void
@@ -1572,11 +1566,15 @@ Client::dragInfoReceived(UInt32 fileNum, std::string data)
 bool
 Client::isReceivedFileSizeValid()
 {
-    if (!m_receivedFileSpoolPath.empty()) {
-        return barrier::fs::exists(m_receivedFileSpoolPath) &&
-            static_cast<std::size_t>(barrier::fs::file_size(m_receivedFileSpoolPath)) == m_expectedFileSize;
+    if (!m_fileReceiveSession.isComplete()) {
+        return false;
     }
-    return m_expectedFileSize == m_receivedFileData.size();
+    if (!m_fileReceiveSession.spoolPath().empty()) {
+        return barrier::fs::exists(m_fileReceiveSession.spoolPath()) &&
+            static_cast<std::size_t>(barrier::fs::file_size(m_fileReceiveSession.spoolPath())) ==
+                m_fileReceiveSession.expectedSize();
+    }
+    return m_fileReceiveSession.expectedSize() == m_fileReceiveSession.data().size();
 }
 
 void
@@ -1713,16 +1711,13 @@ std::shared_ptr<Client::CompletedFileTransfer>
 Client::takeCompletedFileTransfer()
 {
 	std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
-	transfer->expectedSize = m_expectedFileSize;
-	transfer->data.swap(m_receivedFileData);
-	transfer->spoolPath = m_receivedFileSpoolPath;
-	m_receivedFileSpoolPath.clear();
+	m_fileReceiveSession.takeCompleted(
+		transfer->data, transfer->expectedSize, transfer->spoolPath);
 	if (m_screen != NULL) {
 		transfer->dropTarget = m_screen->getDropTarget();
 	}
 	transfer->dragFileList.swap(m_dragFileList);
 	transfer->remoteFileClipboardSession = m_remoteFileClipboardSession;
-	m_expectedFileSize = 0;
 	return transfer;
 }
 

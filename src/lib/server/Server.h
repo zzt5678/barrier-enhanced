@@ -25,6 +25,7 @@
 #include "barrier/mouse_types.h"
 #include "barrier/INode.h"
 #include "barrier/DragInformation.h"
+#include "barrier/FileReceiveSession.h"
 #include "barrier/ServerArgs.h"
 #include "base/Event.h"
 #include "base/Stopwatch.h"
@@ -180,7 +181,7 @@ public:
         m_lockedToScreen(false),
         m_screen(NULL),
         m_events(NULL),
-        m_expectedFileSize(0),
+        m_fileReceiveSession(),
         m_sendFileThread(NULL),
         m_sendFileTarget(NULL),
         m_sendFileTransferId(0),
@@ -266,14 +267,7 @@ public:
     //! Return true if received file size is valid
     bool                isReceivedFileSizeValid();
 
-    //! Return expected file data size
-    size_t&                getExpectedFileSize() { return m_expectedFileSize; }
-
-    //! Return received file data
-    std::string& getReceivedFileData() { return m_receivedFileData; }
-
-    //! Return received file spool path when large payload is kept on disk
-    barrier::fs::path& getReceivedFileSpoolPath() { return m_receivedFileSpoolPath; }
+    FileReceiveSession& getFileReceiveSession() { return m_fileReceiveSession; }
 
     //! Return fake drag file list
     DragFileList        getFakeDragFileList() { return m_fakeDragFileList; }
@@ -681,9 +675,7 @@ private:
     IEventQueue*        m_events;
 
     // file transfer
-    size_t                m_expectedFileSize;
-    std::string m_receivedFileData;
-    barrier::fs::path m_receivedFileSpoolPath;
+    FileReceiveSession     m_fileReceiveSession;
     DragFileList        m_dragFileList;
     DragFileList        m_fakeDragFileList;
     Thread*                m_sendFileThread;

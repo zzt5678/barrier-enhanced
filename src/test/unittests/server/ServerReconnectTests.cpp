@@ -575,9 +575,7 @@ void initializeServer(Server& server, Config& config, PrimaryClient& primary,
     server.m_y = 654;
     server.m_enableClipboard = false;
     server.m_lockedToScreen = false;
-    server.m_expectedFileSize = 0;
-    server.m_receivedFileData.clear();
-    server.m_receivedFileSpoolPath.clear();
+    server.m_fileReceiveSession.reset();
     server.m_sendFileThread = NULL;
     server.m_writeToDropDirThread = NULL;
     server.m_args = ServerArgs();
@@ -668,10 +666,10 @@ TEST(ServerReconnectTests, constructorInitializesTransferAndCursorState)
     Server server(config, &primary, &screen, &events, args);
     server.m_mock = true;
 
-    EXPECT_TRUE(server.isReceivedFileSizeValid());
-    EXPECT_EQ(0u, server.m_expectedFileSize);
-    EXPECT_TRUE(server.m_receivedFileData.empty());
-    EXPECT_TRUE(server.m_receivedFileSpoolPath.empty());
+    EXPECT_FALSE(server.isReceivedFileSizeValid());
+    EXPECT_EQ(0u, server.m_fileReceiveSession.expectedSize());
+    EXPECT_TRUE(server.m_fileReceiveSession.data().empty());
+    EXPECT_TRUE(server.m_fileReceiveSession.spoolPath().empty());
     EXPECT_EQ(0, server.m_x);
     EXPECT_EQ(0, server.m_y);
 }
@@ -920,35 +918,29 @@ TEST(ServerReconnectTests, completedTransferSnapshotOwnsSpoolBeforeNextReceive)
     Server server;
     initializeServer(server, config, primary, events, active);
 
-    const barrier::fs::path spoolPath =
-        barrier::fs::temp_directory_path() / barrier::fs::u8path("weave-server-snapshot.part");
-    barrier::fs::remove(spoolPath);
-    {
-        std::ofstream file(spoolPath.u8string().c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        file << "payload";
-    }
+    ASSERT_TRUE(server.m_fileReceiveSession.begin(7, 0, 0));
+    ASSERT_TRUE(server.m_fileReceiveSession.append("payload"));
+    ASSERT_TRUE(server.m_fileReceiveSession.finish());
+    const barrier::fs::path spoolPath = server.m_fileReceiveSession.spoolPath();
 
     DragInformation entry;
     String filename("payload.txt");
     entry.setFilename(filename);
 
-    server.m_expectedFileSize = 7;
-    server.m_receivedFileData = "memory-copy";
-    server.m_receivedFileSpoolPath = spoolPath;
     server.m_fakeDragFileList.push_back(entry);
     server.m_remoteFileClipboardSession = "session-1";
 
     auto transfer = server.testTakeCompletedFileTransfer();
 
-    EXPECT_EQ(0u, server.m_expectedFileSize);
-    EXPECT_TRUE(server.m_receivedFileData.empty());
-    EXPECT_TRUE(server.m_receivedFileSpoolPath.empty());
+    EXPECT_EQ(0u, server.m_fileReceiveSession.expectedSize());
+    EXPECT_TRUE(server.m_fileReceiveSession.data().empty());
+    EXPECT_TRUE(server.m_fileReceiveSession.spoolPath().empty());
     EXPECT_TRUE(server.m_fakeDragFileList.empty());
     EXPECT_TRUE(barrier::fs::exists(spoolPath));
 
     ASSERT_TRUE(transfer);
     EXPECT_EQ(7u, transfer->expectedSize);
-    EXPECT_EQ("memory-copy", transfer->data);
+    EXPECT_TRUE(transfer->data.empty());
     EXPECT_EQ(spoolPath, transfer->spoolPath);
     EXPECT_EQ(1u, transfer->dragFileList.size());
     EXPECT_EQ("session-1", transfer->remoteFileClipboardSession);
@@ -992,17 +984,18 @@ TEST(ServerReconnectTests, fileReceiveCompleteDoesNotBlockOnBusyDropDirWriter)
         }
     }));
 
-    server.m_expectedFileSize = 4;
-    server.m_receivedFileData = "data";
+    ASSERT_TRUE(server.m_fileReceiveSession.begin(4, FileChunk::kMemoryReceiveLimit, 64));
+    ASSERT_TRUE(server.m_fileReceiveSession.append("data"));
+    ASSERT_TRUE(server.m_fileReceiveSession.finish());
 
     server.onFileRecieveCompleted();
 
     EXPECT_FALSE(writerCancelled.load());
     EXPECT_TRUE(server.testHasWriteToDropDirThread());
     EXPECT_EQ(1u, server.testPendingDropDirTransferCount());
-    EXPECT_EQ(0u, server.m_expectedFileSize);
-    EXPECT_TRUE(server.m_receivedFileData.empty());
-    EXPECT_TRUE(server.m_receivedFileSpoolPath.empty());
+    EXPECT_EQ(0u, server.m_fileReceiveSession.expectedSize());
+    EXPECT_TRUE(server.m_fileReceiveSession.data().empty());
+    EXPECT_TRUE(server.m_fileReceiveSession.spoolPath().empty());
 
     releaseWriter.store(true);
     for (int i = 0; i < 200 && server.testHasWriteToDropDirThread(); ++i) {
@@ -1061,23 +1054,15 @@ TEST(ServerReconnectTests, clientDisconnectReleasesPartialReceiveSpool)
     Server server;
     initializeServer(server, config, primary, events, active);
 
-    const barrier::fs::path spoolPath =
-        barrier::fs::temp_directory_path() / barrier::fs::u8path("weave-server-disconnect-spool.part");
-    barrier::fs::remove(spoolPath);
-    {
-        std::ofstream file(spoolPath.u8string().c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        file << "partial";
-    }
-
-    server.m_expectedFileSize = 1024;
-    server.m_receivedFileData = "stale";
-    server.m_receivedFileSpoolPath = spoolPath;
+    ASSERT_TRUE(server.m_fileReceiveSession.begin(1024, 0, 0));
+    ASSERT_TRUE(server.m_fileReceiveSession.append("partial"));
+    const barrier::fs::path spoolPath = server.m_fileReceiveSession.spoolPath();
 
     server.handleClientDisconnected(Event(), new RecordingClient("client"));
 
-    EXPECT_EQ(0u, server.m_expectedFileSize);
-    EXPECT_TRUE(server.m_receivedFileData.empty());
-    EXPECT_TRUE(server.m_receivedFileSpoolPath.empty());
+    EXPECT_EQ(0u, server.m_fileReceiveSession.expectedSize());
+    EXPECT_TRUE(server.m_fileReceiveSession.data().empty());
+    EXPECT_TRUE(server.m_fileReceiveSession.spoolPath().empty());
     EXPECT_FALSE(barrier::fs::exists(spoolPath));
 }
 
@@ -2727,23 +2712,15 @@ TEST(ServerReconnectTests, invalidFileCompletionReleasesReceiveState)
     Server server;
     initializeServer(server, config, primary, events, client);
 
-    const barrier::fs::path spoolPath =
-        barrier::fs::temp_directory_path() / barrier::fs::u8path("weave-server-invalid-complete.part");
-    barrier::fs::remove(spoolPath);
-    {
-        std::ofstream file(spoolPath.u8string().c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        file << "partial";
-    }
-
-    server.getExpectedFileSize() = 1024;
-    server.getReceivedFileData() = "stale";
-    server.getReceivedFileSpoolPath() = spoolPath;
+    ASSERT_TRUE(server.getFileReceiveSession().begin(1024, 0, 0));
+    ASSERT_TRUE(server.getFileReceiveSession().append("partial"));
+    const barrier::fs::path spoolPath = server.getFileReceiveSession().spoolPath();
 
     server.onFileRecieveCompleted();
 
-    EXPECT_EQ(0u, server.getExpectedFileSize());
-    EXPECT_TRUE(server.getReceivedFileData().empty());
-    EXPECT_TRUE(server.getReceivedFileSpoolPath().empty());
+    EXPECT_EQ(0u, server.getFileReceiveSession().expectedSize());
+    EXPECT_TRUE(server.getFileReceiveSession().data().empty());
+    EXPECT_TRUE(server.getFileReceiveSession().spoolPath().empty());
     EXPECT_FALSE(barrier::fs::exists(spoolPath));
 }
 

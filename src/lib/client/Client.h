@@ -22,6 +22,7 @@
 
 #include "barrier/Clipboard.h"
 #include "barrier/DragInformation.h"
+#include "barrier/FileReceiveSession.h"
 #include "base/Event.h"
 #include "barrier/INode.h"
 #include "barrier/ClientArgs.h"
@@ -138,14 +139,7 @@ public:
     //! Return true if received file size is valid
     bool                isReceivedFileSizeValid();
 
-    //! Return expected file size
-    size_t&                getExpectedFileSize() { return m_expectedFileSize; }
-
-    //! Return received file data
-    std::string& getReceivedFileData() { return m_receivedFileData; }
-
-    //! Return received file spool path when large payload is kept on disk
-    barrier::fs::path& getReceivedFileSpoolPath() { return m_receivedFileSpoolPath; }
+    FileReceiveSession& getFileReceiveSession() { return m_fileReceiveSession; }
 
     //! Return drag file list
     DragFileList        getDragFileList() { return m_dragFileList; }
@@ -393,9 +387,7 @@ private:
     ClipboardDataSnapshot m_pendingClipboardData[kClipboardEnd];
     std::vector<barrier::fs::path> m_pendingFileClipboardPaths[kClipboardEnd];
     IEventQueue*        m_events;
-    std::size_t            m_expectedFileSize;
-    std::string m_receivedFileData;
-    barrier::fs::path m_receivedFileSpoolPath;
+    FileReceiveSession     m_fileReceiveSession;
     DragFileList        m_dragFileList;
     std::string m_dragFileExt;
     Thread*                m_sendFileThread;

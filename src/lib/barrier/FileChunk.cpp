@@ -21,72 +21,24 @@
 #include "barrier/protocol_types.h"
 #include "io/IStream.h"
 #include "io/filesystem.h"
-#include "base/Stopwatch.h"
 #include "base/Log.h"
 
-#include <fstream>
-#include <map>
-
-static const UInt16 kIntervalThreshold = 1;
 static const size_t kFileReceiveReserveLimit = 64 * 1024 * 1024;
 
 const size_t FileChunk::kMaxReceiveSize = 512 * 1024 * 1024;
 const size_t FileChunk::kMemoryReceiveLimit = 32 * 1024 * 1024;
 
-namespace {
-
-struct ReceiveState {
-    ReceiveState() : inProgress(false), failed(false), receivedSize(0) { }
-    bool inProgress;
-    bool failed;
-    size_t receivedSize;
-};
-
-typedef std::map<const void*, ReceiveState> ReceiveStateMap;
-
-ReceiveState&
-receiveStateFor(const String& dataReceived)
+void
+FileChunk::releaseReceiveBuffer(FileReceiveSession& session)
 {
-    static thread_local ReceiveStateMap states;
-    return states[&dataReceived];
+    session.reset();
 }
-
-bool makeReceiveSpoolPath(barrier::fs::path& path)
-{
-    return barrier::create_secure_temp_file("weave-receive-", ".part", path);
-}
-
-bool appendToReceiveSpool(const barrier::fs::path& path, const String& content)
-{
-    std::ofstream output;
-    barrier::open_utf8_path(output, path, std::ios::out | std::ios::binary | std::ios::app);
-    if (!output.is_open()) {
-        return false;
-    }
-
-    output.write(content.data(), static_cast<std::streamsize>(content.size()));
-    output.flush();
-    output.close();
-    return !output.fail();
-}
-
-bool canAppendReceivedFileData(size_t currentSize, const String& content, size_t expectedSize)
-{
-    return currentSize <= expectedSize &&
-        content.size() <= expectedSize - currentSize;
-}
-
-} // namespace
 
 void
 FileChunk::releaseReceiveBuffer(String& dataReceived,
                                 size_t& expectedSize,
                                 barrier::fs::path* spoolPath)
 {
-    ReceiveState& receiveState = receiveStateFor(dataReceived);
-    receiveState.inProgress = false;
-    receiveState.failed = false;
-    receiveState.receivedSize = 0;
     String().swap(dataReceived);
     expectedSize = 0;
     if (spoolPath != NULL && !spoolPath->empty()) {
@@ -151,176 +103,86 @@ FileChunk::cancel()
 
 int
 FileChunk::assemble(barrier::IStream* stream,
-                    String& dataReceived,
-                    size_t& expectedSize,
-                    barrier::fs::path* spoolPath)
+                    FileReceiveSession& session)
 {
     // parse
     UInt8 mark = 0;
     String content;
-    static thread_local size_t receivedDataSize = 0;
-    static thread_local double elapsedTime = 0;
-    static thread_local Stopwatch stopwatch;
-    ReceiveState& receiveState = receiveStateFor(dataReceived);
 
     if (!ProtocolUtil::readf(stream, kMsgDFileTransfer + 4, &mark, &content)) {
-        releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-        receiveState.inProgress = false;
-        receiveState.failed = true;
-        receiveState.receivedSize = 0;
+        session.fail();
         return kError;
     }
 
     switch (mark) {
     case kDataStart:
-        releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-        receiveState.inProgress = true;
-        receiveState.failed = false;
-        receiveState.receivedSize = 0;
-        expectedSize = barrier::string::stringToSizeType(content);
+    {
+        const size_t expectedSize = barrier::string::stringToSizeType(content);
         if (expectedSize > kMaxReceiveSize) {
-            LOG((CLOG_ERR "refusing file transfer larger than receive limit, expected size=%d limit=%d",
-                expectedSize, kMaxReceiveSize));
-            releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-            receiveState.inProgress = false;
-            receiveState.failed = true;
-            receiveState.receivedSize = 0;
+            LOG((CLOG_ERR "refusing file transfer larger than receive limit, expected size=%llu limit=%llu",
+                static_cast<unsigned long long>(expectedSize),
+                static_cast<unsigned long long>(kMaxReceiveSize)));
+            session.fail();
             return kError;
         }
-        if (spoolPath != NULL && expectedSize > kMemoryReceiveLimit) {
-            if (!makeReceiveSpoolPath(*spoolPath)) {
-                LOG((CLOG_ERR "failed to create receive spool file: %s",
-                    spoolPath->u8string().c_str()));
-                releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-                receiveState.inProgress = false;
-                receiveState.failed = true;
-                receiveState.receivedSize = 0;
-                return kError;
-            }
-            LOG((CLOG_DEBUG "spooling received file payload to %s size=%d",
-                spoolPath->u8string().c_str(), expectedSize));
+        if (!session.begin(expectedSize,
+                           kMemoryReceiveLimit,
+                           kFileReceiveReserveLimit)) {
+            LOG((CLOG_ERR "failed to initialize file receive session, expected size=%llu",
+                static_cast<unsigned long long>(expectedSize)));
+            session.fail();
+            return kError;
         }
-        else if (expectedSize <= kFileReceiveReserveLimit) {
-            dataReceived.reserve(expectedSize);
+        if (!session.spoolPath().empty()) {
+            LOG((CLOG_DEBUG "spooling received file payload to %s size=%llu",
+                session.spoolPath().u8string().c_str(),
+                static_cast<unsigned long long>(expectedSize)));
         }
-        receivedDataSize = 0;
-        elapsedTime = 0;
-        stopwatch.reset();
-
-        if (CLOG->getFilter() >= kDEBUG2) {
-            LOG((CLOG_DEBUG2 "recv file size=%s", content.c_str()));
-            stopwatch.start();
-        }
+        LOG((CLOG_DEBUG2 "recv file size=%s", content.c_str()));
         return kStart;
+    }
 
     case kDataChunk:
-        if (!receiveState.inProgress || receiveState.failed) {
+        if (session.state() != FileReceiveSession::kReceiving) {
             LOG((CLOG_WARN "ignoring file chunk without an active receive"));
             return kError;
         }
-        if (expectedSize > kMaxReceiveSize) {
-            LOG((CLOG_ERR "refusing file chunk because expected size exceeds receive limit, expected size=%d limit=%d",
-                expectedSize, kMaxReceiveSize));
-            releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-            receiveState.inProgress = false;
-            receiveState.failed = true;
-            receiveState.receivedSize = 0;
+        if (!session.append(content)) {
+            LOG((CLOG_ERR "failed to append file data, expected size=%llu current size=%llu chunk size=%llu",
+                static_cast<unsigned long long>(session.expectedSize()),
+                static_cast<unsigned long long>(session.receivedSize()),
+                static_cast<unsigned long long>(content.size())));
+            session.fail();
             return kError;
         }
-        if (spoolPath != NULL && !spoolPath->empty()) {
-            if (!canAppendReceivedFileData(receiveState.receivedSize, content, expectedSize)) {
-                LOG((CLOG_ERR "corrupted file data, received chunk exceeds expected size=%d current size=%d chunk size=%d",
-                    expectedSize, receiveState.receivedSize, content.size()));
-                releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-                receiveState.inProgress = false;
-                receiveState.failed = true;
-                receiveState.receivedSize = 0;
-                return kError;
-            }
-            if (!appendToReceiveSpool(*spoolPath, content)) {
-                LOG((CLOG_ERR "failed to append received file spool: %s",
-                    spoolPath->u8string().c_str()));
-                releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-                receiveState.inProgress = false;
-                receiveState.failed = true;
-                receiveState.receivedSize = 0;
-                return kError;
-            }
-        }
-        else if (!canAppendReceivedFileData(receiveState.receivedSize, content, expectedSize)) {
-            LOG((CLOG_ERR "corrupted file data, received chunk exceeds expected size=%d current size=%d chunk size=%d",
-                expectedSize, receiveState.receivedSize, content.size()));
-            releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-            receiveState.inProgress = false;
-            receiveState.failed = true;
-            receiveState.receivedSize = 0;
-            return kError;
-        }
-        else {
-            dataReceived.append(content);
-        }
-        receiveState.receivedSize += content.size();
-        if (CLOG->getFilter() >= kDEBUG2) {
-                LOG((CLOG_DEBUG2 "recv file chunk size=%i", content.size()));
-                double interval = stopwatch.getTime();
-                receivedDataSize += content.size();
-                LOG((CLOG_DEBUG2 "recv file interval=%f s", interval));
-                if (interval >= kIntervalThreshold) {
-                    double averageSpeed = receivedDataSize / interval / 1000;
-                    LOG((CLOG_DEBUG2 "recv file average speed=%f kb/s", averageSpeed));
-
-                    receivedDataSize = 0;
-                    elapsedTime += interval;
-                    stopwatch.reset();
-                }
-            }
+        LOG((CLOG_DEBUG2 "recv file chunk size=%llu",
+            static_cast<unsigned long long>(content.size())));
         return kNotFinish;
 
     case kDataEnd:
-        if (!receiveState.inProgress || receiveState.failed) {
+        if (session.state() != FileReceiveSession::kReceiving) {
             LOG((CLOG_WARN "ignoring file transfer end without a valid receive"));
-            releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-            receiveState.inProgress = false;
-            receiveState.failed = true;
-            receiveState.receivedSize = 0;
+            session.fail();
             return kError;
         }
-        if (expectedSize != receiveState.receivedSize) {
-            LOG((CLOG_ERR "corrupted file data, expected size=%d actual size=%d",
-                expectedSize, receiveState.receivedSize));
-            releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-            receiveState.inProgress = false;
-            receiveState.failed = true;
-            receiveState.receivedSize = 0;
+        if (!session.finish()) {
+            LOG((CLOG_ERR "corrupted file data, expected size=%llu actual size=%llu",
+                static_cast<unsigned long long>(session.expectedSize()),
+                static_cast<unsigned long long>(session.receivedSize())));
+            session.fail();
             return kError;
         }
-
-        if (CLOG->getFilter() >= kDEBUG2) {
-            LOG((CLOG_DEBUG2 "file transfer finished"));
-            elapsedTime += stopwatch.getTime();
-            double averageSpeed = expectedSize / elapsedTime / 1000;
-            LOG((CLOG_DEBUG2 "file transfer finished: total time consumed=%f s", elapsedTime));
-            LOG((CLOG_DEBUG2 "file transfer finished: total data received=%i kb", expectedSize / 1000));
-            LOG((CLOG_DEBUG2 "file transfer finished: total average speed=%f kb/s", averageSpeed));
-        }
-        receiveState.inProgress = false;
-        receiveState.failed = false;
-        receiveState.receivedSize = 0;
+        LOG((CLOG_DEBUG2 "file transfer finished: total data received=%llu kb",
+            static_cast<unsigned long long>(session.expectedSize() / 1000)));
         return kFinish;
 
     case kDataCancel:
         LOG((CLOG_WARN "file transfer cancelled by sender"));
-        releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-        receiveState.inProgress = false;
-        receiveState.failed = true;
-        receiveState.receivedSize = 0;
+        session.fail();
         return kError;
     }
 
-    releaseReceiveBuffer(dataReceived, expectedSize, spoolPath);
-    receiveState.inProgress = false;
-    receiveState.failed = true;
-    receiveState.receivedSize = 0;
+    session.fail();
     return kError;
 }
 

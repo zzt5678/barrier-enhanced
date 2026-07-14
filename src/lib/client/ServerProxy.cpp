@@ -1185,9 +1185,7 @@ ServerProxy::fileChunkReceived()
 {
     int result = FileChunk::assemble(
                     m_stream,
-                    m_client->getReceivedFileData(),
-                    m_client->getExpectedFileSize(),
-                    &m_client->getReceivedFileSpoolPath());
+                    m_client->getFileReceiveSession());
 
     if (result == kFinish) {
         m_events->addEvent(Event(m_events->forFile().fileRecieveCompleted(), m_client));

@@ -702,23 +702,15 @@ TEST(ClientDisconnectTests, invalidFileCompletionReleasesReceiveState)
     Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
                   &screen, args);
 
-    const barrier::fs::path spoolPath =
-        barrier::fs::temp_directory_path() / barrier::fs::u8path("weave-client-invalid-complete.part");
-    barrier::fs::remove(spoolPath);
-    {
-        std::ofstream file(spoolPath.u8string().c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        file << "partial";
-    }
-
-    client.getExpectedFileSize() = 1024;
-    client.getReceivedFileData() = "stale";
-    client.getReceivedFileSpoolPath() = spoolPath;
+    ASSERT_TRUE(client.getFileReceiveSession().begin(1024, 0, 0));
+    ASSERT_TRUE(client.getFileReceiveSession().append("partial"));
+    const barrier::fs::path spoolPath = client.getFileReceiveSession().spoolPath();
 
     client.testOnFileRecieveCompleted();
 
-    EXPECT_EQ(0u, client.getExpectedFileSize());
-    EXPECT_TRUE(client.getReceivedFileData().empty());
-    EXPECT_TRUE(client.getReceivedFileSpoolPath().empty());
+    EXPECT_EQ(0u, client.getFileReceiveSession().expectedSize());
+    EXPECT_TRUE(client.getFileReceiveSession().data().empty());
+    EXPECT_TRUE(client.getFileReceiveSession().spoolPath().empty());
     EXPECT_FALSE(barrier::fs::exists(spoolPath));
 }
 
@@ -735,23 +727,15 @@ TEST(ClientDisconnectTests, cleanupConnectionReleasesPartialReceiveSpool)
     Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
                   &screen, args);
 
-    const barrier::fs::path spoolPath =
-        barrier::fs::temp_directory_path() / barrier::fs::u8path("weave-client-disconnect-spool.part");
-    barrier::fs::remove(spoolPath);
-    {
-        std::ofstream file(spoolPath.u8string().c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        file << "partial";
-    }
-
-    client.getExpectedFileSize() = 1024;
-    client.getReceivedFileData() = "stale";
-    client.getReceivedFileSpoolPath() = spoolPath;
+    ASSERT_TRUE(client.getFileReceiveSession().begin(1024, 0, 0));
+    ASSERT_TRUE(client.getFileReceiveSession().append("partial"));
+    const barrier::fs::path spoolPath = client.getFileReceiveSession().spoolPath();
 
     client.testCleanupConnection();
 
-    EXPECT_EQ(0u, client.getExpectedFileSize());
-    EXPECT_TRUE(client.getReceivedFileData().empty());
-    EXPECT_TRUE(client.getReceivedFileSpoolPath().empty());
+    EXPECT_EQ(0u, client.getFileReceiveSession().expectedSize());
+    EXPECT_TRUE(client.getFileReceiveSession().data().empty());
+    EXPECT_TRUE(client.getFileReceiveSession().spoolPath().empty());
     EXPECT_FALSE(barrier::fs::exists(spoolPath));
 }
 
