@@ -166,6 +166,7 @@ TEST(RemoteFileClipboardTests, createAndExtractPackageRestoresRoots)
     std::ifstream packageFile(packagePath.u8string().c_str(), std::ios::in | std::ios::binary);
     const std::string packageData((std::istreambuf_iterator<char>(packageFile)),
                                   std::istreambuf_iterator<char>());
+    packageFile.close();
 
     std::vector<barrier::fs::path> roots;
     ASSERT_TRUE(RemoteFileClipboard::extractPackage(packageData, tempRoot / "dest", roots, error)) << error;
@@ -243,6 +244,7 @@ TEST(RemoteFileClipboardTests, failedNewSessionExtractionPreservesPreviousSessio
     std::ifstream packageFile(packagePath.u8string().c_str(), std::ios::in | std::ios::binary);
     const std::string packageData((std::istreambuf_iterator<char>(packageFile)),
                                   std::istreambuf_iterator<char>());
+    packageFile.close();
 
     const barrier::fs::path oldSessionRoot =
         RemoteFileClipboard::materializedSessionRoot(cacheRoot, "old-session");

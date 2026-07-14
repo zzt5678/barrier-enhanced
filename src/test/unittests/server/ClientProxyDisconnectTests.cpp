@@ -1,8 +1,5 @@
-#define private public
-#define protected public
+#define BARRIER_TEST_ENV
 #include "server/ClientProxy1_0.h"
-#undef protected
-#undef private
 
 #include "barrier/protocol_types.h"
 

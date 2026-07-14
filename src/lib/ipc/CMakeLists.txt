@@ -23,6 +23,10 @@ endif()
 
 add_library(ipc STATIC ${sources})
 
+if (MSVC AND BARRIER_BUILD_TESTS)
+    target_compile_definitions(ipc PRIVATE BARRIER_TEST_ACCESS)
+endif()
+
 if (UNIX)
     target_link_libraries(ipc arch base common mt io net synlib)
 endif()

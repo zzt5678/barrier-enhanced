@@ -34,9 +34,7 @@ bool testServerPrepareTransferSource(const char* filename,
                                      barrier::fs::path& tempPackagePath,
                                      std::string& error);
 
-#define private public
 #include "server/Server.h"
-#undef private
 
 using ::testing::_;
 using ::testing::Invoke;

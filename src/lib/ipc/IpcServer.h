@@ -66,14 +66,22 @@ public:
 
     //@}
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     void                init();
     void                handleClientConnecting(const Event&, void*);
     void                handleClientDisconnected(const Event&, void*);
     void                handleMessageReceived(const Event&, void*);
     void                deleteClient(IpcClientProxy* proxy);
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     typedef std::list<IpcClientProxy*> ClientList;
 
     bool                m_mock;

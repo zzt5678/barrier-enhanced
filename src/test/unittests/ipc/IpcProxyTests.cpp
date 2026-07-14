@@ -1,10 +1,8 @@
 #define BARRIER_TEST_ENV
-#define private public
 #include "ipc/IpcClientProxy.h"
 #include "ipc/IpcMessage.h"
 #include "ipc/IpcServer.h"
 #include "ipc/IpcServerProxy.h"
-#undef private
 
 #include "test/global/gmock.h"
 #include "test/global/gtest.h"

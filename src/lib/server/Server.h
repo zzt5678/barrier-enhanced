@@ -274,7 +274,11 @@ public:
 
     //@}
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     struct CompletedFileTransfer {
         size_t expectedSize;
 		std::string data;
@@ -561,7 +565,11 @@ public:
 	std::size_t testPendingDropDirTransferCount() const { return m_pendingDropDirTransfers.size(); }
 	bool testCleanupSendFileThread(bool cancel) { return cleanupSendFileThread(cancel); }
 #endif
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     class ClipboardInfo {
     public:
         ClipboardInfo();

@@ -33,14 +33,22 @@ public:
     IpcServerProxy(barrier::IStream& stream, IEventQueue* events);
     virtual ~IpcServerProxy();
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     void                send(const IpcMessage& message);
 
     void                handleData(const Event&, void*);
     IpcLogLineMessage*    parseLogLine();
     void                disconnect();
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     barrier::IStream&    m_stream;
     IEventQueue*        m_events;
 };

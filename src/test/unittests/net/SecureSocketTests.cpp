@@ -4,6 +4,7 @@
 #include "arch/Arch.h"
 #include "base/EventTypes.h"
 #include "net/ISocketMultiplexerJob.h"
+#include "net/NetworkAddress.h"
 #include "net/SocketMultiplexer.h"
 #include "mt/Lock.h"
 #include "test/global/gmock.h"
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 
 using ::testing::_;
 using ::testing::Invoke;
@@ -45,7 +47,7 @@ public:
     }
 
     ArchSocket getSocket() const override { return m_socket; }
-    bool isReadable() const override { return false; }
+    bool isReadable() const override { return true; }
     bool isWritable() const override { return false; }
 
 private:
@@ -54,11 +56,118 @@ private:
     std::atomic<int>& m_destructionCount;
 };
 
+class ConnectedSocketPair {
+public:
+    ConnectedSocketPair()
+    {
+        ArchSocket listener = nullptr;
+        try {
+            NetworkAddress address;
+            for (int port = 41000; port < 42000; ++port) {
+                listener = ARCH->newSocket(
+                    IArchNetwork::kINET, IArchNetwork::kSTREAM);
+                try {
+                    address = NetworkAddress("127.0.0.1", port);
+                    address.resolve();
+                    ARCH->setReuseAddrOnSocket(listener, true);
+                    ARCH->bindSocket(listener, address.getAddress());
+                    ARCH->listenOnSocket(listener);
+                    break;
+                }
+                catch (...) {
+                    ARCH->closeSocket(listener);
+                    listener = nullptr;
+                }
+            }
+
+            if (listener == nullptr) {
+                throw std::runtime_error("cannot bind loopback test socket");
+            }
+
+            m_peer = ARCH->newSocket(
+                IArchNetwork::kINET, IArchNetwork::kSTREAM);
+            ARCH->connectSocket(m_peer, address.getAddress());
+
+            IArchNetwork::PollEntry entry;
+            entry.m_socket = listener;
+            entry.m_events = IArchNetwork::kPOLLIN;
+            entry.m_revents = 0;
+            if (ARCH->pollSocket(&entry, 1, 2.0) == 0) {
+                throw std::runtime_error("loopback test connection timed out");
+            }
+
+            m_socket = ARCH->acceptSocket(listener, nullptr);
+            if (m_socket == nullptr) {
+                throw std::runtime_error("cannot accept loopback test connection");
+            }
+            ARCH->closeSocket(listener);
+            listener = nullptr;
+        }
+        catch (...) {
+            if (listener != nullptr) {
+                ARCH->closeSocket(listener);
+            }
+            close();
+            throw;
+        }
+    }
+
+    ~ConnectedSocketPair()
+    {
+        close();
+    }
+
+    ArchSocket releaseSocket()
+    {
+        ArchSocket socket = m_socket;
+        m_socket = nullptr;
+        return socket;
+    }
+
+    void signalReadable()
+    {
+        const char byte = 1;
+        const double deadline = ARCH->time() + 2.0;
+        size_t written = 0;
+        while (written == 0 && ARCH->time() < deadline) {
+            written = ARCH->writeSocket(m_peer, &byte, sizeof(byte));
+            ARCH->sleep(0.001);
+        }
+        if (written == 0) {
+            throw std::runtime_error("cannot signal loopback test socket");
+        }
+    }
+
+private:
+    void close()
+    {
+        if (m_socket != nullptr) {
+            ARCH->closeSocket(m_socket);
+            m_socket = nullptr;
+        }
+        if (m_peer != nullptr) {
+            ARCH->closeSocket(m_peer);
+            m_peer = nullptr;
+        }
+    }
+
+    ArchSocket m_socket = nullptr;
+    ArchSocket m_peer = nullptr;
+};
+
 class TestableSecureSocket : public SecureSocket {
 public:
     TestableSecureSocket(IEventQueue* events,
                          SocketMultiplexer* multiplexer) :
         SecureSocket(events, multiplexer, IArchNetwork::kINET,
+                     ConnectionSecurityLevel::ENCRYPTED)
+    {
+    }
+
+    TestableSecureSocket(IEventQueue* events,
+                         SocketMultiplexer* multiplexer,
+                         ArchSocket socket) :
+        SecureSocket(events, multiplexer, socket,
                      ConnectionSecurityLevel::ENCRYPTED)
     {
     }
@@ -216,9 +325,11 @@ TEST(SecureSocketTests, tlsFailureLetsMultiplexerRetireCurrentJob)
     setEventDefaults(events, socketEvents, streamEvents, dataSocketEvents);
 
     {
-        TestableSecureSocket socket(&events, &multiplexer);
-        socket.markConnected();
+        ConnectedSocketPair sockets;
+        TestableSecureSocket socket(&events, &multiplexer,
+                                    sockets.releaseSocket());
         socket.installFailingJob(invoked, jobDestructions);
+        sockets.signalReadable();
 
         const double deadline = ARCH->time() + 2.0;
         while ((!invoked.load(std::memory_order_acquire) ||

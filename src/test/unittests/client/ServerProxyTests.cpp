@@ -1,7 +1,5 @@
 #define BARRIER_TEST_ENV
-#define private public
 #include "client/ServerProxy.h"
-#undef private
 
 #include "client/Client.h"
 #include "barrier/Clipboard.h"

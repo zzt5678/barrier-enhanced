@@ -40,7 +40,11 @@ public:
     IpcClientProxy(barrier::IStream& stream, IEventQueue* events);
     virtual ~IpcClientProxy();
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     void                send(const IpcMessage& message);
     bool                tryAddSendRef();
     void                releaseSendRef();
@@ -52,7 +56,11 @@ private:
     IpcCommandMessage*    parseCommand();
     void                disconnect();
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     barrier::IStream&    m_stream;
     EIpcClientType        m_clientType;
     UInt32              m_processId;

@@ -83,12 +83,20 @@ public:
     void                handleDataForTest() { handleData(Event(), NULL); }
 #endif
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 protected:
+#endif
     enum EResult { kOkay, kUnknown, kDisconnect };
     EResult                parseHandshakeMessage(const UInt8* code);
     EResult                parseMessage(const UInt8* code);
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     // if compressing mouse motion then send the last motion now
     void                flushCompressedMouse();
     bool                shouldCompressMouseMoves() const;
@@ -136,7 +144,11 @@ private:
     void                dragInfoReceived();
     void                handleClipboardSendingEvent(const Event&, void*);
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     typedef EResult (ServerProxy::*MessageParser)(const UInt8*);
 
     Client*            m_client;

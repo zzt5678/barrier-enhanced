@@ -23,6 +23,10 @@ endif()
 
 add_library(server STATIC ${sources})
 
+if (MSVC AND BARRIER_BUILD_TESTS)
+    target_compile_definitions(server PRIVATE BARRIER_TEST_ACCESS)
+endif()
+
 target_link_libraries(server)
 
 if (UNIX)
