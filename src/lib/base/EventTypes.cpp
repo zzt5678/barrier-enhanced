@@ -117,6 +117,7 @@ REGISTER_EVENT(ClientListener, connected)
 //
 
 REGISTER_EVENT(ClientProxy, ready)
+REGISTER_EVENT(ClientProxy, inputHandoffReady)
 REGISTER_EVENT(ClientProxy, disconnected)
 
 //

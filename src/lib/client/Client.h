@@ -131,6 +131,12 @@ public:
     */
     bool                isConnecting() const;
 
+    //! Return true when the enabled local screen can accept a new input lease.
+    bool                canAcceptInputHandoff() const;
+
+    static bool         negotiateProtocolVersion(SInt16 serverMajor,
+                                SInt16 serverMinor, SInt16& negotiatedMinor);
+
     //! Get address of server
     /*!
     Returns the address of the server the client is connected (or wants
@@ -424,6 +430,7 @@ private:
     ServerProxy*        m_server;
     bool                m_ready;
     bool                m_active;
+    SInt16              m_protocolMinorVersion;
     bool                m_suspended;
     bool                m_connectOnResume;
     bool                m_terminalEventSent;

@@ -94,6 +94,7 @@ public:
         setClipboardCount(0),
         getClipboardCount(0),
         lastSetClipboardWasNull(false),
+        enterable(true),
         clipboardAvailable(false),
         clipboardContainsFileList(false),
         clipboardText("stable clipboard")
@@ -126,6 +127,7 @@ public:
     void setSequenceNumber(UInt32) override { }
     void setDraggingStarted(bool) override { }
     bool isPrimary() const override { return false; }
+    bool canEnter() const override { return enterable; }
     void* getEventTarget() const override { return const_cast<EnterPlatformScreen*>(this); }
     bool getClipboard(ClipboardID id, IClipboard* clipboard) const override
     {
@@ -230,6 +232,7 @@ public:
     UInt32 setClipboardCount;
     mutable UInt32 getClipboardCount;
     bool lastSetClipboardWasNull;
+    bool enterable;
     Clipboard lastSetClipboard;
     bool clipboardAvailable;
     bool clipboardContainsFileList;
@@ -1382,6 +1385,106 @@ TEST(ClientDisconnectTests, newerEnterAcrossSequenceWrapReplacesLeaseWithoutStal
     ProtocolUtil::writef(&stream, kMsgDMouseUp + 4, kButtonLeft);
     proxy.mouseUp();
     EXPECT_EQ(0u, platform->mouseUpCount);
+}
+
+TEST(ClientDisconnectTests, transactionalPrepareDoesNotEnterUntilMatchingCommit)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 7);
+    client.handshakeComplete();
+
+    ProtocolUtil::writef(&stream, kMsgCPrepareEnter + 4, 10, 20, 42, 0);
+    proxy.prepareEnter();
+
+    UInt32 readySeqNum = 0;
+    UInt8 ready = 0;
+    ASSERT_TRUE(ProtocolUtil::readf(&stream, kMsgDEnterReady,
+                                    &readySeqNum, &ready));
+    EXPECT_EQ(42u, readySeqNum);
+    EXPECT_EQ(1u, ready);
+    EXPECT_EQ(0u, platform->enterCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 42, 0);
+    proxy.enter();
+
+    EXPECT_EQ(1u, platform->enterCount);
+    EXPECT_EQ(1u, platform->mouseMoveCount);
+}
+
+TEST(ClientDisconnectTests, rejectedTransactionalPrepareBlocksCommitUntilAbort)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->enterable = false;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 7);
+    client.handshakeComplete();
+
+    ProtocolUtil::writef(&stream, kMsgCPrepareEnter + 4, 10, 20, 43, 0);
+    proxy.prepareEnter();
+
+    UInt32 readySeqNum = 0;
+    UInt8 ready = 1;
+    ASSERT_TRUE(ProtocolUtil::readf(&stream, kMsgDEnterReady,
+                                    &readySeqNum, &ready));
+    EXPECT_EQ(43u, readySeqNum);
+    EXPECT_EQ(0u, ready);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 43, 0);
+    proxy.enter();
+    EXPECT_EQ(0u, platform->enterCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgCAbortEnter + 4, 43);
+    proxy.abortEnter();
+    EXPECT_FALSE(proxy.m_hasPreparedEnter);
+}
+
+TEST(ClientDisconnectTests, protocolNegotiationFallsBackToPreviousStableMinor)
+{
+    SInt16 negotiatedMinor = 0;
+    EXPECT_TRUE(Client::negotiateProtocolVersion(1, 6, negotiatedMinor));
+    EXPECT_EQ(6, negotiatedMinor);
+    EXPECT_TRUE(Client::negotiateProtocolVersion(1, 7, negotiatedMinor));
+    EXPECT_EQ(7, negotiatedMinor);
+    EXPECT_TRUE(Client::negotiateProtocolVersion(1, 9, negotiatedMinor));
+    EXPECT_EQ(7, negotiatedMinor);
+    EXPECT_FALSE(Client::negotiateProtocolVersion(1, 5, negotiatedMinor));
+    EXPECT_FALSE(Client::negotiateProtocolVersion(2, 0, negotiatedMinor));
 }
 
 TEST(ClientDisconnectTests, newestFileClipboardSupersedesActivePrefetchWithoutWaiting)

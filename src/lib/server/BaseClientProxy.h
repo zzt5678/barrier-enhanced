@@ -19,12 +19,25 @@
 #pragma once
 
 #include "barrier/IClient.h"
+#include "base/Event.h"
 
 namespace barrier { class IStream; }
 
 //! Generic proxy for client or primary
 class BaseClientProxy : public IClient {
 public:
+    class InputHandoffReadyInfo : public EventData {
+    public:
+        InputHandoffReadyInfo(UInt32 seqNum, bool ready) :
+            m_seqNum(seqNum),
+            m_ready(ready)
+        {
+        }
+
+        UInt32 m_seqNum;
+        bool m_ready;
+    };
+
     /*!
     \c name is the name of the client.
     */
@@ -70,6 +83,10 @@ public:
                             UInt32 seqNum, KeyModifierMask mask,
                             bool forScreensaver) = 0;
     virtual bool        leave() = 0;
+    virtual bool        supportsInputHandoff() const { return false; }
+    virtual void        prepareEnter(SInt32, SInt32, UInt32,
+                            KeyModifierMask) { }
+    virtual void        abortEnter(UInt32) { }
     virtual void        setClipboard(ClipboardID, const IClipboard*) = 0;
     virtual void        grabClipboard(ClipboardID) = 0;
     virtual void        setClipboardDirty(ClipboardID, bool) = 0;

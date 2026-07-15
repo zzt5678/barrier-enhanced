@@ -31,9 +31,11 @@
 // 1.4:  adds crypto support
 // 1.5:  adds file transfer and removes home brew crypto
 // 1.6:  adds clipboard streaming
+// 1.7:  adds transactional input handoff readiness
 // NOTE: with new version, barrier minor version should increment
 static const SInt16        kProtocolMajorVersion = 1;
-static const SInt16        kProtocolMinorVersion = 6;
+static const SInt16        kProtocolMinorVersion = 7;
+static const SInt16        kProtocolMinimumMinorVersion = 6;
 
 // default contact port number
 static const UInt16        kDefaultPort = 24800;
@@ -145,6 +147,14 @@ extern const char*        kMsgCClose;
 // should adjust its toggle modifiers to reflect that state.
 extern const char*        kMsgCEnter;
 
+// prepare to enter screen: primary -> secondary
+// $1 = x, $2 = y, $3 = sequence number, $4 = modifier mask.
+extern const char*        kMsgCPrepareEnter;
+
+// abort a prepared enter: primary -> secondary
+// $1 = sequence number.
+extern const char*        kMsgCAbortEnter;
+
 // leave screen:  primary -> secondary
 // leaving screen.  the secondary screen should send clipboard
 // data in response to this message for those clipboards that
@@ -244,6 +254,10 @@ extern const char*        kMsgDMouseWheel;
 // mouse vertical scroll:  primary -> secondary
 // like as kMsgDMouseWheel except only sends $1 = yDelta.
 extern const char*        kMsgDMouseWheel1_0;
+
+// response to kMsgCPrepareEnter: secondary -> primary
+// $1 = sequence number, $2 = 1 when ready and 0 when rejected.
+extern const char*        kMsgDEnterReady;
 
 // clipboard data:  primary <-> secondary
 // $2 = sequence number, $3 = mark $4 = clipboard data.  the sequence number

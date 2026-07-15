@@ -56,12 +56,17 @@ bool isNewerInputSequence(UInt32 candidate, UInt32 current)
 // ServerProxy
 //
 
-ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* events) :
+ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* events,
+                         SInt16 protocolMinorVersion) :
     m_client(client),
     m_stream(stream),
     m_seqNum(0),
     m_hasEnterSequence(false),
     m_inputActive(false),
+    m_protocolMinorVersion(protocolMinorVersion),
+    m_preparedEnterSequence(0),
+    m_hasPreparedEnter(false),
+    m_preparedEnterReady(false),
     m_compressMouse(false),
     m_compressMouseRelative(false),
     m_xMouse(0),
@@ -359,6 +364,16 @@ ServerProxy::parseMessage(const UInt8* code)
 
     else if (memcmp(code, kMsgCEnter, 4) == 0) {
         enter();
+    }
+
+    else if (m_protocolMinorVersion >= 7 &&
+             memcmp(code, kMsgCPrepareEnter, 4) == 0) {
+        prepareEnter();
+    }
+
+    else if (m_protocolMinorVersion >= 7 &&
+             memcmp(code, kMsgCAbortEnter, 4) == 0) {
+        abortEnter();
     }
 
     else if (memcmp(code, kMsgCLeave, 4) == 0) {
@@ -845,6 +860,16 @@ ServerProxy::enter()
         return;
     }
 
+    if (m_hasPreparedEnter && seqNum != m_preparedEnterSequence) {
+        LOG((CLOG_WARN "ignoring enter sequence %u while prepared sequence %u is pending",
+            seqNum, m_preparedEnterSequence));
+        return;
+    }
+    if (m_hasPreparedEnter && !m_preparedEnterReady) {
+        LOG((CLOG_WARN "ignoring rejected enter sequence %u", seqNum));
+        return;
+    }
+
     if (m_inputActive) {
         LOG((CLOG_WARN "replacing active input lease %u with %u", m_seqNum, seqNum));
         discardCompressedMouse();
@@ -858,9 +883,50 @@ ServerProxy::enter()
     m_hasEnterSequence      = true;
     m_ignoreMouse           = false;
     m_inputActive           = true;
+    m_hasPreparedEnter      = false;
+    m_preparedEnterReady    = false;
 
     // forward
     m_client->enter(x, y, seqNum, static_cast<KeyModifierMask>(mask), false);
+}
+
+void
+ServerProxy::prepareEnter()
+{
+    SInt16 x = 0;
+    SInt16 y = 0;
+    UInt16 mask = 0;
+    UInt32 seqNum = 0;
+    ProtocolUtil::readf(m_stream, kMsgCPrepareEnter + 4,
+                        &x, &y, &seqNum, &mask);
+
+    const bool duplicatePrepare =
+        m_hasPreparedEnter && seqNum == m_preparedEnterSequence;
+    const bool sequenceAcceptable = duplicatePrepare ||
+        !m_hasEnterSequence || isNewerInputSequence(seqNum, m_seqNum);
+    const bool ready = !m_inputActive && sequenceAcceptable &&
+        m_client->canAcceptInputHandoff();
+
+    m_preparedEnterSequence = seqNum;
+    m_hasPreparedEnter = true;
+    m_preparedEnterReady = ready;
+
+    LOG((CLOG_DEBUG1 "recv prepare enter, %d,%d %u %04x ready=%d",
+        x, y, seqNum, mask, ready ? 1 : 0));
+    ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
+                         static_cast<UInt8>(ready ? 1 : 0));
+}
+
+void
+ServerProxy::abortEnter()
+{
+    UInt32 seqNum = 0;
+    ProtocolUtil::readf(m_stream, kMsgCAbortEnter + 4, &seqNum);
+    if (m_hasPreparedEnter && seqNum == m_preparedEnterSequence) {
+        LOG((CLOG_DEBUG1 "recv abort prepared enter %u", seqNum));
+        m_hasPreparedEnter = false;
+        m_preparedEnterReady = false;
+    }
 }
 
 void
@@ -880,6 +946,8 @@ ServerProxy::leave()
 
     // forward
     m_inputActive = false;
+    m_hasPreparedEnter = false;
+    m_preparedEnterReady = false;
     m_client->leave();
 }
 

@@ -22,6 +22,7 @@
 #include "barrier/ClipboardChunk.h"
 #include "barrier/key_types.h"
 #include "barrier/option_types.h"
+#include "barrier/protocol_types.h"
 #include "base/Event.h"
 #include "base/Stopwatch.h"
 
@@ -54,7 +55,8 @@ public:
     Process messages from the server on \p stream and forward to
     \p client.
     */
-    ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* events);
+    ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* events,
+                SInt16 protocolMinorVersion = kProtocolMinorVersion);
     virtual ~ServerProxy();
 
     //! @name manipulators
@@ -126,6 +128,8 @@ private:
 
     // message handlers
     void                enter();
+    void                prepareEnter();
+    void                abortEnter();
     void                leave();
     void                setClipboard();
     void                grabClipboard();
@@ -159,6 +163,10 @@ private:
     UInt32                m_seqNum;
     bool                  m_hasEnterSequence;
     bool                  m_inputActive;
+    SInt16                m_protocolMinorVersion;
+    UInt32                m_preparedEnterSequence;
+    bool                  m_hasPreparedEnter;
+    bool                  m_preparedEnterReady;
 
     bool                m_compressMouse;
     bool                m_compressMouseRelative;

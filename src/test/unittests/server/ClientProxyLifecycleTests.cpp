@@ -1,7 +1,9 @@
 #define BARRIER_TEST_ENV
 #include "server/ClientProxy1_6.h"
+#include "server/ClientProxy1_7.h"
 
 #include "barrier/Clipboard.h"
+#include "barrier/protocol_types.h"
 #include "arch/Arch.h"
 #include "base/Stopwatch.h"
 #include "mt/Thread.h"
@@ -12,6 +14,7 @@
 #include "test/mock/server/MockServer.h"
 
 #include <atomic>
+#include <cstring>
 
 using ::testing::_;
 using ::testing::AnyNumber;
@@ -145,6 +148,52 @@ TEST(ClientProxyLifecycleTests, clientProxy16RemovesClipboardSendingHandlerOnDes
     {
         ClientProxy1_6 proxy("client", stream, &server, &events);
     }
+}
+
+TEST(ClientProxyLifecycleTests, clientProxy17PublishesDecodedHandoffReadiness)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientProxyEvents clientProxyEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents,
+                                  fileEvents, nextType);
+    clientProxyEvents.setEvents(&events);
+    ON_CALL(events, forClientProxy()).WillByDefault(ReturnRef(clientProxyEvents));
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    const UInt8 payload[] = { 0x00, 0x00, 0x00, 0x2a, 0x01 };
+    size_t offset = 0;
+    ON_CALL(*stream, read(_, _)).WillByDefault(
+        Invoke([&](void* buffer, UInt32 count) -> UInt32 {
+            const UInt32 available = static_cast<UInt32>(sizeof(payload) - offset);
+            const UInt32 copied = count < available ? count : available;
+            std::memcpy(buffer, payload + offset, copied);
+            offset += copied;
+            return copied;
+        }));
+
+    NiceMock<MockServer> server;
+    ClientProxy1_7 proxy("client", stream, &server, &events);
+    const Event::Type readyType = clientProxyEvents.inputHandoffReady();
+    EXPECT_CALL(events, addEvent(_)).WillOnce(
+        Invoke([&](const Event& event) {
+            EXPECT_EQ(readyType, event.getType());
+            EXPECT_EQ(proxy.getEventTarget(), event.getTarget());
+            BaseClientProxy::InputHandoffReadyInfo* info =
+                static_cast<BaseClientProxy::InputHandoffReadyInfo*>(
+                    event.getDataObject());
+            ASSERT_NE(nullptr, info);
+            EXPECT_EQ(42u, info->m_seqNum);
+            EXPECT_TRUE(info->m_ready);
+            Event::deleteData(event);
+        }));
+
+    EXPECT_TRUE(proxy.parseMessage(
+        reinterpret_cast<const UInt8*>(kMsgDEnterReady)));
 }
 
 TEST(ClientProxyLifecycleTests, clientProxy16CleanupRequestsCancelWithoutWaiting)

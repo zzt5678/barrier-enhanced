@@ -137,6 +137,16 @@ public:
         m_primaryClient(NULL),
         m_active(NULL),
         m_seqNum(0),
+        m_inputHandoffPending(false),
+        m_inputHandoffCommitReady(false),
+        m_inputHandoffSource(NULL),
+        m_inputHandoffTarget(NULL),
+        m_inputHandoffSeqNum(0),
+        m_inputHandoffX(0),
+        m_inputHandoffY(0),
+        m_inputHandoffMask(0),
+        m_inputHandoffGuardDir(kNoDirection),
+        m_inputHandoffTimer(NULL),
         m_x(0),
         m_y(0),
         m_xDelta(0),
@@ -326,8 +336,13 @@ private:
 
     // change the active screen
     bool                switchScreen(BaseClientProxy*,
-	                            SInt32 x, SInt32 y, bool forScreenSaver,
-                            EDirection guardDir = kNoDirection);
+		                            SInt32 x, SInt32 y, bool forScreenSaver,
+                                EDirection guardDir = kNoDirection);
+    bool                beginInputHandoff(BaseClientProxy*, SInt32, SInt32,
+                                EDirection);
+    void                cancelInputHandoff(const char* reason, bool reanchor,
+                                bool notifyTarget = true);
+    void                cleanupInputHandoffTimer();
 
     // jump to screen
     void                jumpToScreen(BaseClientProxy*);
@@ -442,6 +457,8 @@ private:
     void                handleSwitchWaitTimeout(const Event&, void*);
     void                handlePrimaryKeyStateSync(const Event&, void*);
     void                handleMouseMoveFlush(const Event&, void*);
+    void                handleInputHandoffReady(const Event&, void*);
+    void                handleInputHandoffTimeout(const Event&, void*);
     void                handleClipboardSync(const Event&, void*);
     void                handleClientDisconnected(const Event&, void*);
     void                handleClientCloseTimeout(const Event&, void*);
@@ -617,6 +634,18 @@ private:
 
     // the sequence number of enter messages
     UInt32                m_seqNum;
+
+    // two-phase ownership transfer for protocol 1.7 pointer handoffs
+    bool                  m_inputHandoffPending;
+    bool                  m_inputHandoffCommitReady;
+    BaseClientProxy*      m_inputHandoffSource;
+    BaseClientProxy*      m_inputHandoffTarget;
+    UInt32                m_inputHandoffSeqNum;
+    SInt32                m_inputHandoffX;
+    SInt32                m_inputHandoffY;
+    KeyModifierMask       m_inputHandoffMask;
+    EDirection            m_inputHandoffGuardDir;
+    EventQueueTimer*      m_inputHandoffTimer;
 
     // current mouse position (in absolute screen coordinates) on
     // whichever screen is active

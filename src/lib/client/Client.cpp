@@ -101,6 +101,7 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
     m_server(NULL),
     m_ready(false),
     m_active(false),
+    m_protocolMinorVersion(kProtocolMinorVersion),
     m_suspended(false),
     m_connectOnResume(false),
 	    m_terminalEventSent(false),
@@ -304,6 +305,26 @@ bool
 Client::isConnecting() const
 {
     return (m_timer != NULL);
+}
+
+bool
+Client::canAcceptInputHandoff() const
+{
+    return m_ready && !m_active && m_screen != NULL && m_screen->canEnter();
+}
+
+bool
+Client::negotiateProtocolVersion(SInt16 serverMajor, SInt16 serverMinor,
+                                 SInt16& negotiatedMinor)
+{
+    if (serverMajor != kProtocolMajorVersion ||
+        serverMinor < kProtocolMinimumMinorVersion) {
+        return false;
+    }
+
+    negotiatedMinor = serverMinor < kProtocolMinorVersion ?
+        serverMinor : kProtocolMinorVersion;
+    return true;
 }
 
 NetworkAddress
@@ -861,7 +882,8 @@ Client::setupScreen()
     assert(m_server == NULL);
 
     m_ready  = false;
-    m_server = new ServerProxy(this, m_stream, m_events);
+    m_server = new ServerProxy(this, m_stream, m_events,
+                               m_protocolMinorVersion);
     m_events->adoptHandler(m_events->forIScreen().shapeChanged(),
                             getEventTarget(),
                             new TMethodEventJob<Client>(this,
@@ -1265,8 +1287,7 @@ Client::handleHello(const Event&, void*)
 
     // check versions
     LOG((CLOG_DEBUG1 "got hello version %d.%d", major, minor));
-    if (major < kProtocolMajorVersion ||
-        (major == kProtocolMajorVersion && minor < kProtocolMinorVersion)) {
+    if (!negotiateProtocolVersion(major, minor, m_protocolMinorVersion)) {
         sendConnectionFailedEvent(XIncompatibleClient(major, minor).what());
         cleanupTimer();
         cleanupConnection();
@@ -1274,10 +1295,11 @@ Client::handleHello(const Event&, void*)
     }
 
     // say hello back
-    LOG((CLOG_DEBUG1 "say hello version %d.%d", kProtocolMajorVersion, kProtocolMinorVersion));
+    LOG((CLOG_DEBUG1 "say hello version %d.%d", kProtocolMajorVersion,
+        m_protocolMinorVersion));
     ProtocolUtil::writef(m_stream, kMsgHelloBack,
                             kProtocolMajorVersion,
-                            kProtocolMinorVersion, &m_name);
+                            m_protocolMinorVersion, &m_name);
 
     // now connected but waiting to complete handshake
     setupScreen();

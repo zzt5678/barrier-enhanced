@@ -374,6 +374,7 @@ class ClientProxyEvents : public EventTypes {
 public:
     ClientProxyEvents() :
         m_ready(Event::kUnknown),
+        m_inputHandoffReady(Event::kUnknown),
         m_disconnected(Event::kUnknown) { }
 
     //! @name accessors
@@ -387,6 +388,9 @@ public:
     */
     Event::Type        ready();
 
+    //! Get input handoff readiness event type
+    Event::Type        inputHandoffReady();
+
     //! Get disconnect event type
     /*!
     Returns the disconnect event type.  This is sent when the client
@@ -398,6 +402,7 @@ public:
 
 private:
     Event::Type        m_ready;
+    Event::Type        m_inputHandoffReady;
     Event::Type        m_disconnected;
 };
 

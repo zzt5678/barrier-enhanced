@@ -67,6 +67,7 @@ const SInt32 kMinUsableScreenDimension = 64;
 const SInt32 kSwitchEdgeHysteresisInset = 16;
 const SInt32 kSwitchReverseClearDistance = 96;
 const double kSwitchReverseGuardMaxSeconds = 2.0;
+const double kInputHandoffTimeoutSeconds = 0.5;
 const int kClipboardReadAttempts = 8;
 const double kClipboardReadRetrySeconds = 0.025;
 const double kClipboardSyncDelaySeconds = 0.01;
@@ -241,6 +242,16 @@ Server::Server(
 		m_primaryClient(primaryClient),
 		m_active(primaryClient),
 		m_seqNum(0),
+		m_inputHandoffPending(false),
+		m_inputHandoffCommitReady(false),
+		m_inputHandoffSource(NULL),
+		m_inputHandoffTarget(NULL),
+		m_inputHandoffSeqNum(0),
+		m_inputHandoffX(0),
+		m_inputHandoffY(0),
+		m_inputHandoffMask(0),
+		m_inputHandoffGuardDir(kNoDirection),
+		m_inputHandoffTimer(NULL),
 		m_x(0),
 		m_y(0),
 		m_xDelta(0),
@@ -460,6 +471,7 @@ Server::~Server()
 		return;
 	}
 
+	cancelInputHandoff("server is shutting down", false);
 	discardPendingMouseMove();
 
 	if (!cleanupSendFileThread(true) && m_sendFileThread != NULL) {
@@ -595,8 +607,11 @@ Server::adoptClient(BaseClientProxy* client)
 
 	// watch for client disconnection
 	m_events->adoptHandler(m_events->forClientProxy().disconnected(), client,
-							new TMethodEventJob<Server>(this,
-								&Server::handleClientDisconnected, client));
+								new TMethodEventJob<Server>(this,
+									&Server::handleClientDisconnected, client));
+	m_events->adoptHandler(m_events->forClientProxy().inputHandoffReady(), client,
+								new TMethodEventJob<Server>(this,
+									&Server::handleInputHandoffReady, client));
 
 	// name must be in our configuration
 	if (!m_config->isScreen(client->getName())) {
@@ -778,6 +793,11 @@ Server::switchScreen(BaseClientProxy* dst,
 {
 	assert(dst != NULL);
 
+	if (m_inputHandoffPending &&
+		(dst != m_inputHandoffTarget || m_active != m_inputHandoffSource)) {
+		cancelInputHandoff("superseded by another switch", false);
+	}
+
 	if (!canEnterScreen(dst)) {
 		stopSwitch();
 		return false;
@@ -813,6 +833,12 @@ Server::switchScreen(BaseClientProxy* dst,
 
 	// stop waiting to switch
 	stopSwitch();
+
+	if (!m_inputHandoffCommitReady && m_active != dst &&
+		guardDir != kNoDirection && dst != m_primaryClient &&
+		dst->supportsInputHandoff()) {
+		return beginInputHandoff(dst, x, y, guardDir);
+	}
 
 	// wrapping means leaving the active screen and entering it again.
 	// since that's a waste of time we skip that and just warp the
@@ -861,12 +887,17 @@ Server::switchScreen(BaseClientProxy* dst,
 		// cut over
 		m_active = dst;
 
-		// increment enter sequence number
-		++m_seqNum;
+		if (m_inputHandoffCommitReady) {
+			m_seqNum = m_inputHandoffSeqNum;
+		}
+		else {
+			++m_seqNum;
+		}
 
 		// enter new screen
 		m_active->enter(x, y, m_seqNum,
-								m_primaryClient->getToggleMask(),
+								m_inputHandoffCommitReady ? m_inputHandoffMask :
+									m_primaryClient->getToggleMask(),
 								forScreensaver);
 		if (m_active == m_primaryClient) {
 			m_primaryClient->refreshKeyState();
@@ -895,6 +926,133 @@ Server::switchScreen(BaseClientProxy* dst,
 		}
 
 	return true;
+}
+
+bool
+Server::beginInputHandoff(BaseClientProxy* dst, SInt32 x, SInt32 y,
+						  EDirection guardDir)
+{
+	if (m_inputHandoffPending) {
+		if (m_inputHandoffSource == m_active &&
+			m_inputHandoffTarget == dst) {
+			return true;
+		}
+		cancelInputHandoff("superseded before readiness", false);
+	}
+
+	m_inputHandoffPending = true;
+	m_inputHandoffSource = m_active;
+	m_inputHandoffTarget = dst;
+	m_inputHandoffSeqNum = ++m_seqNum;
+	m_inputHandoffX = x;
+	m_inputHandoffY = y;
+	m_inputHandoffMask = m_primaryClient->getToggleMask();
+	m_inputHandoffGuardDir = guardDir;
+
+	LOG((CLOG_DEBUG1 "preparing input handoff from \"%s\" to \"%s\", seq=%u",
+		getName(m_inputHandoffSource).c_str(), getName(dst).c_str(),
+		m_inputHandoffSeqNum));
+	dst->prepareEnter(x, y, m_inputHandoffSeqNum, m_inputHandoffMask);
+
+	m_inputHandoffTimer =
+		m_events->newOneShotTimer(kInputHandoffTimeoutSeconds, NULL);
+	m_events->adoptHandler(Event::kTimer, m_inputHandoffTimer,
+		new TMethodEventJob<Server>(this,
+			&Server::handleInputHandoffTimeout, NULL));
+	return true;
+}
+
+void
+Server::cleanupInputHandoffTimer()
+{
+	if (m_inputHandoffTimer != NULL) {
+		m_events->removeHandler(Event::kTimer, m_inputHandoffTimer);
+		m_events->deleteTimer(m_inputHandoffTimer);
+		m_inputHandoffTimer = NULL;
+	}
+}
+
+void
+Server::cancelInputHandoff(const char* reason, bool reanchor, bool notifyTarget)
+{
+	if (!m_inputHandoffPending) {
+		return;
+	}
+
+	BaseClientProxy* source = m_inputHandoffSource;
+	BaseClientProxy* target = m_inputHandoffTarget;
+	const UInt32 seqNum = m_inputHandoffSeqNum;
+	LOG((CLOG_WARN "canceling input handoff to \"%s\", seq=%u: %s",
+		target != NULL ? getName(target).c_str() : "unknown", seqNum, reason));
+
+	cleanupInputHandoffTimer();
+	m_inputHandoffPending = false;
+	m_inputHandoffCommitReady = false;
+	m_inputHandoffSource = NULL;
+	m_inputHandoffTarget = NULL;
+	m_inputHandoffGuardDir = kNoDirection;
+
+	if (notifyTarget && target != NULL && m_clientSet.count(target) != 0) {
+		target->abortEnter(seqNum);
+	}
+
+	if (reanchor && source != NULL && m_active == source) {
+		if (source == m_primaryClient) {
+			recoverPrimaryAfterSwitchFailure(m_x, m_y);
+		}
+		else {
+			reanchorActiveAfterFailedSwitch(target);
+		}
+	}
+}
+
+void
+Server::handleInputHandoffReady(const Event& event, void* vclient)
+{
+	BaseClientProxy* client = static_cast<BaseClientProxy*>(vclient);
+	BaseClientProxy::InputHandoffReadyInfo* info =
+		static_cast<BaseClientProxy::InputHandoffReadyInfo*>(
+			event.getDataObject() != NULL ? event.getDataObject() :
+			static_cast<EventData*>(event.getData()));
+	if (info == NULL || !m_inputHandoffPending ||
+		client != m_inputHandoffTarget ||
+		info->m_seqNum != m_inputHandoffSeqNum) {
+		LOG((CLOG_DEBUG1 "ignoring stale input handoff readiness"));
+		return;
+	}
+
+	if (!info->m_ready) {
+		cancelInputHandoff("target rejected readiness", true);
+		return;
+	}
+	if (m_active != m_inputHandoffSource ||
+		m_clientSet.count(client) == 0) {
+		cancelInputHandoff("source or target changed before commit", false);
+		return;
+	}
+
+	const SInt32 x = m_inputHandoffX;
+	const SInt32 y = m_inputHandoffY;
+	const EDirection guardDir = m_inputHandoffGuardDir;
+	cleanupInputHandoffTimer();
+	m_inputHandoffPending = false;
+	m_inputHandoffCommitReady = true;
+
+	const bool committed = switchScreen(client, x, y, false, guardDir);
+	m_inputHandoffCommitReady = false;
+	m_inputHandoffSource = NULL;
+	m_inputHandoffTarget = NULL;
+	m_inputHandoffGuardDir = kNoDirection;
+	if (!committed) {
+		client->abortEnter(info->m_seqNum);
+		reanchorActiveAfterFailedSwitch(client);
+	}
+}
+
+void
+Server::handleInputHandoffTimeout(const Event&, void*)
+{
+	cancelInputHandoff("target readiness timed out", true);
 }
 
 bool
@@ -1687,6 +1845,9 @@ Server::isSwitchOkay(BaseClientProxy* newScreen,
 void
 Server::noSwitch(SInt32 x, SInt32 y)
 {
+	if (m_inputHandoffPending) {
+		cancelInputHandoff("pointer left the switch edge", false);
+	}
 	armSwitchTwoTap(x, y);
 	stopSwitchWait();
 }
@@ -3789,6 +3950,12 @@ Server::removeClient(BaseClientProxy* client)
 	if (i == m_clientSet.end()) {
 		return false;
 	}
+	if (m_inputHandoffPending && client == m_inputHandoffTarget) {
+		cancelInputHandoff("handoff target disconnected", true, false);
+	}
+	else if (m_inputHandoffPending && client == m_inputHandoffSource) {
+		cancelInputHandoff("handoff source disconnected", false);
+	}
 	discardPendingMouseMove(client);
 	if (m_pendingFileClipboardPrefetchTarget == client) {
 		m_pendingFileClipboardPrefetchTarget = NULL;
@@ -3801,7 +3968,8 @@ Server::removeClient(BaseClientProxy* client)
 	m_events->removeHandler(m_events->forClipboard().clipboardGrabbed(),
 							client->getEventTarget());
 	m_events->removeHandler(m_events->forClipboard().clipboardChanged(),
-							client->getEventTarget());
+								client->getEventTarget());
+	m_events->removeHandler(m_events->forClientProxy().inputHandoffReady(), client);
 
 	// remove from list
 	m_clients.erase(getName(client));
@@ -3895,6 +4063,7 @@ Server::removeOldClient(BaseClientProxy* client)
 	OldClients::iterator i = m_oldClients.find(client);
 	if (i != m_oldClients.end()) {
 		m_events->removeHandler(m_events->forClientProxy().disconnected(), client);
+		m_events->removeHandler(m_events->forClientProxy().inputHandoffReady(), client);
 		m_events->removeHandler(Event::kTimer, i->second);
 		m_events->deleteTimer(i->second);
 		m_oldClients.erase(i);
