@@ -37,6 +37,7 @@ class MSWindowsKeyState;
 class MSWindowsScreenSaver;
 class Thread;
 class MSWindowsDropTarget;
+class MSWindowsClipboardBridge;
 
 //! Implementation of IPlatformScreen for Microsoft Windows
 class MSWindowsScreen : public PlatformScreen {
@@ -298,6 +299,8 @@ private:
     bool                m_ownClipboard;
     MSWindowsClipboardChangeTracker
                         m_clipboardChangeTracker;
+    MSWindowsClipboardBridge*
+                        m_clipboardBridge;
 
     // one desk per desktop and a cond var to communicate with it
     MSWindowsDesks*    m_desks;

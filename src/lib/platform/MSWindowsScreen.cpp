@@ -40,7 +40,7 @@
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
 #include "io/filesystem.h"
-#include "common/win32/SessionUserImpersonation.h"
+#include "platform/MSWindowsClipboardBridge.h"
 
 #include <string.h>
 #include <sstream>
@@ -117,6 +117,7 @@ MSWindowsScreen::MSWindowsScreen(
     m_window(NULL),
     m_nextClipboardWindow(NULL),
     m_ownClipboard(false),
+    m_clipboardBridge(NULL),
     m_desks(NULL),
     m_keyState(NULL),
     m_hasMouse(GetSystemMetrics(SM_MOUSEPRESENT) != 0),
@@ -143,6 +144,8 @@ MSWindowsScreen::MSWindowsScreen(
         updateScreenShape();
         m_class       = createWindowClass();
         m_window      = createWindow(m_class, "Barrier");
+        m_clipboardBridge = new MSWindowsClipboardBridge();
+        m_clipboardBridge->warmUp();
         forceShowCursor();
         LOG((CLOG_DEBUG "screen shape: %d,%d %dx%d %s", m_x, m_y, m_w, m_h, m_multimon ? "(multi-monitor)" : ""));
         LOG((CLOG_DEBUG "window is 0x%08x", m_window));
@@ -153,6 +156,7 @@ MSWindowsScreen::MSWindowsScreen(
         RegisterDragDrop(m_dropWindow, m_dropTarget);
     }
     catch (...) {
+        delete m_clipboardBridge;
         delete m_keyState;
         delete m_desks;
         delete m_screensaver;
@@ -181,6 +185,7 @@ MSWindowsScreen::~MSWindowsScreen()
     delete m_keyState;
     delete m_desks;
     delete m_screensaver;
+    delete m_clipboardBridge;
     destroyWindow(m_window);
     destroyClass(m_class);
 
@@ -525,17 +530,18 @@ MSWindowsScreen::getClipboard(ClipboardID id, IClipboard* dst) const
         return false;
     }
 
-    SessionUserImpersonation impersonation;
-    if (!impersonation.ready()) {
-        LOG((CLOG_WARN "could not use the active session user identity to read the clipboard: "
-             "failure=%s session=%lu error=%lu", impersonation.failureName(),
-             impersonation.sessionId(), impersonation.error()));
+    std::string bridgeError;
+    const MSWindowsClipboardBridge::ReadResult bridgeResult =
+        m_clipboardBridge->readSnapshot(dst, dst->getTime(), &bridgeError);
+    if (bridgeResult == MSWindowsClipboardBridge::ReadResult::Succeeded) {
+        return true;
+    }
+    if (bridgeResult == MSWindowsClipboardBridge::ReadResult::Failed) {
+        LOG((CLOG_WARN "could not read the active-session clipboard: %s",
+             bridgeError.c_str()));
         return false;
     }
-    if (impersonation.required()) {
-        LOG((CLOG_DEBUG "reading clipboard as the active session user: session=%lu",
-             impersonation.sessionId()));
-    }
+
     MSWindowsClipboard src(m_window);
     constexpr int kClipboardReadAttempts = 8;
     constexpr double kClipboardReadRetrySeconds = 0.025;
@@ -545,34 +551,12 @@ MSWindowsScreen::getClipboard(ClipboardID id, IClipboard* dst) const
             if (attempt > 0) {
                 LOG((CLOG_DEBUG "clipboard read succeeded after %d retry attempt(s)", attempt));
             }
-            const bool restored = impersonation.finish();
-            if (!restored) {
-                LOG((CLOG_ERR "could not restore the process identity after reading the clipboard: "
-                     "failure=%s error=%lu", impersonation.failureName(),
-                     impersonation.error()));
-            }
-            else if (impersonation.usedRevertFallback()) {
-                LOG((CLOG_WARN "RevertToSelf failed after reading the clipboard; "
-                     "the fallback cleared the thread token: error=%lu",
-                     impersonation.revertError()));
-            }
-            return restored;
+            return true;
         }
 
         ARCH->sleep(kClipboardReadRetrySeconds);
     }
 
-    const bool restored = impersonation.finish();
-    if (!restored) {
-        LOG((CLOG_ERR "could not restore the process identity after the clipboard read failed: "
-             "failure=%s error=%lu", impersonation.failureName(),
-             impersonation.error()));
-    }
-    else if (impersonation.usedRevertFallback()) {
-        LOG((CLOG_WARN "RevertToSelf failed after the clipboard read failed; "
-             "the fallback cleared the thread token: error=%lu",
-             impersonation.revertError()));
-    }
     LOG((CLOG_WARN "failed to read clipboard after %d attempts", kClipboardReadAttempts));
     return false;
 }

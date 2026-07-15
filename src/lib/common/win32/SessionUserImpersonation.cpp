@@ -90,6 +90,19 @@ SessionUserImpersonation::SessionUserImpersonation() :
     m_impersonating = true;
 }
 
+bool
+SessionUserImpersonation::queryRequired(bool& required, DWORD& error)
+{
+    const LocalSystemStatus status = localSystemStatus(error);
+    if (status == LocalSystemStatus::Unknown) {
+        required = true;
+        return false;
+    }
+
+    required = status == LocalSystemStatus::Yes;
+    return true;
+}
+
 SessionUserImpersonation::~SessionUserImpersonation()
 {
     finish();

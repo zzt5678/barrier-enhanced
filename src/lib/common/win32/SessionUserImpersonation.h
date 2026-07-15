@@ -17,6 +17,8 @@ public:
     SessionUserImpersonation();
     ~SessionUserImpersonation();
 
+    static bool queryRequired(bool& required, DWORD& error);
+
     bool ready() const;
     bool finish();
     const char* failureName() const;
