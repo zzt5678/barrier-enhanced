@@ -463,7 +463,14 @@ Client::leave()
     if (m_enableClipboard && m_server != NULL) {
         // Windows can miss the clipboard-viewer notification and only
         // discover the new owner during Screen::leave(). Defer the snapshot
-        // so clipboard providers cannot block the input handoff.
+        // so clipboard providers cannot block the input handoff. A previous
+        // one-shot timer may be stale after rapid enter/leave cycles, so each
+        // leave creates a fresh snapshot attempt.
+        cleanupClipboardRetryTimer();
+        for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+            m_clipboardRetryPending[id] = false;
+            m_clipboardRetryCount[id] = 0;
+        }
         for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
             if (id == kClipboardClipboard || m_ownClipboard[id]) {
                 scheduleClipboardRetry(id);

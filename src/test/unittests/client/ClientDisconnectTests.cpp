@@ -2493,6 +2493,62 @@ TEST(ClientDisconnectTests, leaveDefersClipboardReadAndDoesNotRetryUnsupportedSe
     EXPECT_FALSE(client.testClipboardRetryPending(kClipboardClipboard));
 }
 
+TEST(ClientDisconnectTests, repeatedLeaveRearmsDeferredClipboardSnapshot)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    UInt32 timersCreated = 0;
+    std::vector<EventQueueTimer*> deletedTimers;
+    ON_CALL(events, newOneShotTimer(_, _))
+        .WillByDefault(Invoke([&timersCreated](double, void*) {
+            ++timersCreated;
+            return reinterpret_cast<EventQueueTimer*>(
+                static_cast<uintptr_t>(timersCreated));
+        }));
+    ON_CALL(events, deleteTimer(_))
+        .WillByDefault(Invoke([&deletedTimers](EventQueueTimer* timer) {
+            deletedTimers.push_back(timer);
+        }));
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+    const UInt32 baselineTimers = timersCreated;
+
+    client.enter(0, 0, 1, 0, false);
+    ASSERT_TRUE(client.leave());
+    ASSERT_EQ(baselineTimers + 1, timersCreated);
+
+    client.enter(0, 0, 2, 0, false);
+    ASSERT_TRUE(client.leave());
+
+    EXPECT_EQ(baselineTimers + 2, timersCreated);
+    ASSERT_EQ(1u, deletedTimers.size());
+    EXPECT_EQ(reinterpret_cast<EventQueueTimer*>(
+                  static_cast<uintptr_t>(baselineTimers + 1)),
+              deletedTimers[0]);
+    EXPECT_TRUE(client.testClipboardRetryPending(kClipboardClipboard));
+}
+
 TEST(ClientDisconnectTests, imageFileListClipboardIsNotDowngradedToPngAndSent)
 {
     NiceMock<MockEventQueue> events;
