@@ -82,8 +82,11 @@ ClientApp::parseArgs(int argc, const char* const* argv)
     ArgParser argParser(this);
     bool result = argParser.parseClientArgs(args(), argc, argv);
 
-    if (!result || args().m_shouldExit) {
+    if (!result) {
         m_bye(kExitArgs);
+    }
+    else if (args().m_shouldExit) {
+        m_bye(kExitSuccess);
     }
     else {
         // save server address

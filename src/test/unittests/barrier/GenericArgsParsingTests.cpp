@@ -17,6 +17,7 @@
 
 #include "barrier/ArgParser.h"
 #include "barrier/ArgsBase.h"
+#include "common/Version.h"
 #include "test/mock/barrier/MockApp.h"
 
 #include "test/global/gtest.h"
@@ -39,6 +40,15 @@ void
 showMockVersion()
 {
     g_versionShowed = true;
+}
+
+TEST(VersionMetadataTests, buildIdentityIncludesRevisionAndDate)
+{
+    EXPECT_EQ(8u, std::string(kBuildRevision).size());
+    EXPECT_EQ(8u, std::string(kBuildDate).size());
+    EXPECT_NE(std::string::npos, std::string(kBuildId).find(kVersion));
+    EXPECT_NE(std::string::npos, std::string(kBuildId).find(kBuildRevision));
+    EXPECT_NE(std::string::npos, std::string(kBuildId).find(kBuildDate));
 }
 
 TEST(GenericArgsParsingTests, parseGenericArgs_logLevelCmd_setLogLevel)

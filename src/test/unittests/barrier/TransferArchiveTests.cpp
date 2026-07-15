@@ -102,8 +102,25 @@ std::string makeSingleFilePackage(const std::string& relativePath,
     appendUInt64(data, static_cast<std::uint64_t>(payload.size()));
     data.append(payload);
     data.push_back('E');
-    appendUInt32(data, 0);
     return data;
+}
+
+void appendDirectoryEntry(std::string& data, const std::string& relativePath)
+{
+    data.push_back('D');
+    appendUInt32(data, static_cast<std::uint32_t>(relativePath.size()));
+    data.append(relativePath);
+}
+
+void appendFileEntry(std::string& data,
+                     const std::string& relativePath,
+                     const std::string& payload)
+{
+    data.push_back('F');
+    appendUInt32(data, static_cast<std::uint32_t>(relativePath.size()));
+    data.append(relativePath);
+    appendUInt64(data, static_cast<std::uint64_t>(payload.size()));
+    data.append(payload);
 }
 
 }
@@ -275,6 +292,259 @@ TEST(TransferArchiveTests, extractPackage_rejectsTraversalPathWithoutWritingOuts
 
     barrier::fs::remove_all(root);
 }
+
+TEST(TransferArchiveTests, extractPackage_rejectsDuplicateNormalizedPathBeforeWriting)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-duplicate-path-" + uniqueToken());
+    const barrier::fs::path destination = root / "destination";
+
+    std::string packageData("BDIRPKG1", 8);
+    appendFileEntry(packageData, "folder/../same.txt", "first");
+    appendFileEntry(packageData, "same.txt", "second");
+    packageData.push_back('E');
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(packageData, destination, error));
+    EXPECT_EQ("duplicate or conflicting path in transfer package", error);
+    EXPECT_FALSE(barrier::fs::exists(destination));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, extractPackageFile_rejectsDuplicatePathBeforeWriting)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-file-duplicate-" + uniqueToken());
+    barrier::fs::create_directories(root);
+    const barrier::fs::path packagePath = root / "duplicate.bdir";
+    const barrier::fs::path destination = root / "destination";
+
+    std::string packageData("BDIRPKG1", 8);
+    appendFileEntry(packageData, "same.txt", "first");
+    appendFileEntry(packageData, "same.txt", "second");
+    packageData.push_back('E');
+    {
+        std::ofstream package;
+        barrier::open_utf8_path(package, packagePath, std::ios::out | std::ios::binary | std::ios::trunc);
+        package.write(packageData.data(), static_cast<std::streamsize>(packageData.size()));
+    }
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackageFile(packagePath, destination, error));
+    EXPECT_EQ("duplicate or conflicting path in transfer package", error);
+    EXPECT_FALSE(barrier::fs::exists(destination));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, extractPackage_rejectsPathBeyondMaximumDepthBeforeWriting)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-deep-path-" + uniqueToken());
+    const barrier::fs::path destination = root / "destination";
+
+    std::string deepPath;
+    for (int i = 0; i < 65; ++i) {
+        if (!deepPath.empty()) {
+            deepPath += '/';
+        }
+        deepPath += "d";
+    }
+
+    std::string packageData("BDIRPKG1", 8);
+    appendDirectoryEntry(packageData, deepPath);
+    packageData.push_back('E');
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(packageData, destination, error));
+    EXPECT_EQ("transfer package path is too deep", error);
+    EXPECT_FALSE(barrier::fs::exists(destination));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, extractPackage_rejectsInvalidUtf8PathBeforeWriting)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-invalid-utf8-" + uniqueToken());
+    const barrier::fs::path destination = root / "destination";
+    const std::string invalidPath("bad\xc3\x28.txt", 9);
+    const std::string packageData = makeSingleFilePackage(invalidPath, "payload");
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(packageData, destination, error));
+    EXPECT_EQ("invalid transfer package path encoding", error);
+    EXPECT_FALSE(barrier::fs::exists(destination));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, extractPackage_rejectsTooManyEntriesBeforeWriting)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-entry-limit-" + uniqueToken());
+    const barrier::fs::path destination = root / "destination";
+
+    std::string packageData("BDIRPKG1", 8);
+    for (std::size_t i = 0; i < 65537; ++i) {
+        appendDirectoryEntry(packageData, "d" + std::to_string(i));
+    }
+    packageData.push_back('E');
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(packageData, destination, error));
+    EXPECT_EQ("transfer package has too many entries", error);
+    EXPECT_FALSE(barrier::fs::exists(destination));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, extractPackage_rejectsTrailingDataAfterEndMarker)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-trailing-data-" + uniqueToken());
+    const barrier::fs::path destination = root / "destination";
+    const std::string packageData("BDIRPKG1Etrailing", 17);
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(packageData, destination, error));
+    EXPECT_EQ("transfer package has trailing data", error);
+    EXPECT_FALSE(barrier::fs::exists(destination));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, extractPackageFile_rejectsTrailingDataAfterEndMarker)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-file-trailing-" + uniqueToken());
+    barrier::fs::create_directories(root);
+    const barrier::fs::path packagePath = root / "trailing.bdir";
+    const barrier::fs::path destination = root / "destination";
+    {
+        std::ofstream package;
+        barrier::open_utf8_path(package, packagePath, std::ios::out | std::ios::binary | std::ios::trunc);
+        package.write("BDIRPKG1Etrailing", 17);
+    }
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackageFile(packagePath, destination, error));
+    EXPECT_EQ("transfer package has trailing data", error);
+    EXPECT_FALSE(barrier::fs::exists(destination));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, createSelectionPackageFile_rejectsOversizedExpandedPayload)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-source-size-" + uniqueToken());
+    barrier::fs::create_directories(root);
+    const barrier::fs::path sourcePath = root / "oversized.bin";
+    {
+        std::ofstream source;
+        barrier::open_utf8_path(source, sourcePath, std::ios::out | std::ios::binary | std::ios::trunc);
+        source.seekp(static_cast<std::streamoff>(512) * 1024 * 1024);
+        source.put('x');
+    }
+
+    barrier::fs::path packagePath;
+    std::string error;
+    EXPECT_FALSE(TransferArchive::createSelectionPackageFile({sourcePath}, packagePath, error));
+    EXPECT_EQ("transfer package expanded size exceeds limit", error);
+    EXPECT_TRUE(packagePath.empty());
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, createSelectionPackageFile_rejectsPayloadWhoseArchiveExceedsTransportLimit)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-package-size-" + uniqueToken());
+    barrier::fs::create_directories(root);
+    const barrier::fs::path sourcePath = root / "maximum.bin";
+    {
+        std::ofstream source;
+        barrier::open_utf8_path(source, sourcePath, std::ios::out | std::ios::binary | std::ios::trunc);
+        source.seekp(static_cast<std::streamoff>(512) * 1024 * 1024 - 1);
+        source.put('x');
+    }
+
+    barrier::fs::path packagePath;
+    std::string error;
+    EXPECT_FALSE(TransferArchive::createSelectionPackageFile({sourcePath}, packagePath, error));
+    EXPECT_EQ("transfer package exceeds size limit", error);
+    EXPECT_TRUE(packagePath.empty());
+
+    barrier::fs::remove_all(root);
+}
+
+#ifndef WIN32
+TEST(TransferArchiveTests, createSelectionPackageFile_rejectsRootSymbolicLink)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-source-link-" + uniqueToken());
+    barrier::fs::create_directories(root);
+    const barrier::fs::path targetPath = root / "target.txt";
+    const barrier::fs::path linkPath = root / "link.txt";
+    {
+        std::ofstream target;
+        barrier::open_utf8_path(target, targetPath, std::ios::out | std::ios::binary | std::ios::trunc);
+        target << "payload";
+    }
+    barrier::fs::create_symlink(targetPath, linkPath);
+
+    barrier::fs::path packagePath;
+    std::string error;
+    EXPECT_FALSE(TransferArchive::createSelectionPackageFile({linkPath}, packagePath, error));
+    EXPECT_EQ("symbolic links are not supported in file transfer", error);
+    EXPECT_TRUE(packagePath.empty());
+
+    barrier::fs::remove_all(root);
+}
+#endif
+
+#ifdef WIN32
+TEST(TransferArchiveTests, extractPackage_rejectsWindowsUnsafeNamesBeforeWriting)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-windows-name-" + uniqueToken());
+    const barrier::fs::path destination = root / "destination";
+    const std::array<const char*, 5> unsafePaths{{
+        "file.txt:secret", "CON.txt", "folder./file.txt", "bad<name.txt", "C:drive-relative.txt"
+    }};
+
+    for (const char* unsafePath : unsafePaths) {
+        std::string packageData = makeSingleFilePackage(unsafePath, "payload");
+        std::string error;
+        EXPECT_FALSE(TransferArchive::extractPackage(packageData, destination, error)) << unsafePath;
+        EXPECT_EQ("unsafe Windows path in transfer package", error) << unsafePath;
+        EXPECT_FALSE(barrier::fs::exists(destination)) << unsafePath;
+    }
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, extractPackage_rejectsWindowsCaseFoldCollisionBeforeWriting)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-windows-collision-" + uniqueToken());
+    const barrier::fs::path destination = root / "destination";
+
+    std::string packageData("BDIRPKG1", 8);
+    appendFileEntry(packageData, "Readme.txt", "first");
+    appendFileEntry(packageData, "README.TXT", "second");
+    packageData.push_back('E');
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(packageData, destination, error));
+    EXPECT_EQ("duplicate or conflicting path in transfer package", error);
+    EXPECT_FALSE(barrier::fs::exists(destination));
+
+    barrier::fs::remove_all(root);
+}
+#endif
 
 TEST(TransferArchiveTests, dragInfo_roundTripsDirectoryType)
 {

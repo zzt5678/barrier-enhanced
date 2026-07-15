@@ -27,3 +27,6 @@ const char* kContact     = "Email: todo@mail.com";
 const char* kWebsite     = "https://github.com/debauchee/barrier/";
 const char* kVersion     = BARRIER_VERSION;
 const char* kAppVersion  = "Barrier " BARRIER_VERSION;
+const char* kBuildRevision = BARRIER_REVISION;
+const char* kBuildDate     = BARRIER_BUILD_DATE;
+const char* kBuildId       = BARRIER_VERSION "+" BARRIER_REVISION "." BARRIER_BUILD_DATE;

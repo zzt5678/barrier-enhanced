@@ -31,6 +31,7 @@
 #include "ipc/Ipc.h"
 #include "base/EventQueue.h"
 #include "common/DataDirectories.h"
+#include "io/filesystem.h"
 
 #if SYSAPI_WIN32
 #include "base/IEventQueue.h"
@@ -80,6 +81,7 @@ void
 App::version()
 {
     std::cout << argsBase().m_exename << " " << kVersion << "\n";
+    std::cout << "Build ID " << kBuildId << "\n";
     std::cout <<"Protocol version " << kProtocolMajorVersion << "." << kProtocolMinorVersion << "\n";
     std::cout << kCopyright << "\n";
 }
@@ -183,6 +185,17 @@ App::initApp(int argc, const char** argv)
 
     // setup file logging after parsing args
     setupFileLogging();
+
+    std::string executablePath = argc > 0 && argv[0] != nullptr ? argv[0] : "unknown";
+    try {
+        executablePath = barrier::fs::absolute(barrier::fs::u8path(executablePath))
+            .lexically_normal().u8string();
+    }
+    catch (...) {
+        // Keep argv[0] when the platform cannot resolve an absolute path.
+    }
+    LOG((CLOG_INFO "build identity: %s; executable: %s",
+        kBuildId, executablePath.c_str()));
 
     // load configuration
     loadConfig();
