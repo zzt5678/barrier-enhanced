@@ -99,7 +99,9 @@ private:
 #endif
     // if compressing mouse motion then send the last motion now
     void                flushCompressedMouse();
+    void                discardCompressedMouse();
     bool                shouldCompressMouseMoves() const;
+    bool                hasActivePointerLease(const char* inputType) const;
     void                clearStaleInfoAckGate();
 
     void                sendInfo(const ClientInfo&);
@@ -155,6 +157,8 @@ private:
     barrier::IStream*    m_stream;
 
     UInt32                m_seqNum;
+    bool                  m_hasEnterSequence;
+    bool                  m_inputActive;
 
     bool                m_compressMouse;
     bool                m_compressMouseRelative;

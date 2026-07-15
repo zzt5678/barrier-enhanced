@@ -461,53 +461,74 @@ Client::setClipboardDirty(ClipboardID, bool)
     assert(0 && "shouldn't be called");
 }
 
+bool
+Client::hasActivePointerLease(const char* inputType) const
+{
+    if (m_active) {
+        return true;
+    }
+
+    LOG((CLOG_DEBUG1 "dropping %s without an active input lease", inputType));
+    return false;
+}
+
 void
 Client::keyDown(KeyID id, KeyModifierMask mask, KeyButton button)
 {
-     m_screen->keyDown(id, mask, button);
+    m_screen->keyDown(id, mask, button);
 }
 
 void
 Client::keyRepeat(KeyID id, KeyModifierMask mask,
                 SInt32 count, KeyButton button)
 {
-     m_screen->keyRepeat(id, mask, count, button);
+    m_screen->keyRepeat(id, mask, count, button);
 }
 
 void
 Client::keyUp(KeyID id, KeyModifierMask mask, KeyButton button)
 {
-     m_screen->keyUp(id, mask, button);
+    m_screen->keyUp(id, mask, button);
 }
 
 void
 Client::mouseDown(ButtonID id)
 {
-     m_screen->mouseDown(id);
+    if (hasActivePointerLease("mouse down")) {
+        m_screen->mouseDown(id);
+    }
 }
 
 void
 Client::mouseUp(ButtonID id)
 {
-     m_screen->mouseUp(id);
+    if (hasActivePointerLease("mouse up")) {
+        m_screen->mouseUp(id);
+    }
 }
 
 void
 Client::mouseMove(SInt32 x, SInt32 y)
 {
-    m_screen->mouseMove(x, y);
+    if (hasActivePointerLease("mouse move")) {
+        m_screen->mouseMove(x, y);
+    }
 }
 
 void
 Client::mouseRelativeMove(SInt32 dx, SInt32 dy)
 {
-    m_screen->mouseRelativeMove(dx, dy);
+    if (hasActivePointerLease("relative mouse move")) {
+        m_screen->mouseRelativeMove(dx, dy);
+    }
 }
 
 void
 Client::mouseWheel(SInt32 xDelta, SInt32 yDelta)
 {
-    m_screen->mouseWheel(xDelta, yDelta);
+    if (hasActivePointerLease("mouse wheel")) {
+        m_screen->mouseWheel(xDelta, yDelta);
+    }
 }
 
 void
@@ -919,6 +940,9 @@ Client::cleanupConnection()
 void
 Client::cleanupScreen()
 {
+    // Revoke the logical pointer lease before any cleanup can defer or return.
+    // Screen::disable() releases the platform state for a ready connection.
+    m_active = false;
     releaseDetachedServerProxies();
     cleanupClipboardRetryTimer();
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {

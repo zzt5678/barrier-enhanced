@@ -44,6 +44,12 @@ const size_t kMaxFramesPerInputBatch = 64;
 const size_t kMaxBytesPerInputBatch = 256 * 1024;
 const double kMaxSecondsPerInputBatch = 0.002;
 
+bool isNewerInputSequence(UInt32 candidate, UInt32 current)
+{
+    const UInt32 distance = candidate - current;
+    return distance != 0 && distance < 0x80000000u;
+}
+
 }
 
 //
@@ -54,6 +60,8 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_client(client),
     m_stream(stream),
     m_seqNum(0),
+    m_hasEnterSequence(false),
+    m_inputActive(false),
     m_compressMouse(false),
     m_compressMouseRelative(false),
     m_xMouse(0),
@@ -646,6 +654,11 @@ ServerProxy::detachForDeferredCleanup()
 void
 ServerProxy::flushCompressedMouse()
 {
+    if (!m_inputActive) {
+        discardCompressedMouse();
+        return;
+    }
+
     if (m_compressMouse) {
         m_compressMouse = false;
         m_client->mouseMove(m_xMouse, m_yMouse);
@@ -656,6 +669,26 @@ ServerProxy::flushCompressedMouse()
         m_dxMouse = 0;
         m_dyMouse = 0;
     }
+}
+
+void
+ServerProxy::discardCompressedMouse()
+{
+    m_compressMouse = false;
+    m_compressMouseRelative = false;
+    m_dxMouse = 0;
+    m_dyMouse = 0;
+}
+
+bool
+ServerProxy::hasActivePointerLease(const char* inputType) const
+{
+    if (m_inputActive) {
+        return true;
+    }
+
+    LOG((CLOG_DEBUG1 "dropping %s outside the active enter sequence", inputType));
+    return false;
 }
 
 bool
@@ -805,15 +838,26 @@ ServerProxy::enter()
     UInt16 mask;
     UInt32 seqNum;
     ProtocolUtil::readf(m_stream, kMsgCEnter + 4, &x, &y, &seqNum, &mask);
-    LOG((CLOG_DEBUG1 "recv enter, %d,%d %d %04x", x, y, seqNum, mask));
+    LOG((CLOG_DEBUG1 "recv enter, %d,%d %u %04x", x, y, seqNum, mask));
+
+    if (m_hasEnterSequence && !isNewerInputSequence(seqNum, m_seqNum)) {
+        LOG((CLOG_WARN "ignoring stale enter sequence %u; current=%u", seqNum, m_seqNum));
+        return;
+    }
+
+    if (m_inputActive) {
+        LOG((CLOG_WARN "replacing active input lease %u with %u", m_seqNum, seqNum));
+        discardCompressedMouse();
+        m_inputActive = false;
+        m_client->leave();
+    }
 
     // discard old compressed mouse motion, if any
-    m_compressMouse         = false;
-    m_compressMouseRelative = false;
-    m_dxMouse               = 0;
-    m_dyMouse               = 0;
+    discardCompressedMouse();
     m_seqNum                = seqNum;
+    m_hasEnterSequence      = true;
     m_ignoreMouse           = false;
+    m_inputActive           = true;
 
     // forward
     m_client->enter(x, y, seqNum, static_cast<KeyModifierMask>(mask), false);
@@ -825,10 +869,17 @@ ServerProxy::leave()
     // parse
     LOG((CLOG_DEBUG1 "recv leave"));
 
+    if (!m_inputActive) {
+        discardCompressedMouse();
+        LOG((CLOG_DEBUG1 "ignoring leave without an active input lease"));
+        return;
+    }
+
     // send last mouse motion
     flushCompressedMouse();
 
     // forward
+    m_inputActive = false;
     m_client->leave();
 }
 
@@ -896,6 +947,9 @@ ServerProxy::keyDown()
         LOG((CLOG_DEBUG1 "key down translated to id=0x%08x, mask=0x%04x", id2, mask2));
 
     // forward
+    // Keyboard broadcast intentionally targets inactive screens.  The 1.6
+    // protocol has no broadcast marker, so keyboard events cannot use the
+    // pointer lease gate without breaking that feature.
     m_client->keyDown(id2, mask2, button);
 }
 
@@ -958,7 +1012,9 @@ ServerProxy::mouseDown()
     LOG((CLOG_DEBUG1 "recv mouse down id=%d", id));
 
     // forward
-    m_client->mouseDown(static_cast<ButtonID>(id));
+    if (hasActivePointerLease("mouse down")) {
+        m_client->mouseDown(static_cast<ButtonID>(id));
+    }
 }
 
 void
@@ -973,7 +1029,9 @@ ServerProxy::mouseUp()
     LOG((CLOG_DEBUG1 "recv mouse up id=%d", id));
 
     // forward
-    m_client->mouseUp(static_cast<ButtonID>(id));
+    if (hasActivePointerLease("mouse up")) {
+        m_client->mouseUp(static_cast<ButtonID>(id));
+    }
 }
 
 void
@@ -986,7 +1044,7 @@ ServerProxy::mouseMove()
 
     // note if we should ignore the move
     clearStaleInfoAckGate();
-    ignore = m_ignoreMouse;
+    ignore = m_ignoreMouse || !hasActivePointerLease("mouse move");
 
     // compress mouse motion events if more input follows
     if (!ignore && shouldCompressMouseMoves() &&
@@ -1021,7 +1079,7 @@ ServerProxy::mouseRelativeMove()
 
     // note if we should ignore the move
     clearStaleInfoAckGate();
-    ignore = m_ignoreMouse;
+    ignore = m_ignoreMouse || !hasActivePointerLease("relative mouse move");
 
     // compress mouse motion events if more input follows
     if (!ignore && shouldCompressMouseMoves() &&
@@ -1055,7 +1113,9 @@ ServerProxy::mouseWheel()
     LOG((CLOG_DEBUG2 "recv mouse wheel %+d,%+d", xDelta, yDelta));
 
     // forward
-    m_client->mouseWheel(xDelta, yDelta);
+    if (hasActivePointerLease("mouse wheel")) {
+        m_client->mouseWheel(xDelta, yDelta);
+    }
 }
 
 void

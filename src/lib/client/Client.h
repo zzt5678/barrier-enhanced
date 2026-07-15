@@ -259,6 +259,7 @@ private:
     void                sendClipboardThread(void*);
     void                sendClipboardSelectionToServer(const std::vector<barrier::fs::path>& sourcePaths);
     void                startPendingFileClipboardPrefetch();
+    bool                hasActivePointerLease(const char* inputType) const;
 
 public:
     bool                m_mock;

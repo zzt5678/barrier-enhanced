@@ -9,6 +9,7 @@
 #include "barrier/IPlatformScreen.h"
 #include "barrier/RemoteFileClipboard.h"
 #include "barrier/StreamChunker.h"
+#include "barrier/ProtocolUtil.h"
 #include "barrier/protocol_types.h"
 #include "barrier/Screen.h"
 #include "arch/Arch.h"
@@ -24,8 +25,9 @@
 #include "test/mock/barrier/MockEventQueue.h"
 #include "test/mock/io/MockStream.h"
 
-#include <fstream>
 #include <atomic>
+#include <cstring>
+#include <fstream>
 #include <system_error>
 #include <vector>
 
@@ -80,7 +82,15 @@ public:
     EnterPlatformScreen() :
         IPlatformScreen(NULL),
         enterCount(0),
+        leaveCount(0),
         mouseMoveCount(0),
+        mouseRelativeMoveCount(0),
+        mouseWheelCount(0),
+        mouseDownCount(0),
+        mouseUpCount(0),
+        keyDownCount(0),
+        keyRepeatCount(0),
+        keyUpCount(0),
         setClipboardCount(0),
         getClipboardCount(0),
         lastSetClipboardWasNull(false),
@@ -93,7 +103,11 @@ public:
     void enable() override { }
     void disable() override { }
     void enter() override { ++enterCount; }
-    bool leave() override { return true; }
+    bool leave() override
+    {
+        ++leaveCount;
+        return true;
+    }
     bool setClipboard(ClipboardID, const IClipboard* clipboard) override
     {
         ++setClipboardCount;
@@ -161,16 +175,32 @@ public:
         x = 512;
         y = 384;
     }
-    void fakeMouseButton(ButtonID, bool) override { }
+    void fakeMouseButton(ButtonID, bool press) override
+    {
+        if (press) {
+            ++mouseDownCount;
+        }
+        else {
+            ++mouseUpCount;
+        }
+    }
     void fakeMouseMove(SInt32, SInt32) override { ++mouseMoveCount; }
-    void fakeMouseRelativeMove(SInt32, SInt32) const override { }
-    void fakeMouseWheel(SInt32, SInt32) const override { }
+    void fakeMouseRelativeMove(SInt32, SInt32) const override { ++mouseRelativeMoveCount; }
+    void fakeMouseWheel(SInt32, SInt32) const override { ++mouseWheelCount; }
     void updateKeyMap() override { }
     void updateKeyState() override { }
     void setHalfDuplexMask(KeyModifierMask) override { }
-    void fakeKeyDown(KeyID, KeyModifierMask, KeyButton) override { }
-    bool fakeKeyRepeat(KeyID, KeyModifierMask, SInt32, KeyButton) override { return true; }
-    bool fakeKeyUp(KeyButton) override { return true; }
+    void fakeKeyDown(KeyID, KeyModifierMask, KeyButton) override { ++keyDownCount; }
+    bool fakeKeyRepeat(KeyID, KeyModifierMask, SInt32, KeyButton) override
+    {
+        ++keyRepeatCount;
+        return true;
+    }
+    bool fakeKeyUp(KeyButton) override
+    {
+        ++keyUpCount;
+        return true;
+    }
     void fakeAllKeysUp() override { }
     bool fakeCtrlAltDel() override { return false; }
     bool isKeyDown(KeyButton) const override { return false; }
@@ -188,7 +218,15 @@ public:
     void handleSystemEvent(const Event&, void*) override { }
 
     UInt32 enterCount;
+    UInt32 leaveCount;
     UInt32 mouseMoveCount;
+    mutable UInt32 mouseRelativeMoveCount;
+    mutable UInt32 mouseWheelCount;
+    UInt32 mouseDownCount;
+    UInt32 mouseUpCount;
+    UInt32 keyDownCount;
+    UInt32 keyRepeatCount;
+    UInt32 keyUpCount;
     UInt32 setClipboardCount;
     mutable UInt32 getClipboardCount;
     bool lastSetClipboardWasNull;
@@ -226,6 +264,47 @@ public:
 
 private:
     UInt32* m_deletedCount;
+};
+
+class ScriptedStream : public barrier::IStream {
+public:
+    void clearData()
+    {
+        m_data.clear();
+        m_offset = 0;
+    }
+
+    void close() override { }
+    UInt32 read(void* buffer, UInt32 count) override
+    {
+        const UInt32 remaining = getSize();
+        const UInt32 copied = count < remaining ? count : remaining;
+        if (copied != 0) {
+            std::memcpy(buffer, &m_data[m_offset], copied);
+            m_offset += copied;
+        }
+        return copied;
+    }
+    void write(const void* buffer, UInt32 count) override
+    {
+        const UInt8* bytes = static_cast<const UInt8*>(buffer);
+        m_data.insert(m_data.end(), bytes, bytes + count);
+    }
+    void writeLowPriority(const void* buffer, UInt32 count) override { write(buffer, count); }
+    void flush() override { }
+    void shutdownInput() override { }
+    void shutdownOutput() override { }
+    void* getEventTarget() const override { return const_cast<ScriptedStream*>(this); }
+    bool isReady() const override { return getSize() != 0; }
+    UInt32 getSize() const override
+    {
+        return static_cast<UInt32>(m_data.size() - m_offset);
+    }
+    UInt32 getBufferedOutputSize() const override { return 0; }
+
+private:
+    std::vector<UInt8> m_data;
+    std::size_t m_offset = 0;
 };
 
 class DeferringServerProxy : public ServerProxy {
@@ -1099,6 +1178,210 @@ TEST(ClientDisconnectTests, enterInterruptsFileSenderWithoutLosingThreadHandle)
     EXPECT_TRUE(reaped);
     EXPECT_FALSE(client.testHasSendFileThread());
     EXPECT_TRUE(client.leave());
+}
+
+TEST(ClientDisconnectTests, inactiveClientRejectsPointerButPreservesKeyboardBroadcast)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    setClientEventDefaults(events, clientEvents, screenEvents, fileEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    client.keyDown(1, 0, 1);
+    client.keyRepeat(1, 0, 1, 1);
+    client.keyUp(1, 0, 1);
+    client.mouseDown(kButtonLeft);
+    client.mouseUp(kButtonLeft);
+    client.mouseMove(20, 30);
+    client.mouseRelativeMove(2, 3);
+    client.mouseWheel(0, 120);
+
+    EXPECT_EQ(1u, platform->keyDownCount);
+    EXPECT_EQ(1u, platform->keyRepeatCount);
+    EXPECT_EQ(1u, platform->keyUpCount);
+    EXPECT_EQ(0u, platform->mouseDownCount);
+    EXPECT_EQ(0u, platform->mouseUpCount);
+    EXPECT_EQ(0u, platform->mouseMoveCount);
+    EXPECT_EQ(0u, platform->mouseRelativeMoveCount);
+    EXPECT_EQ(0u, platform->mouseWheelCount);
+
+    client.enter(10, 20, 1, 0, false);
+    client.keyDown(1, 0, 1);
+    client.keyRepeat(1, 0, 1, 1);
+    client.keyUp(1, 0, 1);
+    client.mouseDown(kButtonLeft);
+    client.mouseUp(kButtonLeft);
+    client.mouseMove(20, 30);
+    client.mouseRelativeMove(2, 3);
+    client.mouseWheel(0, 120);
+
+    EXPECT_EQ(2u, platform->keyDownCount);
+    EXPECT_EQ(2u, platform->keyRepeatCount);
+    EXPECT_EQ(2u, platform->keyUpCount);
+    EXPECT_EQ(1u, platform->mouseDownCount);
+    EXPECT_EQ(1u, platform->mouseUpCount);
+    EXPECT_EQ(2u, platform->mouseMoveCount);
+    EXPECT_EQ(1u, platform->mouseRelativeMoveCount);
+    EXPECT_EQ(1u, platform->mouseWheelCount);
+
+    ASSERT_TRUE(client.leave());
+    client.keyDown(1, 0, 1);
+    client.keyRepeat(1, 0, 1, 1);
+    client.keyUp(1, 0, 1);
+    client.mouseDown(kButtonLeft);
+    client.mouseUp(kButtonLeft);
+    client.mouseMove(20, 30);
+    client.mouseRelativeMove(2, 3);
+    client.mouseWheel(0, 120);
+
+    EXPECT_EQ(3u, platform->keyDownCount);
+    EXPECT_EQ(3u, platform->keyRepeatCount);
+    EXPECT_EQ(3u, platform->keyUpCount);
+    EXPECT_EQ(1u, platform->mouseDownCount);
+    EXPECT_EQ(1u, platform->mouseUpCount);
+    EXPECT_EQ(2u, platform->mouseMoveCount);
+    EXPECT_EQ(1u, platform->mouseRelativeMoveCount);
+    EXPECT_EQ(1u, platform->mouseWheelCount);
+}
+
+TEST(ClientDisconnectTests, disconnectRevokesPointerLeaseBeforeReconnect)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream firstStream;
+    client.testSetServerProxy(new ServerProxy(&client, &firstStream, &events));
+    client.handshakeComplete();
+    client.enter(10, 20, 1, 0, false);
+    ASSERT_EQ(1u, platform->enterCount);
+    ASSERT_EQ(1u, platform->mouseMoveCount);
+
+    client.disconnect(NULL);
+    EXPECT_EQ(1u, platform->leaveCount);
+
+    client.mouseMove(30, 40);
+    client.mouseDown(kButtonLeft);
+    EXPECT_EQ(1u, platform->mouseMoveCount);
+    EXPECT_EQ(0u, platform->mouseDownCount);
+
+    ScriptedStream secondStream;
+    client.testSetServerProxy(new ServerProxy(&client, &secondStream, &events));
+    client.handshakeComplete();
+    client.enter(50, 60, 2, 0, false);
+    EXPECT_EQ(2u, platform->enterCount);
+    EXPECT_EQ(2u, platform->mouseMoveCount);
+}
+
+TEST(ClientDisconnectTests, staleEnterSequenceDoesNotReactivateClient)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events);
+
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 10, 0);
+    proxy.enter();
+    proxy.leave();
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 30, 40, 9, 0);
+    proxy.enter();
+
+    EXPECT_EQ(1u, platform->enterCount);
+    EXPECT_EQ(1u, platform->leaveCount);
+}
+
+TEST(ClientDisconnectTests, newerEnterAcrossSequenceWrapReplacesLeaseWithoutStaleMotion)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events);
+
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 0xffffffffu, 0);
+    proxy.enter();
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 30, 40, 0xffffffffu, 0);
+    proxy.enter();
+    EXPECT_EQ(1u, platform->enterCount);
+    EXPECT_EQ(0u, platform->leaveCount);
+
+    proxy.m_compressMouse = true;
+    proxy.m_xMouse = 500;
+    proxy.m_yMouse = 500;
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 50, 60, 0, 0);
+    proxy.enter();
+
+    EXPECT_EQ(2u, platform->enterCount);
+    EXPECT_EQ(1u, platform->leaveCount);
+    EXPECT_EQ(2u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgDMouseDown + 4, kButtonLeft);
+    proxy.mouseDown();
+    EXPECT_EQ(1u, platform->mouseDownCount);
+
+    proxy.leave();
+    proxy.leave();
+    EXPECT_EQ(2u, platform->leaveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgDMouseUp + 4, kButtonLeft);
+    proxy.mouseUp();
+    EXPECT_EQ(0u, platform->mouseUpCount);
 }
 
 TEST(ClientDisconnectTests, newestFileClipboardSupersedesActivePrefetchWithoutWaiting)
