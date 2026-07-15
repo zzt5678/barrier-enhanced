@@ -18,6 +18,12 @@
 #include <sstream>
 #include <thread>
 
+#ifdef WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#endif
+
 namespace {
 
 std::string uniqueToken()
@@ -293,6 +299,73 @@ TEST(TransferArchiveTests, extractPackage_rejectsTraversalPathWithoutWritingOuts
     barrier::fs::remove_all(root);
 }
 
+TEST(TransferArchiveTests, extractPackage_rejectsExistingFileWithoutOverwriting)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-existing-target-" + uniqueToken());
+    const barrier::fs::path destination = root / "destination";
+    const barrier::fs::path existing = destination / "same.txt";
+    barrier::fs::create_directories(destination);
+    {
+        std::ofstream sentinel;
+        barrier::open_utf8_path(sentinel, existing, std::ios::out | std::ios::binary | std::ios::trunc);
+        sentinel << "sentinel";
+    }
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(
+        makeSingleFilePackage("same.txt", "overwritten"),
+        destination,
+        error));
+    EXPECT_EQ("extraction target already exists", error);
+    EXPECT_EQ("sentinel", readFileUtf8(existing));
+
+    barrier::fs::remove_all(root);
+}
+
+#ifndef WIN32
+TEST(TransferArchiveTests, extractPackage_rejectsDestinationRootSymbolicLink)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-root-link-" + uniqueToken());
+    const barrier::fs::path outside = root / "outside";
+    const barrier::fs::path destination = root / "destination";
+    barrier::fs::create_directories(outside);
+    barrier::fs::create_directory_symlink(outside, destination);
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(
+        makeSingleFilePackage("escaped.txt", "payload"),
+        destination,
+        error));
+    EXPECT_EQ("unsafe extraction root", error);
+    EXPECT_FALSE(barrier::fs::exists(outside / "escaped.txt"));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, extractPackage_rejectsParentSymbolicLink)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-parent-link-" + uniqueToken());
+    const barrier::fs::path outside = root / "outside";
+    const barrier::fs::path destination = root / "destination";
+    barrier::fs::create_directories(outside);
+    barrier::fs::create_directories(destination);
+    barrier::fs::create_directory_symlink(outside, destination / "linked");
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(
+        makeSingleFilePackage("linked/escaped.txt", "payload"),
+        destination,
+        error));
+    EXPECT_EQ("unsafe extraction path", error);
+    EXPECT_FALSE(barrier::fs::exists(outside / "escaped.txt"));
+
+    barrier::fs::remove_all(root);
+}
+#endif
+
 TEST(TransferArchiveTests, extractPackage_rejectsDuplicateNormalizedPathBeforeWriting)
 {
     const barrier::fs::path root =
@@ -541,6 +614,34 @@ TEST(TransferArchiveTests, extractPackage_rejectsWindowsCaseFoldCollisionBeforeW
     EXPECT_FALSE(TransferArchive::extractPackage(packageData, destination, error));
     EXPECT_EQ("duplicate or conflicting path in transfer package", error);
     EXPECT_FALSE(barrier::fs::exists(destination));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(TransferArchiveTests, extractPackage_rejectsWindowsDirectoryReparsePoint)
+{
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() / barrier::fs::u8path("barrier-windows-reparse-" + uniqueToken());
+    const barrier::fs::path outside = root / "outside";
+    const barrier::fs::path destination = root / "destination";
+    barrier::fs::create_directories(outside);
+    barrier::fs::create_directories(destination);
+
+    constexpr DWORD kAllowUnprivilegedCreate = 0x2;
+    const barrier::fs::path linked = destination / "linked";
+    if (!CreateSymbolicLinkW(linked.c_str(), outside.c_str(),
+                             SYMBOLIC_LINK_FLAG_DIRECTORY | kAllowUnprivilegedCreate)) {
+        barrier::fs::remove_all(root);
+        GTEST_SKIP() << "Windows symbolic-link creation is unavailable";
+    }
+
+    std::string error;
+    EXPECT_FALSE(TransferArchive::extractPackage(
+        makeSingleFilePackage("linked/escaped.txt", "payload"),
+        destination,
+        error));
+    EXPECT_EQ("unsafe extraction path", error);
+    EXPECT_FALSE(barrier::fs::exists(outside / "escaped.txt"));
 
     barrier::fs::remove_all(root);
 }

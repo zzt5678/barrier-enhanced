@@ -13,6 +13,11 @@
 #include <limits>
 #include <unordered_set>
 
+#if defined(WINAPI_MSWINDOWS)
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#endif
+
 namespace {
 
 constexpr std::array<char, 8> kArchiveMagic{{'B', 'D', 'I', 'R', 'P', 'K', 'G', '1'}};
@@ -169,6 +174,121 @@ bool isSafeRelativePath(const barrier::fs::path& relativePath)
     }
 
     return true;
+}
+
+bool isReparsePath(const barrier::fs::path& path,
+                   const barrier::fs::file_status& status)
+{
+    if (barrier::fs::is_symlink(status)) {
+        return true;
+    }
+#if defined(WINAPI_MSWINDOWS)
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+    (void)path;
+    return false;
+#endif
+}
+
+bool readPathStatus(const barrier::fs::path& path,
+                    barrier::fs::file_status& status,
+                    std::string& error)
+{
+    std::error_code statusError;
+    status = barrier::fs::symlink_status(path, statusError);
+    if (statusError && statusError != std::errc::no_such_file_or_directory) {
+        error = "failed to inspect extraction path";
+        return false;
+    }
+    return true;
+}
+
+bool ensureExtractionRoot(const barrier::fs::path& destinationRoot,
+                          std::string& error)
+{
+    if (destinationRoot.empty()) {
+        error = "unsafe extraction root";
+        return false;
+    }
+
+    barrier::fs::file_status status;
+    if (!readPathStatus(destinationRoot, status, error)) {
+        return false;
+    }
+    if (barrier::fs::exists(status)) {
+        if (isReparsePath(destinationRoot, status) || !barrier::fs::is_directory(status)) {
+            error = "unsafe extraction root";
+            return false;
+        }
+        return true;
+    }
+
+    std::error_code createError;
+    barrier::fs::create_directories(destinationRoot, createError);
+    if (createError || !readPathStatus(destinationRoot, status, error) ||
+        !barrier::fs::is_directory(status) || isReparsePath(destinationRoot, status)) {
+        error = "unsafe extraction root";
+        return false;
+    }
+    return true;
+}
+
+bool ensureExtractionDirectory(const barrier::fs::path& destinationRoot,
+                               const barrier::fs::path& relativeDirectory,
+                               std::string& error)
+{
+    barrier::fs::path current = destinationRoot;
+    for (const auto& component : relativeDirectory) {
+        if (component == ".") {
+            continue;
+        }
+        current /= component;
+
+        barrier::fs::file_status status;
+        if (!readPathStatus(current, status, error)) {
+            return false;
+        }
+        if (barrier::fs::exists(status)) {
+            if (isReparsePath(current, status) || !barrier::fs::is_directory(status)) {
+                error = "unsafe extraction path";
+                return false;
+            }
+            continue;
+        }
+
+        std::error_code createError;
+        if (!barrier::fs::create_directory(current, createError) || createError ||
+            !readPathStatus(current, status, error) ||
+            !barrier::fs::is_directory(status) || isReparsePath(current, status)) {
+            error = "unsafe extraction path";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool prepareExtractionFile(const barrier::fs::path& destinationRoot,
+                           const barrier::fs::path& relativePath,
+                           std::string& error)
+{
+    if (!ensureExtractionDirectory(destinationRoot, relativePath.parent_path(), error)) {
+        return false;
+    }
+
+    const barrier::fs::path targetPath = destinationRoot / relativePath;
+    barrier::fs::file_status status;
+    if (!readPathStatus(targetPath, status, error)) {
+        return false;
+    }
+    if (!barrier::fs::exists(status)) {
+        return true;
+    }
+    error = isReparsePath(targetPath, status)
+        ? "unsafe extraction path"
+        : "extraction target already exists";
+    return false;
 }
 
 std::string archivePathKey(const barrier::fs::path& relativePath)
@@ -746,6 +866,9 @@ TransferArchive::extractPackage(const std::string& packageData,
     if (!validatePackageData(packageData, error)) {
         return false;
     }
+    if (!ensureExtractionRoot(destinationRoot, error)) {
+        return false;
+    }
 
     ArchiveValidationState extractionState;
     size_t offset = kArchiveMagic.size();
@@ -775,7 +898,9 @@ TransferArchive::extractPackage(const std::string& packageData,
         const barrier::fs::path targetPath = (destinationRoot / relativePath).lexically_normal();
 
         if (type == kEntryDirectory) {
-            barrier::fs::create_directories(targetPath);
+            if (!ensureExtractionDirectory(destinationRoot, relativePath, error)) {
+                return false;
+            }
             continue;
         }
 
@@ -794,7 +919,9 @@ TransferArchive::extractPackage(const std::string& packageData,
             return false;
         }
 
-        barrier::fs::create_directories(targetPath.parent_path());
+        if (!prepareExtractionFile(destinationRoot, relativePath, error)) {
+            return false;
+        }
         std::ofstream output;
         barrier::open_utf8_path(output, targetPath, std::ios::out | std::ios::binary | std::ios::trunc);
         if (!output.is_open()) {
@@ -850,6 +977,9 @@ TransferArchive::extractPackageFile(const barrier::fs::path& packagePath,
     if (!validatePackageStream(input, packageSize, error)) {
         return false;
     }
+    if (!ensureExtractionRoot(destinationRoot, error)) {
+        return false;
+    }
     input.clear();
     input.seekg(static_cast<std::streamoff>(kArchiveMagic.size()), std::ios::beg);
     if (!input.good()) {
@@ -897,7 +1027,9 @@ TransferArchive::extractPackageFile(const barrier::fs::path& packagePath,
         const barrier::fs::path targetPath = (destinationRoot / relativePath).lexically_normal();
 
         if (type == kEntryDirectory) {
-            barrier::fs::create_directories(targetPath);
+            if (!ensureExtractionDirectory(destinationRoot, relativePath, error)) {
+                return false;
+            }
             continue;
         }
 
@@ -916,7 +1048,9 @@ TransferArchive::extractPackageFile(const barrier::fs::path& packagePath,
             return false;
         }
 
-        barrier::fs::create_directories(targetPath.parent_path());
+        if (!prepareExtractionFile(destinationRoot, relativePath, error)) {
+            return false;
+        }
         std::ofstream output;
         barrier::open_utf8_path(output, targetPath, std::ios::out | std::ios::binary | std::ios::trunc);
         if (!output.is_open()) {
