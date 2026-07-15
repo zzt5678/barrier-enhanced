@@ -36,6 +36,7 @@ std::string lowerAscii(std::string value)
 
 bool extractExecutableToken(const std::string& command,
                             std::string& token,
+                            std::string* arguments,
                             std::string* reason)
 {
     if (command.find('\0') != std::string::npos) {
@@ -48,6 +49,9 @@ bool extractExecutableToken(const std::string& command,
     const std::string trimmed = trim(command);
     if (trimmed.empty() || trimmed == "\"\"") {
         token.clear();
+        if (arguments != nullptr) {
+            arguments->clear();
+        }
         return true;
     }
 
@@ -60,16 +64,32 @@ bool extractExecutableToken(const std::string& command,
             return false;
         }
 
+        if (close + 1 < trimmed.size() && !isSpace(trimmed[close + 1])) {
+            if (reason != nullptr) {
+                *reason = "quoted executable is not followed by whitespace";
+            }
+            return false;
+        }
+
         token = trimmed.substr(1, close - 1);
         if (token.empty()) {
             token.clear();
+            if (arguments != nullptr) {
+                arguments->clear();
+            }
             return true;
+        }
+        if (arguments != nullptr) {
+            *arguments = trimmed.substr(close + 1);
         }
         return true;
     }
 
     const std::string::size_type end = trimmed.find_first_of(" \t\r\n");
     token = trimmed.substr(0, end);
+    if (arguments != nullptr) {
+        *arguments = end == std::string::npos ? std::string() : trimmed.substr(end);
+    }
     return true;
 }
 
@@ -97,6 +117,27 @@ IpcCommandValidator::CommandRole classifyBasename(const std::string& name)
     return IpcCommandValidator::CommandRole::kInvalid;
 }
 
+bool isSafeTrustedExecutable(const std::string& executable,
+                             IpcCommandValidator::CommandRole expectedRole,
+                             std::string* reason)
+{
+    if (executable.empty() || executable.find('\0') != std::string::npos ||
+        executable.find('"') != std::string::npos) {
+        if (reason != nullptr) {
+            *reason = "trusted executable path is empty or contains an unsafe character";
+        }
+        return false;
+    }
+
+    if (classifyBasename(basename(executable)) != expectedRole) {
+        if (reason != nullptr) {
+            *reason = "trusted executable does not match the command role";
+        }
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 namespace IpcCommandValidator {
@@ -105,7 +146,7 @@ CommandRole classifyDaemonCommand(const std::string& command,
                                   std::string* reason)
 {
     std::string token;
-    if (!extractExecutableToken(command, token, reason)) {
+    if (!extractExecutableToken(command, token, nullptr, reason)) {
         return CommandRole::kInvalid;
     }
 
@@ -130,6 +171,45 @@ bool isAllowedDaemonCommand(const std::string& command,
 bool isServerCommand(const std::string& command)
 {
     return classifyDaemonCommand(command) == CommandRole::kServer;
+}
+
+bool rewriteDaemonExecutable(const std::string& command,
+                             const std::string& trustedServerExecutable,
+                             const std::string& trustedClientExecutable,
+                             std::string& rewritten,
+                             std::string* reason)
+{
+    if (reason != nullptr) {
+        reason->clear();
+    }
+
+    std::string token;
+    std::string arguments;
+    if (!extractExecutableToken(command, token, &arguments, reason)) {
+        return false;
+    }
+
+    if (token.empty()) {
+        rewritten.clear();
+        return true;
+    }
+
+    const CommandRole role = classifyBasename(basename(token));
+    if (role != CommandRole::kServer && role != CommandRole::kClient) {
+        if (reason != nullptr) {
+            *reason = "command executable is not a weave server/client";
+        }
+        return false;
+    }
+
+    const std::string& trustedExecutable =
+        role == CommandRole::kServer ? trustedServerExecutable : trustedClientExecutable;
+    if (!isSafeTrustedExecutable(trustedExecutable, role, reason)) {
+        return false;
+    }
+
+    rewritten = "\"" + trustedExecutable + "\"" + arguments;
+    return true;
 }
 
 } // namespace IpcCommandValidator

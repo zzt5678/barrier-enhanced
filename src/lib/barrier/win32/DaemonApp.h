@@ -41,6 +41,9 @@ private:
     void daemonize();
     void foregroundError(const char* message);
     std::string            logFilename();
+    void                initializeTrustedExecutables();
+    bool                prepareWatchdogCommand(std::string& command,
+                                               std::string& reason) const;
     void                handleIpcMessage(const Event&, void*);
 
 public:
@@ -53,6 +56,9 @@ private:
     IpcLogOutputter*    m_ipcLogOutputter;
     IEventQueue*        m_events;
     FileLogOutputter*    m_fileLogOutputter;
+    bool                m_daemonized;
+    std::string         m_trustedServerExecutable;
+    std::string         m_trustedClientExecutable;
 };
 
 #define LOG_FILENAME "barrierd.log"

@@ -5,7 +5,7 @@
 #define MyAppURL "https://github.com/debauchee/barrier/wiki"
 #define MyAppCopyright "Copyright (C) 2018 Debauchee Open Source Group"
 #define MyAppExeName "weave.exe"
-#define MyAppServiceName "Weave"
+#define MyAppServiceName "Barrier"
 #define MyAppServiceExe "weaved.exe"
 #define MyAppServiceDesc "Manages the Weave background processes."
 #define MyAppListenerDesc "Weave Listener"
@@ -55,6 +55,7 @@ Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: 
 Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall delete rule name=""{#MyAppListenerDesc}"""; Flags: runhidden
 Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall add rule name=""{#MyAppListenerDesc}"" protocol=TCP dir=in localport=24800 action=allow"; Flags: runhidden
 Filename: {sys}\sc.exe; Parameters: "create {#MyAppServiceName} start= auto binPath= ""\""{app}\{#MyAppServiceExe}\"""""; Flags: runhidden
+Filename: {sys}\sc.exe; Parameters: "config {#MyAppServiceName} start= auto binPath= ""\""{app}\{#MyAppServiceExe}\"""""; Flags: runhidden
 Filename: {sys}\sc.exe; Parameters: "description {#MyAppServiceName} ""{#MyAppServiceDesc}"""; Flags: runhidden
 Filename: {sys}\sc.exe; Parameters: "start {#MyAppServiceName}"; Flags: runhidden
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

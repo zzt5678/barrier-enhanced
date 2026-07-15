@@ -48,10 +48,14 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <iostream>
 #include <sstream>
 #include <cstdlib>
+#include <stdexcept>
+#include <vector>
 
 using namespace std;
 
@@ -63,6 +67,64 @@ readElevateModeSetting()
     return ElevationPolicy::modeFromSettings(
         ARCH->setting("ElevateMode"),
         ARCH->setting("Elevate"));
+}
+
+static std::string
+normalizedWindowsPath(std::string path)
+{
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char ch) {
+        if (ch == '/') {
+            return '\\';
+        }
+        return static_cast<char>(std::tolower(ch));
+    });
+    while (path.size() > 3 && path.back() == '\\') {
+        path.pop_back();
+    }
+    return path;
+}
+
+static std::string
+environmentPath(const char* name)
+{
+    const DWORD required = GetEnvironmentVariableA(name, nullptr, 0);
+    if (required == 0) {
+        return std::string();
+    }
+
+    std::vector<char> buffer(required);
+    const DWORD written = GetEnvironmentVariableA(name, buffer.data(), required);
+    if (written == 0 || written >= required) {
+        return std::string();
+    }
+    return std::string(buffer.data(), written);
+}
+
+static bool
+isBelowDirectory(const std::string& path, const std::string& directory)
+{
+    const std::string normalizedPath = normalizedWindowsPath(path);
+    const std::string normalizedDirectory = normalizedWindowsPath(directory);
+    return !normalizedDirectory.empty() &&
+           normalizedPath.size() > normalizedDirectory.size() &&
+           normalizedPath.compare(0, normalizedDirectory.size(), normalizedDirectory) == 0 &&
+           normalizedPath[normalizedDirectory.size()] == '\\';
+}
+
+static bool
+isProtectedProgramFilesPath(const std::string& path)
+{
+    static const char* kRoots[] = {
+        "ProgramFiles",
+        "ProgramW6432",
+        "ProgramFiles(x86)"
+    };
+    for (const char* rootName : kRoots) {
+        if (isBelowDirectory(path, environmentPath(rootName))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int
@@ -83,7 +145,8 @@ DaemonApp::DaemonApp() :
     m_ipcLogOutputter(nullptr),
     m_watchdog(nullptr),
     m_events(nullptr),
-    m_fileLogOutputter(nullptr)
+    m_fileLogOutputter(nullptr),
+    m_daemonized(false)
 {
     s_instance = this;
 }
@@ -183,11 +246,16 @@ DaemonApp::mainLoop(bool daemonized)
 {
     try
     {
+        m_daemonized = daemonized;
         DAEMON_RUNNING(true);
 
         if (daemonized) {
             m_fileLogOutputter = new FileLogOutputter(logFilename().c_str());
             CLOG->insert(m_fileLogOutputter);
+        }
+
+        if (daemonized) {
+            initializeTrustedExecutables();
         }
 
         // create socket multiplexer.  this must happen after daemonization
@@ -217,7 +285,13 @@ DaemonApp::mainLoop(bool daemonized)
         UInt8 elevateMode = readElevateModeSetting();
         if (command != "") {
             std::string rejectReason;
-            if (IpcCommandValidator::isAllowedDaemonCommand(command, &rejectReason)) {
+            const String requestedCommand = command;
+            if (prepareWatchdogCommand(command, rejectReason)) {
+                if (command != requestedCommand) {
+                    LOG((CLOG_WARN "replaced persisted executable with protected sibling: %s",
+                         command.c_str()));
+                    ARCH->setting("Command", command);
+                }
                 LOG((CLOG_INFO "using last known command: %s", command.c_str()));
                 m_watchdog->setCommand(command, elevateMode);
             }
@@ -248,6 +322,57 @@ DaemonApp::mainLoop(bool daemonized)
     catch (...) {
         LOG((CLOG_CRIT "An unknown error occurred.\n"));
     }
+}
+
+void
+DaemonApp::initializeTrustedExecutables()
+{
+    std::vector<char> modulePath(32768);
+    const DWORD length = GetModuleFileNameA(nullptr, modulePath.data(),
+                                            static_cast<DWORD>(modulePath.size()));
+    if (length == 0 || length >= modulePath.size()) {
+        throw std::runtime_error("unable to resolve the daemon executable path");
+    }
+
+    const std::string daemonPath(modulePath.data(), length);
+    if (!isProtectedProgramFilesPath(daemonPath)) {
+        throw std::runtime_error(
+            "refusing to run the SYSTEM service from outside Program Files");
+    }
+
+    const std::string::size_type separator = daemonPath.find_last_of("/\\");
+    if (separator == std::string::npos) {
+        throw std::runtime_error("daemon executable has no parent directory");
+    }
+
+    const std::string installDirectory = daemonPath.substr(0, separator + 1);
+    m_trustedServerExecutable = installDirectory + "weaves.exe";
+    m_trustedClientExecutable = installDirectory + "weavec.exe";
+    LOG((CLOG_INFO "protected runtime directory: %s", installDirectory.c_str()));
+}
+
+bool
+DaemonApp::prepareWatchdogCommand(std::string& command,
+                                  std::string& reason) const
+{
+    if (!IpcCommandValidator::isAllowedDaemonCommand(command, &reason)) {
+        return false;
+    }
+    if (!m_daemonized || command.empty() || command == "\"\"") {
+        return true;
+    }
+
+    std::string rewritten;
+    if (!IpcCommandValidator::rewriteDaemonExecutable(
+            command,
+            m_trustedServerExecutable,
+            m_trustedClientExecutable,
+            rewritten,
+            &reason)) {
+        return false;
+    }
+    command = rewritten;
+    return true;
 }
 
 void
@@ -287,9 +412,14 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
 
             if (!command.empty()) {
                 std::string rejectReason;
-                if (!IpcCommandValidator::isAllowedDaemonCommand(command, &rejectReason)) {
+                const String requestedCommand = command;
+                if (!prepareWatchdogCommand(command, rejectReason)) {
                     LOG((CLOG_ERR "rejecting ipc command: %s", rejectReason.c_str()));
                     break;
+                }
+                if (command != requestedCommand) {
+                    LOG((CLOG_WARN "replaced ipc executable with protected sibling: %s",
+                         command.c_str()));
                 }
 
                 LOG((CLOG_DEBUG "new command, elevateMode=%d command=%s", cm->elevateMode(), command.c_str()));

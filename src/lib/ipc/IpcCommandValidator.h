@@ -25,5 +25,10 @@ CommandRole classifyDaemonCommand(const std::string& command,
 bool isAllowedDaemonCommand(const std::string& command,
                             std::string* reason = nullptr);
 bool isServerCommand(const std::string& command);
+bool rewriteDaemonExecutable(const std::string& command,
+                             const std::string& trustedServerExecutable,
+                             const std::string& trustedClientExecutable,
+                             std::string& rewritten,
+                             std::string* reason = nullptr);
 
 } // namespace IpcCommandValidator

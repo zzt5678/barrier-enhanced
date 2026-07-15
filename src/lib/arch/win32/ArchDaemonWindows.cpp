@@ -82,7 +82,8 @@ ArchDaemonWindows::installDaemon(const char* name,
                 const char* dependencies)
 {
     // open service manager
-    SC_HANDLE mgr = OpenSCManager(NULL, NULL, GENERIC_WRITE);
+    SC_HANDLE mgr = OpenSCManager(NULL, NULL,
+                                 SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
     if (mgr == NULL) {
         // can't open service manager
         throw XArchDaemonInstallFailed(new XArchEvalWindows);
@@ -105,12 +106,35 @@ ArchDaemonWindows::installDaemon(const char* name,
         NULL);
 
     if (service == NULL) {
-        // can't create service
         DWORD err = GetLastError();
         if (err != ERROR_SERVICE_EXISTS) {
             CloseServiceHandle(mgr);
             throw XArchDaemonInstallFailed(new XArchEvalWindows(err));
         }
+
+        service = OpenService(mgr, name, SERVICE_CHANGE_CONFIG);
+        if (service == NULL) {
+            err = GetLastError();
+            CloseServiceHandle(mgr);
+            throw XArchDaemonInstallFailed(new XArchEvalWindows(err));
+        }
+        if (!ChangeServiceConfig(service,
+                                 SERVICE_NO_CHANGE,
+                                 SERVICE_AUTO_START,
+                                 SERVICE_NO_CHANGE,
+                                 pathname,
+                                 NULL,
+                                 NULL,
+                                 NULL,
+                                 NULL,
+                                 NULL,
+                                 NULL)) {
+            err = GetLastError();
+            CloseServiceHandle(service);
+            CloseServiceHandle(mgr);
+            throw XArchDaemonInstallFailed(new XArchEvalWindows(err));
+        }
+        CloseServiceHandle(service);
     }
     else {
         // done with service (but only try to close if not null)
@@ -641,8 +665,16 @@ ArchDaemonWindows::start(const char* name)
 
     // start the service
     if (!StartService(service, 0, NULL)) {
-        throw XArchDaemonFailed(new XArchEvalWindows());
+        const DWORD error = GetLastError();
+        CloseServiceHandle(service);
+        CloseServiceHandle(mgr);
+        if (error != ERROR_SERVICE_ALREADY_RUNNING) {
+            throw XArchDaemonFailed(new XArchEvalWindows(error));
+        }
+        return;
     }
+    CloseServiceHandle(service);
+    CloseServiceHandle(mgr);
 }
 
 void
@@ -677,19 +709,16 @@ ArchDaemonWindows::stop(const char* name)
 void
 ArchDaemonWindows::installDaemon()
 {
-    // install default daemon if not already installed.
-    if (!isDaemonInstalled(DEFAULT_DAEMON_NAME)) {
-        char path[MAX_PATH];
-        GetModuleFileName(ArchMiscWindows::instanceWin32(), path, MAX_PATH);
+    char path[MAX_PATH];
+    GetModuleFileName(ArchMiscWindows::instanceWin32(), path, MAX_PATH);
 
-        // wrap in quotes so a malicious user can't start \Program.exe as admin.
-        std::stringstream ss;
-        ss << '"';
-        ss << path;
-        ss << '"';
+    // Refresh the service path as part of every install/upgrade.
+    std::stringstream ss;
+    ss << '"';
+    ss << path;
+    ss << '"';
 
-        installDaemon(DEFAULT_DAEMON_NAME, DEFAULT_DAEMON_INFO, ss.str().c_str(), "", "");
-    }
+    installDaemon(DEFAULT_DAEMON_NAME, DEFAULT_DAEMON_INFO, ss.str().c_str(), "", "");
 
     start(DEFAULT_DAEMON_NAME);
 }
