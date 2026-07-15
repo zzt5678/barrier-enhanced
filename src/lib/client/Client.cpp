@@ -43,6 +43,10 @@
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
 
+#if defined(_WIN32)
+#include "common/win32/SessionUserImpersonation.h"
+#endif
+
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -1971,6 +1975,21 @@ Client::send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourceP
     bool chunkerOwnsMaintenanceEvent = false;
     try {
         Thread::testCancel();
+#if defined(_WIN32)
+        SessionUserImpersonation impersonation;
+        if (!impersonation.ready()) {
+            std::ostringstream message;
+            message << "could not use the active session user identity to package "
+                       "clipboard files: failure=" << impersonation.failureName()
+                    << " session=" << impersonation.sessionId()
+                    << " error=" << impersonation.error();
+            throw std::runtime_error(message.str());
+        }
+        if (impersonation.required()) {
+            LOG((CLOG_DEBUG "packaging remote clipboard files as the active session user: "
+                 "session=%lu", impersonation.sessionId()));
+        }
+#endif
         RemoteFileClipboard::Data payload;
         payload.mode = RemoteFileClipboard::Mode::SourcePaths;
         payload.paths = sourcePaths;
@@ -1979,6 +1998,20 @@ Client::send_clipboard_file_thread(const std::vector<barrier::fs::path>& sourceP
         if (!RemoteFileClipboard::createPackage(payload, packagePath, error)) {
             throw std::runtime_error(error);
         }
+#if defined(_WIN32)
+        if (!impersonation.finish()) {
+            std::ostringstream message;
+            message << "could not restore the process identity after packaging "
+                       "clipboard files: failure=" << impersonation.failureName()
+                    << " error=" << impersonation.error();
+            throw std::runtime_error(message.str());
+        }
+        if (impersonation.usedRevertFallback()) {
+            LOG((CLOG_WARN "RevertToSelf failed after packaging clipboard files; "
+                 "the fallback cleared the thread token: error=%lu",
+                 impersonation.revertError()));
+        }
+#endif
 
         Thread::testCancel();
         chunkerOwnsMaintenanceEvent = true;

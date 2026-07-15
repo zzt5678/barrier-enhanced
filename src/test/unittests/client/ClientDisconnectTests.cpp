@@ -485,6 +485,31 @@ public:
     mutable UInt32 calls;
 };
 
+class TextThenEmptyClipboardScreen : public TestScreen {
+public:
+    TextThenEmptyClipboardScreen() :
+        calls(0)
+    {
+    }
+
+    bool getClipboard(ClipboardID id, IClipboard* clipboard) const override
+    {
+        ++calls;
+        if (id != kClipboardClipboard || !clipboard->open(20 + calls)) {
+            return false;
+        }
+
+        clipboard->empty();
+        if (calls == 1) {
+            clipboard->add(IClipboard::kText, "sensitive text");
+        }
+        clipboard->close();
+        return true;
+    }
+
+    mutable UInt32 calls;
+};
+
 class FileListThenTextClipboardScreen : public TestScreen {
 public:
     FileListThenTextClipboardScreen() :
@@ -2720,6 +2745,48 @@ TEST(ClientDisconnectTests, clipboardReadFailureRetriesWithoutPublishingEmptyCli
     EXPECT_EQ(2u, screen.calls);
     EXPECT_EQ(baselineTimers + 1, timersCreated);
     EXPECT_GT(queuedClipboardChunks, baselineChunks);
+}
+
+TEST(ClientDisconnectTests, successfulEmptyClipboardSnapshotClearsPreviousText)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    TextThenEmptyClipboardScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    proxy->result = ServerProxy::kClipboardSendQueued;
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+    client.testSendClipboard(kClipboardClipboard);
+    EXPECT_EQ(1u, screen.calls);
+    EXPECT_EQ(1u, proxy->sendCalls);
+
+    client.testSendClipboard(kClipboardClipboard);
+
+    EXPECT_EQ(2u, screen.calls);
+    EXPECT_EQ(2u, proxy->sendCalls);
+    ASSERT_TRUE(proxy->lastClipboard.open(0));
+    for (UInt32 format = 0; format < IClipboard::kNumFormats; ++format) {
+        EXPECT_FALSE(proxy->lastClipboard.has(
+            static_cast<IClipboard::EFormat>(format)));
+    }
+    proxy->lastClipboard.close();
 }
 
 TEST(ClientDisconnectTests, materializedFileListClipboardIsSentToServer)

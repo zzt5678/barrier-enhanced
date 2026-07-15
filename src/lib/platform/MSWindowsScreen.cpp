@@ -40,6 +40,7 @@
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
 #include "io/filesystem.h"
+#include "common/win32/SessionUserImpersonation.h"
 
 #include <string.h>
 #include <sstream>
@@ -524,6 +525,17 @@ MSWindowsScreen::getClipboard(ClipboardID id, IClipboard* dst) const
         return false;
     }
 
+    SessionUserImpersonation impersonation;
+    if (!impersonation.ready()) {
+        LOG((CLOG_WARN "could not use the active session user identity to read the clipboard: "
+             "failure=%s session=%lu error=%lu", impersonation.failureName(),
+             impersonation.sessionId(), impersonation.error()));
+        return false;
+    }
+    if (impersonation.required()) {
+        LOG((CLOG_DEBUG "reading clipboard as the active session user: session=%lu",
+             impersonation.sessionId()));
+    }
     MSWindowsClipboard src(m_window);
     constexpr int kClipboardReadAttempts = 8;
     constexpr double kClipboardReadRetrySeconds = 0.025;
@@ -533,12 +545,34 @@ MSWindowsScreen::getClipboard(ClipboardID id, IClipboard* dst) const
             if (attempt > 0) {
                 LOG((CLOG_DEBUG "clipboard read succeeded after %d retry attempt(s)", attempt));
             }
-            return true;
+            const bool restored = impersonation.finish();
+            if (!restored) {
+                LOG((CLOG_ERR "could not restore the process identity after reading the clipboard: "
+                     "failure=%s error=%lu", impersonation.failureName(),
+                     impersonation.error()));
+            }
+            else if (impersonation.usedRevertFallback()) {
+                LOG((CLOG_WARN "RevertToSelf failed after reading the clipboard; "
+                     "the fallback cleared the thread token: error=%lu",
+                     impersonation.revertError()));
+            }
+            return restored;
         }
 
         ARCH->sleep(kClipboardReadRetrySeconds);
     }
 
+    const bool restored = impersonation.finish();
+    if (!restored) {
+        LOG((CLOG_ERR "could not restore the process identity after the clipboard read failed: "
+             "failure=%s error=%lu", impersonation.failureName(),
+             impersonation.error()));
+    }
+    else if (impersonation.usedRevertFallback()) {
+        LOG((CLOG_WARN "RevertToSelf failed after the clipboard read failed; "
+             "the fallback cleared the thread token: error=%lu",
+             impersonation.revertError()));
+    }
     LOG((CLOG_WARN "failed to read clipboard after %d attempts", kClipboardReadAttempts));
     return false;
 }
