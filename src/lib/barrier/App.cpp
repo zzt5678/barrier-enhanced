@@ -204,11 +204,13 @@ void
 App::initIpcClient()
 {
     m_ipcClient = new IpcClient(m_events, m_socketMultiplexer.get());
-    m_ipcClient->connect();
-
     m_events->adoptHandler(
         m_events->forIpcClient().messageReceived(), m_ipcClient,
         new TMethodEventJob<App>(this, &App::handleIpcMessage));
+    m_events->adoptHandler(
+        m_events->forIpcClient().connected(), m_ipcClient,
+        new TMethodEventJob<App>(this, &App::handleIpcConnected));
+    m_ipcClient->connect();
 }
 
 void
@@ -221,7 +223,15 @@ App::cleanupIpcClient()
     }
 
     m_events->removeHandler(m_events->forIpcClient().messageReceived(), client);
+    m_events->removeHandler(m_events->forIpcClient().connected(), client);
     delete client;
+}
+
+void
+App::handleIpcConnected(const Event&, void*)
+{
+    IpcNodeReadyMessage ready;
+    m_ipcClient->send(ready);
 }
 
 void

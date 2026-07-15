@@ -104,6 +104,7 @@ public:
 
 private:
     void                handleIpcMessage(const Event&, void*);
+    void                handleIpcConnected(const Event&, void*);
 
 protected:
     void                initIpcClient();

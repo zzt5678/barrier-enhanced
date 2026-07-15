@@ -182,6 +182,44 @@ IpcServer::hasClients(EIpcClientType clientType) const
     return false;
 }
 
+bool
+IpcServer::hasClientProcess(EIpcClientType clientType, UInt32 processId) const
+{
+    if (processId == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (ClientList::const_iterator it = m_clients.begin(); it != m_clients.end(); ++it) {
+        IpcClientProxy* proxy = *it;
+        if (!proxy->m_disconnecting && proxy->m_clientType == clientType &&
+            proxy->m_processId == processId) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool
+IpcServer::hasReadyClientProcess(EIpcClientType clientType, UInt32 processId) const
+{
+    if (processId == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (ClientList::const_iterator it = m_clients.begin(); it != m_clients.end(); ++it) {
+        IpcClientProxy* proxy = *it;
+        if (!proxy->m_disconnecting.load() && proxy->m_ready.load() &&
+            proxy->m_clientType == clientType && proxy->m_processId == processId) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void
 IpcServer::send(const IpcMessage& message, EIpcClientType filterType)
 {

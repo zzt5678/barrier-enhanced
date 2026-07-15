@@ -47,6 +47,8 @@ static const int kDesktopNameReadAttempts = 50;
 static const double kDesktopNameReadRetrySeconds = 0.1;
 static const double kDesktopRelaunchSettleSeconds = 0.25;
 static const double kDesktopRelaunchDebounceSeconds = 2.0;
+static const double kProcessReadyTimeoutSeconds = 10.0;
+static const double kProcessReadyPollSeconds = 0.05;
 
 typedef VOID (WINAPI *SendSas)(BOOL asUser);
 
@@ -700,11 +702,37 @@ MSWindowsWatchdog::startProcess()
         throw XArch(new XArchEvalWindows);
     }
     else {
-        // wait for program to fail.
-        ARCH->sleep(1);
-        if (!isProcessHandleActive(newProcessInfo.hProcess)) {
+        bool processReady = false;
+        if (!m_daemonized) {
+            // Foreground relaunches do not use daemon IPC. Preserve the startup
+            // crash observation window before adopting the process.
+            ARCH->sleep(1);
+            processReady = isProcessHandleActive(newProcessInfo.hProcess);
+        }
+        else {
+            const double readyStart = ARCH->time();
+            do {
+                if (!isProcessHandleActive(newProcessInfo.hProcess)) {
+                    break;
+                }
+
+                processReady = m_ipcServer.hasReadyClientProcess(
+                    kIpcClientNode, newProcessInfo.dwProcessId);
+                if (processReady || !m_monitoring.load()) {
+                    break;
+                }
+
+                ARCH->sleep(kProcessReadyPollSeconds);
+            } while (ARCH->time() - readyStart < kProcessReadyTimeoutSeconds);
+        }
+
+        if (!processReady) {
+            LOG((CLOG_ERR "process %lu did not complete IPC readiness within %.1f seconds",
+                newProcessInfo.dwProcessId, kProcessReadyTimeoutSeconds));
+            shutdownProcess(newProcessInfo.hProcess, newProcessInfo.dwProcessId, 3,
+                            true, newProcessInfo.dwProcessId);
             closeProcessInfo(newProcessInfo);
-            throw XMSWindowsWatchdogError("process immediately stopped");
+            throw XMSWindowsWatchdogError("process did not become ready");
         }
 
         PROCESS_INFORMATION previousProcessInfo = m_processInfo;
@@ -723,8 +751,10 @@ MSWindowsWatchdog::startProcess()
 	        closeProcessInfo(previousProcessInfo);
 	    }
 
-        LOG((CLOG_DEBUG "started process, session=%i, elevated: %s, command=%s",
-            m_session.getActiveSessionId(),
+        LOG((CLOG_INFO "started ready process, pid=%lu, session=%i, desktop=%s, "
+            "generation=%llu, elevated=%s, command=%s",
+            m_processInfo.dwProcessId, m_session.getActiveSessionId(), desktopName.c_str(),
+            state.generation,
             (shouldElevateProcess(state.elevateMode) || autoElevated) ? "yes" : "no",
             command.c_str()));
     }
@@ -862,10 +892,18 @@ BOOL MSWindowsWatchdog::doStartProcessAsUser(std::string& command, HANDLE userTo
 void
 MSWindowsWatchdog::setCommand(const std::string& command, UInt8 elevateMode)
 {
-    LOG((CLOG_INFO "service command updated"));
     std::lock_guard<std::mutex> lock(m_commandMutex);
+    const UInt8 normalizedMode = ElevationPolicy::normalizeMode(elevateMode);
+    if (!ElevationPolicy::commandRequiresRelaunch(
+            m_command, m_elevateMode, command, normalizedMode)) {
+        LOG((CLOG_DEBUG "service command unchanged; keeping process generation=%llu",
+            m_commandGeneration));
+        return;
+    }
+
+    LOG((CLOG_INFO "service command updated; scheduling process replacement"));
     m_command = command;
-    m_elevateMode = ElevationPolicy::normalizeMode(elevateMode);
+    m_elevateMode = normalizedMode;
     m_commandChanged = true;
     m_processFailures = 0;
     ++m_commandGeneration;

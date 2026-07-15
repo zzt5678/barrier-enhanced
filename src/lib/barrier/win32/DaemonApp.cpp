@@ -374,7 +374,7 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
             break;
         }
 
-        case kIpcHello:
+        case kIpcHello: {
             IpcHelloMessage* hm = static_cast<IpcHelloMessage*>(m);
             String type;
             switch (hm->clientType()) {
@@ -392,6 +392,11 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
             LOG((CLOG_PRINT "server status: %s", serverstatus));
 
             m_ipcLogOutputter->notifyBuffer();
+            break;
+        }
+
+        case kIpcReady:
+            LOG((CLOG_DEBUG "ipc node reported ready"));
             break;
     }
 }

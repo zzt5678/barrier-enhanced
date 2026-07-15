@@ -39,6 +39,15 @@ IpcHelloMessage::~IpcHelloMessage()
 {
 }
 
+IpcNodeReadyMessage::IpcNodeReadyMessage() :
+IpcMessage(kIpcReady)
+{
+}
+
+IpcNodeReadyMessage::~IpcNodeReadyMessage()
+{
+}
+
 IpcShutdownMessage::IpcShutdownMessage() :
 IpcMessage(kIpcShutdown)
 {

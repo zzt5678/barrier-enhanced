@@ -287,6 +287,117 @@ TEST(IpcProxyTests, serverSendToProcessOnlyWritesMatchingNodePid)
 	EXPECT_TRUE(server.sendToProcess(message, kIpcClientNode, 1001));
 }
 
+TEST(IpcProxyTests, serverFindsOnlyReadyMatchingProcess)
+{
+	NiceMock<MockEventQueue> events;
+	IStreamEvents streamEvents;
+	IpcClientProxyEvents ipcEvents;
+	setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+	NiceMock<MockStream>* readyStream = new NiceMock<MockStream>();
+	NiceMock<MockStream>* disconnectingStream = new NiceMock<MockStream>();
+	ON_CALL(*readyStream, getEventTarget()).WillByDefault(Invoke([readyStream]() { return readyStream; }));
+	ON_CALL(*disconnectingStream, getEventTarget()).WillByDefault(
+		Invoke([disconnectingStream]() { return disconnectingStream; }));
+
+	IpcClientProxy readyProxy(*readyStream, &events);
+	IpcClientProxy disconnectingProxy(*disconnectingStream, &events);
+	readyProxy.m_clientType = kIpcClientNode;
+	readyProxy.m_processId = 1001;
+	disconnectingProxy.m_clientType = kIpcClientNode;
+	disconnectingProxy.m_processId = 1002;
+	disconnectingProxy.m_disconnecting = true;
+
+	IpcServer server;
+	server.m_clients.push_back(&readyProxy);
+	server.m_clients.push_back(&disconnectingProxy);
+
+	EXPECT_TRUE(server.hasClientProcess(kIpcClientNode, 1001));
+	EXPECT_FALSE(server.hasReadyClientProcess(kIpcClientNode, 1001));
+	readyProxy.m_ready = true;
+	EXPECT_TRUE(server.hasReadyClientProcess(kIpcClientNode, 1001));
+	EXPECT_FALSE(server.hasClientProcess(kIpcClientNode, 1002));
+	EXPECT_FALSE(server.hasReadyClientProcess(kIpcClientNode, 1002));
+	EXPECT_FALSE(server.hasClientProcess(kIpcClientGui, 1001));
+	EXPECT_FALSE(server.hasClientProcess(kIpcClientNode, 0));
+}
+
+TEST(IpcProxyTests, clientProxyRequiresNodeReadyAfterHello)
+{
+	NiceMock<MockEventQueue> events;
+	IStreamEvents streamEvents;
+	IpcClientProxyEvents ipcEvents;
+	setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+	NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+	ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+	IpcClientProxy proxy(*stream, &events);
+	const Event::Type messageType = ipcEvents.messageReceived();
+	std::vector<UInt8> bytes;
+	appendBytes(bytes, "IHEL", 4);
+	bytes.push_back(static_cast<UInt8>(kIpcClientNode));
+	appendUInt32(bytes, 12345);
+	appendBytes(bytes, "IRDY", 4);
+	size_t offset = 0;
+	int messageEvents = 0;
+	bool sawReady = false;
+
+	EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+		[&](void* buffer, UInt32 size) {
+			return readFromBuffer(bytes, offset, buffer, size);
+		}));
+	EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke([&](const Event& event) {
+		ASSERT_EQ(messageType, event.getType());
+		++messageEvents;
+		IpcMessage* message = static_cast<IpcMessage*>(event.getDataObject());
+		sawReady = sawReady || message->type() == kIpcReady;
+		delete message;
+	}));
+
+	proxy.handleData(Event(Event::kUnknown), NULL);
+	EXPECT_EQ(2, messageEvents);
+	EXPECT_TRUE(sawReady);
+	EXPECT_TRUE(proxy.m_ready);
+}
+
+TEST(IpcProxyTests, clientProxyRejectsReadyBeforeNodeHello)
+{
+	NiceMock<MockEventQueue> events;
+	IStreamEvents streamEvents;
+	IpcClientProxyEvents ipcEvents;
+	setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+	NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+	ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+	IpcClientProxy proxy(*stream, &events);
+	const Event::Type messageType = ipcEvents.messageReceived();
+	const Event::Type disconnectedType = ipcEvents.disconnected();
+	const std::vector<UInt8> bytes = { 'I', 'R', 'D', 'Y' };
+	size_t offset = 0;
+	int messageEvents = 0;
+
+	EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+		[&](void* buffer, UInt32 size) {
+			return readFromBuffer(bytes, offset, buffer, size);
+		}));
+	EXPECT_CALL(*stream, close()).Times(1);
+	EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke([&](const Event& event) {
+		if (event.getType() == messageType) {
+			++messageEvents;
+			delete event.getDataObject();
+		}
+		else {
+			EXPECT_EQ(disconnectedType, event.getType());
+		}
+	}));
+
+	proxy.handleData(Event(Event::kUnknown), NULL);
+	EXPECT_EQ(0, messageEvents);
+	EXPECT_FALSE(proxy.m_ready.load());
+}
+
 TEST(IpcProxyTests, serverProxyInvalidHeaderDisconnectsWithoutNullMessageEvent)
 {
     NiceMock<MockEventQueue> events;

@@ -34,6 +34,7 @@ IpcClientProxy::IpcClientProxy(barrier::IStream& stream, IEventQueue* events) :
     m_stream(stream),
     m_clientType(kIpcClientUnknown),
     m_processId(0),
+    m_ready(false),
     m_disconnecting(false),
     m_deleting(false),
     m_sendRefCount(0),
@@ -145,6 +146,9 @@ IpcClientProxy::handleData(const Event&, void*)
         if (memcmp(code, kIpcMsgHello, 4) == 0) {
             m = parseHello();
         }
+        else if (memcmp(code, kIpcMsgReady, 4) == 0) {
+            m = parseReady();
+        }
         else if (memcmp(code, kIpcMsgCommand, 4) == 0) {
             if (m_clientType != kIpcClientGui) {
                 LOG((CLOG_WARN "rejecting ipc command from non-gui client type=%d", m_clientType));
@@ -222,6 +226,19 @@ IpcClientProxy::parseHello()
 
     // must be deleted by event handler.
     return new IpcHelloMessage(m_clientType, m_processId);
+}
+
+IpcMessage*
+IpcClientProxy::parseReady()
+{
+    if (m_clientType != kIpcClientNode || m_processId == 0) {
+        LOG((CLOG_WARN "rejecting ipc ready before a valid node hello"));
+        disconnect();
+        return nullptr;
+    }
+
+    m_ready = true;
+    return new IpcNodeReadyMessage();
 }
 
 IpcCommandMessage*

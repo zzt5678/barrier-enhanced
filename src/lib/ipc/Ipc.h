@@ -26,6 +26,7 @@ enum EIpcMessage {
     kIpcLogLine,
     kIpcCommand,
     kIpcShutdown,
+    kIpcReady,
 };
 
 enum EIpcClientType {
@@ -38,6 +39,10 @@ enum EIpcClientType {
 // $1 = type, the client identifies itself as gui or node (barrierc/s).
 // $2 = client process id, used by the daemon for targeted node shutdown.
 extern const char*        kIpcMsgHello;
+
+// ready: node -> daemon
+// Sent only after node startup has completed and its IPC event loop is active.
+extern const char*        kIpcMsgReady;
 
 // log line: daemon -> gui
 // $1 = aggregate log lines collected from barriers/c or the daemon itself.

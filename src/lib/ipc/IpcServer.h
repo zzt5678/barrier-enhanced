@@ -63,6 +63,8 @@ public:
 
     //! Returns true when there are clients of the specified type connected.
     virtual bool        hasClients(EIpcClientType clientType) const;
+    virtual bool        hasClientProcess(EIpcClientType clientType, UInt32 processId) const;
+    virtual bool        hasReadyClientProcess(EIpcClientType clientType, UInt32 processId) const;
 
     //@}
 

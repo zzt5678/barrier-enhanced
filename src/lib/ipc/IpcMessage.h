@@ -57,6 +57,12 @@ public:
     virtual ~IpcShutdownMessage();
 };
 
+class IpcNodeReadyMessage : public IpcMessage {
+public:
+    IpcNodeReadyMessage();
+    virtual ~IpcNodeReadyMessage();
+};
+
 
 class IpcLogLineMessage : public IpcMessage {
 public:

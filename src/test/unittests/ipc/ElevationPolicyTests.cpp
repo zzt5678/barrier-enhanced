@@ -59,6 +59,26 @@ TEST(ElevationPolicyTests, onlyAsNeededModeRelaunchesOnDesktopSwitch)
     EXPECT_TRUE(ElevationPolicy::shouldRelaunchOnDesktopSwitch(99));
 }
 
+TEST(ElevationPolicyTests, identicalNormalizedCommandDoesNotRelaunch)
+{
+    EXPECT_FALSE(ElevationPolicy::commandRequiresRelaunch(
+        "weavec --ipc --name windows", IpcCommandMessage::kElevateAlways,
+        "weavec --ipc --name windows", IpcCommandMessage::kElevateAlways));
+}
+
+TEST(ElevationPolicyTests, commandOrElevationChangeRequiresRelaunch)
+{
+    EXPECT_TRUE(ElevationPolicy::commandRequiresRelaunch(
+        "weavec --ipc --name windows", IpcCommandMessage::kElevateAlways,
+        "weavec --ipc --name windows-2", IpcCommandMessage::kElevateAlways));
+    EXPECT_TRUE(ElevationPolicy::commandRequiresRelaunch(
+        "weavec --ipc --name windows", IpcCommandMessage::kElevateAsNeeded,
+        "weavec --ipc --name windows", IpcCommandMessage::kElevateAlways));
+    EXPECT_FALSE(ElevationPolicy::commandRequiresRelaunch(
+        "weavec --ipc --name windows", 99,
+        "weavec --ipc --name windows", IpcCommandMessage::kElevateAsNeeded));
+}
+
 TEST(ElevationPolicyTests, modeSettingOverridesLegacyElevateFlag)
 {
     EXPECT_EQ(IpcCommandMessage::kElevateNever,

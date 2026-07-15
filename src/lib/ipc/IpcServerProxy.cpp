@@ -93,6 +93,10 @@ IpcServerProxy::send(const IpcMessage& message)
         break;
     }
 
+    case kIpcReady:
+        ProtocolUtil::writef(&m_stream, kIpcMsgReady);
+        break;
+
     case kIpcCommand: {
         const IpcCommandMessage& cm = static_cast<const IpcCommandMessage&>(message);
         std::string command = cm.command();

@@ -53,6 +53,7 @@ private:
     void                handleDisconnect(const Event&, void*);
     void                handleWriteError(const Event&, void*);
     IpcHelloMessage*    parseHello();
+    IpcMessage*         parseReady();
     IpcCommandMessage*    parseCommand();
     void                disconnect();
 
@@ -64,6 +65,7 @@ private:
     barrier::IStream&    m_stream;
     EIpcClientType        m_clientType;
     UInt32              m_processId;
+    std::atomic<bool>   m_ready;
     std::atomic<bool>    m_disconnecting;
     bool                m_deleting;
     UInt32              m_sendRefCount;
