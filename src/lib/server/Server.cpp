@@ -2950,7 +2950,7 @@ Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button,
 		for (ClientList::const_iterator index = m_clients.begin();
 								index != m_clients.end(); ++index) {
 			if (IKeyState::KeyInfo::contains(screens, index->first)) {
-				index->second->keyDown(id, mask, button);
+				index->second->keyDownBroadcast(id, mask, button);
 			}
 		}
 	}
@@ -2997,7 +2997,7 @@ Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button,
 		for (ClientList::const_iterator index = m_clients.begin();
 								index != m_clients.end(); ++index) {
 			if (IKeyState::KeyInfo::contains(screens, index->first)) {
-				index->second->keyUp(id, mask, button);
+				index->second->keyUpBroadcast(id, mask, button);
 			}
 		}
 	}

@@ -964,6 +964,9 @@ Client::cleanupScreen()
 {
     // Revoke the logical pointer lease before any cleanup can defer or return.
     // Screen::disable() releases the platform state for a ready connection.
+    if (m_server != NULL) {
+        m_server->revokeInputLease();
+    }
     m_active = false;
     releaseDetachedServerProxies();
     cleanupClipboardRetryTimer();

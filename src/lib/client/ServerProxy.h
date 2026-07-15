@@ -21,12 +21,15 @@
 #include "barrier/clipboard_types.h"
 #include "barrier/ClipboardChunk.h"
 #include "barrier/key_types.h"
+#include "barrier/mouse_types.h"
 #include "barrier/option_types.h"
 #include "barrier/protocol_types.h"
 #include "base/Event.h"
 #include "base/Stopwatch.h"
 
 #include <memory>
+#include <map>
+#include <set>
 #include <string>
 
 class Client;
@@ -70,6 +73,7 @@ public:
     virtual bool        cleanupClipboardSendThread(bool cancel);
     virtual bool        reapClipboardSendResult(ClipboardID id, bool& succeeded);
     void                detachForDeferredCleanup();
+    void                revokeInputLease();
 
     //@}
 
@@ -105,6 +109,14 @@ private:
     bool                shouldCompressMouseMoves() const;
     bool                hasActivePointerLease(const char* inputType) const;
     void                clearStaleInfoAckGate();
+    bool                acceptEpochInput(UInt32 epoch, UInt32 sequence,
+                            UInt8 flags, const char* inputType);
+
+    typedef void (ServerProxy::*InputPayloadHandler)();
+    void                dispatchEpochInput(UInt32 epoch, UInt32 sequence,
+                            UInt8 flags, const char* inputType,
+                            InputPayloadHandler handler);
+    void                releaseEpochPressedInput();
 
     void                sendInfo(const ClientInfo&);
 
@@ -141,6 +153,14 @@ private:
     void                mouseMove();
     void                mouseRelativeMove();
     void                mouseWheel();
+    void                keyDown1_8();
+    void                keyRepeat1_8();
+    void                keyUp1_8();
+    void                mouseDown1_8();
+    void                mouseUp1_8();
+    void                mouseMove1_8();
+    void                mouseRelativeMove1_8();
+    void                mouseWheel1_8();
     void                screensaver();
     void                resetOptions();
     void                setOptions();
@@ -167,6 +187,22 @@ private:
     UInt32                m_preparedEnterSequence;
     bool                  m_hasPreparedEnter;
     bool                  m_preparedEnterReady;
+    UInt32                m_lastInputSequence;
+    bool                  m_hasInputSequence;
+    bool                  m_inputFrameAccepted;
+    bool                  m_inputFrameBroadcast;
+    bool                  m_inputFrameHasEpoch;
+
+    struct PressedKey {
+        PressedKey() : id(0), mask(0) { }
+        PressedKey(KeyID keyId, KeyModifierMask keyMask) :
+            id(keyId), mask(keyMask) { }
+
+        KeyID id;
+        KeyModifierMask mask;
+    };
+    std::map<KeyButton, PressedKey> m_epochPressedKeys;
+    std::set<ButtonID> m_epochPressedButtons;
 
     bool                m_compressMouse;
     bool                m_compressMouseRelative;

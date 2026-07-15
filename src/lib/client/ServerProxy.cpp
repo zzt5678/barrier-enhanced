@@ -67,6 +67,13 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_preparedEnterSequence(0),
     m_hasPreparedEnter(false),
     m_preparedEnterReady(false),
+    m_lastInputSequence(0),
+    m_hasInputSequence(false),
+    m_inputFrameAccepted(true),
+    m_inputFrameBroadcast(false),
+    m_inputFrameHasEpoch(false),
+    m_epochPressedKeys(),
+    m_epochPressedButtons(),
     m_compressMouse(false),
     m_compressMouseRelative(false),
     m_xMouse(0),
@@ -318,35 +325,83 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
 ServerProxy::EResult
 ServerProxy::parseMessage(const UInt8* code)
 {
-    if (memcmp(code, kMsgDMouseMove, 4) == 0) {
+    if (m_protocolMinorVersion >= 8 &&
+        memcmp(code, kMsgDMouseMove1_8, 4) == 0) {
+        mouseMove1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDMouseRelMove1_8, 4) == 0) {
+        mouseRelativeMove1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDMouseWheel1_8, 4) == 0) {
+        mouseWheel1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDKeyDown1_8, 4) == 0) {
+        keyDown1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDKeyUp1_8, 4) == 0) {
+        keyUp1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDMouseDown1_8, 4) == 0) {
+        mouseDown1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDMouseUp1_8, 4) == 0) {
+        mouseUp1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDKeyRepeat1_8, 4) == 0) {
+        keyRepeat1_8();
+    }
+
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDMouseMove, 4) == 0) {
         mouseMove();
     }
 
-    else if (memcmp(code, kMsgDMouseRelMove, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDMouseRelMove, 4) == 0) {
         mouseRelativeMove();
     }
 
-    else if (memcmp(code, kMsgDMouseWheel, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDMouseWheel, 4) == 0) {
         mouseWheel();
     }
 
-    else if (memcmp(code, kMsgDKeyDown, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDKeyDown, 4) == 0) {
         keyDown();
     }
 
-    else if (memcmp(code, kMsgDKeyUp, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDKeyUp, 4) == 0) {
         keyUp();
     }
 
-    else if (memcmp(code, kMsgDMouseDown, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDMouseDown, 4) == 0) {
         mouseDown();
     }
 
-    else if (memcmp(code, kMsgDMouseUp, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDMouseUp, 4) == 0) {
         mouseUp();
     }
 
-    else if (memcmp(code, kMsgDKeyRepeat, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDKeyRepeat, 4) == 0) {
         keyRepeat();
     }
 
@@ -873,6 +928,7 @@ ServerProxy::enter()
     if (m_inputActive) {
         LOG((CLOG_WARN "replacing active input lease %u with %u", m_seqNum, seqNum));
         discardCompressedMouse();
+        releaseEpochPressedInput();
         m_inputActive = false;
         m_client->leave();
     }
@@ -885,6 +941,8 @@ ServerProxy::enter()
     m_inputActive           = true;
     m_hasPreparedEnter      = false;
     m_preparedEnterReady    = false;
+    m_lastInputSequence     = 0;
+    m_hasInputSequence      = false;
 
     // forward
     m_client->enter(x, y, seqNum, static_cast<KeyModifierMask>(mask), false);
@@ -943,6 +1001,7 @@ ServerProxy::leave()
 
     // send last mouse motion
     flushCompressedMouse();
+    releaseEpochPressedInput();
 
     // forward
     m_inputActive = false;
@@ -1018,7 +1077,12 @@ ServerProxy::keyDown()
     // Keyboard broadcast intentionally targets inactive screens.  The 1.6
     // protocol has no broadcast marker, so keyboard events cannot use the
     // pointer lease gate without breaking that feature.
-    m_client->keyDown(id2, mask2, button);
+    if (m_inputFrameAccepted) {
+        m_client->keyDown(id2, mask2, button);
+        if (m_inputFrameHasEpoch && !m_inputFrameBroadcast) {
+            m_epochPressedKeys[button] = PressedKey(id2, mask2);
+        }
+    }
 }
 
 void
@@ -1042,7 +1106,9 @@ ServerProxy::keyRepeat()
         LOG((CLOG_DEBUG1 "key repeat translated to id=0x%08x, mask=0x%04x", id2, mask2));
 
     // forward
-    m_client->keyRepeat(id2, mask2, count, button);
+    if (m_inputFrameAccepted) {
+        m_client->keyRepeat(id2, mask2, count, button);
+    }
 }
 
 void
@@ -1065,7 +1131,12 @@ ServerProxy::keyUp()
         LOG((CLOG_DEBUG1 "key up translated to id=0x%08x, mask=0x%04x", id2, mask2));
 
     // forward
-    m_client->keyUp(id2, mask2, button);
+    if (m_inputFrameAccepted) {
+        m_client->keyUp(id2, mask2, button);
+        if (m_inputFrameHasEpoch && !m_inputFrameBroadcast) {
+            m_epochPressedKeys.erase(button);
+        }
+    }
 }
 
 void
@@ -1080,8 +1151,11 @@ ServerProxy::mouseDown()
     LOG((CLOG_DEBUG1 "recv mouse down id=%d", id));
 
     // forward
-    if (hasActivePointerLease("mouse down")) {
+    if (m_inputFrameAccepted && hasActivePointerLease("mouse down")) {
         m_client->mouseDown(static_cast<ButtonID>(id));
+        if (m_inputFrameHasEpoch) {
+            m_epochPressedButtons.insert(static_cast<ButtonID>(id));
+        }
     }
 }
 
@@ -1097,8 +1171,11 @@ ServerProxy::mouseUp()
     LOG((CLOG_DEBUG1 "recv mouse up id=%d", id));
 
     // forward
-    if (hasActivePointerLease("mouse up")) {
+    if (m_inputFrameAccepted && hasActivePointerLease("mouse up")) {
         m_client->mouseUp(static_cast<ButtonID>(id));
+        if (m_inputFrameHasEpoch) {
+            m_epochPressedButtons.erase(static_cast<ButtonID>(id));
+        }
     }
 }
 
@@ -1112,7 +1189,8 @@ ServerProxy::mouseMove()
 
     // note if we should ignore the move
     clearStaleInfoAckGate();
-    ignore = m_ignoreMouse || !hasActivePointerLease("mouse move");
+    ignore = m_ignoreMouse || !m_inputFrameAccepted ||
+        !hasActivePointerLease("mouse move");
 
     // compress mouse motion events if more input follows
     if (!ignore && shouldCompressMouseMoves() &&
@@ -1121,7 +1199,7 @@ ServerProxy::mouseMove()
     }
 
     // if compressing then ignore the motion but record it
-    if (m_compressMouse) {
+    if (m_compressMouse && m_inputFrameAccepted) {
         m_compressMouseRelative = false;
         ignore    = true;
         m_xMouse  = x;
@@ -1147,7 +1225,8 @@ ServerProxy::mouseRelativeMove()
 
     // note if we should ignore the move
     clearStaleInfoAckGate();
-    ignore = m_ignoreMouse || !hasActivePointerLease("relative mouse move");
+    ignore = m_ignoreMouse || !m_inputFrameAccepted ||
+        !hasActivePointerLease("relative mouse move");
 
     // compress mouse motion events if more input follows
     if (!ignore && shouldCompressMouseMoves() &&
@@ -1156,7 +1235,7 @@ ServerProxy::mouseRelativeMove()
     }
 
     // if compressing then ignore the motion but record it
-    if (m_compressMouseRelative) {
+    if (m_compressMouseRelative && m_inputFrameAccepted) {
         ignore     = true;
         m_dxMouse += dx;
         m_dyMouse += dy;
@@ -1181,9 +1260,186 @@ ServerProxy::mouseWheel()
     LOG((CLOG_DEBUG2 "recv mouse wheel %+d,%+d", xDelta, yDelta));
 
     // forward
-    if (hasActivePointerLease("mouse wheel")) {
+    if (m_inputFrameAccepted && hasActivePointerLease("mouse wheel")) {
         m_client->mouseWheel(xDelta, yDelta);
     }
+}
+
+bool
+ServerProxy::acceptEpochInput(UInt32 epoch, UInt32 sequence, UInt8 flags,
+                              const char* inputType)
+{
+    if ((flags & ~static_cast<UInt8>(kInputMessageBroadcast)) != 0) {
+        LOG((CLOG_WARN "dropping %s with invalid input flags 0x%02x",
+            inputType, flags));
+        return false;
+    }
+
+    const bool broadcast = (flags & kInputMessageBroadcast) != 0;
+    const bool epochMatches =
+        (m_hasEnterSequence && epoch == m_seqNum) ||
+        (!m_hasEnterSequence && broadcast && epoch == 0);
+    if (!epochMatches) {
+        LOG((CLOG_DEBUG1 "dropping %s for stale input epoch %u; current=%u",
+            inputType, epoch, m_seqNum));
+        return false;
+    }
+    if (!broadcast && !m_inputActive) {
+        LOG((CLOG_DEBUG1 "dropping %s without an active input lease",
+            inputType));
+        return false;
+    }
+    if (m_hasInputSequence &&
+        !isNewerInputSequence(sequence, m_lastInputSequence)) {
+        LOG((CLOG_DEBUG1 "dropping replayed %s sequence %u; current=%u",
+            inputType, sequence, m_lastInputSequence));
+        return false;
+    }
+
+    m_lastInputSequence = sequence;
+    m_hasInputSequence = true;
+    return true;
+}
+
+void
+ServerProxy::dispatchEpochInput(UInt32 epoch, UInt32 sequence, UInt8 flags,
+                                const char* inputType,
+                                InputPayloadHandler handler)
+{
+    const bool previousAccepted = m_inputFrameAccepted;
+    const bool previousBroadcast = m_inputFrameBroadcast;
+    const bool previousHasEpoch = m_inputFrameHasEpoch;
+    m_inputFrameAccepted = acceptEpochInput(epoch, sequence, flags, inputType);
+    m_inputFrameBroadcast =
+        (flags & static_cast<UInt8>(kInputMessageBroadcast)) != 0;
+    m_inputFrameHasEpoch = true;
+    try {
+        (this->*handler)();
+    }
+    catch (...) {
+        m_inputFrameAccepted = previousAccepted;
+        m_inputFrameBroadcast = previousBroadcast;
+        m_inputFrameHasEpoch = previousHasEpoch;
+        throw;
+    }
+    m_inputFrameAccepted = previousAccepted;
+    m_inputFrameBroadcast = previousBroadcast;
+    m_inputFrameHasEpoch = previousHasEpoch;
+}
+
+void
+ServerProxy::releaseEpochPressedInput()
+{
+    if (m_epochPressedKeys.empty() && m_epochPressedButtons.empty()) {
+        return;
+    }
+
+    std::map<KeyButton, PressedKey> keys;
+    std::set<ButtonID> buttons;
+    keys.swap(m_epochPressedKeys);
+    buttons.swap(m_epochPressedButtons);
+
+    LOG((CLOG_DEBUG1 "releasing %lu key(s) and %lu mouse button(s) for input epoch %u",
+        static_cast<unsigned long>(keys.size()),
+        static_cast<unsigned long>(buttons.size()), m_seqNum));
+    for (std::set<ButtonID>::const_iterator i = buttons.begin();
+         i != buttons.end(); ++i) {
+        m_client->mouseUp(*i);
+    }
+    for (std::map<KeyButton, PressedKey>::const_iterator i = keys.begin();
+         i != keys.end(); ++i) {
+        m_client->keyUp(i->second.id, i->second.mask, i->first);
+    }
+}
+
+void
+ServerProxy::revokeInputLease()
+{
+    discardCompressedMouse();
+    releaseEpochPressedInput();
+    m_inputActive = false;
+    m_hasPreparedEnter = false;
+    m_preparedEnterReady = false;
+}
+
+void
+ServerProxy::keyDown1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    UInt8 flags = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i%1i", &epoch, &sequence, &flags);
+    dispatchEpochInput(epoch, sequence, flags, "key down", &ServerProxy::keyDown);
+}
+
+void
+ServerProxy::keyRepeat1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    UInt8 flags = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i%1i", &epoch, &sequence, &flags);
+    dispatchEpochInput(epoch, sequence, flags, "key repeat", &ServerProxy::keyRepeat);
+}
+
+void
+ServerProxy::keyUp1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    UInt8 flags = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i%1i", &epoch, &sequence, &flags);
+    dispatchEpochInput(epoch, sequence, flags, "key up", &ServerProxy::keyUp);
+}
+
+void
+ServerProxy::mouseDown1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i", &epoch, &sequence);
+    dispatchEpochInput(epoch, sequence, kInputMessageNoFlags,
+                       "mouse down", &ServerProxy::mouseDown);
+}
+
+void
+ServerProxy::mouseUp1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i", &epoch, &sequence);
+    dispatchEpochInput(epoch, sequence, kInputMessageNoFlags,
+                       "mouse up", &ServerProxy::mouseUp);
+}
+
+void
+ServerProxy::mouseMove1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i", &epoch, &sequence);
+    dispatchEpochInput(epoch, sequence, kInputMessageNoFlags,
+                       "mouse move", &ServerProxy::mouseMove);
+}
+
+void
+ServerProxy::mouseRelativeMove1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i", &epoch, &sequence);
+    dispatchEpochInput(epoch, sequence, kInputMessageNoFlags,
+                       "relative mouse move", &ServerProxy::mouseRelativeMove);
+}
+
+void
+ServerProxy::mouseWheel1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i", &epoch, &sequence);
+    dispatchEpochInput(epoch, sequence, kInputMessageNoFlags,
+                       "mouse wheel", &ServerProxy::mouseWheel);
 }
 
 void

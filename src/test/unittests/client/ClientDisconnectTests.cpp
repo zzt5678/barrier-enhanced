@@ -1474,6 +1474,265 @@ TEST(ClientDisconnectTests, rejectedTransactionalPrepareBlocksCommitUntilAbort)
     EXPECT_FALSE(proxy.m_hasPreparedEnter);
 }
 
+TEST(ClientDisconnectTests, protocol18RejectsStaleEpochAndReplayedInput)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 8);
+
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 100, 0);
+    proxy.enter();
+    ASSERT_EQ(1u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgDMouseMove + 4, 25, 35);
+    EXPECT_EQ(ServerProxy::kUnknown, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>(kMsgDMouseMove)));
+    EXPECT_EQ(1u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8MM%4i%4i%2i%2i" + 4,
+                         99, 1, 30, 40);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8MM")));
+    EXPECT_EQ(1u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8MM%4i%4i%2i%2i" + 4,
+                         100, 10, 30, 40);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8MM")));
+    EXPECT_EQ(2u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8MM%4i%4i%2i%2i" + 4,
+                         100, 10, 31, 41);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8MM")));
+    EXPECT_EQ(2u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8MM%4i%4i%2i%2i" + 4,
+                         100, 9, 32, 42);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8MM")));
+    EXPECT_EQ(2u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8MM%4i%4i%2i%2i" + 4,
+                         100, 11, 33, 43);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8MM")));
+    EXPECT_EQ(3u, platform->mouseMoveCount);
+}
+
+TEST(ClientDisconnectTests, protocol17AcceptsLegacyInputFrames)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 7);
+
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 100, 0);
+    proxy.enter();
+    ASSERT_EQ(1u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgDMouseMove + 4, 25, 35);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>(kMsgDMouseMove)));
+    EXPECT_EQ(2u, platform->mouseMoveCount);
+}
+
+TEST(ClientDisconnectTests, protocol18RequiresActiveLeaseUnlessKeyboardBroadcast)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 8);
+
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 200, 0);
+    proxy.enter();
+    proxy.leave();
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8KD%4i%4i%1i%2i%2i%2i" + 4,
+                         200, 1, 0, 1, 0, 1);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8KD")));
+    EXPECT_EQ(0u, platform->keyDownCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8KD%4i%4i%1i%2i%2i%2i" + 4,
+                         200, 2, 1, 1, 0, 1);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8KD")));
+    EXPECT_EQ(1u, platform->keyDownCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8KD%4i%4i%1i%2i%2i%2i" + 4,
+                         199, 3, 1, 1, 0, 1);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8KD")));
+    EXPECT_EQ(1u, platform->keyDownCount);
+}
+
+TEST(ClientDisconnectTests, protocol18AcceptsInputSequenceAfterEpochWrap)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 8);
+
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 0xffffffffu, 0);
+    proxy.enter();
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8MM%4i%4i%2i%2i" + 4,
+                         0xffffffffu, 0xffffffffu, 30, 40);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8MM")));
+    ASSERT_EQ(2u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8MM%4i%4i%2i%2i" + 4,
+                         0xffffffffu, 0, 31, 41);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8MM")));
+    EXPECT_EQ(3u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 50, 60, 0, 0);
+    proxy.enter();
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8MM%4i%4i%2i%2i" + 4,
+                         0xffffffffu, 1, 32, 42);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8MM")));
+    EXPECT_EQ(4u, platform->mouseMoveCount);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8MM%4i%4i%2i%2i" + 4,
+                         0, 1, 33, 43);
+    EXPECT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8MM")));
+    EXPECT_EQ(5u, platform->mouseMoveCount);
+}
+
+TEST(ClientDisconnectTests, protocol18LeaveReleasesOnlyEpochOwnedPressedInput)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 8);
+
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 300, 0);
+    proxy.enter();
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8MD%4i%4i%1i" + 4,
+                         300, 1, kButtonLeft);
+    ASSERT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8MD")));
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8KD%4i%4i%1i%2i%2i%2i" + 4,
+                         300, 2, 0, 7, 0, 9);
+    ASSERT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8KD")));
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, "D8KD%4i%4i%1i%2i%2i%2i" + 4,
+                         300, 3, 1, 8, 0, 10);
+    ASSERT_EQ(ServerProxy::kOkay, proxy.parseMessage(
+        reinterpret_cast<const UInt8*>("D8KD")));
+    ASSERT_EQ(1u, platform->mouseDownCount);
+    ASSERT_EQ(2u, platform->keyDownCount);
+
+    proxy.leave();
+
+    EXPECT_EQ(1u, platform->mouseUpCount);
+    EXPECT_EQ(1u, platform->keyUpCount);
+    EXPECT_EQ(1u, platform->leaveCount);
+}
+
 TEST(ClientDisconnectTests, protocolNegotiationFallsBackToPreviousStableMinor)
 {
     SInt16 negotiatedMinor = 0;
@@ -1482,7 +1741,7 @@ TEST(ClientDisconnectTests, protocolNegotiationFallsBackToPreviousStableMinor)
     EXPECT_TRUE(Client::negotiateProtocolVersion(1, 7, negotiatedMinor));
     EXPECT_EQ(7, negotiatedMinor);
     EXPECT_TRUE(Client::negotiateProtocolVersion(1, 9, negotiatedMinor));
-    EXPECT_EQ(7, negotiatedMinor);
+    EXPECT_EQ(8, negotiatedMinor);
     EXPECT_FALSE(Client::negotiateProtocolVersion(1, 5, negotiatedMinor));
     EXPECT_FALSE(Client::negotiateProtocolVersion(2, 0, negotiatedMinor));
 }

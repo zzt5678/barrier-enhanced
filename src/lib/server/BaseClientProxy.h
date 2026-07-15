@@ -91,9 +91,13 @@ public:
     virtual void        grabClipboard(ClipboardID) = 0;
     virtual void        setClipboardDirty(ClipboardID, bool) = 0;
     virtual void        keyDown(KeyID, KeyModifierMask, KeyButton) = 0;
+    virtual void        keyDownBroadcast(KeyID key, KeyModifierMask mask,
+                            KeyButton button) { keyDown(key, mask, button); }
     virtual void        keyRepeat(KeyID, KeyModifierMask,
                             SInt32 count, KeyButton) = 0;
     virtual void        keyUp(KeyID, KeyModifierMask, KeyButton) = 0;
+    virtual void        keyUpBroadcast(KeyID key, KeyModifierMask mask,
+                            KeyButton button) { keyUp(key, mask, button); }
     virtual void        mouseDown(ButtonID) = 0;
     virtual void        mouseUp(ButtonID) = 0;
     virtual void        mouseMove(SInt32 xAbs, SInt32 yAbs) = 0;

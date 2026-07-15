@@ -1,8 +1,10 @@
 #define BARRIER_TEST_ENV
 #include "server/ClientProxy1_6.h"
 #include "server/ClientProxy1_7.h"
+#include "server/ClientProxy1_8.h"
 
 #include "barrier/Clipboard.h"
+#include "barrier/ProtocolUtil.h"
 #include "barrier/protocol_types.h"
 #include "arch/Arch.h"
 #include "base/Stopwatch.h"
@@ -15,6 +17,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <vector>
 
 using ::testing::_;
 using ::testing::AnyNumber;
@@ -125,6 +128,53 @@ public:
     int cleanupCalls = 0;
 };
 
+class RecordingStream : public barrier::IStream {
+public:
+    void clear()
+    {
+        data.clear();
+        offset = 0;
+    }
+
+    void close() override { }
+    UInt32 read(void* buffer, UInt32 count) override
+    {
+        const UInt32 available = getSize();
+        const UInt32 copied = count < available ? count : available;
+        if (copied != 0) {
+            std::memcpy(buffer, data.data() + offset, copied);
+            offset += copied;
+        }
+        return copied;
+    }
+    void write(const void* buffer, UInt32 count) override
+    {
+        const UInt8* bytes = static_cast<const UInt8*>(buffer);
+        data.insert(data.end(), bytes, bytes + count);
+    }
+    void writeLowPriority(const void* buffer, UInt32 count) override
+    {
+        write(buffer, count);
+    }
+    void flush() override { }
+    void shutdownInput() override { }
+    void shutdownOutput() override { }
+    void* getEventTarget() const override
+    {
+        return const_cast<RecordingStream*>(this);
+    }
+    bool isReady() const override { return getSize() != 0; }
+    UInt32 getSize() const override
+    {
+        return static_cast<UInt32>(data.size() - offset);
+    }
+    UInt32 getBufferedOutputSize() const override { return 0; }
+
+private:
+    std::vector<UInt8> data;
+    std::size_t offset = 0;
+};
+
 }
 
 TEST(ClientProxyLifecycleTests, clientProxy16RemovesClipboardSendingHandlerOnDestruction)
@@ -194,6 +244,80 @@ TEST(ClientProxyLifecycleTests, clientProxy17PublishesDecodedHandoffReadiness)
 
     EXPECT_TRUE(proxy.parseMessage(
         reinterpret_cast<const UInt8*>(kMsgDEnterReady)));
+}
+
+TEST(ClientProxyLifecycleTests, clientProxy18FramesEveryInputWithEpochAndSequence)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientProxyEvents clientProxyEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents,
+                                  fileEvents, nextType);
+    clientProxyEvents.setEvents(&events);
+    ON_CALL(events, forClientProxy()).WillByDefault(ReturnRef(clientProxyEvents));
+
+    RecordingStream* stream = new RecordingStream();
+    NiceMock<MockServer> server;
+    ClientProxy1_8 proxy("client", stream, &server, &events);
+
+    stream->clear();
+    proxy.enter(10, 20, 42, 0, false);
+    SInt16 x = 0;
+    SInt16 y = 0;
+    UInt32 epoch = 0;
+    UInt16 mask = 0;
+    ASSERT_TRUE(ProtocolUtil::readf(stream, kMsgCEnter,
+                                    &x, &y, &epoch, &mask));
+    EXPECT_EQ(42u, epoch);
+
+    stream->clear();
+    proxy.mouseMove(30, 40);
+    UInt32 sequence = 0;
+    ASSERT_TRUE(ProtocolUtil::readf(stream, kMsgDMouseMove1_8,
+                                    &epoch, &sequence, &x, &y));
+    EXPECT_EQ(42u, epoch);
+    EXPECT_EQ(1u, sequence);
+    EXPECT_EQ(30, x);
+    EXPECT_EQ(40, y);
+
+    stream->clear();
+    proxy.mouseDown(kButtonLeft);
+    UInt8 button = 0;
+    ASSERT_TRUE(ProtocolUtil::readf(stream, kMsgDMouseDown1_8,
+                                    &epoch, &sequence, &button));
+    EXPECT_EQ(42u, epoch);
+    EXPECT_EQ(2u, sequence);
+    EXPECT_EQ(kButtonLeft, button);
+
+    stream->clear();
+    proxy.keyDownBroadcast(7, KeyModifierControl, 9);
+    UInt8 flags = 0;
+    UInt16 key = 0;
+    UInt16 keyMask = 0;
+    UInt16 keyButton = 0;
+    ASSERT_TRUE(ProtocolUtil::readf(stream, kMsgDKeyDown1_8,
+                                    &epoch, &sequence, &flags,
+                                    &key, &keyMask, &keyButton));
+    EXPECT_EQ(42u, epoch);
+    EXPECT_EQ(3u, sequence);
+    EXPECT_EQ(kInputMessageBroadcast, flags);
+    EXPECT_EQ(7u, key);
+    EXPECT_EQ(KeyModifierControl, keyMask);
+    EXPECT_EQ(9u, keyButton);
+
+    stream->clear();
+    proxy.mouseWheel(-120, 120);
+    SInt16 xDelta = 0;
+    SInt16 yDelta = 0;
+    ASSERT_TRUE(ProtocolUtil::readf(stream, kMsgDMouseWheel1_8,
+                                    &epoch, &sequence, &xDelta, &yDelta));
+    EXPECT_EQ(42u, epoch);
+    EXPECT_EQ(4u, sequence);
+    EXPECT_EQ(-120, xDelta);
+    EXPECT_EQ(120, yDelta);
 }
 
 TEST(ClientProxyLifecycleTests, clientProxy16CleanupRequestsCancelWithoutWaiting)

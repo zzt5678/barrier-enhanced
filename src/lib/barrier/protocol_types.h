@@ -32,9 +32,11 @@
 // 1.5:  adds file transfer and removes home brew crypto
 // 1.6:  adds clipboard streaming
 // 1.7:  adds transactional input handoff readiness
+// 1.8:  adds input epochs, per-connection input sequence, and explicit
+//       keyboard broadcast routing
 // NOTE: with new version, barrier minor version should increment
 static const SInt16        kProtocolMajorVersion = 1;
-static const SInt16        kProtocolMinorVersion = 7;
+static const SInt16        kProtocolMinorVersion = 8;
 static const SInt16        kProtocolMinimumMinorVersion = 6;
 
 // default contact port number
@@ -98,6 +100,11 @@ enum EDataReceived {
     kNotFinish,
     kFinish,
     kError
+};
+
+enum EInputMessageFlags {
+    kInputMessageNoFlags = 0,
+    kInputMessageBroadcast = 1
 };
 
 //
@@ -254,6 +261,18 @@ extern const char*        kMsgDMouseWheel;
 // mouse vertical scroll:  primary -> secondary
 // like as kMsgDMouseWheel except only sends $1 = yDelta.
 extern const char*        kMsgDMouseWheel1_0;
+
+// Protocol 1.8 input frames. Each carries $1 = InputEpoch and
+// $2 = InputSequence before the legacy input payload. Keyboard frames also
+// carry $3 = EInputMessageFlags so broadcast input remains explicit.
+extern const char*        kMsgDKeyDown1_8;
+extern const char*        kMsgDKeyRepeat1_8;
+extern const char*        kMsgDKeyUp1_8;
+extern const char*        kMsgDMouseDown1_8;
+extern const char*        kMsgDMouseUp1_8;
+extern const char*        kMsgDMouseMove1_8;
+extern const char*        kMsgDMouseRelMove1_8;
+extern const char*        kMsgDMouseWheel1_8;
 
 // response to kMsgCPrepareEnter: secondary -> primary
 // $1 = sequence number, $2 = 1 when ready and 0 when rejected.
