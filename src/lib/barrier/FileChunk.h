@@ -50,7 +50,7 @@ public:
 
     static FileChunk*    start(const String& size);
     static FileChunk*    data(const UInt8* data, size_t dataSize);
-    static FileChunk*    end();
+    static FileChunk*    end(const String& digest = String());
     static FileChunk*    cancel();
     static int            assemble(
                             barrier::IStream* stream,

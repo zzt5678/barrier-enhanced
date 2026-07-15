@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <vector>
 
 static bool
@@ -48,6 +49,15 @@ waitForPathRemoval(const barrier::fs::path& path, int attempts = 500)
         ARCH->sleep(0.001);
     }
     return !barrier::fs::exists(path);
+}
+
+static std::string
+readFileBytes(const barrier::fs::path& path)
+{
+    std::ifstream input;
+    barrier::open_utf8_path(input, path, std::ios::in | std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
 }
 
 class FileChunkTestStream : public barrier::IStream {
@@ -275,6 +285,78 @@ TEST(FileChunkTests, assemble_zeroByteTransferCanFinish)
     EXPECT_EQ(0u, session.expectedSize());
 }
 
+TEST(FileChunkTests, assemble_legacyEmptyEndStillFinishes)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "3");
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    appendFileChunkMessage(data, kDataEnd, "");
+    FileChunkTestStream stream(data);
+
+    FileReceiveSession session;
+
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ("abc", session.data());
+}
+
+TEST(FileChunkTests, assemble_matchingSha256EndFinishes)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "3");
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    appendFileChunkMessage(
+        data,
+        kDataEnd,
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    FileChunkTestStream stream(data);
+
+    FileReceiveSession session;
+
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ("abc", session.data());
+}
+
+TEST(FileChunkTests, assemble_mismatchedSha256EndFailsAndClearsPayload)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "3");
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    appendFileChunkMessage(
+        data,
+        kDataEnd,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    FileChunkTestStream stream(data);
+
+    FileReceiveSession session;
+
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_TRUE(session.data().empty());
+    EXPECT_EQ(0u, session.expectedSize());
+}
+
+TEST(FileChunkTests, assemble_malformedSha256EndFailsAndClearsPayload)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "3");
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    appendFileChunkMessage(data, kDataEnd, "sha256:not-a-digest");
+    FileChunkTestStream stream(data);
+
+    FileReceiveSession session;
+
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_TRUE(session.data().empty());
+    EXPECT_EQ(0u, session.expectedSize());
+}
+
 TEST(FileChunkTests, assemble_receiveErrorDoesNotPoisonAnotherReceiveBuffer)
 {
     std::vector<UInt8> failingData;
@@ -420,6 +502,40 @@ TEST(FileChunkTests, receiveSessionKeepsOneSpoolHandleOpenUntilTransferEnds)
     EXPECT_EQ(generation, session.generation());
     EXPECT_EQ(1u, session.spoolOpenCount());
     EXPECT_EQ(6u, barrier::fs::file_size(session.spoolPath()));
+}
+
+TEST(FileChunkTests, receiveSessionVerifiesSha256BeforeCompletingSpool)
+{
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(6, 0, 0));
+    ASSERT_TRUE(session.append("abc"));
+    ASSERT_TRUE(session.append("def"));
+    ASSERT_TRUE(session.finish(
+        "sha256:bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721"));
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+
+    EXPECT_EQ(1u, session.spoolOpenCount());
+    EXPECT_EQ("abcdef", readFileBytes(session.spoolPath()));
+}
+
+TEST(FileChunkTests, receiveSessionRejectsSha256MismatchAndRemovesSpool)
+{
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(6, 0, 0));
+    ASSERT_TRUE(session.append("abc"));
+    ASSERT_TRUE(session.append("def"));
+    const barrier::fs::path spoolPath = waitForSpoolPath(session);
+    ASSERT_FALSE(spoolPath.empty());
+
+    EXPECT_FALSE(session.finish(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    session.fail();
+
+    EXPECT_EQ(FileReceiveSession::kFailed, session.state());
+    EXPECT_TRUE(session.spoolPath().empty());
+    EXPECT_TRUE(waitForPathRemoval(spoolPath));
 }
 
 TEST(FileChunkTests, receiveSessionRejectsChunkLargerThanAsyncQueueBudget)

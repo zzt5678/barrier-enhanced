@@ -17,6 +17,10 @@
 #include <string>
 #include <thread>
 
+namespace barrier {
+class TransferDigest;
+}
+
 class FileReceiveSession {
 public:
     enum State {
@@ -37,7 +41,7 @@ public:
                               size_t reserveLimit,
                               size_t asyncQueueLimit = kDefaultAsyncQueueLimit);
     bool                append(std::string content);
-    bool                finish();
+    bool                finish(const std::string& expectedDigest = std::string());
     void                fail();
     void                reset();
     void                takeCompleted(std::string& data,
@@ -78,4 +82,5 @@ private:
     std::shared_ptr<AsyncState> m_asyncState;
     std::thread*        m_spoolWorker;
     std::uint64_t       m_generation;
+    std::unique_ptr<barrier::TransferDigest> m_digest;
 };

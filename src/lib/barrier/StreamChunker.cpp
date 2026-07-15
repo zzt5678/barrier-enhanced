@@ -20,6 +20,7 @@
 #include "barrier/FileChunk.h"
 #include "barrier/ClipboardChunk.h"
 #include "barrier/protocol_types.h"
+#include "barrier/TransferDigest.h"
 #include "base/EventTypes.h"
 #include "base/Event.h"
 #include "base/IEventQueue.h"
@@ -338,6 +339,10 @@ StreamChunker::sendFile(const char* filename,
         throw runtime_error("failed to open file");
     }
     FileInterruptResetGuard resetInterrupt(m_interruptFile);
+    barrier::TransferDigest digest;
+    if (!digest.isReady()) {
+        throw runtime_error("failed to initialize file transfer digest");
+    }
 
     // check file size
     file.seekg (0, std::ios::end);
@@ -401,6 +406,10 @@ StreamChunker::sendFile(const char* filename,
         if (!file) {
             throw runtime_error("failed to read file");
         }
+        if (!digest.update(chunkBuffer.data(), bytesToRead)) {
+            LOG((CLOG_ERR "failed to update file transfer digest"));
+            break;
+        }
         FileChunk* fileChunk = FileChunk::data(
             reinterpret_cast<const UInt8*>(chunkBuffer.data()), bytesToRead);
         fileChunk->m_transferId = transferId;
@@ -418,6 +427,12 @@ StreamChunker::sendFile(const char* filename,
         }
     }
 
+    String encodedDigest;
+    if (sentLength == size && !digest.finish(encodedDigest)) {
+        LOG((CLOG_ERR "failed to finalize file transfer digest"));
+        sentLength = 0;
+    }
+
     if (sentLength != size) {
         LOG((CLOG_DEBUG "file transmission stopped before completion, sent=%d expected=%d",
             sentLength, size));
@@ -431,7 +446,7 @@ StreamChunker::sendFile(const char* filename,
     }
 
     // send last message
-    FileChunk* end = FileChunk::end();
+    FileChunk* end = FileChunk::end(encodedDigest);
     end->m_transferId = transferId;
     Event endEvent(events->forFile().fileChunkSending(), eventTarget, end);
     endEvent.setDataObject(end);

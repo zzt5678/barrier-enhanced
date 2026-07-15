@@ -9,6 +9,8 @@
 
 #include "barrier/FileReceiveSession.h"
 
+#include "barrier/TransferDigest.h"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -222,6 +224,18 @@ FileReceiveSession::begin(size_t expectedSize,
     m_expectedSize = expectedSize;
     m_state = kReceiving;
 
+    try {
+        m_digest.reset(new barrier::TransferDigest());
+    }
+    catch (const std::exception&) {
+        fail();
+        return false;
+    }
+    if (!m_digest->isReady()) {
+        fail();
+        return false;
+    }
+
     if (expectedSize > memoryLimit) {
         if (asyncQueueLimit == 0) {
             fail();
@@ -261,6 +275,9 @@ FileReceiveSession::append(std::string content)
         contentSize > m_expectedSize - m_receivedSize) {
         return false;
     }
+    if (!m_digest || !m_digest->update(content.data(), contentSize)) {
+        return false;
+    }
 
     if (m_asyncState) {
         std::lock_guard<std::mutex> lock(m_asyncState->mutex);
@@ -292,9 +309,15 @@ FileReceiveSession::append(std::string content)
 }
 
 bool
-FileReceiveSession::finish()
+FileReceiveSession::finish(const std::string& expectedDigest)
 {
     if (state() != kReceiving || m_receivedSize != m_expectedSize) {
+        return false;
+    }
+    const bool digestMatches = expectedDigest.empty() ||
+        (m_digest && m_digest->verify(expectedDigest));
+    m_digest.reset();
+    if (!digestMatches) {
         return false;
     }
 
@@ -591,4 +614,5 @@ FileReceiveSession::clearPayload()
     std::string().swap(m_data);
     m_expectedSize = 0;
     m_receivedSize = 0;
+    m_digest.reset();
 }

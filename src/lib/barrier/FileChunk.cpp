@@ -80,12 +80,15 @@ FileChunk::data(const UInt8* data, size_t dataSize)
 }
 
 FileChunk*
-FileChunk::end()
+FileChunk::end(const String& digest)
 {
-    FileChunk* end = new FileChunk(FILE_CHUNK_META_SIZE);
+    FileChunk* end = new FileChunk(digest.size() + FILE_CHUNK_META_SIZE);
     char* chunk = end->m_chunk;
     chunk[0] = kDataEnd;
-    chunk[1] = '\0';
+    if (!digest.empty()) {
+        memcpy(&chunk[1], digest.data(), digest.size());
+    }
+    chunk[digest.size() + 1] = '\0';
 
     return end;
 }
@@ -168,8 +171,8 @@ FileChunk::assemble(barrier::IStream* stream,
             session.fail();
             return kError;
         }
-        if (!session.finish()) {
-            LOG((CLOG_ERR "corrupted file data, expected size=%llu actual size=%llu",
+        if (!session.finish(content)) {
+            LOG((CLOG_ERR "corrupted file data or digest, expected size=%llu actual size=%llu",
                 static_cast<unsigned long long>(session.expectedSize()),
                 static_cast<unsigned long long>(session.receivedSize())));
             session.fail();

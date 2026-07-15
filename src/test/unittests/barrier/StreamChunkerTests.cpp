@@ -199,6 +199,49 @@ TEST(StreamChunkerTests, sendFileQueuesFinalKeepAliveAfterCompletion)
     barrier::fs::remove(path);
 }
 
+TEST(StreamChunkerTests, sendFileEndCarriesSha256Digest)
+{
+    NiceMock<MockEventQueue> events;
+    NiceMock<MockStream> stream;
+    FileEvents fileEvents;
+    fileEvents.setEvents(&events);
+
+    String endDigest;
+    Event::Type nextType = Event::kLast;
+
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    ON_CALL(events, registerTypeOnce(_, _))
+        .WillByDefault(Invoke([&nextType](Event::Type& type, const char*) {
+            if (type == Event::kUnknown) {
+                type = nextType++;
+            }
+            return type;
+        }));
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&fileEvents, &endDigest](const Event& event) {
+            if (event.getType() == fileEvents.fileChunkSending() &&
+                event.getData() != NULL) {
+                const auto* chunk = static_cast<const FileChunk*>(event.getData());
+                if (chunk->m_chunk[0] == kDataEnd) {
+                    endDigest.assign(&chunk->m_chunk[1], chunk->m_dataSize);
+                }
+            }
+            Event::deleteData(event);
+        }));
+    ON_CALL(events, getQueuedEventCount()).WillByDefault(Return(0u));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+
+    const barrier::fs::path path = writeTempFile(3);
+    StreamChunker chunker;
+    chunker.sendFile(path.u8string().c_str(), &events, &events, &stream);
+
+    EXPECT_EQ(
+        "sha256:cd2eb0837c9b4c962c22d2ff8b5441b7b45805887f051d39bf133b583baf6860",
+        endDigest);
+
+    barrier::fs::remove(path);
+}
+
 TEST(StreamChunkerTests, sendFileQueuesFinalKeepAliveAfterOpenFailure)
 {
     NiceMock<MockEventQueue> events;
