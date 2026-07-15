@@ -91,6 +91,7 @@ public:
         keyDownCount(0),
         keyRepeatCount(0),
         keyUpCount(0),
+        sequenceNumber(0),
         setClipboardCount(0),
         getClipboardCount(0),
         lastSetClipboardWasNull(false),
@@ -124,7 +125,7 @@ public:
     void screensaver(bool) override { }
     void resetOptions() override { }
     void setOptions(const OptionsList&) override { }
-    void setSequenceNumber(UInt32) override { }
+    void setSequenceNumber(UInt32 value) override { sequenceNumber = value; }
     void setDraggingStarted(bool) override { }
     bool isPrimary() const override { return false; }
     bool canEnter() const override { return enterable; }
@@ -229,6 +230,7 @@ public:
     UInt32 keyDownCount;
     UInt32 keyRepeatCount;
     UInt32 keyUpCount;
+    UInt32 sequenceNumber;
     UInt32 setClipboardCount;
     mutable UInt32 getClipboardCount;
     bool lastSetClipboardWasNull;
@@ -1183,6 +1185,26 @@ TEST(ClientDisconnectTests, enterInterruptsFileSenderWithoutLosingThreadHandle)
     EXPECT_TRUE(client.leave());
 }
 
+TEST(ClientDisconnectTests, enterSynchronizesClipboardSequenceAfterReconnect)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    setClientEventDefaults(events, clientEvents, screenEvents, fileEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    client.enter(10, 20, 42, 0, false);
+
+    EXPECT_EQ(42u, platform->sequenceNumber);
+    EXPECT_TRUE(client.leave());
+}
+
 TEST(ClientDisconnectTests, inactiveClientRejectsPointerButPreservesKeyboardBroadcast)
 {
     NiceMock<MockEventQueue> events;
@@ -1294,6 +1316,9 @@ TEST(ClientDisconnectTests, disconnectRevokesPointerLeaseBeforeReconnect)
     client.enter(50, 60, 2, 0, false);
     EXPECT_EQ(2u, platform->enterCount);
     EXPECT_EQ(2u, platform->mouseMoveCount);
+
+    client.testCleanupScreen();
+    client.testCleanupConnection();
 }
 
 TEST(ClientDisconnectTests, staleEnterSequenceDoesNotReactivateClient)
@@ -1741,7 +1766,9 @@ TEST(ClientDisconnectTests, protocolNegotiationFallsBackToPreviousStableMinor)
     EXPECT_TRUE(Client::negotiateProtocolVersion(1, 7, negotiatedMinor));
     EXPECT_EQ(7, negotiatedMinor);
     EXPECT_TRUE(Client::negotiateProtocolVersion(1, 9, negotiatedMinor));
-    EXPECT_EQ(8, negotiatedMinor);
+    EXPECT_EQ(9, negotiatedMinor);
+    EXPECT_TRUE(Client::negotiateProtocolVersion(1, 10, negotiatedMinor));
+    EXPECT_EQ(9, negotiatedMinor);
     EXPECT_FALSE(Client::negotiateProtocolVersion(1, 5, negotiatedMinor));
     EXPECT_FALSE(Client::negotiateProtocolVersion(2, 0, negotiatedMinor));
 }

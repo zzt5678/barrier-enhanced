@@ -20,6 +20,7 @@
 #pragma once
 
 #include "platform/MSWindowsHook.h"
+#include "platform/MSWindowsClipboardChangeTracker.h"
 #include "barrier/PlatformScreen.h"
 #include "barrier/DragInformation.h"
 #include "platform/synwinhk.h"
@@ -295,6 +296,8 @@ private:
     HWND                m_window;
     HWND                m_nextClipboardWindow;
     bool                m_ownClipboard;
+    MSWindowsClipboardChangeTracker
+                        m_clipboardChangeTracker;
 
     // one desk per desktop and a cond var to communicate with it
     MSWindowsDesks*    m_desks;

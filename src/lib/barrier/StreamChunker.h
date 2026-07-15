@@ -22,9 +22,13 @@
 #include "common/basic_types.h"
 
 #include <atomic>
+#include <memory>
 
 class IEventQueue;
-namespace barrier { class IStream; }
+namespace barrier {
+class BulkChannel;
+class IStream;
+}
 
 class StreamChunker {
 public:
@@ -39,7 +43,9 @@ public:
                             UInt32 sequence,
                             IEventQueue* events,
                             void* eventTarget,
-                            barrier::IStream* stream = nullptr);
+                            barrier::IStream* stream = nullptr,
+                            const std::shared_ptr<barrier::BulkChannel>& bulkChannel =
+                                std::shared_ptr<barrier::BulkChannel>());
     static bool            sendClipboard(
                             const String& data,
                             size_t size,
@@ -47,7 +53,9 @@ public:
                             UInt32 sequence,
                             IEventQueue* events,
                             void* eventTarget,
-                            barrier::IStream* stream = nullptr);
+                            barrier::IStream* stream = nullptr,
+                            const std::shared_ptr<barrier::BulkChannel>& bulkChannel =
+                                std::shared_ptr<barrier::BulkChannel>());
     void                   interruptFile();
 
 #if defined(BARRIER_TEST_ENV)

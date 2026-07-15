@@ -21,6 +21,8 @@
 #include "client/Client.h"
 #include "barrier/FileChunk.h"
 #include "barrier/ClipboardChunk.h"
+#include "barrier/RemoteFileClipboard.h"
+#include "barrier/BulkChannel.h"
 #include "barrier/StreamChunker.h"
 #include "barrier/Clipboard.h"
 #include "barrier/ProtocolUtil.h"
@@ -94,6 +96,8 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_parser(&ServerProxy::parseHandshakeMessage),
     m_events(events),
     m_clipboardSendThread(NULL),
+    m_clipboardBulkChannel(),
+    m_clipboardSendStream(stream),
     m_detachedForDeferredCleanup(false),
     m_clipboardSendId(kClipboardEnd),
     m_clipboardSendSucceeded(false),
@@ -256,6 +260,10 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
 
     else if (memcmp(code, kMsgCInfoAck, 4) == 0) {
         infoAcknowledgment();
+    }
+
+    else if (memcmp(code, kMsgCBulkOffer, 4) == 0) {
+        bulkOffer();
     }
 
     else if (memcmp(code, kMsgDSetOptions, 4) == 0) {
@@ -455,6 +463,10 @@ ServerProxy::parseMessage(const UInt8* code)
         setClipboard();
     }
 
+    else if (memcmp(code, kMsgCBulkOffer, 4) == 0) {
+        bulkOffer();
+    }
+
     else if (memcmp(code, kMsgCResetOptions, 4) == 0) {
         resetOptions();
     }
@@ -623,12 +635,26 @@ ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard* clipboard)
     std::shared_ptr<const std::string> data(
         new std::string(IClipboard::marshall(clipboard)));
 
+    const bool needsOrderedBulkRoute =
+        id == kClipboardClipboard &&
+        RemoteFileClipboard::containsFileList(*clipboard);
+    m_clipboardBulkChannel =
+        (data->size() > kSynchronousClipboardSendLimit || needsOrderedBulkRoute) ?
+        m_client->acquireBulkChannel() :
+        std::shared_ptr<barrier::BulkChannel>();
+    m_clipboardSendStream = m_clipboardBulkChannel &&
+        m_clipboardBulkChannel->isActive() ?
+        m_clipboardBulkChannel->getStream() : m_stream;
+
     if (data->size() <= kSynchronousClipboardSendLimit) {
         const bool sent = StreamChunker::sendClipboard(
-            *data, data->size(), id, m_seqNum, m_events, this, m_stream);
+            *data, data->size(), id, m_seqNum, m_events, this,
+            m_clipboardSendStream, m_clipboardBulkChannel);
         if (!sent) {
             LOG((CLOG_WARN "clipboard %d was not fully queued for sending", id));
         }
+        m_clipboardBulkChannel.reset();
+        m_clipboardSendStream = m_stream;
         return sent ? kClipboardSendQueued : kClipboardSendFailed;
     }
 
@@ -651,7 +677,8 @@ ServerProxy::sendClipboardThread(const std::shared_ptr<const std::string>& data,
                                  const std::shared_ptr<StreamChunker>& chunker)
 {
     const bool sent = chunker->sendClipboardData(
-            *data, data->size(), id, sequence, m_events, this, m_stream);
+            *data, data->size(), id, sequence, m_events, this,
+            m_clipboardSendStream, m_clipboardBulkChannel);
     m_clipboardSendSucceeded = sent;
     m_clipboardSendResultAvailable = true;
     if (!sent) {
@@ -703,6 +730,8 @@ ServerProxy::cleanupClipboardSendThread(bool cancel)
     }
 
     m_clipboardChunker.reset();
+    m_clipboardBulkChannel.reset();
+    m_clipboardSendStream = m_stream;
     return true;
 }
 
@@ -1013,11 +1042,17 @@ ServerProxy::leave()
 void
 ServerProxy::setClipboard()
 {
+    setClipboard(m_stream);
+}
+
+void
+ServerProxy::setClipboard(barrier::IStream* stream)
+{
     // parse
     ClipboardID id;
     UInt32 seq;
 
-    int r = ClipboardChunk::assemble(m_stream, m_clipboardReceiveBuffer, id, seq);
+    int r = ClipboardChunk::assemble(stream, m_clipboardReceiveBuffer, id, seq);
 
     if (r == kStart) {
         size_t size = m_clipboardReceiveBuffer.expectedSize;
@@ -1567,8 +1602,14 @@ ServerProxy::infoAcknowledgment()
 void
 ServerProxy::fileChunkReceived()
 {
+    fileChunkReceived(m_stream);
+}
+
+void
+ServerProxy::fileChunkReceived(barrier::IStream* stream)
+{
     int result = FileChunk::assemble(
-                    m_stream,
+                    stream,
                     m_client->getFileReceiveSession());
 
     if (result == kFinish) {
@@ -1587,6 +1628,30 @@ ServerProxy::fileChunkReceived()
 }
 
 void
+ServerProxy::bulkOffer()
+{
+    std::string token;
+    ProtocolUtil::readf(m_stream, kMsgCBulkOffer + 4, &token);
+    if (m_protocolMinorVersion >= 9 && !token.empty()) {
+        m_client->connectBulkChannel(token);
+    }
+}
+
+bool
+ServerProxy::handleBulkMessage(const UInt8* code, barrier::IStream* stream)
+{
+    if (memcmp(code, kMsgDFileTransfer, 4) == 0) {
+        fileChunkReceived(stream);
+        return true;
+    }
+    if (memcmp(code, kMsgDClipboard, 4) == 0) {
+        setClipboard(stream);
+        return true;
+    }
+    return false;
+}
+
+void
 ServerProxy::dragInfoReceived()
 {
     // parse
@@ -1600,7 +1665,8 @@ ServerProxy::dragInfoReceived()
 void
 ServerProxy::handleClipboardSendingEvent(const Event& event, void*)
 {
-    ClipboardChunk::send(m_stream, event.getData());
+    ClipboardChunk* chunk = static_cast<ClipboardChunk*>(event.getData());
+    ClipboardChunk::send(chunk->getSendStream(m_stream), chunk);
 }
 
 void

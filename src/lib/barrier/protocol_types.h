@@ -34,9 +34,10 @@
 // 1.7:  adds transactional input handoff readiness
 // 1.8:  adds input epochs, per-connection input sequence, and explicit
 //       keyboard broadcast routing
+// 1.9:  adds a separately authenticated bulk payload connection
 // NOTE: with new version, barrier minor version should increment
 static const SInt16        kProtocolMajorVersion = 1;
-static const SInt16        kProtocolMinorVersion = 8;
+static const SInt16        kProtocolMinorVersion = 9;
 static const SInt16        kProtocolMinimumMinorVersion = 6;
 
 // default contact port number
@@ -133,6 +134,10 @@ extern const char*        kMsgHello;
 // name.
 extern const char*        kMsgHelloBack;
 
+// identify a secondary bulk connection; secondary -> primary
+// $1 = major, $2 = minor, $3 = client name, $4 = one-time binding token.
+extern const char*        kMsgHelloBulkBack;
+
 
 //
 // command codes
@@ -201,6 +206,17 @@ extern const char*        kMsgCInfoAck;
 // should disconnect from the server.  the appropriate interval is
 // defined by an option.
 extern const char*        kMsgCKeepAlive;
+
+// offer a one-time token for a secondary bulk connection; primary -> secondary
+extern const char*        kMsgCBulkOffer;
+
+// accept/reject a secondary bulk connection; primary -> secondary
+extern const char*        kMsgDBulkAccepted;
+extern const char*        kMsgDBulkRejected;
+
+// independent liveness probe/acknowledgment on the secondary bulk stream
+extern const char*        kMsgBulkKeepAlive;
+extern const char*        kMsgBulkKeepAliveAck;
 
 //
 // data codes

@@ -92,6 +92,10 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
     m_socketFactory(socketFactory),
     m_screen(screen),
     m_stream(NULL),
+    m_bulkHandshakeStream(NULL),
+    m_bulkHandshakeState(kBulkIdle),
+    m_bulkBindingToken(),
+    m_bulkChannel(),
     m_detachedSendFileStreams(),
     m_detachedServerProxies(),
     m_timer(NULL),
@@ -108,6 +112,7 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
 	    m_events(events),
 	    m_fileReceiveSession(),
     m_sendFileThread(NULL),
+    m_sendFileBulkChannel(),
     m_sendFileTransferId(0),
     m_sendFileIsClipboardPrefetch(false),
     m_sendFileStarted(false),
@@ -288,6 +293,83 @@ Client::disconnect(const char* msg)
 }
 
 void
+Client::connectBulkChannel(const std::string& token)
+{
+    if (m_protocolMinorVersion < 9 || token.empty() || m_stream == NULL ||
+        m_server == NULL) {
+        return;
+    }
+    if (m_bulkChannel && m_bulkChannel->isActive()) {
+        LOG((CLOG_DEBUG "ignoring duplicate bulk offer while channel is active"));
+        return;
+    }
+
+    cleanupBulkHandshake();
+    if (m_bulkChannel) {
+        m_bulkChannel->close();
+        m_bulkChannel.reset();
+    }
+
+    ConnectionSecurityLevel securityLevel = ConnectionSecurityLevel::PLAINTEXT;
+    if (m_useSecureNetwork) {
+        securityLevel = ConnectionSecurityLevel::ENCRYPTED_AUTHENTICATED;
+    }
+
+    try {
+        IDataSocket* socket = m_socketFactory->create(
+            ARCH->getAddrFamily(m_serverAddress.getAddress()), securityLevel);
+        if (socket == NULL) {
+            throw XBase("could not create bulk socket");
+        }
+        m_bulkHandshakeStream = new PacketStreamFilter(m_events, socket, true);
+        m_bulkBindingToken = token;
+        m_bulkHandshakeState = kBulkWaitingForHello;
+
+        Event::Type connectedType = m_useSecureNetwork ?
+            m_events->forIDataSocket().secureConnected() :
+            m_events->forIDataSocket().connected();
+        m_events->adoptHandler(connectedType,
+            m_bulkHandshakeStream->getEventTarget(),
+            new TMethodEventJob<Client>(this, &Client::handleBulkConnected));
+        m_events->adoptHandler(m_events->forIDataSocket().connectionFailed(),
+            m_bulkHandshakeStream->getEventTarget(),
+            new TMethodEventJob<Client>(this,
+                &Client::handleBulkConnectionFailed));
+
+        LOG((CLOG_DEBUG1 "connecting separate bulk channel"));
+        socket->connect(m_serverAddress);
+    }
+    catch (const XBase& e) {
+        LOG((CLOG_WARN "bulk connection setup failed; using control fallback: %s",
+             e.what()));
+        cleanupBulkHandshake();
+    }
+}
+
+std::shared_ptr<barrier::BulkChannel>
+Client::acquireBulkChannel() const
+{
+    if (m_bulkChannel && m_bulkChannel->isActive()) {
+        return m_bulkChannel;
+    }
+    return std::shared_ptr<barrier::BulkChannel>();
+}
+
+bool
+Client::handleBulkMessage(const UInt8* code, barrier::IStream* stream)
+{
+    return m_server != NULL && m_server->handleBulkMessage(code, stream);
+}
+
+void
+Client::handleBulkDisconnected(barrier::BulkChannel* channel)
+{
+    if (m_bulkChannel && m_bulkChannel.get() == channel) {
+        LOG((CLOG_WARN "bulk channel disconnected; control connection remains active"));
+    }
+}
+
+void
 Client::handshakeComplete()
 {
     m_ready = true;
@@ -358,9 +440,10 @@ Client::getCursorPos(SInt32& x, SInt32& y) const
 }
 
 void
-Client::enter(SInt32 xAbs, SInt32 yAbs, UInt32, KeyModifierMask mask, bool)
+Client::enter(SInt32 xAbs, SInt32 yAbs, UInt32 seqNum, KeyModifierMask mask, bool)
 {
     m_active = true;
+    m_screen->setSequenceNumber(seqNum);
     m_screen->enter(mask);
     m_screen->mouseMove(xAbs, yAbs);
 
@@ -805,14 +888,23 @@ Client::sendFileChunk(const void* data)
         return;
     }
 
-    // relay
-    m_server->fileChunkSending(chunk->m_chunk[0], &chunk->m_chunk[1], chunk->m_dataSize);
+    // Keep the selected route for the entire transfer. A failed bulk stream
+    // must not spill the remainder of a file frame sequence into control.
+    if (m_sendFileBulkChannel) {
+        FileChunk::send(m_sendFileBulkChannel->getStream(), chunk->m_chunk[0],
+                        &chunk->m_chunk[1], chunk->m_dataSize);
+    }
+    else {
+        m_server->fileChunkSending(chunk->m_chunk[0], &chunk->m_chunk[1],
+                                   chunk->m_dataSize);
+    }
     if (chunk->m_chunk[0] == kDataStart) {
         m_sendFileStarted = true;
         m_sendFileCompletionPending = false;
     }
     else if (chunk->m_chunk[0] == kDataEnd || chunk->m_chunk[0] == kDataCancel) {
         m_sendFileCompletionPending = true;
+        m_sendFileBulkChannel.reset();
     }
 }
 
@@ -876,6 +968,129 @@ Client::setupConnection()
 }
 
 void
+Client::cleanupBulkHandshake()
+{
+    if (m_bulkHandshakeStream == NULL) {
+        m_bulkHandshakeState = kBulkIdle;
+        m_bulkBindingToken.clear();
+        return;
+    }
+    void* target = m_bulkHandshakeStream->getEventTarget();
+    m_events->removeHandler(m_events->forIDataSocket().connected(), target);
+    m_events->removeHandler(m_events->forIDataSocket().secureConnected(), target);
+    m_events->removeHandler(m_events->forIDataSocket().connectionFailed(), target);
+    m_events->removeHandler(m_events->forIStream().inputReady(), target);
+    m_events->removeHandler(m_events->forIStream().outputError(), target);
+    m_events->removeHandler(m_events->forIStream().inputShutdown(), target);
+    m_events->removeHandler(m_events->forIStream().outputShutdown(), target);
+    m_events->removeHandler(m_events->forIStream().inputFormatError(), target);
+    m_bulkHandshakeStream->close();
+    delete m_bulkHandshakeStream;
+    m_bulkHandshakeStream = NULL;
+    m_bulkHandshakeState = kBulkIdle;
+    m_bulkBindingToken.clear();
+}
+
+void
+Client::cleanupBulkConnection()
+{
+    cleanupBulkHandshake();
+    if (m_bulkChannel) {
+        m_bulkChannel->close();
+        m_bulkChannel.reset();
+    }
+}
+
+void
+Client::handleBulkConnected(const Event&, void*)
+{
+    if (m_bulkHandshakeStream == NULL) {
+        return;
+    }
+    void* target = m_bulkHandshakeStream->getEventTarget();
+    m_events->removeHandler(m_events->forIDataSocket().connected(), target);
+    m_events->removeHandler(m_events->forIDataSocket().secureConnected(), target);
+    m_events->removeHandler(m_events->forIDataSocket().connectionFailed(), target);
+    m_events->adoptHandler(m_events->forIStream().inputReady(), target,
+        new TMethodEventJob<Client>(this, &Client::handleBulkHandshakeData));
+    m_events->adoptHandler(m_events->forIStream().outputError(), target,
+        new TMethodEventJob<Client>(this, &Client::handleBulkHandshakeError));
+    m_events->adoptHandler(m_events->forIStream().inputShutdown(), target,
+        new TMethodEventJob<Client>(this, &Client::handleBulkHandshakeError));
+    m_events->adoptHandler(m_events->forIStream().outputShutdown(), target,
+        new TMethodEventJob<Client>(this, &Client::handleBulkHandshakeError));
+    m_events->adoptHandler(m_events->forIStream().inputFormatError(), target,
+        new TMethodEventJob<Client>(this, &Client::handleBulkHandshakeError));
+}
+
+void
+Client::handleBulkConnectionFailed(const Event& event, void*)
+{
+    IDataSocket::ConnectionFailedInfo* info =
+        static_cast<IDataSocket::ConnectionFailedInfo*>(event.getData());
+    LOG((CLOG_WARN "bulk connection failed; using control fallback: %s",
+         info == NULL ? "unknown error" : info->m_what.c_str()));
+    delete info;
+    cleanupBulkHandshake();
+}
+
+void
+Client::handleBulkHandshakeError(const Event&, void*)
+{
+    LOG((CLOG_WARN "bulk handshake failed; using control fallback"));
+    cleanupBulkHandshake();
+}
+
+void
+Client::handleBulkHandshakeData(const Event&, void*)
+{
+    if (m_bulkHandshakeStream == NULL) {
+        return;
+    }
+
+    if (m_bulkHandshakeState == kBulkWaitingForHello) {
+        SInt16 major = 0;
+        SInt16 minor = 0;
+        if (!ProtocolUtil::readf(m_bulkHandshakeStream, kMsgHello,
+                                 &major, &minor) ||
+            major != kProtocolMajorVersion || minor < 9) {
+            handleBulkHandshakeError(Event(), NULL);
+            return;
+        }
+        ProtocolUtil::writef(m_bulkHandshakeStream, kMsgHelloBulkBack,
+                             kProtocolMajorVersion, kProtocolMinorVersion,
+                             &m_name, &m_bulkBindingToken);
+        m_bulkHandshakeState = kBulkWaitingForAck;
+        if (!m_bulkHandshakeStream->isReady()) {
+            return;
+        }
+    }
+
+    UInt8 code[4];
+    if (m_bulkHandshakeStream->read(code, 4) != 4 ||
+        memcmp(code, kMsgDBulkAccepted, 4) != 0) {
+        handleBulkHandshakeError(Event(), NULL);
+        return;
+    }
+
+    barrier::IStream* stream = m_bulkHandshakeStream;
+    void* target = stream->getEventTarget();
+    m_events->removeHandler(m_events->forIStream().inputReady(), target);
+    m_events->removeHandler(m_events->forIStream().outputError(), target);
+    m_events->removeHandler(m_events->forIStream().inputShutdown(), target);
+    m_events->removeHandler(m_events->forIStream().outputShutdown(), target);
+    m_events->removeHandler(m_events->forIStream().inputFormatError(), target);
+    m_bulkHandshakeStream = NULL;
+    m_bulkHandshakeState = kBulkIdle;
+    m_bulkBindingToken.clear();
+    m_bulkChannel = std::make_shared<barrier::BulkChannel>(stream, this, m_events);
+    LOG((CLOG_NOTE "separate bulk channel is ready"));
+    if (stream->isReady()) {
+        m_events->addEvent(Event(m_events->forIStream().inputReady(), target));
+    }
+}
+
+void
 Client::setupScreen()
 {
     reapDetachedConnectionState();
@@ -931,6 +1146,13 @@ Client::cleanupConnection()
         ++m_sendFileTransferId;
     }
     const bool fileSenderStopped = cleanupSendFileThread(true);
+    // A secondary transport is valid only while its authenticated control
+    // connection is alive. Closing it does not destroy a route pinned by a
+    // still-running sender; that shared owner is released after cancellation.
+    cleanupBulkConnection();
+    if (fileSenderStopped) {
+        m_sendFileBulkChannel.reset();
+    }
     m_sendFileStarted = false;
     m_sendFileCompletionPending = false;
 
@@ -1717,7 +1939,9 @@ Client::startPendingFileClipboardPrefetch()
     m_sendFileIsClipboardPrefetch = true;
     m_sendFileStarted = false;
     m_sendFileCompletionPending = false;
-    barrier::IStream* stream = m_stream;
+    m_sendFileBulkChannel = acquireBulkChannel();
+    barrier::IStream* stream = m_sendFileBulkChannel ?
+        m_sendFileBulkChannel->getStream() : m_stream;
     ++m_sendFileTransferId;
     if (m_sendFileTransferId == 0) {
         ++m_sendFileTransferId;
@@ -1814,7 +2038,9 @@ Client::sendFileToServer(const std::string& filename)
     m_sendFileIsClipboardPrefetch = false;
     m_sendFileStarted = false;
     m_sendFileCompletionPending = false;
-    barrier::IStream* stream = m_stream;
+    m_sendFileBulkChannel = acquireBulkChannel();
+    barrier::IStream* stream = m_sendFileBulkChannel ?
+        m_sendFileBulkChannel->getStream() : m_stream;
     ++m_sendFileTransferId;
     if (m_sendFileTransferId == 0) {
         ++m_sendFileTransferId;

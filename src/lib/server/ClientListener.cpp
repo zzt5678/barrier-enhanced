@@ -20,7 +20,11 @@
 
 #include "server/ClientProxy.h"
 #include "server/ClientProxyUnknown.h"
+#include "server/Server.h"
 #include "barrier/PacketStreamFilter.h"
+#include "barrier/ProtocolUtil.h"
+#include "barrier/protocol_types.h"
+#include "io/IStream.h"
 #include "net/IDataSocket.h"
 #include "net/IListenSocket.h"
 #include "net/ISocketFactory.h"
@@ -224,10 +228,24 @@ ClientListener::handleUnknownClient(const Event&, void* vclient)
                             new TMethodEventJob<ClientListener>(this,
                                 &ClientListener::handleClientDisconnected,
                                 client));
-    } else {
-        auto* stream = unknownClient->getStream();
-        if (stream) {
-            stream->close();
+    }
+    else {
+        std::string bulkName;
+        std::string bulkToken;
+        barrier::IStream* bulkStream =
+            unknownClient->orphanBulkStream(bulkName, bulkToken);
+        if (bulkStream != NULL) {
+            if (!m_server->attachBulkStream(bulkName, bulkToken, bulkStream)) {
+                ProtocolUtil::writef(bulkStream, kMsgDBulkRejected);
+                bulkStream->close();
+                delete bulkStream;
+            }
+        }
+        else {
+            auto* stream = unknownClient->getStream();
+            if (stream) {
+                stream->close();
+            }
         }
     }
 

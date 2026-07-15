@@ -21,7 +21,9 @@
 #include "barrier/IClient.h"
 #include "base/Event.h"
 
-namespace barrier { class IStream; }
+#include <memory>
+
+namespace barrier { class BulkChannel; class IStream; }
 
 //! Generic proxy for client or primary
 class BaseClientProxy : public IClient {
@@ -84,6 +86,13 @@ public:
                             bool forScreensaver) = 0;
     virtual bool        leave() = 0;
     virtual bool        supportsInputHandoff() const { return false; }
+    virtual bool        supportsBulkChannel() const { return false; }
+    virtual void        offerBulkChannel(const std::string&) { }
+    virtual bool        attachBulkChannel(barrier::IStream*) { return false; }
+    virtual void        detachBulkChannel() { }
+    virtual std::shared_ptr<barrier::BulkChannel>
+                        acquireBulkChannel() const
+                        { return std::shared_ptr<barrier::BulkChannel>(); }
     virtual void        prepareEnter(SInt32, SInt32, UInt32,
                             KeyModifierMask) { }
     virtual void        abortEnter(UInt32) { }

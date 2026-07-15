@@ -20,6 +20,7 @@
 
 const char*                kMsgHello            = "Barrier%2i%2i";
 const char*                kMsgHelloBack        = "Barrier%2i%2i%s";
+const char*                kMsgHelloBulkBack    = "WBUL%2i%2i%s%s";
 const char*                kMsgCNoop             = "CNOP";
 const char*                kMsgCClose             = "CBYE";
 const char*                kMsgCEnter             = "CINN%2i%2i%4i%2i";
@@ -31,6 +32,11 @@ const char*                kMsgCScreenSaver     = "CSEC%1i";
 const char*                kMsgCResetOptions    = "CROP";
 const char*                kMsgCInfoAck        = "CIAK";
 const char*                kMsgCKeepAlive        = "CALV";
+const char*                kMsgCBulkOffer        = "CBLK%s";
+const char*                kMsgDBulkAccepted     = "BACC";
+const char*                kMsgDBulkRejected     = "BREJ";
+const char*                kMsgBulkKeepAlive     = "BPNG";
+const char*                kMsgBulkKeepAliveAck  = "BPON";
 const char*                kMsgDKeyDown        = "DKDN%2i%2i%2i";
 const char*                kMsgDKeyDown1_0        = "DKDN%2i%2i";
 const char*                kMsgDKeyRepeat        = "DKRP%2i%2i%2i%2i";

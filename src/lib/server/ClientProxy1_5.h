@@ -35,6 +35,7 @@ public:
     virtual void        fileChunkSending(UInt8 mark, char* data, size_t dataSize);
     virtual bool        parseMessage(const UInt8* code);
     void                fileChunkReceived();
+    void                fileChunkReceived(barrier::IStream* stream);
     void                dragInfoReceived();
 
 private:

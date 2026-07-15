@@ -21,6 +21,8 @@
 #include "barrier/ProtocolUtil.h"
 #include "barrier/StreamChunker.h"
 #include "barrier/ClipboardChunk.h"
+#include "barrier/BulkChannel.h"
+#include "barrier/RemoteFileClipboard.h"
 #include "io/IStream.h"
 #include "base/TMethodEventJob.h"
 #include "base/Log.h"
@@ -45,7 +47,9 @@ ClientProxy1_6::ClientProxy1_6(const std::string& name, barrier::IStream* stream
     m_clipboardSendThread(NULL),
     m_clipboardSendId(kClipboardEnd),
     m_clipboardSendSucceeded(false),
-    m_clipboardSendResultAvailable(false)
+    m_clipboardSendResultAvailable(false),
+    m_clipboardBulkChannel(),
+    m_clipboardSendStream(stream)
 {
     m_events->adoptHandler(m_events->forClipboard().clipboardSending(),
                                 this,
@@ -87,12 +91,28 @@ ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard* clipboard)
         size_t size = data->size();
         LOG((CLOG_DEBUG "sending clipboard %d to \"%s\"", id, getName().c_str()));
 
+        const bool needsOrderedBulkRoute =
+            id == kClipboardClipboard &&
+            RemoteFileClipboard::containsFileList(m_clipboard[id].m_clipboard);
+        m_clipboardBulkChannel =
+            (data->size() > kSynchronousClipboardSendLimit || needsOrderedBulkRoute) ?
+            acquireBulkChannel() : std::shared_ptr<barrier::BulkChannel>();
+        m_clipboardSendStream = m_clipboardBulkChannel &&
+            m_clipboardBulkChannel->isActive() ?
+            m_clipboardBulkChannel->getStream() : getStream();
+
         if (data->size() <= kSynchronousClipboardSendLimit) {
-            if (!StreamChunker::sendClipboard(*data, size, id, 0, m_events, this, getStream())) {
+            if (!StreamChunker::sendClipboard(*data, size, id, 0, m_events, this,
+                                              m_clipboardSendStream,
+                                              m_clipboardBulkChannel)) {
                 LOG((CLOG_WARN "clipboard %d was not fully queued for \"%s\"", id, getName().c_str()));
+                m_clipboardBulkChannel.reset();
+                m_clipboardSendStream = getStream();
                 return;
             }
             m_clipboard[id].m_dirty = false;
+            m_clipboardBulkChannel.reset();
+            m_clipboardSendStream = getStream();
             return;
         }
 
@@ -113,7 +133,8 @@ ClientProxy1_6::sendClipboardThread(const std::shared_ptr<const std::string>& da
                                     const std::shared_ptr<StreamChunker>& chunker)
 {
     const bool sent = chunker->sendClipboardData(
-            *data, data->size(), id, 0, m_events, this, getStream());
+            *data, data->size(), id, 0, m_events, this, m_clipboardSendStream,
+            m_clipboardBulkChannel);
     m_clipboardSendSucceeded = sent;
     m_clipboardSendResultAvailable = true;
     if (!sent) {
@@ -149,23 +170,32 @@ ClientProxy1_6::cleanupClipboardSendThread(bool cancel)
     }
 
     m_clipboardChunker.reset();
+    m_clipboardBulkChannel.reset();
+    m_clipboardSendStream = getStream();
     return true;
 }
 
 void
 ClientProxy1_6::handleClipboardSendingEvent(const Event& event, void*)
 {
-    ClipboardChunk::send(getStream(), event.getData());
+    ClipboardChunk* chunk = static_cast<ClipboardChunk*>(event.getData());
+    ClipboardChunk::send(chunk->getSendStream(getStream()), chunk);
 }
 
 bool
 ClientProxy1_6::recvClipboard()
 {
+    return recvClipboard(getStream());
+}
+
+bool
+ClientProxy1_6::recvClipboard(barrier::IStream* stream)
+{
     // parse message
     ClipboardID id;
     UInt32 seq;
 
-    int r = ClipboardChunk::assemble(getStream(), m_clipboardReceiveBuffer, id, seq);
+    int r = ClipboardChunk::assemble(stream, m_clipboardReceiveBuffer, id, seq);
 
     if (r == kStart) {
         size_t size = m_clipboardReceiveBuffer.expectedSize;

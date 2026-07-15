@@ -4,6 +4,7 @@
 #include "client/Client.h"
 #include "barrier/Clipboard.h"
 #include "barrier/ClipboardChunk.h"
+#include "barrier/RemoteFileClipboard.h"
 #include "barrier/ClientArgs.h"
 #include "barrier/option_types.h"
 #include "barrier/protocol_types.h"
@@ -87,6 +88,22 @@ public:
     mutable int hasCount = 0;
     mutable int getCount = 0;
 };
+
+Clipboard makeFileClipboard()
+{
+    RemoteFileClipboard::Data payload;
+    payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+    payload.sessionId = "small-file-clipboard";
+    payload.paths.push_back(barrier::fs::u8path("C:/small.txt"));
+
+    Clipboard clipboard;
+    clipboard.open(40);
+    clipboard.empty();
+    clipboard.add(IClipboard::kFileList,
+                  RemoteFileClipboard::serialize(payload));
+    clipboard.close();
+    return clipboard;
+}
 
 class CleanupFailingServerProxy : public ServerProxy {
 public:
@@ -552,7 +569,14 @@ TEST(ServerProxyTests, largeClipboardUsesAsyncSenderAndCanBeReaped)
     IStreamEvents streamEvents;
     ClipboardEvents clipboardEvents;
     FileEvents fileEvents;
-    setServerProxyEventDefaults(events, streamEvents, clipboardEvents, fileEvents);
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents, clientEvents, screenEvents);
+
+    TestScreen screen;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, ClientArgs());
 
     NiceMock<MockStream> stream;
     ON_CALL(stream, getEventTarget()).WillByDefault(Return(&stream));
@@ -576,7 +600,7 @@ TEST(ServerProxyTests, largeClipboardUsesAsyncSenderAndCanBeReaped)
     clipboard.add(IClipboard::kText, std::string(300 * 1024, 'x'));
     clipboard.close();
 
-    ServerProxy proxy(reinterpret_cast<Client*>(1), &stream, &events);
+    ServerProxy proxy(&client, &stream, &events);
     EXPECT_EQ(ServerProxy::kClipboardSendPending,
               proxy.onClipboardChanged(kClipboardClipboard, &clipboard));
 
@@ -595,6 +619,53 @@ TEST(ServerProxyTests, largeClipboardUsesAsyncSenderAndCanBeReaped)
     ASSERT_GE(clipboardMarks.size(), 3u);
     EXPECT_EQ(kDataStart, clipboardMarks.front());
     EXPECT_EQ(kDataEnd, clipboardMarks.back());
+}
+
+TEST(ServerProxyTests, smallFileClipboardMetadataUsesBulkStream)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents, clientEvents, screenEvents);
+
+    TestScreen screen;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, ClientArgs());
+
+    NiceMock<MockStream> controlStream;
+    ON_CALL(controlStream, getEventTarget()).WillByDefault(Return(&controlStream));
+    ON_CALL(controlStream, getBufferedOutputSize()).WillByDefault(Return(0u));
+
+    NiceMock<MockStream>* bulkStream = new NiceMock<MockStream>();
+    ON_CALL(*bulkStream, getEventTarget()).WillByDefault(Return(bulkStream));
+    ON_CALL(*bulkStream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    client.testAttachBulkStream(bulkStream);
+
+    ServerProxy proxy(&client, &controlStream, &events);
+    Clipboard clipboard = makeFileClipboard();
+    ASSERT_TRUE(RemoteFileClipboard::containsFileList(clipboard));
+    std::vector<ClipboardChunk*> queuedChunks;
+    EXPECT_CALL(events, addEvent(_)).Times(AnyNumber()).WillRepeatedly(
+        Invoke([&clipboardEvents, &queuedChunks](const Event& event) {
+            if (event.getType() == clipboardEvents.clipboardSending() &&
+                event.getData() != nullptr) {
+                queuedChunks.push_back(static_cast<ClipboardChunk*>(event.getData()));
+            }
+        }));
+    EXPECT_CALL(controlStream, writeLowPriority(_, _)).Times(0);
+    EXPECT_CALL(*bulkStream, writeLowPriority(_, _)).Times(AtLeast(1));
+    EXPECT_EQ(ServerProxy::kClipboardSendQueued,
+              proxy.onClipboardChanged(kClipboardClipboard, &clipboard));
+    ASSERT_EQ(3u, queuedChunks.size());
+    for (ClipboardChunk* chunk : queuedChunks) {
+        EXPECT_EQ(bulkStream, chunk->getSendStream(nullptr));
+        ClipboardChunk::send(chunk->getSendStream(nullptr), chunk);
+        delete chunk;
+    }
 }
 
 TEST(ServerProxyTests, cleanupFailureSkipsClipboardMarshall)

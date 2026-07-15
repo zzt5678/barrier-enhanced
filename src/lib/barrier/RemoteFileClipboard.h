@@ -48,6 +48,7 @@ bool readFromClipboard(const IClipboard& clipboard, Data& data, std::string* err
 bool normalizeClipboard(Clipboard& clipboard, Data* normalized = nullptr, std::string* error = nullptr);
 bool pathsMatch(const Data& data, const std::vector<std::string>& paths);
 bool allPathsLookLikeImages(const Data& data);
+bool containsFileList(const IClipboard& clipboard);
 bool stripImageFileTransferMetadata(Clipboard& clipboard);
 AutomaticSharingStatus prepareForAutomaticClipboardSharing(Clipboard& clipboard);
 bool buildMaterializedClipboard(const std::vector<barrier::fs::path>& paths,

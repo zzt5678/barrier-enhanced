@@ -22,9 +22,12 @@
 #include "base/String.h"
 #include "common/basic_types.h"
 
+#include <memory>
+
 #define CLIPBOARD_CHUNK_META_SIZE 7
 
 namespace barrier {
+class BulkChannel;
 class IStream;
 };
 
@@ -66,5 +69,14 @@ public:
                             UInt32& sequence);
 
     static void            send(barrier::IStream* stream, void* data);
+
+    void                   setSendRoute(
+                            barrier::IStream* stream,
+                            const std::shared_ptr<barrier::BulkChannel>& bulkChannel);
+    barrier::IStream*      getSendStream(barrier::IStream* fallback) const;
+
+private:
+    barrier::IStream*      m_sendStream;
+    std::shared_ptr<barrier::BulkChannel> m_bulkChannelLease;
 
 };

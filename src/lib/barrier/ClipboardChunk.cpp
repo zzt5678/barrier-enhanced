@@ -17,6 +17,8 @@
 
 #include "barrier/ClipboardChunk.h"
 
+#include "barrier/BulkChannel.h"
+
 #include "barrier/ProtocolUtil.h"
 #include "barrier/protocol_types.h"
 #include "io/IStream.h"
@@ -53,9 +55,26 @@ ClipboardChunk::ReceiveBuffer::release()
 }
 
 ClipboardChunk::ClipboardChunk(size_t size) :
-    Chunk(size)
+    Chunk(size),
+    m_sendStream(nullptr),
+    m_bulkChannelLease()
 {
         m_dataSize = size - CLIPBOARD_CHUNK_META_SIZE;
+}
+
+void
+ClipboardChunk::setSendRoute(
+                barrier::IStream* stream,
+                const std::shared_ptr<barrier::BulkChannel>& bulkChannel)
+{
+    m_sendStream = stream;
+    m_bulkChannelLease = bulkChannel;
+}
+
+barrier::IStream*
+ClipboardChunk::getSendStream(barrier::IStream* fallback) const
+{
+    return m_sendStream != nullptr ? m_sendStream : fallback;
 }
 
 ClipboardChunk*

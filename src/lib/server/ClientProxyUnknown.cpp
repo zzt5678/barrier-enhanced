@@ -28,6 +28,7 @@
 #include "server/ClientProxy1_6.h"
 #include "server/ClientProxy1_7.h"
 #include "server/ClientProxy1_8.h"
+#include "server/ClientProxy1_9.h"
 #include "barrier/protocol_types.h"
 #include "barrier/ProtocolUtil.h"
 #include "barrier/XBarrier.h"
@@ -45,6 +46,9 @@ ClientProxyUnknown::ClientProxyUnknown(barrier::IStream* stream, double timeout,
     m_stream(stream),
     m_proxy(NULL),
     m_ready(false),
+    m_handshakeKind(kHandshakeNone),
+    m_bulkName(),
+    m_bulkToken(),
     m_server(server),
     m_events(events)
 {
@@ -73,7 +77,7 @@ ClientProxyUnknown::~ClientProxyUnknown()
 ClientProxy*
 ClientProxyUnknown::orphanClientProxy()
 {
-    if (m_ready) {
+    if (m_ready && m_handshakeKind == kHandshakeControl) {
         removeHandlers();
         ClientProxy* proxy = m_proxy;
         m_proxy = NULL;
@@ -83,6 +87,20 @@ ClientProxyUnknown::orphanClientProxy()
     else {
         return NULL;
     }
+}
+
+barrier::IStream*
+ClientProxyUnknown::orphanBulkStream(std::string& name, std::string& token)
+{
+    if (!m_ready || m_handshakeKind != kHandshakeBulk) {
+        return NULL;
+    }
+    removeHandlers();
+    name = m_bulkName;
+    token = m_bulkToken;
+    barrier::IStream* stream = m_stream;
+    m_stream = NULL;
+    return stream;
 }
 
 void
@@ -99,6 +117,7 @@ ClientProxyUnknown::sendFailure()
     delete m_proxy;
     m_proxy = NULL;
     m_ready = false;
+    m_handshakeKind = kHandshakeNone;
     removeHandlers();
     removeTimer();
     m_events->addEvent(Event(m_events->forClientProxyUnknown().failure(), this));
@@ -193,10 +212,35 @@ ClientProxyUnknown::handleData(const Event&, void*)
             throw XBadClient();
         }
 
-        // parse the reply to hello
+        UInt8 code[4];
+        if (m_stream->read(code, 4) != 4) {
+            throw XBadClient();
+        }
+
+        // Parse either a normal control hello or a typed bulk hello. Reading
+        // the discriminator first prevents WBUL from ever creating a screen.
         SInt16 major, minor;
-        if (!ProtocolUtil::readf(m_stream, kMsgHelloBack,
-                                    &major, &minor, &name)) {
+        if (memcmp(code, kMsgHelloBulkBack, 4) == 0) {
+            std::string token;
+            if (!ProtocolUtil::readf(m_stream, kMsgHelloBulkBack + 4,
+                                     &major, &minor, &name, &token) ||
+                name.empty() || token.empty() || token.size() > 256 ||
+                major != kProtocolMajorVersion || minor < 9) {
+                throw XBadClient();
+            }
+            removeHandlers();
+            m_handshakeKind = kHandshakeBulk;
+            m_bulkName = name;
+            m_bulkToken = token;
+            LOG((CLOG_DEBUG1 "received bulk connection hello for client \"%s\"",
+                 name.c_str()));
+            sendSuccess();
+            return;
+        }
+
+        if (memcmp(code, kMsgHelloBack, 4) != 0 ||
+            !ProtocolUtil::readf(m_stream, kMsgHelloBack + 4,
+                                 &major, &minor, &name)) {
             throw XBadClient();
         }
 
@@ -204,6 +248,8 @@ ClientProxyUnknown::handleData(const Event&, void*)
         if (major <= 0 || minor < 0) {
             throw XIncompatibleClient(major, minor);
         }
+
+        m_handshakeKind = kHandshakeControl;
 
         // remove stream event handlers.  the proxy we're about to create
         // may install its own handlers and we don't want to accidentally
@@ -247,6 +293,10 @@ ClientProxyUnknown::handleData(const Event&, void*)
 
             case 8:
                 m_proxy = new ClientProxy1_8(name, m_stream, m_server, m_events);
+                break;
+
+            case 9:
+                m_proxy = new ClientProxy1_9(name, m_stream, m_server, m_events);
                 break;
             }
         }

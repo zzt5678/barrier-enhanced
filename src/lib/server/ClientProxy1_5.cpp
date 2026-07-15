@@ -81,9 +81,15 @@ ClientProxy1_5::parseMessage(const UInt8* code)
 void
 ClientProxy1_5::fileChunkReceived()
 {
+    fileChunkReceived(getStream());
+}
+
+void
+ClientProxy1_5::fileChunkReceived(barrier::IStream* stream)
+{
     Server* server = getServer();
     int result = FileChunk::assemble(
-                    getStream(),
+                    stream,
                     server->getFileReceiveSession());
 
 

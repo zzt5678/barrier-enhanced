@@ -39,6 +39,7 @@ class IClipboard;
 class StreamChunker;
 class Thread;
 namespace barrier { class IStream; }
+namespace barrier { class BulkChannel; }
 class IEventQueue;
 
 //! Proxy for server
@@ -74,6 +75,8 @@ public:
     virtual bool        reapClipboardSendResult(ClipboardID id, bool& succeeded);
     void                detachForDeferredCleanup();
     void                revokeInputLease();
+    bool                handleBulkMessage(const UInt8* code,
+                                          barrier::IStream* stream);
 
     //@}
 
@@ -144,6 +147,7 @@ private:
     void                abortEnter();
     void                leave();
     void                setClipboard();
+    void                setClipboard(barrier::IStream* stream);
     void                grabClipboard();
     void                keyDown();
     void                keyRepeat();
@@ -167,6 +171,8 @@ private:
     void                queryInfo();
     void                infoAcknowledgment();
     void                fileChunkReceived();
+    void                fileChunkReceived(barrier::IStream* stream);
+    void                bulkOffer();
     void                dragInfoReceived();
     void                handleClipboardSendingEvent(const Event&, void*);
 
@@ -228,6 +234,8 @@ private:
     MessageParser        m_parser;
     IEventQueue*        m_events;
     Thread*             m_clipboardSendThread;
+    std::shared_ptr<barrier::BulkChannel> m_clipboardBulkChannel;
+    barrier::IStream*   m_clipboardSendStream;
     std::shared_ptr<StreamChunker> m_clipboardChunker;
     bool                m_detachedForDeferredCleanup;
     ClipboardID         m_clipboardSendId;

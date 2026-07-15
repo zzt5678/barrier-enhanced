@@ -46,6 +46,7 @@ class PrimaryClient;
 class InputFilter;
 class StreamChunker;
 namespace barrier {
+class BulkChannel;
 class IStream;
 class Screen;
 }
@@ -195,6 +196,7 @@ public:
         m_events(NULL),
         m_fileReceiveSession(),
         m_sendFileThread(NULL),
+        m_sendFileBulkChannel(),
         m_sendFileTarget(NULL),
         m_sendFileTransferId(0),
         m_sendFileCompletionPending(false),
@@ -268,6 +270,14 @@ public:
 
     //! Store ClientListener pointer
     void                setListener(ClientListener* p) { m_clientListener = p; }
+
+    //! Bind an authenticated secondary stream to its live control client.
+    bool                attachBulkStream(const std::string& name,
+                                         const std::string& token,
+                                         barrier::IStream* stream);
+
+    //! Replace a consumed or failed bulk binding token over control.
+    void                renewBulkChannel(BaseClientProxy* client);
 
     //@}
     //! @name accessors
@@ -510,6 +520,8 @@ private:
     void                sendClipboardSelectionToClient(BaseClientProxy* target,
                                                        const std::vector<barrier::fs::path>& sourcePaths);
     void                startPendingFileClipboardPrefetch();
+    void                eraseBulkBindings(BaseClientProxy* client);
+    std::string         generateBulkToken() const;
 
     // add client to list and attach event handlers for client
     bool                addClient(BaseClientProxy*);
@@ -613,7 +625,7 @@ private:
         ClipboardDataSnapshot m_clipboardData;
         std::string m_clipboardOwner;
         UInt32            m_clipboardSeqNum;
-        bool              m_pendingPrimaryFetch;
+        bool              m_pendingClipboardFetch;
     };
 
     // the primary screen client
@@ -624,6 +636,18 @@ private:
     typedef std::set<BaseClientProxy*> ClientSet;
     ClientList            m_clients;
     ClientSet            m_clientSet;
+
+    struct PendingBulkBinding {
+        PendingBulkBinding() : client(NULL), issued() { }
+        PendingBulkBinding(const std::string& clientName,
+                           BaseClientProxy* boundClient) :
+            name(clientName), client(boundClient), issued() { }
+
+        std::string name;
+        BaseClientProxy* client;
+        Stopwatch issued;
+    };
+    std::map<std::string, PendingBulkBinding> m_pendingBulkBindings;
 
     // all old connections that we're waiting to hangup
     typedef std::map<BaseClientProxy*, EventQueueTimer*> OldClients;
@@ -739,6 +763,7 @@ private:
     DragFileList        m_fakeDragFileList;
     Thread*                m_sendFileThread;
     std::shared_ptr<StreamChunker> m_sendFileChunker;
+    std::shared_ptr<barrier::BulkChannel> m_sendFileBulkChannel;
     BaseClientProxy*       m_sendFileTarget;
     UInt32                 m_sendFileTransferId;
     bool                   m_sendFileCompletionPending;

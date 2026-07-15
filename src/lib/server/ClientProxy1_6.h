@@ -22,6 +22,7 @@
 
 #include <memory>
 
+namespace barrier { class BulkChannel; }
 class Server;
 class IEventQueue;
 class StreamChunker;
@@ -36,12 +37,16 @@ public:
 
     virtual void        setClipboard(ClipboardID id, const IClipboard* clipboard);
     virtual bool        recvClipboard();
+    bool                recvClipboard(barrier::IStream* stream);
 
     virtual bool        cleanupClipboardSendThread(bool cancel);
 
 #ifdef BARRIER_TEST_ENV
     bool                testClipboardDirty(ClipboardID id) const { return m_clipboard[id].m_dirty; }
     void                testSetClipboardSendThread(Thread* thread) { m_clipboardSendThread = thread; }
+    barrier::IStream*   testClipboardSendStream() const { return m_clipboardSendStream; }
+    bool                testHasClipboardBulkChannel() const
+                            { return static_cast<bool>(m_clipboardBulkChannel); }
 #endif
 
 private:
@@ -59,4 +64,6 @@ private:
     ClipboardID         m_clipboardSendId;
     bool                m_clipboardSendSucceeded;
     bool                m_clipboardSendResultAvailable;
+    std::shared_ptr<barrier::BulkChannel> m_clipboardBulkChannel;
+    barrier::IStream*   m_clipboardSendStream;
 };

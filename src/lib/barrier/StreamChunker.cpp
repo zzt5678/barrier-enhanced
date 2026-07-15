@@ -211,6 +211,7 @@ bool queueClipboardChunks(
                 IEventQueue* events,
                 void* eventTarget,
                 barrier::IStream* stream,
+                const std::shared_ptr<barrier::BulkChannel>& bulkChannel,
                 size_t maxQueuedBulkEvents,
                 bool waitForBudgets,
                 const std::function<bool()>& shouldInterrupt)
@@ -236,6 +237,7 @@ bool queueClipboardChunks(
 
     String dataSize = barrier::string::sizeTypeToString(size);
     ClipboardChunk* sizeMessage = ClipboardChunk::start(id, sequence, dataSize);
+    sizeMessage->setSendRoute(stream, bulkChannel);
 
     Event sizeEvent(events->forClipboard().clipboardSending(), eventTarget, sizeMessage);
     sizeEvent.setDataObject(sizeMessage);
@@ -279,6 +281,7 @@ bool queueClipboardChunks(
 
         String chunk(data.data() + sentLength, bytesToSend);
         ClipboardChunk* dataChunk = ClipboardChunk::data(id, sequence, chunk);
+        dataChunk->setSendRoute(stream, bulkChannel);
 
         Event dataEvent(events->forClipboard().clipboardSending(), eventTarget, dataChunk);
         dataEvent.setDataObject(dataChunk);
@@ -297,6 +300,7 @@ bool queueClipboardChunks(
         LOG((CLOG_WARN "clipboard transmission stopped before completion, sent=%d expected=%d",
             sentLength, size));
         ClipboardChunk* cancel = ClipboardChunk::cancel(id, sequence);
+        cancel->setSendRoute(stream, bulkChannel);
         Event cancelEvent(events->forClipboard().clipboardSending(), eventTarget, cancel);
         cancelEvent.setDataObject(cancel);
         events->addEvent(cancelEvent);
@@ -304,6 +308,7 @@ bool queueClipboardChunks(
     }
 
     ClipboardChunk* end = ClipboardChunk::end(id, sequence);
+    end->setSendRoute(stream, bulkChannel);
     Event endEvent(events->forClipboard().clipboardSending(), eventTarget, end);
     endEvent.setDataObject(end);
     events->addEvent(endEvent);
@@ -443,7 +448,8 @@ StreamChunker::sendClipboardData(
                 UInt32 sequence,
                 IEventQueue* events,
                 void* eventTarget,
-                barrier::IStream* stream)
+                barrier::IStream* stream,
+                const std::shared_ptr<barrier::BulkChannel>& bulkChannel)
 {
     const size_t maxQueuedBulkEvents = stream == nullptr ? 0 : 32;
     FileInterruptResetGuard resetInterrupt(m_interruptFile);
@@ -455,6 +461,7 @@ StreamChunker::sendClipboardData(
         events,
         eventTarget,
         stream,
+        bulkChannel,
         maxQueuedBulkEvents,
         true,
         [this]() { return shouldInterrupt(); });
@@ -468,7 +475,8 @@ StreamChunker::sendClipboard(
                 UInt32 sequence,
                 IEventQueue* events,
                 void* eventTarget,
-                barrier::IStream* stream)
+                barrier::IStream* stream,
+                const std::shared_ptr<barrier::BulkChannel>& bulkChannel)
 {
     return queueClipboardChunks(
         data,
@@ -478,6 +486,7 @@ StreamChunker::sendClipboard(
         events,
         eventTarget,
         stream,
+        bulkChannel,
         0,
         false,
         std::function<bool()>());

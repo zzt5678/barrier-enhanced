@@ -27,6 +27,7 @@
 #include "base/Event.h"
 #include "barrier/INode.h"
 #include "barrier/ClientArgs.h"
+#include "barrier/BulkChannel.h"
 #include "net/NetworkAddress.h"
 #include "base/EventTypes.h"
 #include "mt/CondVar.h"
@@ -51,7 +52,8 @@ class StreamChunker;
 /*!
 This class implements the top-level client algorithms for barrier.
 */
-class Client : public IClient, public INode {
+class Client : public IClient, public INode,
+               public barrier::IBulkChannelHandler {
 public:
 	class FileClipboardReadyInfo : public EventData {
 	public:
@@ -97,6 +99,13 @@ public:
     Disconnects from the server with an optional error message.
     */
     void                disconnect(const char* msg);
+
+    void                connectBulkChannel(const std::string& token);
+    std::shared_ptr<barrier::BulkChannel> acquireBulkChannel() const;
+
+    bool                handleBulkMessage(const UInt8* code,
+                                          barrier::IStream* stream) override;
+    void                handleBulkDisconnected(barrier::BulkChannel* channel) override;
 
     //! Notify of handshake complete
     /*!
@@ -218,6 +227,12 @@ private:
     void                handleFileClipboardReady(const Event&, void*);
     void                setupConnecting();
     void                setupConnection();
+    void                cleanupBulkConnection();
+    void                cleanupBulkHandshake();
+    void                handleBulkConnected(const Event&, void*);
+    void                handleBulkConnectionFailed(const Event&, void*);
+    void                handleBulkHandshakeData(const Event&, void*);
+    void                handleBulkHandshakeError(const Event&, void*);
     void                setupScreen();
     void                setupTimer();
     void                cleanupConnecting();
@@ -292,6 +307,10 @@ public:
     void                testCleanupConnection() { cleanupConnection(); }
     void                testCleanupScreen() { cleanupScreen(); }
     void                testSetStreamOnly(barrier::IStream* stream) { m_stream = stream; }
+    void                testAttachBulkStream(barrier::IStream* stream)
+    {
+        m_bulkChannel.reset(new barrier::BulkChannel(stream, this, m_events));
+    }
     void                testSetupConnecting(barrier::IStream* stream)
     {
         m_stream = stream;
@@ -421,6 +440,11 @@ private:
     ISocketFactory*        m_socketFactory;
     barrier::Screen*    m_screen;
     barrier::IStream*    m_stream;
+    barrier::IStream*    m_bulkHandshakeStream;
+    enum BulkHandshakeState { kBulkIdle, kBulkWaitingForHello, kBulkWaitingForAck };
+    BulkHandshakeState   m_bulkHandshakeState;
+    std::string          m_bulkBindingToken;
+    std::shared_ptr<barrier::BulkChannel> m_bulkChannel;
     std::vector<barrier::IStream*> m_detachedSendFileStreams;
     std::vector<ServerProxy*> m_detachedServerProxies;
     EventQueueTimer*    m_timer;
@@ -449,6 +473,7 @@ private:
     std::string m_dragFileExt;
     Thread*                m_sendFileThread;
     std::shared_ptr<StreamChunker> m_sendFileChunker;
+    std::shared_ptr<barrier::BulkChannel> m_sendFileBulkChannel;
     UInt32              m_sendFileTransferId;
     bool                m_sendFileIsClipboardPrefetch;
     bool                m_sendFileStarted;

@@ -24,6 +24,7 @@
 #include "server/PrimaryClient.h"
 #include "server/ClientListener.h"
 #include "barrier/FileChunk.h"
+#include "barrier/BulkChannel.h"
 #include "barrier/IPlatformScreen.h"
 #include "barrier/DropHelper.h"
 #include "barrier/option_types.h"
@@ -60,8 +61,12 @@
 #include <ctime>
 #include <stdexcept>
 #include <vector>
+#include <iomanip>
+#include <random>
 
 namespace {
+
+const double kBulkBindingLifetimeSeconds = 30.0;
 
 const SInt32 kMinUsableScreenDimension = 64;
 const SInt32 kSwitchEdgeHysteresisInset = 16;
@@ -298,6 +303,7 @@ Server::Server(
 		m_events(events),
 		m_fileReceiveSession(),
 	m_sendFileThread(NULL),
+	m_sendFileBulkChannel(),
 	m_sendFileTarget(NULL),
 	m_sendFileTransferId(0),
 	m_sendFileCompletionPending(false),
@@ -652,6 +658,7 @@ Server::adoptClient(BaseClientProxy* client)
 
 	// send configuration options to client
 	sendOptions(client);
+	renewBulkChannel(client);
 
 	// activate screen saver on new client if active on the primary screen
 	if (m_activeSaver != NULL) {
@@ -677,6 +684,82 @@ Server::adoptClient(BaseClientProxy* client)
 					 m_primaryClient->getEventTarget(), info);
 	connectedEvent.setDataObject(info);
 	m_events->addEvent(connectedEvent);
+}
+
+std::string
+Server::generateBulkToken() const
+{
+	std::random_device random;
+	std::ostringstream token;
+	token << std::hex << std::setfill('0');
+	for (size_t i = 0; i < 32; ++i) {
+		token << std::setw(2) << (random() & 0xffu);
+	}
+	return token.str();
+}
+
+void
+Server::eraseBulkBindings(BaseClientProxy* client)
+{
+	for (std::map<std::string, PendingBulkBinding>::iterator i =
+			m_pendingBulkBindings.begin(); i != m_pendingBulkBindings.end();) {
+		if (i->second.client == client) {
+			i = m_pendingBulkBindings.erase(i);
+		}
+		else {
+			++i;
+		}
+	}
+}
+
+void
+Server::renewBulkChannel(BaseClientProxy* client)
+{
+	if (client == NULL || !client->supportsBulkChannel() ||
+		m_clientSet.count(client) == 0) {
+		return;
+	}
+	eraseBulkBindings(client);
+
+	std::string token;
+	do {
+		token = generateBulkToken();
+	} while (m_pendingBulkBindings.count(token) != 0);
+
+	m_pendingBulkBindings.insert(std::make_pair(
+		token, PendingBulkBinding(getName(client), client)));
+	client->offerBulkChannel(token);
+}
+
+bool
+Server::attachBulkStream(const std::string& name, const std::string& token,
+					 barrier::IStream* stream)
+{
+	std::map<std::string, PendingBulkBinding>::iterator binding =
+		m_pendingBulkBindings.find(token);
+	if (binding == m_pendingBulkBindings.end()) {
+		LOG((CLOG_WARN "rejected bulk connection with unknown or reused token"));
+		return false;
+	}
+
+	PendingBulkBinding pending = binding->second;
+	if (pending.issued.getTime() > kBulkBindingLifetimeSeconds) {
+		m_pendingBulkBindings.erase(binding);
+		LOG((CLOG_WARN "rejected expired bulk connection token for \"%s\"",
+			 pending.name.c_str()));
+		return false;
+	}
+	if (pending.name != name || pending.client == NULL ||
+		m_clientSet.count(pending.client) == 0 ||
+		getName(pending.client) != name) {
+		LOG((CLOG_WARN "rejected bulk connection with mismatched client binding"));
+		return false;
+	}
+
+	// Exact-match attempts consume the bearer token whether attachment succeeds
+	// or fails, so a captured hello can never be replayed.
+	m_pendingBulkBindings.erase(binding);
+	return pending.client->attachBulkChannel(stream);
 }
 
 void
@@ -1149,9 +1232,16 @@ Server::fetchPendingPrimaryClipboards()
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         ClipboardInfo& clipboard = m_clipboards[id];
         const bool pendingFetch = clipboard.m_clipboardOwner == primaryName &&
-            clipboard.m_pendingPrimaryFetch;
+            clipboard.m_pendingClipboardFetch;
         if (pendingFetch) {
             onClipboardChanged(m_primaryClient, id, clipboard.m_clipboardSeqNum);
+            continue;
+        }
+
+        // A remote screen has announced a newer clipboard revision but has
+        // not committed its payload yet. The primary fallback snapshot is
+        // stale in this interval and must not take ownership back.
+        if (clipboard.m_pendingClipboardFetch) {
             continue;
         }
 
@@ -1161,7 +1251,7 @@ Server::fetchPendingPrimaryClipboards()
         // event-driven to avoid unnecessary reads and switch latency.
         if (id == kClipboardClipboard) {
             const std::string previousOwner = clipboard.m_clipboardOwner;
-            const bool previousPendingFetch = clipboard.m_pendingPrimaryFetch;
+            const bool previousPendingFetch = clipboard.m_pendingClipboardFetch;
 
             Clipboard observedClipboard;
             if (!readClipboardWithRetry(m_primaryClient, id, observedClipboard)) {
@@ -1185,7 +1275,7 @@ Server::fetchPendingPrimaryClipboards()
                     static_cast<unsigned long>(m_readyFileClipboardPaths.size())));
                 clipboard.m_clipboard = observedClipboard;
                 clipboard.m_clipboardData.set(observedClipboard.marshall());
-                clipboard.m_pendingPrimaryFetch = false;
+                clipboard.m_pendingClipboardFetch = false;
                 m_readyFileClipboardSession.clear();
                 m_readyFileClipboardPaths.clear();
                 m_readyFileClipboardRevision.reset();
@@ -1200,10 +1290,10 @@ Server::fetchPendingPrimaryClipboards()
             }
 
             clipboard.m_clipboardOwner = primaryName;
-            clipboard.m_pendingPrimaryFetch = true;
+            clipboard.m_pendingClipboardFetch = true;
             if (!onClipboardChanged(m_primaryClient, id, clipboard.m_clipboardSeqNum)) {
                 clipboard.m_clipboardOwner = previousOwner;
-                clipboard.m_pendingPrimaryFetch = previousPendingFetch;
+                clipboard.m_pendingClipboardFetch = previousPendingFetch;
             }
         }
     }
@@ -1256,6 +1346,11 @@ Server::replayClipboardsToActive()
     const std::string primaryName = getName(m_primaryClient);
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         ClipboardInfo& clipboard = m_clipboards[id];
+        if (clipboard.m_clipboardOwner == activeName) {
+            LOG((CLOG_DEBUG "not replaying clipboard %d to its current owner \"%s\"",
+                 id, activeName.c_str()));
+            continue;
+        }
         if (id == kClipboardClipboard) {
             RemoteFileClipboard::Data remoteFileClipboard;
             if (RemoteFileClipboard::readFromClipboard(clipboard.m_clipboard, remoteFileClipboard) &&
@@ -2301,7 +2396,7 @@ Server::handleClipboardGrabbed(const Event& event, void* vclient)
 	LOG((CLOG_INFO "screen \"%s\" grabbed clipboard %d from \"%s\"", getName(grabber).c_str(), info->m_id, clipboard.m_clipboardOwner.c_str()));
 	clipboard.m_clipboardOwner  = getName(grabber);
 	clipboard.m_clipboardSeqNum = info->m_sequenceNumber;
-	clipboard.m_pendingPrimaryFetch = (grabber == m_primaryClient);
+	clipboard.m_pendingClipboardFetch = true;
 
 	LOG((CLOG_DEBUG "deferred clipboard %d fetch from \"%s\" until screen leave",
 		info->m_id, getName(grabber).c_str()));
@@ -2713,9 +2808,7 @@ Server::onClipboardChanged(BaseClientProxy* sender,
     std::string data = clipboard.m_clipboard.marshall();
 	if (clipboard.m_clipboardData.matches(data)) {
 		LOG((CLOG_DEBUG "ignored screen \"%s\" update of clipboard %d (unchanged)", clipboard.m_clipboardOwner.c_str(), id));
-		if (sender == m_primaryClient) {
-			clipboard.m_pendingPrimaryFetch = false;
-		}
+		clipboard.m_pendingClipboardFetch = false;
 		return true;
 	}
 	if (id == kClipboardClipboard) {
@@ -2732,9 +2825,6 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 				clipboard.m_clipboard, &sourceFileClipboard, &error)) {
 			LOG((CLOG_WARN "file clipboard metadata could not be normalized: %s",
 				error.c_str()));
-			if (sender == m_primaryClient) {
-				clipboard.m_pendingPrimaryFetch = false;
-			}
 			return false;
 		}
 
@@ -2765,16 +2855,12 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 			BaseClientProxy* client = index->second;
 			client->setClipboardDirty(id, client != sender);
 		}
-		if (sender == m_primaryClient) {
-			clipboard.m_pendingPrimaryFetch = false;
-		}
+		clipboard.m_pendingClipboardFetch = false;
 		return true;
 	}
 
 	clipboard.m_clipboardData.set(data);
-	if (sender == m_primaryClient) {
-		clipboard.m_pendingPrimaryFetch = false;
-	}
+	clipboard.m_pendingClipboardFetch = false;
 
 	// tell all clients except the sender that the clipboard is dirty
 	for (ClientList::const_iterator index = m_clients.begin();
@@ -3510,8 +3596,17 @@ Server::onFileChunkSending(const void* data)
 		return;
 	}
 
-	// relay
-	target->fileChunkSending(chunk->m_chunk[0], &chunk->m_chunk[1], chunk->m_dataSize);
+	// The route is pinned for the complete transfer. If bulk disconnects,
+	// writes fail on that closed stream; remaining frames must never spill into
+	// control and corrupt the peer's transfer state.
+	if (m_sendFileBulkChannel) {
+		FileChunk::send(m_sendFileBulkChannel->getStream(), chunk->m_chunk[0],
+			&chunk->m_chunk[1], chunk->m_dataSize);
+	}
+	else {
+		target->fileChunkSending(chunk->m_chunk[0], &chunk->m_chunk[1],
+			chunk->m_dataSize);
+	}
 	if (chunk->m_chunk[0] == kDataStart) {
 		m_sendFileStarted = true;
 		m_sendFileCompletionPending = false;
@@ -3851,7 +3946,9 @@ Server::startPendingFileClipboardPrefetch()
 		m_sendFileTransferId++;
 	}
 	const UInt32 transferId = m_sendFileTransferId;
-	barrier::IStream* stream = pendingTarget->getStream();
+	m_sendFileBulkChannel = pendingTarget->acquireBulkChannel();
+	barrier::IStream* stream = m_sendFileBulkChannel ?
+		m_sendFileBulkChannel->getStream() : pendingTarget->getStream();
 	LOG((CLOG_INFO "remote clipboard prefetch started: direction=server-to-client items=%lu target=%s",
 		static_cast<unsigned long>(sourcePaths.size()),
 		pendingTarget->getName().c_str()));
@@ -3957,6 +4054,8 @@ Server::removeClient(BaseClientProxy* client)
 		cancelInputHandoff("handoff source disconnected", false);
 	}
 	discardPendingMouseMove(client);
+	eraseBulkBindings(client);
+	client->detachBulkChannel();
 	if (m_pendingFileClipboardPrefetchTarget == client) {
 		m_pendingFileClipboardPrefetchTarget = NULL;
 		m_pendingFileClipboardPrefetchPaths.clear();
@@ -4149,7 +4248,7 @@ Server::ClipboardInfo::ClipboardInfo() :
 	m_clipboardData(),
 	m_clipboardOwner(),
 	m_clipboardSeqNum(0),
-	m_pendingPrimaryFetch(false)
+	m_pendingClipboardFetch(false)
 {
 	// do nothing
 }
@@ -4262,7 +4361,9 @@ Server::sendFileToClient(const std::string& filename)
 		m_sendFileTransferId++;
 	}
 	const UInt32 transferId = m_sendFileTransferId;
-	barrier::IStream* stream = target->getStream();
+	m_sendFileBulkChannel = target->acquireBulkChannel();
+	barrier::IStream* stream = m_sendFileBulkChannel ?
+		m_sendFileBulkChannel->getStream() : target->getStream();
     m_sendFileThread = new Thread([this, stream, filename, chunker, transferId]() {
 		send_file_thread(stream, filename, chunker, transferId);
 	});
@@ -4327,6 +4428,7 @@ Server::cleanupSendFileThread(bool cancel)
 	}
 
 	m_sendFileChunker.reset();
+	m_sendFileBulkChannel.reset();
 	m_sendFileTarget = NULL;
 	m_sendFileCompletionPending = false;
 	m_sendFileStarted = false;
@@ -4353,6 +4455,7 @@ Server::reapSendFileThreadIfReady()
 	if (m_sendFileCleanupPending) {
 		BaseClientProxy* target = m_sendFileTarget;
 		m_sendFileTarget = NULL;
+		m_sendFileBulkChannel.reset();
 		m_sendFileCompletionPending = false;
 		m_sendFileStarted = false;
 		m_sendFileCleanupPending = false;
@@ -4372,13 +4475,15 @@ Server::finishCompletedSendFileIfReady()
 
 	BaseClientProxy* target = m_sendFileTarget;
 	if (target != NULL && m_clientSet.count(target) != 0) {
-		barrier::IStream* stream = target->getStream();
+		barrier::IStream* stream = m_sendFileBulkChannel ?
+			m_sendFileBulkChannel->getStream() : target->getStream();
 		if (stream != NULL && stream->getBufferedOutputSize() > 0) {
 			return false;
 		}
 	}
 
 	m_sendFileTarget = NULL;
+	m_sendFileBulkChannel.reset();
 	m_sendFileCompletionPending = false;
 	m_sendFileStarted = false;
 	m_sendFileCleanupPending = false;

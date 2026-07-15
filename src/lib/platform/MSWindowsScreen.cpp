@@ -219,6 +219,8 @@ MSWindowsScreen::enable()
 
     // install our clipboard snooper
     m_nextClipboardWindow = SetClipboardViewer(m_window);
+    m_clipboardChangeTracker.reset(GetClipboardSequenceNumber());
+    m_ownClipboard = MSWindowsClipboard::isOwnedByBarrier();
 
     // track the active desk and (re)install the hooks
     m_desks->enable();
@@ -434,10 +436,12 @@ MSWindowsScreen::checkClipboards()
     // next reboot we do this double check.  clipboard ownership
     // won't be reflected on other screens until we leave but at
     // least the clipboard itself will work.
-    if (m_ownClipboard && !MSWindowsClipboard::isOwnedByBarrier()) {
-        LOG((CLOG_DEBUG "clipboard changed: lost ownership and no notification received"));
-        m_ownClipboard = false;
-        sendClipboardEvent(m_events->forClipboard().clipboardGrabbed(), kClipboardClipboard);
+    const DWORD sequence = GetClipboardSequenceNumber();
+    const bool ownedByWeave = MSWindowsClipboard::isOwnedByBarrier();
+    if (m_clipboardChangeTracker.changed(sequence) ||
+        (m_ownClipboard && !ownedByWeave)) {
+        LOG((CLOG_DEBUG "clipboard changed: viewer notification was missed"));
+        onClipboardChange();
     }
 }
 
@@ -1579,14 +1583,18 @@ MSWindowsScreen::onDisplayChange()
 bool
 MSWindowsScreen::onClipboardChange()
 {
-    // now notify client that somebody changed the clipboard (unless
-    // we're the owner).
-    if (!MSWindowsClipboard::isOwnedByBarrier()) {
-        if (m_ownClipboard) {
-            LOG((CLOG_DEBUG "clipboard changed: lost ownership"));
-            m_ownClipboard = false;
+    const bool ownedByWeave = MSWindowsClipboard::isOwnedByBarrier();
+    const bool notify = m_clipboardChangeTracker.observe(
+        GetClipboardSequenceNumber(), ownedByWeave);
+
+    // Notify on every new external clipboard revision, not only on the first
+    // transition away from a clipboard published by Weave.
+    if (!ownedByWeave) {
+        if (notify) {
+            LOG((CLOG_DEBUG "clipboard changed: new external revision"));
             sendClipboardEvent(m_events->forClipboard().clipboardGrabbed(), kClipboardClipboard);
         }
+        m_ownClipboard = false;
     }
     else if (!m_ownClipboard) {
         LOG((CLOG_DEBUG "clipboard changed: barrier owned"));

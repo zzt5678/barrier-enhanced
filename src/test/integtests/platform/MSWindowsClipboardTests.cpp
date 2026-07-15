@@ -17,6 +17,7 @@
  */
 
 #include "platform/MSWindowsClipboard.h"
+#include "platform/MSWindowsClipboardChangeTracker.h"
 #include "platform/IMSWindowsClipboardFacade.h"
 
 #include "test/global/gmock.h"
@@ -49,6 +50,34 @@ class MockFacade : public IMSWindowsClipboardFacade
 public:
     MOCK_METHOD2(write, void(HANDLE, UINT));
 };
+
+TEST(MSWindowsClipboardChangeTrackerTests, consecutiveExternalRevisionsNotify)
+{
+    MSWindowsClipboardChangeTracker tracker;
+    tracker.reset(100);
+
+    EXPECT_TRUE(tracker.observe(101, false));
+    EXPECT_TRUE(tracker.observe(102, false));
+}
+
+TEST(MSWindowsClipboardChangeTrackerTests, duplicateRevisionDoesNotNotify)
+{
+    MSWindowsClipboardChangeTracker tracker;
+    tracker.reset(100);
+
+    EXPECT_FALSE(tracker.observe(100, false));
+    EXPECT_TRUE(tracker.observe(101, false));
+    EXPECT_FALSE(tracker.observe(101, false));
+}
+
+TEST(MSWindowsClipboardChangeTrackerTests, weaveOwnedRevisionDoesNotEcho)
+{
+    MSWindowsClipboardChangeTracker tracker;
+    tracker.reset(100);
+
+    EXPECT_FALSE(tracker.observe(101, true));
+    EXPECT_TRUE(tracker.observe(102, false));
+}
 
 TEST_F(MSWindowsClipboardTests, emptyUnowned_openCalled_returnsTrue)
 {

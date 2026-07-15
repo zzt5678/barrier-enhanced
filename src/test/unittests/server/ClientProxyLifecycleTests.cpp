@@ -2,9 +2,11 @@
 #include "server/ClientProxy1_6.h"
 #include "server/ClientProxy1_7.h"
 #include "server/ClientProxy1_8.h"
+#include "server/ClientProxy1_9.h"
 
 #include "barrier/Clipboard.h"
 #include "barrier/ProtocolUtil.h"
+#include "barrier/RemoteFileClipboard.h"
 #include "barrier/protocol_types.h"
 #include "arch/Arch.h"
 #include "base/Stopwatch.h"
@@ -57,6 +59,22 @@ Clipboard makeLargeClipboard()
     clipboard.open(40);
     clipboard.empty();
     clipboard.add(IClipboard::kText, std::string(300 * 1024, 'x'));
+    clipboard.close();
+    return clipboard;
+}
+
+Clipboard makeFileClipboard()
+{
+    RemoteFileClipboard::Data payload;
+    payload.mode = RemoteFileClipboard::Mode::SourcePaths;
+    payload.sessionId = "small-file-clipboard";
+    payload.paths.push_back(barrier::fs::u8path("/tmp/small.txt"));
+
+    Clipboard clipboard;
+    clipboard.open(40);
+    clipboard.empty();
+    clipboard.add(IClipboard::kFileList,
+                  RemoteFileClipboard::serialize(payload));
     clipboard.close();
     return clipboard;
 }
@@ -384,6 +402,86 @@ TEST(ClientProxyLifecycleTests, clientProxy16KeepsClipboardDirtyWhileAsyncSendIs
         ARCH->sleep(0.001);
     }
     EXPECT_TRUE(proxy.cleanupClipboardSendThread(true));
+}
+
+TEST(ClientProxyLifecycleTests, clientProxy19RoutesLargeClipboardToBulkStream)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents, fileEvents, nextType);
+
+    NiceMock<MockStream>* controlStream = new NiceMock<MockStream>();
+    ON_CALL(*controlStream, getEventTarget()).WillByDefault(Return(controlStream));
+    ON_CALL(*controlStream, getBufferedOutputSize()).WillByDefault(Return(0));
+
+    NiceMock<MockStream>* bulkStream = new NiceMock<MockStream>();
+    ON_CALL(*bulkStream, getEventTarget()).WillByDefault(Return(bulkStream));
+    ON_CALL(*bulkStream, getBufferedOutputSize()).WillByDefault(Return(0));
+
+    NiceMock<MockServer> server;
+    EXPECT_CALL(events, adoptHandler(_, _, _)).Times(AnyNumber());
+    EXPECT_CALL(events, removeHandler(_, _)).Times(AnyNumber());
+
+    ClientProxy1_9 proxy("client", controlStream, &server, &events);
+    ASSERT_TRUE(proxy.attachBulkChannel(bulkStream));
+    Clipboard clipboard = makeLargeClipboard();
+
+    proxy.setClipboardDirty(kClipboardClipboard, true);
+    proxy.setClipboard(kClipboardClipboard, &clipboard);
+
+    EXPECT_TRUE(proxy.testHasClipboardBulkChannel());
+    EXPECT_EQ(bulkStream, proxy.testClipboardSendStream());
+
+    for (int i = 0; i < 200 && !proxy.cleanupClipboardSendThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(proxy.cleanupClipboardSendThread(true));
+}
+
+TEST(ClientProxyLifecycleTests, clientProxy19RoutesSmallFileClipboardMetadataToBulkStream)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents, fileEvents, nextType);
+
+    NiceMock<MockStream>* controlStream = new NiceMock<MockStream>();
+    ON_CALL(*controlStream, getEventTarget()).WillByDefault(Return(controlStream));
+    ON_CALL(*controlStream, getBufferedOutputSize()).WillByDefault(Return(0));
+
+    NiceMock<MockStream>* bulkStream = new NiceMock<MockStream>();
+    ON_CALL(*bulkStream, getEventTarget()).WillByDefault(Return(bulkStream));
+    ON_CALL(*bulkStream, getBufferedOutputSize()).WillByDefault(Return(0));
+
+    NiceMock<MockServer> server;
+    ClientProxy1_9 proxy("client", controlStream, &server, &events);
+    ASSERT_TRUE(proxy.attachBulkChannel(bulkStream));
+    Clipboard clipboard = makeFileClipboard();
+    ASSERT_TRUE(RemoteFileClipboard::containsFileList(clipboard));
+
+    proxy.setClipboardDirty(kClipboardClipboard, true);
+    std::vector<ClipboardChunk*> queuedChunks;
+    EXPECT_CALL(events, addEvent(_)).Times(AnyNumber()).WillRepeatedly(
+        Invoke([&clipboardEvents, &queuedChunks](const Event& event) {
+            if (event.getType() == clipboardEvents.clipboardSending() &&
+                event.getData() != nullptr) {
+                queuedChunks.push_back(static_cast<ClipboardChunk*>(event.getData()));
+            }
+        }));
+    EXPECT_CALL(*controlStream, writeLowPriority(_, _)).Times(0);
+    EXPECT_CALL(*bulkStream, writeLowPriority(_, _)).Times(testing::AtLeast(1));
+    proxy.setClipboard(kClipboardClipboard, &clipboard);
+    ASSERT_EQ(3u, queuedChunks.size());
+    for (ClipboardChunk* chunk : queuedChunks) {
+        EXPECT_EQ(bulkStream, chunk->getSendStream(nullptr));
+        ClipboardChunk::send(chunk->getSendStream(nullptr), chunk);
+        delete chunk;
+    }
 }
 
 TEST(ClientProxyLifecycleTests, clientProxy16ClearsClipboardDirtyAfterAsyncSendCompletes)

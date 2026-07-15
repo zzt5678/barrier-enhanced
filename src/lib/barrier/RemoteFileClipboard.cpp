@@ -235,7 +235,7 @@ bool rewriteClipboard(Clipboard& clipboard,
     return true;
 }
 
-bool hasFileListFormat(const Clipboard& clipboard)
+bool hasFileListFormat(const IClipboard& clipboard)
 {
     if (!clipboard.open(0)) {
         return false;
@@ -288,6 +288,11 @@ barrier::fs::file_time_type pathModifiedTime(const barrier::fs::path& path)
 } // namespace
 
 namespace RemoteFileClipboard {
+
+bool containsFileList(const IClipboard& clipboard)
+{
+    return hasFileListFormat(clipboard);
+}
 
 bool collectMaterializedRoots(const barrier::fs::path& destinationRoot,
                               std::vector<barrier::fs::path>& roots,
@@ -570,7 +575,7 @@ bool stripImageFileTransferMetadata(Clipboard& clipboard)
 
 AutomaticSharingStatus prepareForAutomaticClipboardSharing(Clipboard& clipboard)
 {
-    if (!hasFileListFormat(clipboard)) {
+    if (!containsFileList(clipboard)) {
         return AutomaticSharingStatus::Safe;
     }
 
