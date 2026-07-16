@@ -249,11 +249,14 @@ Server::Server(
 		m_seqNum(0),
 		m_inputHandoffPending(false),
 		m_inputHandoffCommitReady(false),
+		m_inputHandoffCommitted(false),
 		m_inputHandoffSource(NULL),
 		m_inputHandoffTarget(NULL),
 		m_inputHandoffSeqNum(0),
 		m_inputHandoffX(0),
 		m_inputHandoffY(0),
+		m_inputHandoffSourceX(0),
+		m_inputHandoffSourceY(0),
 		m_inputHandoffMask(0),
 		m_inputHandoffGuardDir(kNoDirection),
 		m_inputHandoffTimer(NULL),
@@ -875,7 +878,6 @@ Server::switchScreen(BaseClientProxy* dst,
 					EDirection guardDir)
 {
 	assert(dst != NULL);
-
 	if (m_inputHandoffPending &&
 		(dst != m_inputHandoffTarget || m_active != m_inputHandoffSource)) {
 		cancelInputHandoff("superseded by another switch", false);
@@ -920,6 +922,9 @@ Server::switchScreen(BaseClientProxy* dst,
 	if (!m_inputHandoffCommitReady && m_active != dst &&
 		guardDir != kNoDirection && dst != m_primaryClient &&
 		dst->supportsInputHandoff()) {
+		m_inputHandoffCommitted = false;
+		m_inputHandoffSource = NULL;
+		m_inputHandoffTarget = NULL;
 		return beginInputHandoff(dst, x, y, guardDir);
 	}
 
@@ -950,6 +955,12 @@ Server::switchScreen(BaseClientProxy* dst,
 				}
 				return false;
 			}
+
+		if (!m_inputHandoffCommitReady && m_inputHandoffCommitted) {
+			m_inputHandoffCommitted = false;
+			m_inputHandoffSource = NULL;
+			m_inputHandoffTarget = NULL;
+		}
 
 		m_primaryLeaveFailedRecently = false;
 		if (oldActive == m_primaryClient) {
@@ -1029,6 +1040,8 @@ Server::beginInputHandoff(BaseClientProxy* dst, SInt32 x, SInt32 y,
 	m_inputHandoffSeqNum = ++m_seqNum;
 	m_inputHandoffX = x;
 	m_inputHandoffY = y;
+	m_inputHandoffSourceX = m_x;
+	m_inputHandoffSourceY = m_y;
 	m_inputHandoffMask = m_primaryClient->getToggleMask();
 	m_inputHandoffGuardDir = guardDir;
 
@@ -1071,6 +1084,7 @@ Server::cancelInputHandoff(const char* reason, bool reanchor, bool notifyTarget)
 	cleanupInputHandoffTimer();
 	m_inputHandoffPending = false;
 	m_inputHandoffCommitReady = false;
+	m_inputHandoffCommitted = false;
 	m_inputHandoffSource = NULL;
 	m_inputHandoffTarget = NULL;
 	m_inputHandoffGuardDir = kNoDirection;
@@ -1097,6 +1111,26 @@ Server::handleInputHandoffReady(const Event& event, void* vclient)
 		static_cast<BaseClientProxy::InputHandoffReadyInfo*>(
 			event.getDataObject() != NULL ? event.getDataObject() :
 			static_cast<EventData*>(event.getData()));
+	if (info != NULL && !info->m_ready && m_inputHandoffCommitted &&
+		client == m_inputHandoffTarget &&
+		info->m_seqNum == m_inputHandoffSeqNum &&
+		m_active == m_inputHandoffTarget) {
+		BaseClientProxy* source = m_inputHandoffSource;
+		const SInt32 sourceX = m_inputHandoffSourceX;
+		const SInt32 sourceY = m_inputHandoffSourceY;
+		m_inputHandoffCommitted = false;
+		m_inputHandoffSource = NULL;
+		m_inputHandoffTarget = NULL;
+		LOG((CLOG_WARN
+			"target rejected committed input handoff, seq=%u; restoring source lease",
+			info->m_seqNum));
+		if (source != NULL && m_clientSet.count(source) != 0 &&
+			!switchScreen(source, sourceX, sourceY, false, kNoDirection)) {
+			reanchorActiveAfterFailedSwitch(client);
+		}
+		return;
+	}
+
 	if (info == NULL || !m_inputHandoffPending ||
 		client != m_inputHandoffTarget ||
 		info->m_seqNum != m_inputHandoffSeqNum) {
@@ -1123,12 +1157,16 @@ Server::handleInputHandoffReady(const Event& event, void* vclient)
 
 	const bool committed = switchScreen(client, x, y, false, guardDir);
 	m_inputHandoffCommitReady = false;
-	m_inputHandoffSource = NULL;
-	m_inputHandoffTarget = NULL;
 	m_inputHandoffGuardDir = kNoDirection;
 	if (!committed) {
+		m_inputHandoffCommitted = false;
+		m_inputHandoffSource = NULL;
+		m_inputHandoffTarget = NULL;
 		client->abortEnter(info->m_seqNum);
 		reanchorActiveAfterFailedSwitch(client);
+	}
+	else {
+		m_inputHandoffCommitted = true;
 	}
 }
 
@@ -4052,6 +4090,12 @@ Server::removeClient(BaseClientProxy* client)
 	}
 	else if (m_inputHandoffPending && client == m_inputHandoffSource) {
 		cancelInputHandoff("handoff source disconnected", false);
+	}
+	if (m_inputHandoffCommitted &&
+		(client == m_inputHandoffTarget || client == m_inputHandoffSource)) {
+		m_inputHandoffCommitted = false;
+		m_inputHandoffSource = NULL;
+		m_inputHandoffTarget = NULL;
 	}
 	discardPendingMouseMove(client);
 	eraseBulkBindings(client);

@@ -140,11 +140,14 @@ public:
         m_seqNum(0),
         m_inputHandoffPending(false),
         m_inputHandoffCommitReady(false),
+        m_inputHandoffCommitted(false),
         m_inputHandoffSource(NULL),
         m_inputHandoffTarget(NULL),
         m_inputHandoffSeqNum(0),
         m_inputHandoffX(0),
         m_inputHandoffY(0),
+        m_inputHandoffSourceX(0),
+        m_inputHandoffSourceY(0),
         m_inputHandoffMask(0),
         m_inputHandoffGuardDir(kNoDirection),
         m_inputHandoffTimer(NULL),
@@ -662,11 +665,14 @@ private:
     // two-phase ownership transfer for protocol 1.7 pointer handoffs
     bool                  m_inputHandoffPending;
     bool                  m_inputHandoffCommitReady;
+    bool                  m_inputHandoffCommitted;
     BaseClientProxy*      m_inputHandoffSource;
     BaseClientProxy*      m_inputHandoffTarget;
     UInt32                m_inputHandoffSeqNum;
     SInt32                m_inputHandoffX;
     SInt32                m_inputHandoffY;
+    SInt32                m_inputHandoffSourceX;
+    SInt32                m_inputHandoffSourceY;
     KeyModifierMask       m_inputHandoffMask;
     EDirection            m_inputHandoffGuardDir;
     EventQueueTimer*      m_inputHandoffTimer;

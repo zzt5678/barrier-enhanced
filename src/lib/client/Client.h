@@ -143,6 +143,9 @@ public:
     //! Return true when the enabled local screen can accept a new input lease.
     bool                canAcceptInputHandoff() const;
 
+    //! Return the input backend generation used to validate a prepared lease.
+    std::uint64_t       inputHandoffGeneration() const;
+
     static bool         negotiateProtocolVersion(SInt16 serverMajor,
                                 SInt16 serverMinor, SInt16& negotiatedMinor);
 

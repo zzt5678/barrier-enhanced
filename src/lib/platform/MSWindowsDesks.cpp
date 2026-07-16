@@ -27,8 +27,8 @@
 #include "arch/win32/ArchMiscWindows.h"
 #include "base/Log.h"
 #include "base/IEventQueue.h"
+#include "base/Stopwatch.h"
 #include "base/TMethodEventJob.h"
-#include "base/IEventQueue.h"
 
 #include <malloc.h>
 #include <VersionHelpers.h>
@@ -73,6 +73,10 @@ namespace {
 
 const double kNormalDeskPollInterval = 0.2;
 const double kLowLatencyDeskPollInterval = 0.05;
+const double kDeskCommandTimeout = 0.25;
+const double kDeskCommandExecutionGrace = 0.75;
+const double kDeskStartupTimeout = 2.0;
+const ULONGLONG kDeskRecoveryProbeInterval = 1000;
 
 }
 
@@ -90,7 +94,7 @@ const double kLowLatencyDeskPollInterval = 0.05;
 #define BARRIER_MSG_FAKE_MOVE        BARRIER_HOOK_LAST_MSG + 6
 // xDelta; yDelta
 #define BARRIER_MSG_FAKE_WHEEL        BARRIER_HOOK_LAST_MSG + 7
-// POINT*; <unused>
+// <unused>; <unused>
 #define BARRIER_MSG_CURSOR_POS        BARRIER_HOOK_LAST_MSG + 8
 // IKeyState*; <unused>
 #define BARRIER_MSG_SYNC_KEYS        BARRIER_HOOK_LAST_MSG + 9
@@ -100,8 +104,26 @@ const double kLowLatencyDeskPollInterval = 0.05;
 #define BARRIER_MSG_FAKE_REL_MOVE    BARRIER_HOOK_LAST_MSG + 11
 // enable; <unused>
 #define BARRIER_MSG_FAKE_INPUT        BARRIER_HOOK_LAST_MSG + 12
+// DeskCommand*; <unused>
+#define BARRIER_MSG_DESK_COMMAND      BARRIER_HOOK_LAST_MSG + 13
 
 namespace {
+
+struct DeskCommand {
+    DeskCommand(UINT commandMessage, WPARAM commandWParam,
+                LPARAM commandLParam, std::uint64_t commandSequence) :
+        message(commandMessage),
+        wParam(commandWParam),
+        lParam(commandLParam),
+        sequence(commandSequence)
+    {
+    }
+
+    UINT message;
+    WPARAM wParam;
+    LPARAM lParam;
+    std::uint64_t sequence;
+};
 
 LONG normalizeMouseCoordinate(SInt32 value, SInt32 origin, SInt32 length)
 {
@@ -178,7 +200,12 @@ MSWindowsDesks::MSWindowsDesks(bool isPrimary, bool noHooks,
     m_activeDesk(NULL),
     m_activeDeskName(),
     m_mutex(),
+    m_sendMutex(),
     m_deskReady(&m_mutex, false),
+    m_inputDesktopGeneration(0),
+    m_nextDeskCommandSequence(0),
+    m_cursorPos{0, 0},
+    m_nextDeskRecoveryProbe(0),
     m_updateKeys(updateKeys),
     m_leaveForegroundOption(false),
     m_lowLatencyMode(false),
@@ -382,10 +409,10 @@ MSWindowsDesks::fakeInputEnd()
 void
 MSWindowsDesks::getCursorPos(SInt32& x, SInt32& y) const
 {
-    POINT pos;
-    sendMessage(BARRIER_MSG_CURSOR_POS, reinterpret_cast<WPARAM>(&pos), 0);
-    x = pos.x;
-    y = pos.y;
+    const bool updated = sendMessage(BARRIER_MSG_CURSOR_POS, 0, 0);
+    Lock lock(&m_mutex);
+    x = updated ? m_cursorPos.x : m_xCenter;
+    y = updated ? m_cursorPos.y : m_yCenter;
 }
 
 void
@@ -481,13 +508,167 @@ MSWindowsDesks::fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const
     sendMessage(BARRIER_MSG_FAKE_WHEEL, xDelta, yDelta);
 }
 
-void
+bool
+MSWindowsDesks::canEnter() const
+{
+    Lock lock(&m_mutex);
+    return isDeskReadyLocked(m_activeDesk);
+}
+
+std::uint64_t
+MSWindowsDesks::inputDesktopGeneration() const
+{
+    Lock lock(&m_mutex);
+    return m_inputDesktopGeneration;
+}
+
+bool
+MSWindowsDesks::isDesktopReadyForTest(bool isPrimary, bool noHooks,
+                                      bool threadAttached, bool windowReady,
+                                      bool hookInstalled,
+                                      bool commandResponsive)
+{
+    return threadAttached && windowReady && commandResponsive &&
+        (!isPrimary || noHooks || hookInstalled);
+}
+
+bool
+MSWindowsDesks::isDeskCommandCompleteForTest(
+    std::uint64_t expectedSequence, std::uint64_t completedSequence,
+    bool threadRunning)
+{
+    return threadRunning && completedSequence >= expectedSequence;
+}
+
+bool
+MSWindowsDesks::shouldProcessDeskCommandForTest(
+    std::uint64_t sequence, std::uint64_t cancelledThroughSequence)
+{
+    return sequence > cancelledThroughSequence;
+}
+
+bool
+MSWindowsDesks::canCancelTimedOutDeskCommandForTest(
+    std::uint64_t sequence, std::uint64_t executingSequence)
+{
+    return sequence != executingSequence;
+}
+
+bool
+MSWindowsDesks::commandCompletionProvesResponsiveForTest(
+    bool commandExecuted, std::uint64_t sequence,
+    std::uint64_t poisonedThroughSequence)
+{
+    return commandExecuted && sequence > poisonedThroughSequence;
+}
+
+bool
 MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
 {
-    if (m_activeDesk != NULL && m_activeDesk->m_window != NULL) {
-        PostThreadMessage(m_activeDesk->m_threadID, msg, wParam, lParam);
-        waitForDesk();
+    Lock sendLock(&m_sendMutex);
+
+    Desk* desk = NULL;
+    std::uint64_t sequence = 0;
+    {
+        Lock lock(&m_mutex);
+        desk = m_activeDesk;
+        if (desk == NULL || !desk->m_threadRunning ||
+            !desk->m_threadAttached || !desk->m_windowReady ||
+            (!desk->m_commandResponsive && msg != BARRIER_MSG_SWITCH)) {
+            return false;
+        }
+        sequence = ++m_nextDeskCommandSequence;
     }
+
+    DeskCommand* command = new DeskCommand(msg, wParam, lParam, sequence);
+    if (PostThreadMessage(desk->m_threadID, BARRIER_MSG_DESK_COMMAND,
+                          reinterpret_cast<WPARAM>(command), 0) == 0) {
+        const DWORD error = GetLastError();
+        delete command;
+        {
+            Lock lock(&m_mutex);
+            if (desk == m_activeDesk && desk->m_commandResponsive) {
+                ++m_inputDesktopGeneration;
+            }
+            desk->m_commandResponsive = false;
+            if (sequence > desk->m_cancelledCommandSequence) {
+                desk->m_cancelledCommandSequence = sequence;
+            }
+        }
+        LOG((CLOG_WARN
+            "cannot post Windows input command message=%u sequence=%llu error=%lu",
+            static_cast<unsigned int>(msg),
+            static_cast<unsigned long long>(sequence),
+            static_cast<unsigned long>(error)));
+        return false;
+    }
+
+    if (!waitForDeskCommand(desk, sequence, kDeskCommandTimeout)) {
+        bool commandIsExecuting = false;
+        {
+            Lock lock(&m_mutex);
+            if (isDeskCommandCompleteForTest(
+                    sequence, desk->m_completedCommandSequence,
+                    desk->m_threadRunning)) {
+                return true;
+            }
+            commandIsExecuting = !canCancelTimedOutDeskCommandForTest(
+                sequence, desk->m_executingCommandSequence);
+            if (!commandIsExecuting) {
+                if (desk == m_activeDesk && desk->m_commandResponsive) {
+                    ++m_inputDesktopGeneration;
+                }
+                desk->m_commandResponsive = false;
+                if (sequence > desk->m_cancelledCommandSequence) {
+                    desk->m_cancelledCommandSequence = sequence;
+                }
+            }
+        }
+
+        if (commandIsExecuting) {
+            LOG((CLOG_WARN
+                "Windows input command exceeded %.3fs after execution began; allowing %.3fs recovery grace message=%u sequence=%llu desktop=%s",
+                kDeskCommandTimeout, kDeskCommandExecutionGrace,
+                static_cast<unsigned int>(msg),
+                static_cast<unsigned long long>(sequence),
+                desk->m_name.c_str()));
+            if (waitForDeskCommand(
+                    desk, sequence, kDeskCommandExecutionGrace)) {
+                return true;
+            }
+
+            {
+                Lock lock(&m_mutex);
+                if (isDeskCommandCompleteForTest(
+                        sequence, desk->m_completedCommandSequence,
+                        desk->m_threadRunning)) {
+                    return true;
+                }
+                if (desk == m_activeDesk && desk->m_commandResponsive) {
+                    ++m_inputDesktopGeneration;
+                }
+                desk->m_commandResponsive = false;
+                if (sequence > desk->m_poisonedThroughCommandSequence) {
+                    desk->m_poisonedThroughCommandSequence = sequence;
+                }
+            }
+            LOG((CLOG_ERR
+                "Windows input desktop is poisoned by a stuck command; requesting supervised process recovery message=%u sequence=%llu desktop=%s",
+                static_cast<unsigned int>(msg),
+                static_cast<unsigned long long>(sequence),
+                desk->m_name.c_str()));
+            m_events->addEvent(Event(Event::kQuit));
+            return false;
+        }
+
+        LOG((CLOG_WARN
+            "Windows input command timed out message=%u sequence=%llu desktop=%s",
+            static_cast<unsigned int>(msg),
+            static_cast<unsigned long long>(sequence), desk->m_name.c_str()));
+        return false;
+    }
+
+    return true;
 }
 
 HCURSOR
@@ -776,7 +957,9 @@ void MSWindowsDesks::desk_thread(Desk* desk)
     desk->m_threadID         = GetCurrentThreadId();
     desk->m_window           = NULL;
     desk->m_foregroundWindow = NULL;
-    if (desk->m_desk != NULL && SetThreadDesktop(desk->m_desk) != 0) {
+    const bool threadAttached =
+        desk->m_desk != NULL && SetThreadDesktop(desk->m_desk) != 0;
+    if (threadAttached) {
         // create a message queue
         PeekMessage(&msg, NULL, 0,0, PM_NOREMOVE);
 
@@ -791,48 +974,103 @@ void MSWindowsDesks::desk_thread(Desk* desk)
         }
     }
 
-    // tell main thread that we're ready
+    // Report capability, not just thread startup. A desktop without a
+    // successful attachment and message window cannot accept input safely.
     {
         Lock lock(&m_mutex);
+        desk->m_threadAttached = threadAttached;
+        desk->m_windowReady = desk->m_window != NULL;
+        desk->m_startupComplete = true;
+        desk->m_threadRunning = true;
         m_deskReady = true;
         m_deskReady.broadcast();
     }
 
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        switch (msg.message) {
+    BOOL messageResult = 0;
+    while ((messageResult = GetMessage(&msg, NULL, 0, 0)) > 0) {
+        DeskCommand* command = NULL;
+        if (msg.message == BARRIER_MSG_DESK_COMMAND) {
+            command = reinterpret_cast<DeskCommand*>(msg.wParam);
+            if (command == NULL) {
+                continue;
+            }
+            msg.message = command->message;
+            msg.wParam = command->wParam;
+            msg.lParam = command->lParam;
+        }
+
+        bool processCommand = true;
+        if (command != NULL) {
+            Lock lock(&m_mutex);
+            processCommand = shouldProcessDeskCommandForTest(
+                command->sequence, desk->m_cancelledCommandSequence);
+            if (processCommand) {
+                desk->m_executingCommandSequence = command->sequence;
+            }
+        }
+
+        if (!processCommand) {
+            LOG((CLOG_DEBUG1
+                "dropping expired Windows input command sequence=%llu",
+                static_cast<unsigned long long>(command->sequence)));
+        }
+        else switch (msg.message) {
         default:
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-            continue;
+            if (command == NULL) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+                continue;
+            }
+            LOG((CLOG_WARN "ignoring unknown Windows input command %u",
+                static_cast<unsigned int>(msg.message)));
+            break;
 
         case BARRIER_MSG_SWITCH:
+        {
+            bool hookInstalled = false;
             if (m_isPrimary && !m_noHooks) {
                 MSWindowsHook::uninstall();
                 if (m_screensaverNotify) {
                     MSWindowsHook::uninstallScreenSaver();
                     MSWindowsHook::installScreenSaver();
                 }
-                if (!MSWindowsHook::install()) {
+                hookInstalled = MSWindowsHook::install();
+                if (!hookInstalled) {
                     // we won't work on this desk
-                    LOG((CLOG_DEBUG "Cannot hook on this desk"));
+                    LOG((CLOG_WARN "cannot install input hook on desktop %s",
+                        desk->m_name.c_str()));
                 }
                 // a window on the primary screen with low-level hooks
                 // should never activate.
                 if (desk->m_window)
                     EnableWindow(desk->m_window, FALSE);
             }
+            {
+                Lock lock(&m_mutex);
+                desk->m_hookInstalled = hookInstalled;
+            }
             break;
+        }
 
         case BARRIER_MSG_ENTER:
-            m_isOnScreen = true;
+            {
+                Lock lock(&m_mutex);
+                m_isOnScreen = true;
+            }
             deskEnter(desk);
             break;
 
         case BARRIER_MSG_LEAVE:
-            m_isOnScreen = false;
-            m_keyLayout  = (HKL)msg.wParam;
-            deskLeave(desk, m_keyLayout);
+        {
+            const HKL keyLayout = reinterpret_cast<HKL>(msg.wParam);
+            {
+                Lock lock(&m_mutex);
+                m_isOnScreen = false;
+                m_keyLayout = keyLayout;
+            }
+            deskLeave(desk, keyLayout);
             break;
+        }
 
         case BARRIER_MSG_FAKE_KEY:
             sendKeyboardInput(HIBYTE(msg.lParam), LOBYTE(msg.lParam), (DWORD)msg.wParam);
@@ -867,10 +1105,14 @@ void MSWindowsDesks::desk_thread(Desk* desk)
             break;
 
         case BARRIER_MSG_CURSOR_POS: {
-            POINT* pos = reinterpret_cast<POINT*>(msg.wParam);
-            if (!GetCursorPos(pos)) {
-                pos->x = m_xCenter;
-                pos->y = m_yCenter;
+            POINT pos;
+            if (!GetCursorPos(&pos)) {
+                pos.x = m_xCenter;
+                pos.y = m_yCenter;
+            }
+            {
+                Lock lock(&m_mutex);
+                m_cursorPos = pos;
             }
             break;
         }
@@ -897,13 +1139,46 @@ void MSWindowsDesks::desk_thread(Desk* desk)
             break;
         }
 
-        // notify that message was processed
-        Lock lock(&m_mutex);
-        m_deskReady = true;
-        m_deskReady.broadcast();
+        if (command != NULL) {
+            {
+                Lock lock(&m_mutex);
+                desk->m_completedCommandSequence = command->sequence;
+                if (desk->m_executingCommandSequence == command->sequence) {
+                    desk->m_executingCommandSequence = 0;
+                }
+                if (commandCompletionProvesResponsiveForTest(
+                        processCommand, command->sequence,
+                        desk->m_poisonedThroughCommandSequence)) {
+                    desk->m_commandResponsive = true;
+                }
+                m_deskReady = true;
+                m_deskReady.broadcast();
+            }
+            delete command;
+        }
+    }
+
+    if (messageResult == -1) {
+        LOG((CLOG_ERR "Windows input desktop message loop failed: %lu",
+            static_cast<unsigned long>(GetLastError())));
+    }
+
+    while (PeekMessage(&msg, NULL, BARRIER_MSG_DESK_COMMAND,
+                       BARRIER_MSG_DESK_COMMAND, PM_REMOVE)) {
+        delete reinterpret_cast<DeskCommand*>(msg.wParam);
     }
 
     // clean up
+    {
+        Lock lock(&m_mutex);
+        desk->m_hookInstalled = false;
+        desk->m_windowReady = false;
+        desk->m_threadAttached = false;
+        desk->m_commandResponsive = false;
+        desk->m_executingCommandSequence = 0;
+        desk->m_threadRunning = false;
+        m_deskReady.broadcast();
+    }
     deskEnter(desk);
     if (desk->m_window != NULL) {
         DestroyWindow(desk->m_window);
@@ -918,9 +1193,26 @@ MSWindowsDesks::Desk* MSWindowsDesks::addDesk(const std::string& name, HDESK hde
     Desk* desk      = new Desk;
     desk->m_name     = name;
     desk->m_desk     = hdesk;
+    desk->m_threadID = 0;
     desk->m_targetID = GetCurrentThreadId();
+    desk->m_window = NULL;
+    desk->m_foregroundWindow = NULL;
+    desk->m_lowLevel = false;
+    desk->m_threadAttached = false;
+    desk->m_windowReady = false;
+    desk->m_hookInstalled = false;
+    desk->m_startupComplete = false;
+    desk->m_threadRunning = false;
+    desk->m_commandResponsive = false;
+    desk->m_completedCommandSequence = 0;
+    desk->m_cancelledCommandSequence = 0;
+    desk->m_executingCommandSequence = 0;
+    desk->m_poisonedThroughCommandSequence = 0;
     desk->m_thread   = new Thread([this, desk]() { desk_thread(desk); });
-    waitForDesk();
+    if (!waitForDeskStartup(desk, kDeskStartupTimeout)) {
+        LOG((CLOG_WARN "Windows input desktop thread startup timed out: %s",
+            name.empty() ? "<unavailable>" : name.c_str()));
+    }
     m_desks.insert(std::make_pair(name, desk));
     return desk;
 }
@@ -928,6 +1220,13 @@ MSWindowsDesks::Desk* MSWindowsDesks::addDesk(const std::string& name, HDESK hde
 void
 MSWindowsDesks::removeDesks()
 {
+    Lock sendLock(&m_sendMutex);
+    {
+        Lock lock(&m_mutex);
+        m_activeDesk = NULL;
+        m_activeDeskName = "";
+    }
+
     for (Desks::iterator index = m_desks.begin();
                             index != m_desks.end(); ++index) {
         Desk* desk = index->second;
@@ -937,13 +1236,23 @@ MSWindowsDesks::removeDesks()
         delete desk;
     }
     m_desks.clear();
-    m_activeDesk     = NULL;
-    m_activeDeskName = "";
 }
 
 void
 MSWindowsDesks::checkDesk()
 {
+    Desk* activeDesk = NULL;
+    std::string activeDeskName;
+    bool wasOnScreen = false;
+    HKL keyLayout = NULL;
+    {
+        Lock lock(&m_mutex);
+        activeDesk = m_activeDesk;
+        activeDeskName = m_activeDeskName;
+        wasOnScreen = m_isOnScreen;
+        keyLayout = m_keyLayout;
+    }
+
     // get current desktop.  if we already know about it then return.
     Desk* desk;
     HDESK hdesk  = openInputDesktop();
@@ -961,7 +1270,7 @@ MSWindowsDesks::checkDesk()
 
     // if we are told to shut down on desk switch, and this is not the
     // first switch, then shut down.
-    if (m_stopOnDeskSwitch && m_activeDesk != NULL && name != m_activeDeskName) {
+    if (m_stopOnDeskSwitch && activeDesk != NULL && name != activeDeskName) {
         LOG((CLOG_DEBUG "shutting down because of desk switch to \"%s\"", name.c_str()));
         m_events->addEvent(Event(Event::kQuit));
         return;
@@ -972,9 +1281,8 @@ MSWindowsDesks::checkDesk()
     // active because we'd most likely switch to the screensaver desktop
     // which would have the side effect of forcing the screensaver to
     // stop.
-    if (name != m_activeDeskName && !m_screensaver->isActive()) {
+    if (name != activeDeskName && !m_screensaver->isActive()) {
         // show cursor on previous desk
-        bool wasOnScreen = m_isOnScreen;
         if (!wasOnScreen) {
             sendMessage(BARRIER_MSG_ENTER, 0, 0);
         }
@@ -986,7 +1294,7 @@ MSWindowsDesks::checkDesk()
         LOG((CLOG_DEBUG "switched to desk \"%s\"", name.c_str()));
         bool syncKeys = false;
         bool isAccessible = isDeskAccessible(desk);
-        if (isDeskAccessible(m_activeDesk) != isAccessible) {
+        if (isDeskAccessible(activeDesk) != isAccessible) {
             if (isAccessible) {
                 LOG((CLOG_DEBUG "desktop is now accessible"));
                 syncKeys = true;
@@ -997,13 +1305,45 @@ MSWindowsDesks::checkDesk()
         }
 
         // switch desk
-        m_activeDesk     = desk;
-        m_activeDeskName = name;
+        std::uint64_t generation = 0;
+        {
+            Lock sendLock(&m_sendMutex);
+            {
+                Lock lock(&m_mutex);
+                m_activeDesk = desk;
+                m_activeDeskName = name;
+                // A cached desktop is not ready for a new activation until
+                // its switch command has reinstalled the active hook state.
+                desk->m_commandResponsive = false;
+                generation = ++m_inputDesktopGeneration;
+            }
+        }
+        m_nextDeskRecoveryProbe =
+            GetTickCount64() + kDeskRecoveryProbeInterval;
         sendMessage(BARRIER_MSG_SWITCH, 0, 0);
+
+        const DeskReadinessSnapshot readiness = getDeskReadiness(desk);
+        if (readiness.ready) {
+            LOG((CLOG_INFO
+                "Windows input desktop generation=%llu name=%s attached=yes window=yes hook=%s ready=yes",
+                static_cast<unsigned long long>(generation),
+                name.empty() ? "<unavailable>" : name.c_str(),
+                (m_isPrimary && !m_noHooks) ? "yes" : "not-required"));
+        }
+        else {
+            LOG((CLOG_WARN
+                "Windows input desktop generation=%llu name=%s attached=%s window=%s hook=%s responsive=%s ready=no",
+                static_cast<unsigned long long>(generation),
+                name.empty() ? "<unavailable>" : name.c_str(),
+                readiness.threadAttached ? "yes" : "no",
+                readiness.windowReady ? "yes" : "no",
+                readiness.hookInstalled ? "yes" : "no",
+                readiness.commandResponsive ? "yes" : "no"));
+        }
 
         // hide cursor on new desk
         if (!wasOnScreen) {
-            sendMessage(BARRIER_MSG_LEAVE, (WPARAM)m_keyLayout, 0);
+            sendMessage(BARRIER_MSG_LEAVE, reinterpret_cast<WPARAM>(keyLayout), 0);
         }
 
         // update keys if necessary
@@ -1011,28 +1351,99 @@ MSWindowsDesks::checkDesk()
             updateKeys();
         }
     }
-    else if (name != m_activeDeskName) {
+    else if (name != activeDeskName) {
         // screen saver might have started
         PostThreadMessage(m_threadID, BARRIER_MSG_SCREEN_SAVER, TRUE, 0);
+    }
+    else if (!m_screensaver->isActive() && !isDeskReady(desk) &&
+             GetTickCount64() >= m_nextDeskRecoveryProbe) {
+        m_nextDeskRecoveryProbe =
+            GetTickCount64() + kDeskRecoveryProbeInterval;
+        std::uint64_t generation = 0;
+        {
+            Lock lock(&m_mutex);
+            generation = ++m_inputDesktopGeneration;
+        }
+        LOG((CLOG_INFO
+            "retrying Windows input desktop generation=%llu name=%s",
+            static_cast<unsigned long long>(generation),
+            name.empty() ? "<unavailable>" : name.c_str()));
+        sendMessage(BARRIER_MSG_SWITCH, 0, 0);
     }
 }
 
 bool
 MSWindowsDesks::isDeskAccessible(const Desk* desk) const
 {
-    return (desk != NULL && desk->m_desk != NULL);
+    Lock lock(&m_mutex);
+    return desk != NULL && desk->m_threadAttached;
 }
 
-void
-MSWindowsDesks::waitForDesk() const
+bool
+MSWindowsDesks::isDeskReady(const Desk* desk) const
 {
-    MSWindowsDesks* self = const_cast<MSWindowsDesks*>(this);
-
     Lock lock(&m_mutex);
-    while (!(bool)m_deskReady) {
-        m_deskReady.wait();
+    return isDeskReadyLocked(desk);
+}
+
+bool
+MSWindowsDesks::isDeskReadyLocked(const Desk* desk) const
+{
+    return desk != NULL && isDesktopReadyForTest(
+        m_isPrimary, m_noHooks, desk->m_threadAttached,
+        desk->m_windowReady, desk->m_hookInstalled,
+        desk->m_commandResponsive);
+}
+
+MSWindowsDesks::DeskReadinessSnapshot
+MSWindowsDesks::getDeskReadiness(const Desk* desk) const
+{
+    DeskReadinessSnapshot snapshot;
+    Lock lock(&m_mutex);
+    if (desk != NULL) {
+        snapshot.threadAttached = desk->m_threadAttached;
+        snapshot.windowReady = desk->m_windowReady;
+        snapshot.hookInstalled = desk->m_hookInstalled;
+        snapshot.commandResponsive = desk->m_commandResponsive;
+        snapshot.ready = isDeskReadyLocked(desk);
     }
-    self->m_deskReady = false;
+    return snapshot;
+}
+
+bool
+MSWindowsDesks::waitForDeskStartup(const Desk* desk, double timeout) const
+{
+    Stopwatch timer;
+    Lock lock(&m_mutex);
+    while (!desk->m_startupComplete) {
+        if (!m_deskReady.wait(timer, timeout)) {
+            break;
+        }
+    }
+    return desk->m_startupComplete;
+}
+
+bool
+MSWindowsDesks::waitForDeskCommand(const Desk* desk,
+                                   std::uint64_t sequence,
+                                   double timeout) const
+{
+    Stopwatch timer;
+    Lock lock(&m_mutex);
+    while (!isDeskCommandCompleteForTest(
+               sequence, desk->m_completedCommandSequence,
+               desk->m_threadRunning)) {
+        if (!desk->m_threadRunning) {
+            break;
+        }
+        const bool signalled = timeout < 0.0 ?
+            m_deskReady.wait() : m_deskReady.wait(timer, timeout);
+        if (!signalled) {
+            break;
+        }
+    }
+    return isDeskCommandCompleteForTest(
+        sequence, desk->m_completedCommandSequence, desk->m_threadRunning);
 }
 
 void

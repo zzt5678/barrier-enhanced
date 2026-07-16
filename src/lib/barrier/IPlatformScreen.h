@@ -26,6 +26,8 @@
 #include "barrier/IKeyState.h"
 #include "barrier/option_types.h"
 
+#include <cstdint>
+
 class IClipboard;
 
 //! Screen interface
@@ -151,6 +153,9 @@ public:
     wake it.
     */
     virtual bool        canEnter() const { return true; }
+
+    //! Identity of the input backend validated by a prepared handoff.
+    virtual std::uint64_t inputGeneration() const { return 0; }
 
     //@}
 

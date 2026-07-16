@@ -26,6 +26,7 @@
 #include "mt/CondVar.h"
 #include "mt/Mutex.h"
 #include "common/stdmap.h"
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -191,6 +192,35 @@ public:
     */
     void                fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const;
 
+    //! Return true when the active Windows desktop can process input.
+    bool                canEnter() const;
+
+    //! Monotonically increasing identity for the active desktop backend.
+    std::uint64_t       inputDesktopGeneration() const;
+
+    static bool         isDesktopReadyForTest(bool isPrimary, bool noHooks,
+                            bool threadAttached, bool windowReady,
+                            bool hookInstalled,
+                            bool commandResponsive = true);
+
+    static bool         isDeskCommandCompleteForTest(
+                            std::uint64_t expectedSequence,
+                            std::uint64_t completedSequence,
+                            bool threadRunning);
+
+    static bool         shouldProcessDeskCommandForTest(
+                            std::uint64_t sequence,
+                            std::uint64_t cancelledThroughSequence);
+
+    static bool         canCancelTimedOutDeskCommandForTest(
+                            std::uint64_t sequence,
+                            std::uint64_t executingSequence);
+
+    static bool         commandCompletionProvesResponsiveForTest(
+                            bool commandExecuted,
+                            std::uint64_t sequence,
+                            std::uint64_t poisonedThroughSequence);
+
     //@}
 
 private:
@@ -204,6 +234,33 @@ private:
         HWND            m_window;
         HWND            m_foregroundWindow;
         bool            m_lowLevel;
+        bool            m_threadAttached;
+        bool            m_windowReady;
+        bool            m_hookInstalled;
+        bool            m_startupComplete;
+        bool            m_threadRunning;
+        bool            m_commandResponsive;
+        std::uint64_t   m_completedCommandSequence;
+        std::uint64_t   m_cancelledCommandSequence;
+        std::uint64_t   m_executingCommandSequence;
+        std::uint64_t   m_poisonedThroughCommandSequence;
+    };
+
+    struct DeskReadinessSnapshot {
+        DeskReadinessSnapshot() :
+            threadAttached(false),
+            windowReady(false),
+            hookInstalled(false),
+            commandResponsive(false),
+            ready(false)
+        {
+        }
+
+        bool threadAttached;
+        bool windowReady;
+        bool hookInstalled;
+        bool commandResponsive;
+        bool ready;
     };
     typedef std::map<std::string, Desk*> Desks;
 
@@ -230,11 +287,17 @@ private:
     void                removeDesks();
     void                checkDesk();
     bool                isDeskAccessible(const Desk* desk) const;
+    bool                isDeskReady(const Desk* desk) const;
+    bool                isDeskReadyLocked(const Desk* desk) const;
+    DeskReadinessSnapshot getDeskReadiness(const Desk* desk) const;
     void                handleCheckDesk(const Event& event, void*);
 
     // communication with desk threads
-    void                waitForDesk() const;
-    void                sendMessage(UINT, WPARAM, LPARAM) const;
+    bool                waitForDeskStartup(const Desk* desk,
+                            double timeout) const;
+    bool                waitForDeskCommand(const Desk* desk,
+                            std::uint64_t sequence, double timeout) const;
+    bool                sendMessage(UINT, WPARAM, LPARAM) const;
 
     // work around for messed up keyboard events from low-level hooks
     HWND                getForegroundWindow() const;
@@ -283,9 +346,14 @@ private:
     std::string m_activeDeskName;
 
     // one desk per desktop and a cond var to communicate with it
-    Mutex                m_mutex;
+    mutable Mutex        m_mutex;
+    mutable Mutex        m_sendMutex;
     CondVar<bool>        m_deskReady;
     Desks                m_desks;
+    mutable std::uint64_t m_inputDesktopGeneration;
+    mutable std::uint64_t m_nextDeskCommandSequence;
+    mutable POINT        m_cursorPos;
+    ULONGLONG            m_nextDeskRecoveryProbe;
 
     // keyboard stuff
     std::function<void()> m_updateKeys;

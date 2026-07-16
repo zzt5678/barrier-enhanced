@@ -399,6 +399,12 @@ Client::canAcceptInputHandoff() const
     return m_ready && !m_active && m_screen != NULL && m_screen->canEnter();
 }
 
+std::uint64_t
+Client::inputHandoffGeneration() const
+{
+    return m_screen == NULL ? 0 : m_screen->inputGeneration();
+}
+
 bool
 Client::negotiateProtocolVersion(SInt16 serverMajor, SInt16 serverMinor,
                                  SInt16& negotiatedMinor)

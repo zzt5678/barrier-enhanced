@@ -28,6 +28,7 @@
 #include "base/Stopwatch.h"
 
 #include <memory>
+#include <cstdint>
 #include <map>
 #include <set>
 #include <string>
@@ -193,6 +194,7 @@ private:
     UInt32                m_preparedEnterSequence;
     bool                  m_hasPreparedEnter;
     bool                  m_preparedEnterReady;
+    std::uint64_t         m_preparedInputGeneration;
     UInt32                m_lastInputSequence;
     bool                  m_hasInputSequence;
     bool                  m_inputFrameAccepted;

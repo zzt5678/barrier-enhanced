@@ -26,6 +26,8 @@
 #include "barrier/option_types.h"
 #include "base/String.h"
 
+#include <cstdint>
+
 class IClipboard;
 class IPlatformScreen;
 class IEventQueue;
@@ -251,6 +253,9 @@ public:
 
     //! Test if the platform can safely enter this screen now.
     bool                canEnter() const;
+
+    //! Return the current platform input backend generation.
+    std::uint64_t       inputGeneration() const;
 
     //! Get jump zone size
     /*!

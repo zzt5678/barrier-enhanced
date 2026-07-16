@@ -2589,6 +2589,56 @@ TEST(ServerReconnectTests, rejectedTransactionalSwitchKeepsSourceAndIgnoresLateR
     EXPECT_EQ(0u, client.enterCount);
 }
 
+TEST(ServerReconnectTests, commitRejectionRollsBackToSourceLease)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client");
+    RecordingClient unavailable("unavailable");
+    unavailable.shapeW = 0;
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(unavailable.getName(), &unavailable));
+    server.m_clientSet.insert(&unavailable);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    const UInt32 preparedSeqNum = client.preparedSeqNum;
+
+    BaseClientProxy::InputHandoffReadyInfo ready(preparedSeqNum, true);
+    Event readyEvent(Event::kUnknown, &client, &ready, Event::kDontFreeData);
+    server.handleInputHandoffReady(readyEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+
+    // A failed unrelated switch does not prove that the committed target
+    // accepted its lease, so the source rollback record must remain intact.
+    ASSERT_FALSE(server.switchScreen(&unavailable, 0, 0, false, kNoDirection));
+
+    BaseClientProxy::InputHandoffReadyInfo rejected(preparedSeqNum, false);
+    Event rejectedEvent(Event::kUnknown, &client, &rejected, Event::kDontFreeData);
+    server.handleInputHandoffReady(rejectedEvent, &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+}
+
 TEST(ServerReconnectTests, transactionalSwitchTimeoutKeepsSourceAndAbortsTarget)
 {
     Config config;

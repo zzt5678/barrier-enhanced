@@ -517,6 +517,24 @@ MSWindowsScreen::isPrimary() const
     return m_isPrimary;
 }
 
+bool
+MSWindowsScreen::canEnter() const
+{
+    const bool ready = m_desks != NULL && m_desks->canEnter();
+    if (!ready) {
+        LOG((CLOG_WARN "Windows input desktop is not ready for handoff; generation=%llu",
+            static_cast<unsigned long long>(
+                m_desks == NULL ? 0 : m_desks->inputDesktopGeneration())));
+    }
+    return ready;
+}
+
+std::uint64_t
+MSWindowsScreen::inputGeneration() const
+{
+    return m_desks == NULL ? 0 : m_desks->inputDesktopGeneration();
+}
+
 void*
 MSWindowsScreen::getEventTarget() const
 {

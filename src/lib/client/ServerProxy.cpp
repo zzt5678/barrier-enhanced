@@ -69,6 +69,7 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_preparedEnterSequence(0),
     m_hasPreparedEnter(false),
     m_preparedEnterReady(false),
+    m_preparedInputGeneration(0),
     m_lastInputSequence(0),
     m_hasInputSequence(false),
     m_inputFrameAccepted(true),
@@ -953,6 +954,19 @@ ServerProxy::enter()
         LOG((CLOG_WARN "ignoring rejected enter sequence %u", seqNum));
         return;
     }
+    if (m_hasPreparedEnter &&
+        (m_client->inputHandoffGeneration() != m_preparedInputGeneration ||
+         !m_client->canAcceptInputHandoff())) {
+        LOG((CLOG_WARN
+            "rejecting enter sequence %u because the prepared input backend changed",
+            seqNum));
+        m_hasPreparedEnter = false;
+        m_preparedEnterReady = false;
+        m_preparedInputGeneration = 0;
+        ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
+                             static_cast<UInt8>(0));
+        return;
+    }
 
     if (m_inputActive) {
         LOG((CLOG_WARN "replacing active input lease %u with %u", m_seqNum, seqNum));
@@ -970,6 +984,7 @@ ServerProxy::enter()
     m_inputActive           = true;
     m_hasPreparedEnter      = false;
     m_preparedEnterReady    = false;
+    m_preparedInputGeneration = 0;
     m_lastInputSequence     = 0;
     m_hasInputSequence      = false;
 
@@ -997,6 +1012,8 @@ ServerProxy::prepareEnter()
     m_preparedEnterSequence = seqNum;
     m_hasPreparedEnter = true;
     m_preparedEnterReady = ready;
+    m_preparedInputGeneration = ready ?
+        m_client->inputHandoffGeneration() : 0;
 
     LOG((CLOG_DEBUG1 "recv prepare enter, %d,%d %u %04x ready=%d",
         x, y, seqNum, mask, ready ? 1 : 0));
@@ -1013,6 +1030,7 @@ ServerProxy::abortEnter()
         LOG((CLOG_DEBUG1 "recv abort prepared enter %u", seqNum));
         m_hasPreparedEnter = false;
         m_preparedEnterReady = false;
+        m_preparedInputGeneration = 0;
     }
 }
 
@@ -1036,6 +1054,7 @@ ServerProxy::leave()
     m_inputActive = false;
     m_hasPreparedEnter = false;
     m_preparedEnterReady = false;
+    m_preparedInputGeneration = 0;
     m_client->leave();
 }
 
@@ -1395,6 +1414,7 @@ ServerProxy::revokeInputLease()
     m_inputActive = false;
     m_hasPreparedEnter = false;
     m_preparedEnterReady = false;
+    m_preparedInputGeneration = 0;
 }
 
 void

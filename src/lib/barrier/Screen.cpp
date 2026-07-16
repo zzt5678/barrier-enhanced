@@ -407,6 +407,12 @@ Screen::canEnter() const
     return m_screen->canEnter();
 }
 
+std::uint64_t
+Screen::inputGeneration() const
+{
+    return m_screen->inputGeneration();
+}
+
 SInt32
 Screen::getJumpZoneSize() const
 {

@@ -290,8 +290,10 @@ extern const char*        kMsgDMouseMove1_8;
 extern const char*        kMsgDMouseRelMove1_8;
 extern const char*        kMsgDMouseWheel1_8;
 
-// response to kMsgCPrepareEnter: secondary -> primary
-// $1 = sequence number, $2 = 1 when ready and 0 when rejected.
+// response to kMsgCPrepareEnter: secondary -> primary.  A secondary that
+// becomes unavailable between prepare and commit sends a second rejection for
+// the same sequence.  $1 = sequence number, $2 = 1 when ready and 0 when
+// rejected.
 extern const char*        kMsgDEnterReady;
 
 // clipboard data:  primary <-> secondary

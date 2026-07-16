@@ -119,6 +119,8 @@ public:
     virtual void        setOptions(const OptionsList& options) override;
     virtual void        setSequenceNumber(UInt32) override;
     virtual bool        isPrimary() const override;
+    virtual bool        canEnter() const override;
+    virtual std::uint64_t inputGeneration() const override;
     virtual void        fakeDraggingFiles(DragFileList fileList) override;
     virtual std::string& getDraggingFilename() override;
     virtual const std::string& getDropTarget() const override;

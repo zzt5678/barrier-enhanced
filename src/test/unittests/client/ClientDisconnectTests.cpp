@@ -26,6 +26,7 @@
 #include "test/mock/io/MockStream.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <system_error>
@@ -96,6 +97,7 @@ public:
         getClipboardCount(0),
         lastSetClipboardWasNull(false),
         enterable(true),
+        inputBackendGeneration(1),
         clipboardAvailable(false),
         clipboardContainsFileList(false),
         clipboardText("stable clipboard")
@@ -129,6 +131,7 @@ public:
     void setDraggingStarted(bool) override { }
     bool isPrimary() const override { return false; }
     bool canEnter() const override { return enterable; }
+    std::uint64_t inputGeneration() const override { return inputBackendGeneration; }
     void* getEventTarget() const override { return const_cast<EnterPlatformScreen*>(this); }
     bool getClipboard(ClipboardID id, IClipboard* clipboard) const override
     {
@@ -235,6 +238,7 @@ public:
     mutable UInt32 getClipboardCount;
     bool lastSetClipboardWasNull;
     bool enterable;
+    std::uint64_t inputBackendGeneration;
     Clipboard lastSetClipboard;
     bool clipboardAvailable;
     bool clipboardContainsFileList;
@@ -1522,6 +1526,55 @@ TEST(ClientDisconnectTests, rejectedTransactionalPrepareBlocksCommitUntilAbort)
     ProtocolUtil::writef(&stream, kMsgCAbortEnter + 4, 43);
     proxy.abortEnter();
     EXPECT_FALSE(proxy.m_hasPreparedEnter);
+}
+
+TEST(ClientDisconnectTests, changedInputGenerationRejectsPreparedCommit)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 7);
+    client.handshakeComplete();
+
+    ProtocolUtil::writef(&stream, kMsgCPrepareEnter + 4, 10, 20, 44, 0);
+    proxy.prepareEnter();
+
+    UInt32 readySeqNum = 0;
+    UInt8 ready = 0;
+    ASSERT_TRUE(ProtocolUtil::readf(&stream, kMsgDEnterReady,
+                                    &readySeqNum, &ready));
+    ASSERT_EQ(44u, readySeqNum);
+    ASSERT_EQ(1u, ready);
+
+    ++platform->inputBackendGeneration;
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 44, 0);
+    proxy.enter();
+
+    EXPECT_EQ(0u, platform->enterCount);
+    EXPECT_FALSE(proxy.m_inputActive);
+
+    UInt32 rejectedSeqNum = 0;
+    UInt8 commitReady = 1;
+    ASSERT_TRUE(ProtocolUtil::readf(&stream, kMsgDEnterReady,
+                                    &rejectedSeqNum, &commitReady));
+    EXPECT_EQ(44u, rejectedSeqNum);
+    EXPECT_EQ(0u, commitReady);
 }
 
 TEST(ClientDisconnectTests, protocol18RejectsStaleEpochAndReplayedInput)
