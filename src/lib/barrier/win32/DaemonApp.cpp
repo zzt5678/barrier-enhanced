@@ -534,13 +534,22 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
         case kIpcReadyV2: {
             IpcNodeReadyV2Message* ready =
                 static_cast<IpcNodeReadyV2Message*>(m);
-            LOG((ready->inputReady() ? CLOG_INFO : CLOG_WARN,
-                "ipc node input readiness pid=%u session=%u desktop=%s generation=%llu ready=%s build=%s query=%llu",
-                ready->processId(), ready->sessionId(),
-                ready->desktopName().empty() ? "<none>" : ready->desktopName().c_str(),
-                static_cast<unsigned long long>(ready->inputGeneration()),
-                ready->inputReady() ? "yes" : "no", ready->buildId().c_str(),
-                static_cast<unsigned long long>(ready->queryNonce())));
+            const char* desktop = ready->desktopName().empty() ?
+                "<none>" : ready->desktopName().c_str();
+            if (ready->inputReady()) {
+                LOG((CLOG_INFO "ipc node input readiness pid=%u session=%u desktop=%s generation=%llu ready=yes build=%s query=%llu",
+                    ready->processId(), ready->sessionId(), desktop,
+                    static_cast<unsigned long long>(ready->inputGeneration()),
+                    ready->buildId().c_str(),
+                    static_cast<unsigned long long>(ready->queryNonce())));
+            }
+            else {
+                LOG((CLOG_WARN "ipc node input readiness pid=%u session=%u desktop=%s generation=%llu ready=no build=%s query=%llu",
+                    ready->processId(), ready->sessionId(), desktop,
+                    static_cast<unsigned long long>(ready->inputGeneration()),
+                    ready->buildId().c_str(),
+                    static_cast<unsigned long long>(ready->queryNonce())));
+            }
             break;
         }
     }

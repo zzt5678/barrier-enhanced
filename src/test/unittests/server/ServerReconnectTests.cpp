@@ -633,7 +633,6 @@ void initializeServer(Server& server, Config& config, PrimaryClient& primary,
     server.m_activeSaver = NULL;
     server.m_switchScreen = NULL;
     server.m_recentSwitchGuardActive = false;
-    server.m_recentSwitchGuardLogged = false;
     server.m_recentSwitchFromName.clear();
     server.m_recentSwitchToName.clear();
     server.m_recentSwitchReverseDir = kNoDirection;
@@ -2347,6 +2346,51 @@ TEST(ServerReconnectTests, recentReverseSwitchGuardKeepsClientActiveUntilMovedIn
     EXPECT_EQ(100, primary.enterY);
 }
 
+TEST(ServerReconnectTests, recentReverseSwitchGuardConsumesOnlyOneBounceEvent)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1;
+    server.m_y = 100;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 100));
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_recentSwitchGuardActive);
+
+    // A platform warp can report one reverse-edge event immediately after
+    // entry. Suppress that event, but never trap subsequent user motion at
+    // the edge while waiting for an inward move or a wall-clock timeout.
+    server.onMouseMoveSecondary(40, 0);
+    ASSERT_EQ(&client, server.m_active);
+    EXPECT_FALSE(server.m_recentSwitchGuardActive);
+
+    server.onMouseMoveSecondary(1, 0);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+}
+
 TEST(ServerReconnectTests, repeatedRoundTripCanLeavePrimaryAfterInteriorReturn)
 {
     Config config;
@@ -2475,7 +2519,7 @@ TEST(ServerReconnectTests, primaryReturnUsesLastPrimaryOutputAnchor)
     EXPECT_EQ(100, primary.enterY);
 }
 
-TEST(ServerReconnectTests, delayedSwitchArmsRecentReverseSwitchGuard)
+TEST(ServerReconnectTests, delayedSwitchGuardConsumesOnlyOneBounceEvent)
 {
     Config config;
     config.addScreen("primary");
@@ -2523,17 +2567,9 @@ TEST(ServerReconnectTests, delayedSwitchArmsRecentReverseSwitchGuard)
     EXPECT_EQ(0, server.m_x);
     EXPECT_EQ(1u, client.enterCount);
     EXPECT_EQ(0u, primary.enterCount);
+    EXPECT_FALSE(server.m_recentSwitchGuardActive);
 
-    ARCH->sleep(0.3);
     server.onMouseMoveSecondary(-40, 0);
-    EXPECT_EQ(&client, server.m_active);
-    EXPECT_EQ(0u, primary.enterCount);
-
-    server.onMouseMoveSecondary(160, 0);
-    EXPECT_EQ(&client, server.m_active);
-    EXPECT_GE(server.m_x, 96);
-
-    server.onMouseMoveSecondary(-300, 0);
     EXPECT_EQ(&primary, server.m_active);
     EXPECT_EQ(1u, primary.enterCount);
     EXPECT_GE(primary.enterX, 0);

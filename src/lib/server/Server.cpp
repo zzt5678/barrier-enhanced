@@ -272,7 +272,6 @@ Server::Server(
 	m_switchDir(kNoDirection),
 	m_switchScreen(NULL),
 	m_recentSwitchGuardActive(false),
-	m_recentSwitchGuardLogged(false),
 	m_recentSwitchReverseDir(kNoDirection),
 	m_recentSwitchEntryX(0),
 	m_recentSwitchEntryY(0),
@@ -1791,7 +1790,6 @@ Server::armRecentSwitchGuard(BaseClientProxy* from, BaseClientProxy* to,
 	}
 
 	m_recentSwitchGuardActive = true;
-	m_recentSwitchGuardLogged = false;
 	m_recentSwitchFromName = getName(from);
 	m_recentSwitchToName = getName(to);
 	m_recentSwitchReverseDir = reverseDir;
@@ -1860,7 +1858,16 @@ Server::isRecentReverseSwitch(BaseClientProxy* dst, EDirection dir)
 		return false;
 	}
 
-	return dir == m_recentSwitchReverseDir;
+	if (dir != m_recentSwitchReverseDir) {
+		return false;
+	}
+
+	// A platform warp can produce one motion in the reverse direction after
+	// entry. Consuming every reverse motion for a time window also consumes
+	// real user input and can pin the hidden primary cursor at the edge. One
+	// event is enough to absorb the warp; the next motion must remain usable.
+	m_recentSwitchGuardActive = false;
+	return true;
 }
 
 void
@@ -1922,13 +1929,10 @@ Server::isSwitchOkay(BaseClientProxy* newScreen,
 	}
 
 	if (isRecentReverseSwitch(newScreen, dir)) {
-		if (!m_recentSwitchGuardLogged) {
-			LOG((CLOG_INFO "suppressing immediate reverse switch from \"%s\" to \"%s\" on %s briefly after screen entry",
-				getName(m_active).c_str(),
-				getName(newScreen).c_str(),
-				Config::dirName(dir)));
-			m_recentSwitchGuardLogged = true;
-		}
+		LOG((CLOG_INFO "suppressing one stale reverse motion from \"%s\" to \"%s\" on %s after screen entry",
+			getName(m_active).c_str(),
+			getName(newScreen).c_str(),
+			Config::dirName(dir)));
 		stopSwitch();
 		return false;
 	}
