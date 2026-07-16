@@ -153,6 +153,41 @@ private:
     bool m_quitAfterDispatch;
 };
 
+class ExpireTimerAndAddImmediateEventJob : public IEventJob {
+public:
+    ExpireTimerAndAddImmediateEventJob(EventQueue* events,
+                                       std::vector<int>* order,
+                                       Event::Type immediateType,
+                                       void* immediateTarget,
+                                       void* timerTarget,
+                                       EventQueueTimer** timer) :
+        m_events(events),
+        m_order(order),
+        m_immediateType(immediateType),
+        m_immediateTarget(immediateTarget),
+        m_timerTarget(timerTarget),
+        m_timer(timer)
+    {
+    }
+
+    void run(const Event&) override
+    {
+        m_order->push_back(1);
+        *m_timer = m_events->newOneShotTimer(0.001, m_timerTarget);
+        ARCH->sleep(0.01);
+        m_events->addEvent(Event(m_immediateType, m_immediateTarget, NULL,
+                                 Event::kDeliverImmediately));
+    }
+
+private:
+    EventQueue* m_events;
+    std::vector<int>* m_order;
+    Event::Type m_immediateType;
+    void* m_immediateTarget;
+    void* m_timerTarget;
+    EventQueueTimer** m_timer;
+};
+
 }
 
 TEST(EventQueueTests, destructorDeletesPendingEventData)
@@ -264,6 +299,50 @@ TEST(EventQueueTests, expiredTimerPreemptsContinuouslyReadySystemBuffer)
     EXPECT_EQ(Event::kTimer, event.getType());
     EXPECT_EQ(&timerTarget, event.getTarget());
     EXPECT_EQ(0, buffer->getEventCalls());
+
+    events.deleteTimer(timer);
+}
+
+TEST(EventQueueTests, immediateEventDispatchesBeforeExpiredTimerAndQueuedMotion)
+{
+    EventQueue events;
+    Event::Type inputType = Event::kUnknown;
+    Event::Type immediateType = Event::kUnknown;
+    Event::Type motionType = Event::kUnknown;
+    events.registerTypeOnce(inputType, "testImmediateInputEvent");
+    events.registerTypeOnce(immediateType, "testImmediateAckEvent");
+    events.registerTypeOnce(motionType, "testQueuedMotionEvent");
+
+    std::vector<int> dispatchOrder;
+    int eventTarget = 0;
+    int timerTarget = 0;
+    EventQueueTimer* timer = NULL;
+    events.adoptHandler(
+        inputType, &eventTarget,
+        new ExpireTimerAndAddImmediateEventJob(
+            &events, &dispatchOrder, immediateType, &eventTarget,
+            &timerTarget, &timer));
+    events.adoptHandler(
+        immediateType, &eventTarget,
+        new RecordOrderJob(&events, &dispatchOrder, 2, false));
+    events.adoptHandler(
+        Event::kTimer, &timerTarget,
+        new RecordOrderJob(&events, &dispatchOrder, 3, false));
+    events.adoptHandler(
+        motionType, &eventTarget,
+        new RecordOrderJob(&events, &dispatchOrder, 4, false));
+
+    events.addEvent(Event(inputType, &eventTarget));
+    events.addEvent(Event(motionType, &eventTarget));
+    events.addEvent(Event(Event::kQuit));
+    events.loop();
+
+    ASSERT_NE(static_cast<EventQueueTimer*>(NULL), timer);
+    ASSERT_EQ(4u, dispatchOrder.size());
+    EXPECT_EQ(1, dispatchOrder[0]);
+    EXPECT_EQ(2, dispatchOrder[1]);
+    EXPECT_EQ(3, dispatchOrder[2]);
+    EXPECT_EQ(4, dispatchOrder[3]);
 
     events.deleteTimer(timer);
 }

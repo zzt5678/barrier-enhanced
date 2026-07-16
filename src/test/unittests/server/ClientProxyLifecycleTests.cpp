@@ -285,6 +285,7 @@ TEST(ClientProxyLifecycleTests, clientProxy17PublishesDecodedHandoffReadiness)
         Invoke([&](const Event& event) {
             EXPECT_EQ(readyType, event.getType());
             EXPECT_EQ(proxy.getEventTarget(), event.getTarget());
+            EXPECT_NE(0u, event.getFlags() & Event::kDeliverImmediately);
             BaseClientProxy::InputHandoffReadyInfo* info =
                 static_cast<BaseClientProxy::InputHandoffReadyInfo*>(
                     event.getDataObject());

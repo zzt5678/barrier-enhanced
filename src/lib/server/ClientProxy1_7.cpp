@@ -63,8 +63,11 @@ ClientProxy1_7::recvInputHandoffReady()
     UInt8 ready = 0;
     ProtocolUtil::readf(getStream(), kMsgDEnterReady + 4, &seqNum, &ready);
 
+    // Readiness and commit acknowledgments gate pointer ownership. They are
+    // parsed on the event-loop thread, so dispatch them before later queued
+    // motion can reverse or time out the handoff that they acknowledge.
     Event event(m_events->forClientProxy().inputHandoffReady(),
-                getEventTarget());
+                getEventTarget(), NULL, Event::kDeliverImmediately);
     event.setDataObject(new InputHandoffReadyInfo(seqNum, ready != 0));
     m_events->addEvent(event);
     return true;

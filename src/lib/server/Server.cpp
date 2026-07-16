@@ -891,6 +891,12 @@ Server::switchScreen(BaseClientProxy* dst,
 					EDirection guardDir, bool trackDirectCommit)
 {
 	assert(dst != NULL);
+	if (m_inputHandoffPending &&
+		m_inputHandoffSource == m_active &&
+		m_inputHandoffTarget == dst) {
+		stopSwitch();
+		return true;
+	}
 	if (!m_inputHandoffCommitReady &&
 		m_inputHandoffCommitAckPending && m_active != dst) {
 		BaseClientProxy* confirmedSource = m_inputHandoffSource;
@@ -2328,7 +2334,37 @@ void
 Server::noSwitch(SInt32 x, SInt32 y)
 {
 	if (m_inputHandoffPending) {
-		cancelInputHandoff("pointer left the switch edge", false);
+		bool nearPendingEdge = false;
+		if (m_inputHandoffSource != NULL) {
+			SInt32 sx, sy, sw, sh;
+			m_inputHandoffSource->getShape(sx, sy, sw, sh);
+			const SInt32 margin = (std::max)(
+				static_cast<SInt32>(2 * kSwitchEdgeHysteresisInset),
+				static_cast<SInt32>(getJumpZoneSize(m_inputHandoffSource) + 8));
+			if (sw >= kMinUsableScreenDimension &&
+				sh >= kMinUsableScreenDimension) {
+				switch (m_inputHandoffGuardDir) {
+				case kLeft:
+					nearPendingEdge = x <= sx + margin;
+					break;
+				case kRight:
+					nearPendingEdge = x >= sx + sw - 1 - margin;
+					break;
+				case kTop:
+					nearPendingEdge = y <= sy + margin;
+					break;
+				case kBottom:
+					nearPendingEdge = y >= sy + sh - 1 - margin;
+					break;
+				case kNoDirection:
+					break;
+				}
+			}
+		}
+
+		if (!nearPendingEdge) {
+			cancelInputHandoff("pointer left the switch edge", false);
+		}
 	}
 	armSwitchTwoTap(x, y);
 	stopSwitchWait();

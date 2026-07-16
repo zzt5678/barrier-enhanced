@@ -3041,6 +3041,10 @@ TEST(ServerReconnectTests, repeatedSameEdgeMotionKeepsPreparedHandoff)
     Config config;
     config.addScreen("primary");
     config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
 
     NiceMock<MockEventQueue> events;
     ClientProxyEvents clientProxyEvents;
@@ -3059,22 +3063,26 @@ TEST(ServerReconnectTests, repeatedSameEdgeMotionKeepsPreparedHandoff)
     server.m_clients.insert(std::make_pair(primary.getName(), &primary));
     server.m_clientSet.insert(&primary);
     server.m_active = &primary;
-    server.m_x = 1023;
+    server.m_x = 1;
     server.m_y = 137;
 
-    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
     const UInt32 preparedSeqNum = client.preparedSeqNum;
+    EventQueueTimer* const pendingTimer = server.m_inputHandoffTimer;
 
-    ASSERT_TRUE(server.switchScreen(&client, 0, 140, false, kRight));
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 140));
 
     EXPECT_EQ(&primary, server.m_active);
     EXPECT_TRUE(server.m_inputHandoffPending);
     EXPECT_EQ(&primary, server.m_inputHandoffSource);
     EXPECT_EQ(&client, server.m_inputHandoffTarget);
     EXPECT_EQ(preparedSeqNum, server.m_inputHandoffSeqNum);
+    EXPECT_EQ(pendingTimer, server.m_inputHandoffTimer);
     EXPECT_EQ(1u, client.prepareCount);
     EXPECT_EQ(0u, client.abortCount);
     EXPECT_EQ(137, client.preparedY);
+    EXPECT_EQ(NULL, server.m_switchScreen);
+    EXPECT_EQ(kNoDirection, server.m_switchDir);
 
     BaseClientProxy::InputHandoffReadyInfo ready(preparedSeqNum, true);
     Event readyEvent(Event::kUnknown, &client, &ready, Event::kDontFreeData);
@@ -3090,6 +3098,62 @@ TEST(ServerReconnectTests, repeatedSameEdgeMotionKeepsPreparedHandoff)
     EXPECT_EQ(NULL, server.m_inputHandoffTimer);
     EXPECT_EQ(&primary, server.m_inputHandoffSource);
     EXPECT_EQ(&client, server.m_inputHandoffTarget);
+}
+
+TEST(ServerReconnectTests, nearEdgeBounceKeepsPreparedHandoffUntilPointerClearlyLeaves)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
+    ASSERT_TRUE(server.m_inputHandoffPending);
+    const UInt32 preparedSeqNum = server.m_inputHandoffSeqNum;
+    EventQueueTimer* const pendingTimer = server.m_inputHandoffTimer;
+
+    EXPECT_FALSE(server.onMouseMovePrimary(16, 137));
+
+    EXPECT_TRUE(server.m_inputHandoffPending);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&client, server.m_inputHandoffTarget);
+    EXPECT_EQ(preparedSeqNum, server.m_inputHandoffSeqNum);
+    EXPECT_EQ(pendingTimer, server.m_inputHandoffTimer);
+    EXPECT_EQ(1u, client.prepareCount);
+    EXPECT_EQ(0u, client.abortCount);
+
+    EXPECT_FALSE(server.onMouseMovePrimary(64, 137));
+
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_EQ(1u, client.abortCount);
+    EXPECT_EQ(preparedSeqNum, client.abortedSeqNum);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
 }
 
 TEST(ServerReconnectTests, committedHandoffWaitsForMatchingPositiveAck)
@@ -3642,6 +3706,101 @@ TEST(ServerReconnectTests, switchBackToSourceDuringCommitWaitRollsBackImmediatel
     EXPECT_EQ(NULL, server.m_inputHandoffTimer);
     EXPECT_EQ(NULL, server.m_inputHandoffSource);
     EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+}
+
+TEST(ServerReconnectTests, staleCommitAckCannotBreakImmediateSecondHandoff)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
+    const UInt32 firstSeqNum = client.preparedSeqNum;
+    BaseClientProxy::InputHandoffReadyInfo firstReady(firstSeqNum, true);
+    Event firstReadyEvent(Event::kUnknown, &client, &firstReady,
+                          Event::kDontFreeData);
+    server.handleInputHandoffReady(firstReadyEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    server.onMouseMoveSecondary(-160, 0);
+    ASSERT_EQ(&client, server.m_active);
+    server.onMouseMoveSecondary(177, 0);
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(16, primary.enterX);
+    ASSERT_FALSE(server.m_inputHandoffPending);
+    ASSERT_FALSE(server.m_inputHandoffCommitted);
+    ASSERT_FALSE(server.m_inputHandoffCommitAckPending);
+    ASSERT_EQ(NULL, server.m_inputHandoffTimer);
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
+    const UInt32 secondSeqNum = client.preparedSeqNum;
+    ASSERT_NE(firstSeqNum, secondSeqNum);
+    ASSERT_TRUE(server.m_inputHandoffPending);
+    ASSERT_EQ(&primary, server.m_active);
+
+    BaseClientProxy::InputHandoffReadyInfo staleAck(firstSeqNum, true);
+    Event staleAckEvent(Event::kUnknown, &client, &staleAck,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(staleAckEvent, &client);
+    ASSERT_TRUE(server.m_inputHandoffPending);
+    ASSERT_EQ(secondSeqNum, server.m_inputHandoffSeqNum);
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(1u, client.enterCount);
+
+    BaseClientProxy::InputHandoffReadyInfo secondReady(secondSeqNum, true);
+    Event secondReadyEvent(Event::kUnknown, &client, &secondReady,
+                           Event::kDontFreeData);
+    server.handleInputHandoffReady(secondReadyEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    BaseClientProxy::InputHandoffReadyInfo staleReject(firstSeqNum, false);
+    Event staleRejectEvent(Event::kUnknown, &client, &staleReject,
+                           Event::kDontFreeData);
+    server.handleInputHandoffReady(staleRejectEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    ASSERT_EQ(secondSeqNum, server.m_inputHandoffSeqNum);
+
+    server.handleInputHandoffReady(secondReadyEvent, &client);
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(2u, client.prepareCount);
+    EXPECT_EQ(2u, client.enterCount);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+    EXPECT_EQ(0u, client.abortCount);
 }
 
 TEST(ServerReconnectTests, switchToThirdScreenDuringCommitWaitRollsBackAndRejectsThird)
