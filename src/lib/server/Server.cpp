@@ -73,6 +73,7 @@ const SInt32 kSwitchEdgeHysteresisInset = 16;
 const SInt32 kSwitchReverseClearDistance = 96;
 const double kSwitchReverseGuardMaxSeconds = 2.0;
 const double kInputHandoffTimeoutSeconds = 0.5;
+const double kInputHandoffCommitAckTimeoutSeconds = 0.75;
 const int kClipboardReadAttempts = 8;
 const double kClipboardReadRetrySeconds = 0.025;
 const double kClipboardSyncDelaySeconds = 0.01;
@@ -250,6 +251,7 @@ Server::Server(
 		m_inputHandoffPending(false),
 		m_inputHandoffCommitReady(false),
 		m_inputHandoffCommitted(false),
+		m_inputHandoffCommitAckPending(false),
 		m_inputHandoffSource(NULL),
 		m_inputHandoffTarget(NULL),
 		m_inputHandoffSeqNum(0),
@@ -481,6 +483,7 @@ Server::~Server()
 	}
 
 	cancelInputHandoff("server is shutting down", false);
+	cleanupInputHandoffTimer();
 	discardPendingMouseMove();
 
 	if (!cleanupSendFileThread(true) && m_sendFileThread != NULL) {
@@ -670,22 +673,18 @@ Server::adoptClient(BaseClientProxy* client)
 
 	if (replaceActive && m_activeSaver == NULL) {
 		++m_seqNum;
-		if (client->supportsInputHandoff()) {
-			SInt32 sourceX = 0;
-			SInt32 sourceY = 0;
+		const bool trackReentry = client->supportsInputHandoff();
+		SInt32 sourceX = 0;
+		SInt32 sourceY = 0;
+		if (trackReentry) {
 			getPrimaryRecoveryPoint(client, sourceX, sourceY);
-			m_inputHandoffCommitted = true;
-			m_inputHandoffSource = m_primaryClient;
-			m_inputHandoffTarget = client;
-			m_inputHandoffSeqNum = m_seqNum;
-			m_inputHandoffSourceX = sourceX;
-			m_inputHandoffSourceY = sourceY;
-			LOG((CLOG_INFO
-				"tracking active-client re-entry for \"%s\", seq=%u; rollback=%d,%d",
-				getName(client).c_str(), m_seqNum, sourceX, sourceY));
 		}
 		client->enter(m_x, m_y, m_seqNum,
 			m_primaryClient->getToggleMask(), false);
+		if (trackReentry) {
+			trackCommittedInputHandoff(m_primaryClient, client, m_seqNum,
+				sourceX, sourceY, kNoDirection);
+		}
 		replayClipboardsToActive();
 
 		Server::SwitchToScreenInfo* switchInfo =
@@ -889,9 +888,23 @@ Server::getJumpZoneSize(BaseClientProxy* client) const
 bool
 Server::switchScreen(BaseClientProxy* dst,
 					SInt32 x, SInt32 y, bool forScreensaver,
-					EDirection guardDir)
+					EDirection guardDir, bool trackDirectCommit)
 {
 	assert(dst != NULL);
+	if (!m_inputHandoffCommitReady &&
+		m_inputHandoffCommitAckPending && m_active != dst) {
+		BaseClientProxy* confirmedSource = m_inputHandoffSource;
+		LOG((CLOG_WARN
+			"rolling back unacknowledged input lease before switching from \"%s\" to \"%s\"",
+			getName(m_active).c_str(), getName(dst).c_str()));
+		rollbackCommittedInputHandoff(
+			"superseded before commit acknowledgment");
+		if (dst == confirmedSource && m_active == dst) {
+			return true;
+		}
+		stopSwitch();
+		return false;
+	}
 	if (m_inputHandoffPending &&
 		(dst != m_inputHandoffTarget || m_active != m_inputHandoffSource)) {
 		cancelInputHandoff("superseded by another switch", false);
@@ -936,7 +949,11 @@ Server::switchScreen(BaseClientProxy* dst,
 	if (!m_inputHandoffCommitReady && m_active != dst &&
 		guardDir != kNoDirection && dst != m_primaryClient &&
 		dst->supportsInputHandoff()) {
-		m_inputHandoffCommitted = false;
+		// Legacy peers have no commit acknowledgment. Retire their rollback
+		// record before the currently active target becomes the new source.
+		if (m_inputHandoffCommitted) {
+			finishCommittedInputHandoff();
+		}
 		return beginInputHandoff(dst, x, y, guardDir);
 	}
 
@@ -948,6 +965,10 @@ Server::switchScreen(BaseClientProxy* dst,
 		BaseClientProxy* oldActive = m_active;
 		const SInt32 oldX = m_x;
 		const SInt32 oldY = m_y;
+		const bool trackDirectHandoff =
+			trackDirectCommit && !m_inputHandoffCommitReady &&
+			dst != m_primaryClient &&
+			dst->supportsInputHandoff();
 		if (oldActive == m_primaryClient && dst != m_primaryClient) {
 			rememberPrimaryReturnAnchor(dst, oldX, oldY, guardDir);
 		}
@@ -968,11 +989,9 @@ Server::switchScreen(BaseClientProxy* dst,
 				return false;
 			}
 
-		if (!m_inputHandoffCommitReady && m_inputHandoffCommitted) {
-			m_inputHandoffCommitted = false;
-			m_inputHandoffSource = NULL;
-			m_inputHandoffTarget = NULL;
-		}
+			if (!m_inputHandoffCommitReady && m_inputHandoffCommitted) {
+				finishCommittedInputHandoff();
+			}
 
 		m_primaryLeaveFailedRecently = false;
 		m_primaryLeaveFailureDir = kNoDirection;
@@ -1003,6 +1022,10 @@ Server::switchScreen(BaseClientProxy* dst,
 								m_inputHandoffCommitReady ? m_inputHandoffMask :
 									m_primaryClient->getToggleMask(),
 								forScreensaver);
+		if (trackDirectHandoff) {
+			trackCommittedInputHandoff(oldActive, m_active, m_seqNum,
+				oldX, oldY, guardDir);
+		}
 		if (m_active == m_primaryClient) {
 			m_primaryClient->refreshKeyState();
 		}
@@ -1047,6 +1070,7 @@ Server::beginInputHandoff(BaseClientProxy* dst, SInt32 x, SInt32 y,
 	}
 
 	m_inputHandoffPending = true;
+	m_inputHandoffCommitAckPending = false;
 	m_inputHandoffSource = m_active;
 	m_inputHandoffTarget = dst;
 	m_inputHandoffSeqNum = ++m_seqNum;
@@ -1098,6 +1122,7 @@ Server::cancelInputHandoff(const char* reason, bool reanchor, bool notifyTarget)
 	m_inputHandoffPending = false;
 	m_inputHandoffCommitReady = false;
 	m_inputHandoffCommitted = false;
+	m_inputHandoffCommitAckPending = false;
 	m_inputHandoffSource = NULL;
 	m_inputHandoffTarget = NULL;
 	m_inputHandoffGuardDir = kNoDirection;
@@ -1117,6 +1142,100 @@ Server::cancelInputHandoff(const char* reason, bool reanchor, bool notifyTarget)
 }
 
 void
+Server::trackCommittedInputHandoff(BaseClientProxy* source,
+									BaseClientProxy* target, UInt32 seqNum,
+									SInt32 sourceX, SInt32 sourceY,
+									EDirection guardDir)
+{
+	assert(target != NULL);
+	m_inputHandoffCommitted = true;
+	m_inputHandoffCommitAckPending = false;
+	m_inputHandoffSource = source;
+	m_inputHandoffTarget = target;
+	m_inputHandoffSeqNum = seqNum;
+	m_inputHandoffSourceX = sourceX;
+	m_inputHandoffSourceY = sourceY;
+	m_inputHandoffGuardDir = guardDir;
+
+	LOG((CLOG_INFO
+		"tracking committed input handoff from \"%s\" to \"%s\", seq=%u; rollback=%d,%d",
+		source != NULL ? getName(source).c_str() : "local fallback",
+		getName(target).c_str(), seqNum, sourceX, sourceY));
+	if (target->supportsInputHandoffCommitAck()) {
+		startInputHandoffCommitAckTimer();
+	}
+}
+
+void
+Server::startInputHandoffCommitAckTimer()
+{
+	cleanupInputHandoffTimer();
+	m_inputHandoffCommitAckPending = true;
+	m_inputHandoffTimer =
+		m_events->newOneShotTimer(kInputHandoffCommitAckTimeoutSeconds, NULL);
+	m_events->adoptHandler(Event::kTimer, m_inputHandoffTimer,
+		new TMethodEventJob<Server>(this,
+			&Server::handleInputHandoffTimeout, NULL));
+}
+
+void
+Server::finishCommittedInputHandoff()
+{
+	cleanupInputHandoffTimer();
+	m_inputHandoffCommitted = false;
+	m_inputHandoffCommitAckPending = false;
+	m_inputHandoffSource = NULL;
+	m_inputHandoffTarget = NULL;
+	m_inputHandoffGuardDir = kNoDirection;
+}
+
+void
+Server::rollbackCommittedInputHandoff(const char* reason)
+{
+	if (!m_inputHandoffCommitted) {
+		return;
+	}
+
+	BaseClientProxy* source = m_inputHandoffSource;
+	BaseClientProxy* target = m_inputHandoffTarget;
+	const UInt32 seqNum = m_inputHandoffSeqNum;
+	const SInt32 sourceX = m_inputHandoffSourceX;
+	const SInt32 sourceY = m_inputHandoffSourceY;
+	LOG((CLOG_WARN
+		"rolling back committed input handoff to \"%s\", seq=%u: %s",
+		target != NULL ? getName(target).c_str() : "unknown", seqNum, reason));
+
+	finishCommittedInputHandoff();
+
+	bool restored = false;
+	if (source != NULL && m_clientSet.count(source) != 0) {
+		// The rejected target is not a confirmed rollback source. Restore the
+		// previous lease first, then track that enter against the local primary.
+		restored = switchScreen(source, sourceX, sourceY, false,
+			kNoDirection, false);
+		if (restored && source != m_primaryClient &&
+			source->supportsInputHandoff()) {
+			SInt32 fallbackX = 0;
+			SInt32 fallbackY = 0;
+			BaseClientProxy* fallback = NULL;
+			if (getPrimaryRecoveryPoint(source, fallbackX, fallbackY)) {
+				fallback = m_primaryClient;
+			}
+			trackCommittedInputHandoff(fallback, source, m_seqNum,
+				fallbackX, fallbackY, kNoDirection);
+		}
+	}
+	if (!restored && target != NULL && m_active == target) {
+		LOG((CLOG_WARN
+			"committed handoff rollback could not switch to its source; forcing local recovery"));
+		if (m_clientSet.count(target) != 0) {
+			target->leave();
+		}
+		forceLeaveClient(target);
+	}
+}
+
+void
 Server::handleInputHandoffReady(const Event& event, void* vclient)
 {
 	BaseClientProxy* client = static_cast<BaseClientProxy*>(vclient);
@@ -1124,30 +1243,21 @@ Server::handleInputHandoffReady(const Event& event, void* vclient)
 		static_cast<BaseClientProxy::InputHandoffReadyInfo*>(
 			event.getDataObject() != NULL ? event.getDataObject() :
 			static_cast<EventData*>(event.getData()));
-	if (info != NULL && !info->m_ready && m_inputHandoffCommitted &&
+	if (info != NULL && m_inputHandoffCommitted &&
 		client == m_inputHandoffTarget &&
 		info->m_seqNum == m_inputHandoffSeqNum &&
 		m_active == m_inputHandoffTarget) {
-		BaseClientProxy* source = m_inputHandoffSource;
-		const SInt32 sourceX = m_inputHandoffSourceX;
-		const SInt32 sourceY = m_inputHandoffSourceY;
-		m_inputHandoffCommitted = false;
-		m_inputHandoffSource = NULL;
-		m_inputHandoffTarget = NULL;
-		LOG((CLOG_WARN
-			"target rejected committed input handoff, seq=%u; restoring source lease",
-			info->m_seqNum));
-		bool restored = false;
-		if (source != NULL && m_clientSet.count(source) != 0) {
-			restored = switchScreen(source, sourceX, sourceY, false,
-				kNoDirection);
+		if (!info->m_ready) {
+			rollbackCommittedInputHandoff("target rejected committed lease");
+			return;
 		}
-		if (!restored && m_active == client) {
-			LOG((CLOG_WARN
-				"committed handoff rollback could not switch to its source; forcing local recovery"));
-			forceLeaveClient(client);
+		if (m_inputHandoffCommitAckPending) {
+			LOG((CLOG_INFO
+				"target acknowledged committed input handoff, seq=%u",
+				info->m_seqNum));
+			finishCommittedInputHandoff();
+			return;
 		}
-		return;
 	}
 
 	if (info == NULL || !m_inputHandoffPending ||
@@ -1185,14 +1295,21 @@ Server::handleInputHandoffReady(const Event& event, void* vclient)
 		reanchorActiveAfterFailedSwitch(client);
 	}
 	else {
-		m_inputHandoffCommitted = true;
+		trackCommittedInputHandoff(m_inputHandoffSource, client,
+			m_inputHandoffSeqNum, m_inputHandoffSourceX,
+			m_inputHandoffSourceY, guardDir);
 	}
 }
 
 void
 Server::handleInputHandoffTimeout(const Event&, void*)
 {
-	cancelInputHandoff("target readiness timed out", true);
+	if (m_inputHandoffCommitAckPending) {
+		rollbackCommittedInputHandoff("target commit acknowledgment timed out");
+	}
+	else {
+		cancelInputHandoff("target readiness timed out", true);
+	}
 }
 
 bool
@@ -1210,8 +1327,13 @@ Server::canLeavePrimaryNow(const char* reason, EDirection dir)
 		return true;
 	}
 
-	LOG((CLOG_WARN "suppressing %s while pointer remains on failed %s edge",
+	LOG((CLOG_WARN "suppressing one synthetic %s event on failed %s edge",
 		reason, Config::dirName(dir)));
+	// The platform warp used for recovery is drained before the server can
+	// observe an inward motion. Consume exactly one same-edge event instead of
+	// requiring the user to move away from the edge before retrying.
+	m_primaryLeaveFailedRecently = false;
+	m_primaryLeaveFailureDir = kNoDirection;
 	stopSwitch();
 	return false;
 }
@@ -4367,11 +4489,14 @@ Server::removeClient(BaseClientProxy* client)
 	else if (m_inputHandoffPending && client == m_inputHandoffSource) {
 		cancelInputHandoff("handoff source disconnected", false);
 	}
-	if (m_inputHandoffCommitted &&
-		(client == m_inputHandoffTarget || client == m_inputHandoffSource)) {
-		m_inputHandoffCommitted = false;
+	if (m_inputHandoffCommitted && client == m_inputHandoffTarget) {
+		finishCommittedInputHandoff();
+	}
+	else if (m_inputHandoffCommitted && client == m_inputHandoffSource) {
+		// Keep the target record so a later rejection can still recover locally.
+		// Protocol 1.10 also has a deadline; legacy records retire on the next
+		// switch or when the target disconnects.
 		m_inputHandoffSource = NULL;
-		m_inputHandoffTarget = NULL;
 	}
 	discardPendingMouseMove(client);
 	eraseBulkBindings(client);

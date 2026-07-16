@@ -3,6 +3,7 @@
 #include "server/ClientProxy1_7.h"
 #include "server/ClientProxy1_8.h"
 #include "server/ClientProxy1_9.h"
+#include "server/ClientProxy1_10.h"
 
 #include "barrier/Clipboard.h"
 #include "barrier/ProtocolUtil.h"
@@ -29,6 +30,39 @@ using ::testing::Return;
 using ::testing::ReturnRef;
 
 namespace {
+
+void setClientProxy16EventDefaults(MockEventQueue& events,
+                                   IStreamEvents& streamEvents,
+                                   ClipboardEvents& clipboardEvents,
+                                   FileEvents& fileEvents,
+                                   Event::Type& nextType);
+
+TEST(ClientProxyLifecycleTests, protocol110AdvertisesCommittedHandoffAck)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents,
+                                  fileEvents, nextType);
+
+    NiceMock<MockServer> server;
+    EXPECT_CALL(events, adoptHandler(_, _, _)).Times(AnyNumber());
+    EXPECT_CALL(events, removeHandler(_, _)).Times(AnyNumber());
+
+    NiceMock<MockStream>* legacyStream = new NiceMock<MockStream>();
+    ON_CALL(*legacyStream, getEventTarget()).WillByDefault(Return(legacyStream));
+    ON_CALL(*legacyStream, getBufferedOutputSize()).WillByDefault(Return(0));
+    ClientProxy1_9 legacy("legacy", legacyStream, &server, &events);
+    EXPECT_FALSE(legacy.supportsInputHandoffCommitAck());
+
+    NiceMock<MockStream>* currentStream = new NiceMock<MockStream>();
+    ON_CALL(*currentStream, getEventTarget()).WillByDefault(Return(currentStream));
+    ON_CALL(*currentStream, getBufferedOutputSize()).WillByDefault(Return(0));
+    ClientProxy1_10 current("current", currentStream, &server, &events);
+    EXPECT_TRUE(current.supportsInputHandoffCommitAck());
+}
 
 void setClientProxy16EventDefaults(MockEventQueue& events,
                                    IStreamEvents& streamEvents,

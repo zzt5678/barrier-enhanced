@@ -31,6 +31,7 @@
 #include "base/TMethodEventJob.h"
 
 #include <malloc.h>
+#include <limits>
 #include <VersionHelpers.h>
 
 // these are only defined when WINVER >= 0x0500
@@ -75,8 +76,20 @@ const double kNormalDeskPollInterval = 0.2;
 const double kLowLatencyDeskPollInterval = 0.05;
 const double kDeskCommandTimeout = 0.25;
 const double kDeskCommandExecutionGrace = 0.75;
-const double kDeskStartupTimeout = 2.0;
+const double kLowLatencyDeskCommandTimeout = 0.05;
+const double kLowLatencyDeskCommandExecutionGrace = 0.20;
 const ULONGLONG kDeskRecoveryProbeInterval = 1000;
+const ULONGLONG kDeskStartupDeadline = 2000;
+const std::uint64_t kMaxPendingDeskCommands = 128;
+const int kDeskStopPostRetries = 3;
+const DWORD kInputRecoveryHardExitDelay = 5000;
+
+DWORD WINAPI terminateInputProcessAfterRecoveryDeadline(LPVOID)
+{
+    Sleep(kInputRecoveryHardExitDelay);
+    TerminateProcess(GetCurrentProcess(), ERROR_PROCESS_ABORTED);
+    return 0;
+}
 
 }
 
@@ -106,24 +119,10 @@ const ULONGLONG kDeskRecoveryProbeInterval = 1000;
 #define BARRIER_MSG_FAKE_INPUT        BARRIER_HOOK_LAST_MSG + 12
 // DeskCommand*; <unused>
 #define BARRIER_MSG_DESK_COMMAND      BARRIER_HOOK_LAST_MSG + 13
+// <unused>; <unused>
+#define BARRIER_MSG_DESK_STOP         BARRIER_HOOK_LAST_MSG + 14
 
 namespace {
-
-struct DeskCommand {
-    DeskCommand(UINT commandMessage, WPARAM commandWParam,
-                LPARAM commandLParam, std::uint64_t commandSequence) :
-        message(commandMessage),
-        wParam(commandWParam),
-        lParam(commandLParam),
-        sequence(commandSequence)
-    {
-    }
-
-    UINT message;
-    WPARAM wParam;
-    LPARAM lParam;
-    std::uint64_t sequence;
-};
 
 LONG normalizeMouseCoordinate(SInt32 value, SInt32 origin, SInt32 length)
 {
@@ -143,7 +142,7 @@ LONG normalizeMouseCoordinate(SInt32 value, SInt32 origin, SInt32 length)
     return static_cast<LONG>(scaled + 0.5);
 }
 
-void sendKeyboardInput(UINT virtualKey, UINT scanCode, DWORD flags)
+bool sendKeyboardInput(UINT virtualKey, UINT scanCode, DWORD flags)
 {
     INPUT input;
     ZeroMemory(&input, sizeof(input));
@@ -162,10 +161,10 @@ void sendKeyboardInput(UINT virtualKey, UINT scanCode, DWORD flags)
         input.ki.dwFlags = flags;
     }
 
-    SendInput(1, &input, sizeof(input));
+    return SendInput(1, &input, sizeof(input)) == 1;
 }
 
-void sendMouseInput(LONG dx, LONG dy, DWORD flags, DWORD mouseData)
+bool sendMouseInput(LONG dx, LONG dy, DWORD flags, DWORD mouseData)
 {
     INPUT input;
     ZeroMemory(&input, sizeof(input));
@@ -174,7 +173,25 @@ void sendMouseInput(LONG dx, LONG dy, DWORD flags, DWORD mouseData)
     input.mi.dy = dy;
     input.mi.dwFlags = flags;
     input.mi.mouseData = mouseData;
-    SendInput(1, &input, sizeof(input));
+    return SendInput(1, &input, sizeof(input)) == 1;
+}
+
+bool isOrderedInputCommand(UINT message)
+{
+    return message == BARRIER_MSG_FAKE_KEY ||
+        message == BARRIER_MSG_FAKE_BUTTON ||
+        message == BARRIER_MSG_FAKE_WHEEL;
+}
+
+bool isMouseMotionCommand(UINT message)
+{
+    return message == BARRIER_MSG_FAKE_MOVE ||
+        message == BARRIER_MSG_FAKE_REL_MOVE;
+}
+
+bool isOrdinaryInputCommand(UINT message)
+{
+    return isMouseMotionCommand(message) || isOrderedInputCommand(message);
 }
 
 }
@@ -182,6 +199,16 @@ void sendMouseInput(LONG dx, LONG dy, DWORD flags, DWORD mouseData)
 //
 // MSWindowsDesks
 //
+
+MSWindowsDesks::DeskCommand::DeskCommand(
+    UINT commandMessage, WPARAM commandWParam,
+    LPARAM commandLParam, std::uint64_t commandSequence) :
+    message(commandMessage),
+    wParam(commandWParam),
+    lParam(commandLParam),
+    sequence(commandSequence)
+{
+}
 
 MSWindowsDesks::MSWindowsDesks(bool isPrimary, bool noHooks,
         const IScreenSaver* screensaver, IEventQueue* events,
@@ -199,12 +226,14 @@ MSWindowsDesks::MSWindowsDesks(bool isPrimary, bool noHooks,
     m_screensaverNotify(false),
     m_activeDesk(NULL),
     m_activeDeskName(),
+    m_observedDeskName(),
     m_mutex(),
     m_sendMutex(),
     m_deskReady(&m_mutex, false),
     m_inputDesktopGeneration(0),
     m_nextDeskCommandSequence(0),
     m_cursorPos{0, 0},
+    m_inputRecoveryRequested(false),
     m_nextDeskRecoveryProbe(0),
     m_updateKeys(updateKeys),
     m_leaveForegroundOption(false),
@@ -274,10 +303,16 @@ MSWindowsDesks::enter()
     return sendMessage(BARRIER_MSG_ENTER, 0, 0);
 }
 
-void
+bool
 MSWindowsDesks::leave(HKL keyLayout)
 {
-    sendMessage(BARRIER_MSG_LEAVE, (WPARAM)keyLayout, 0);
+    if (sendMessage(BARRIER_MSG_LEAVE, (WPARAM)keyLayout, 0)) {
+        return true;
+    }
+
+    requestInputRecovery(
+        BARRIER_MSG_LEAVE, "desktop leave command failed", true);
+    return false;
 }
 
 void
@@ -432,9 +467,15 @@ MSWindowsDesks::fakeKeyEvent(
     if (!press) {
         flags |= KEYEVENTF_KEYUP;
     }
-    sendMessage(BARRIER_MSG_FAKE_KEY, flags,
-                            MAKEWORD(static_cast<BYTE>(button & 0xffu),
-                                static_cast<BYTE>(virtualKey & 0xffu)));
+    const DeskCommandDispatch dispatch =
+        deskCommandWaitsForCompletionForTest(kDeskInputKey) ?
+            kWaitForDeskCommand : kPostDeskCommand;
+    if (!sendMessage(BARRIER_MSG_FAKE_KEY, flags,
+            MAKEWORD(static_cast<BYTE>(button & 0xffu),
+                static_cast<BYTE>(virtualKey & 0xffu)), dispatch)) {
+        requestInputRecovery(
+            BARRIER_MSG_FAKE_KEY, "ordered key command failed", true);
+    }
 }
 
 void
@@ -487,36 +528,60 @@ MSWindowsDesks::fakeMouseButton(ButtonID button, bool press)
     }
 
     // do it
-    sendMessage(BARRIER_MSG_FAKE_BUTTON, flags, data);
+    const DeskCommandDispatch dispatch =
+        deskCommandWaitsForCompletionForTest(kDeskInputButton) ?
+            kWaitForDeskCommand : kPostDeskCommand;
+    if (!sendMessage(BARRIER_MSG_FAKE_BUTTON, flags, data, dispatch)) {
+        requestInputRecovery(
+            BARRIER_MSG_FAKE_BUTTON, "ordered button command failed", true);
+    }
 }
 
 bool
-MSWindowsDesks::fakeMouseMove(SInt32 x, SInt32 y) const
+MSWindowsDesks::fakeMouseMove(SInt32 x, SInt32 y,
+                              bool waitForCompletion) const
 {
+    const DeskCommandDispatch dispatch =
+        deskCommandWaitsForCompletionForTest(
+            kDeskInputAbsoluteMove, waitForCompletion) ?
+                kWaitForDeskCommand : kPostDeskCommand;
     return sendMessage(BARRIER_MSG_FAKE_MOVE,
                        static_cast<WPARAM>(x),
-                       static_cast<LPARAM>(y));
+                       static_cast<LPARAM>(y),
+                       dispatch);
 }
 
 void
 MSWindowsDesks::fakeMouseRelativeMove(SInt32 dx, SInt32 dy) const
 {
+    const DeskCommandDispatch dispatch =
+        deskCommandWaitsForCompletionForTest(kDeskInputRelativeMove) ?
+            kWaitForDeskCommand : kPostDeskCommand;
     sendMessage(BARRIER_MSG_FAKE_REL_MOVE,
                             static_cast<WPARAM>(dx),
-                            static_cast<LPARAM>(dy));
+                            static_cast<LPARAM>(dy),
+                            dispatch);
 }
 
 void
 MSWindowsDesks::fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const
 {
-    sendMessage(BARRIER_MSG_FAKE_WHEEL, xDelta, yDelta);
+    const DeskCommandDispatch dispatch =
+        deskCommandWaitsForCompletionForTest(kDeskInputWheel) ?
+            kWaitForDeskCommand : kPostDeskCommand;
+    if (!sendMessage(BARRIER_MSG_FAKE_WHEEL, xDelta, yDelta, dispatch)) {
+        requestInputRecovery(
+            BARRIER_MSG_FAKE_WHEEL, "ordered wheel command failed", true);
+    }
 }
 
 bool
 MSWindowsDesks::canEnter() const
 {
     Lock lock(&m_mutex);
-    return isDeskReadyLocked(m_activeDesk);
+    return canAcceptInputForActiveDesktopForTest(
+        isDeskReadyLocked(m_activeDesk),
+        m_observedDeskName == m_activeDeskName);
 }
 
 std::uint64_t
@@ -560,30 +625,257 @@ MSWindowsDesks::shouldProcessDeskCommandForTest(
 
 bool
 MSWindowsDesks::canCancelTimedOutDeskCommandForTest(
-    std::uint64_t sequence, std::uint64_t executingSequence)
+    std::uint64_t sequence, std::uint64_t executingSequence,
+    bool orderedInputCommand)
 {
-    return sequence != executingSequence;
+    return !orderedInputCommand && sequence != executingSequence;
 }
 
 bool
 MSWindowsDesks::commandCompletionProvesResponsiveForTest(
-    bool commandExecuted, std::uint64_t sequence,
+    bool commandExecuted, bool commandSucceeded, std::uint64_t sequence,
     std::uint64_t poisonedThroughSequence)
 {
-    return commandExecuted && sequence > poisonedThroughSequence;
+    return commandExecuted && commandSucceeded &&
+        sequence > poisonedThroughSequence;
 }
 
 bool
-MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
+MSWindowsDesks::commandInjectionSucceededForTest(
+    std::uint64_t sequence, std::uint64_t failedSequence)
+{
+    return sequence != failedSequence;
+}
+
+bool
+MSWindowsDesks::canQueueDeskCommandForTest(
+    std::uint64_t nextSequence, std::uint64_t completedSequence,
+    std::uint64_t maxPendingCommands)
+{
+    return maxPendingCommands > 0 && nextSequence >= completedSequence &&
+        nextSequence - completedSequence < maxPendingCommands;
+}
+
+std::uint64_t
+MSWindowsDesks::maxPendingDeskCommandsForTest()
+{
+    return kMaxPendingDeskCommands;
+}
+
+bool
+MSWindowsDesks::deskCommandWaitsForCompletionForTest(
+    DeskInputCommand command, bool forceCompletion)
+{
+    if (forceCompletion) {
+        return true;
+    }
+    return command != kDeskInputAbsoluteMove &&
+        command != kDeskInputRelativeMove;
+}
+
+double
+MSWindowsDesks::deskCommandAckTimeoutForTest(
+    bool lowLatencyMode, bool nestedRemoteMode)
+{
+    return (lowLatencyMode || nestedRemoteMode) ?
+        kLowLatencyDeskCommandTimeout : kDeskCommandTimeout;
+}
+
+double
+MSWindowsDesks::deskCommandExecutionGraceForTest(
+    bool lowLatencyMode, bool nestedRemoteMode)
+{
+    return (lowLatencyMode || nestedRemoteMode) ?
+        kLowLatencyDeskCommandExecutionGrace : kDeskCommandExecutionGrace;
+}
+
+bool
+MSWindowsDesks::canActivateDesktopForTest(
+    bool startupComplete, bool threadRunning,
+    bool threadAttached, bool windowReady)
+{
+    return startupComplete && threadRunning && threadAttached && windowReady;
+}
+
+bool
+MSWindowsDesks::canAcceptInputForActiveDesktopForTest(
+    bool activeDesktopReady, bool observedDesktopMatchesActive)
+{
+    return activeDesktopReady && observedDesktopMatchesActive;
+}
+
+bool
+MSWindowsDesks::hasDesktopStartupTimedOutForTest(
+    bool startupComplete, std::uint64_t now, std::uint64_t deadline)
+{
+    return !startupComplete && now >= deadline;
+}
+
+bool
+MSWindowsDesks::shouldPostDeskQuitForTest(
+    bool startupComplete, DWORD threadID)
+{
+    return startupComplete && threadID != 0;
+}
+
+bool
+MSWindowsDesks::coalesceMouseMotionForTest(
+    DeskInputCommand pendingCommand,
+    SInt32& pendingFirst, SInt32& pendingSecond,
+    DeskInputCommand nextCommand,
+    SInt32 nextFirst, SInt32 nextSecond)
+{
+    if (pendingCommand != nextCommand) {
+        return false;
+    }
+
+    if (nextCommand == kDeskInputAbsoluteMove) {
+        pendingFirst = nextFirst;
+        pendingSecond = nextSecond;
+        return true;
+    }
+
+    if (nextCommand != kDeskInputRelativeMove) {
+        return false;
+    }
+
+    const std::int64_t first =
+        static_cast<std::int64_t>(pendingFirst) + nextFirst;
+    const std::int64_t second =
+        static_cast<std::int64_t>(pendingSecond) + nextSecond;
+    const std::int64_t minimum =
+        (std::numeric_limits<SInt32>::min)();
+    const std::int64_t maximum =
+        (std::numeric_limits<SInt32>::max)();
+    pendingFirst = static_cast<SInt32>(
+        first < minimum ? minimum : (first > maximum ? maximum : first));
+    pendingSecond = static_cast<SInt32>(
+        second < minimum ? minimum :
+            (second > maximum ? maximum : second));
+    return true;
+}
+
+MSWindowsDesks::PendingMotionBoundary
+MSWindowsDesks::pendingMotionBoundaryForTest(
+    DeskInputCommand command, bool forceCompletion)
+{
+    if (command == kDeskInputAbsoluteMove ||
+        command == kDeskInputRelativeMove) {
+        return forceCompletion ?
+            kSupersedePendingMotion : kNoPendingMotionBoundary;
+    }
+
+    if (command == kDeskControlEnter ||
+        command == kDeskControlLeave ||
+        command == kDeskControlSwitch) {
+        return kSupersedePendingMotion;
+    }
+
+    return kFlushPendingMotion;
+}
+
+MSWindowsDesks::DesktopTransitionAction
+MSWindowsDesks::desktopTransitionActionForTest(
+    bool observedDesktopMatchesActive,
+    bool observedDesktopReady,
+    bool inputLeaseActive,
+    bool startupComplete,
+    std::uint64_t now,
+    std::uint64_t deadline)
+{
+    if (observedDesktopMatchesActive) {
+        return kKeepActiveDesktop;
+    }
+    if (observedDesktopReady) {
+        return kActivateObservedDesktop;
+    }
+    if (inputLeaseActive || startupComplete || now >= deadline) {
+        return kRecoverInputProcess;
+    }
+    return kWaitForObservedDesktop;
+}
+
+bool
+MSWindowsDesks::beginInputRecoveryForTest(bool& recoveryRequested)
+{
+    if (recoveryRequested) {
+        return false;
+    }
+    recoveryRequested = true;
+    return true;
+}
+
+DWORD
+MSWindowsDesks::inputRecoveryHardExitDelayForTest()
+{
+    return kInputRecoveryHardExitDelay;
+}
+
+MSWindowsDesks::DeskInputCommand
+MSWindowsDesks::classifyDeskCommand(UINT msg)
+{
+    switch (msg) {
+    case BARRIER_MSG_FAKE_KEY:
+        return kDeskInputKey;
+    case BARRIER_MSG_FAKE_BUTTON:
+        return kDeskInputButton;
+    case BARRIER_MSG_FAKE_MOVE:
+        return kDeskInputAbsoluteMove;
+    case BARRIER_MSG_FAKE_REL_MOVE:
+        return kDeskInputRelativeMove;
+    case BARRIER_MSG_FAKE_WHEEL:
+        return kDeskInputWheel;
+    case BARRIER_MSG_ENTER:
+        return kDeskControlEnter;
+    case BARRIER_MSG_LEAVE:
+        return kDeskControlLeave;
+    case BARRIER_MSG_SWITCH:
+        return kDeskControlSwitch;
+    default:
+        return kDeskControlOther;
+    }
+}
+
+bool
+MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam,
+                            DeskCommandDispatch dispatch) const
 {
     Lock sendLock(&m_sendMutex);
 
+    const DeskInputCommand commandType = classifyDeskCommand(msg);
+    const bool motionCommand = isMouseMotionCommand(msg);
+    const bool asyncMotionCommand =
+        motionCommand && dispatch == kPostDeskCommand;
+    const PendingMotionBoundary motionBoundary =
+        pendingMotionBoundaryForTest(
+            commandType, motionCommand && dispatch == kWaitForDeskCommand);
+
     Desk* desk = NULL;
     std::uint64_t sequence = 0;
+    std::uint64_t motionBoundarySequence = 0;
+    bool rejected = false;
+    bool requestRecovery = false;
+    const char* recoveryReason = NULL;
     {
         Lock lock(&m_mutex);
         desk = m_activeDesk;
-        if (desk == NULL || !desk->m_threadRunning ||
+        const bool observedDesktopMatches =
+            m_observedDeskName == m_activeDeskName;
+        if (isOrdinaryInputCommand(msg) &&
+            !observedDesktopMatches) {
+            LOG((CLOG_WARN
+                "Windows input command rejected because observed desktop changed message=%u active=%s observed=%s lease=%d",
+                static_cast<unsigned int>(msg),
+                m_activeDeskName.empty() ?
+                    "<none>" : m_activeDeskName.c_str(),
+                m_observedDeskName.empty() ?
+                    "<none>" : m_observedDeskName.c_str(),
+                m_isOnScreen ? 1 : 0));
+            requestRecovery = m_isOnScreen;
+            recoveryReason = "observed desktop changed during input lease";
+            rejected = true;
+        }
+        else if (desk == NULL || !desk->m_threadRunning ||
             !desk->m_threadAttached || !desk->m_windowReady ||
             (!desk->m_commandResponsive && msg != BARRIER_MSG_SWITCH)) {
             if (msg == BARRIER_MSG_ENTER) {
@@ -595,18 +887,159 @@ MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
                     desk != NULL && desk->m_windowReady ? 1 : 0,
                     desk != NULL && desk->m_commandResponsive ? 1 : 0));
             }
+            else if (dispatch == kPostDeskCommand) {
+                if (isOrderedInputCommand(msg)) {
+                    LOG((CLOG_WARN
+                        "Windows ordered input command rejected before dispatch message=%u desktop=%s running=%d attached=%d windowReady=%d responsive=%d",
+                        static_cast<unsigned int>(msg),
+                        desk == NULL ? "<none>" : desk->m_name.c_str(),
+                        desk != NULL && desk->m_threadRunning ? 1 : 0,
+                        desk != NULL && desk->m_threadAttached ? 1 : 0,
+                        desk != NULL && desk->m_windowReady ? 1 : 0,
+                        desk != NULL && desk->m_commandResponsive ? 1 : 0));
+                }
+                else {
+                    LOG((CLOG_WARN
+                        "Windows async input command rejected before dispatch message=%u desktop=%s running=%d attached=%d windowReady=%d responsive=%d",
+                        static_cast<unsigned int>(msg),
+                        desk == NULL ? "<none>" : desk->m_name.c_str(),
+                        desk != NULL && desk->m_threadRunning ? 1 : 0,
+                        desk != NULL && desk->m_threadAttached ? 1 : 0,
+                        desk != NULL && desk->m_windowReady ? 1 : 0,
+                        desk != NULL && desk->m_commandResponsive ? 1 : 0));
+                }
+                requestRecovery = true;
+                recoveryReason = "pre-dispatch rejection";
+            }
+            rejected = true;
+        }
+        else if (asyncMotionCommand &&
+            desk->m_pendingMotionCommand != NULL) {
+            DeskCommand* pending = desk->m_pendingMotionCommand;
+            SInt32 pendingFirst = static_cast<SInt32>(pending->wParam);
+            SInt32 pendingSecond = static_cast<SInt32>(pending->lParam);
+            if (coalesceMouseMotionForTest(
+                    classifyDeskCommand(pending->message),
+                    pendingFirst, pendingSecond,
+                    commandType,
+                    static_cast<SInt32>(wParam),
+                    static_cast<SInt32>(lParam))) {
+                pending->wParam = static_cast<WPARAM>(pendingFirst);
+                pending->lParam = static_cast<LPARAM>(pendingSecond);
+                return true;
+            }
+
+            // A change between absolute and relative mode is an ordering
+            // boundary. The old command remains queued with immutable data.
+            desk->m_pendingMotionCommand = NULL;
+        }
+
+        if (!rejected && motionBoundary != kNoPendingMotionBoundary &&
+            desk->m_lastMotionCommandSequence >
+                desk->m_completedCommandSequence) {
+            motionBoundarySequence = desk->m_lastMotionCommandSequence;
+            if (motionBoundary == kSupersedePendingMotion &&
+                motionBoundarySequence >
+                    desk->m_cancelledCommandSequence) {
+                desk->m_cancelledCommandSequence = motionBoundarySequence;
+            }
+            desk->m_pendingMotionCommand = NULL;
+        }
+
+        if (!rejected && asyncMotionCommand &&
+            !canQueueDeskCommandForTest(
+                m_nextDeskCommandSequence,
+                desk->m_completedCommandSequence,
+                kMaxPendingDeskCommands)) {
+            const std::uint64_t pending =
+                m_nextDeskCommandSequence >= desk->m_completedCommandSequence ?
+                    m_nextDeskCommandSequence -
+                        desk->m_completedCommandSequence :
+                    kMaxPendingDeskCommands;
+            LOG((CLOG_WARN
+                "Windows input command queue is full; rejecting async command message=%u pending=%llu desktop=%s",
+                static_cast<unsigned int>(msg),
+                static_cast<unsigned long long>(pending),
+                desk->m_name.c_str()));
+            requestRecovery = true;
+            recoveryReason = "queue full";
+            rejected = true;
+        }
+        else if (!rejected) {
+            sequence = ++m_nextDeskCommandSequence;
+        }
+    }
+
+    if (rejected) {
+        if (requestRecovery) {
+            requestInputRecovery(
+                msg, recoveryReason, isOrderedInputCommand(msg));
+        }
+        return false;
+    }
+
+    if (motionBoundarySequence != 0) {
+        const double boundaryTimeout =
+            deskCommandAckTimeoutForTest(
+                m_lowLatencyMode, m_nestedRemoteMode) +
+            deskCommandExecutionGraceForTest(
+                m_lowLatencyMode, m_nestedRemoteMode);
+        const DeskCommandWaitResult boundaryResult = waitForDeskCommand(
+            desk, motionBoundarySequence, boundaryTimeout);
+        if (boundaryResult == kDeskCommandFailed) {
+            LOG((CLOG_ERR
+                "Windows mouse motion injection failed before control boundary message=%u sequence=%llu desktop=%s",
+                static_cast<unsigned int>(msg),
+                static_cast<unsigned long long>(motionBoundarySequence),
+                desk->m_name.c_str()));
             return false;
         }
-        sequence = ++m_nextDeskCommandSequence;
+        if (boundaryResult == kDeskCommandTimedOut) {
+            {
+                Lock lock(&m_mutex);
+                if (desk == m_activeDesk && desk->m_commandResponsive) {
+                    ++m_inputDesktopGeneration;
+                }
+                desk->m_commandResponsive = false;
+                if (motionBoundarySequence >
+                    desk->m_poisonedThroughCommandSequence) {
+                    desk->m_poisonedThroughCommandSequence =
+                        motionBoundarySequence;
+                }
+            }
+            LOG((CLOG_ERR
+                "Windows mouse motion boundary failed to drain within %.3fs before message=%u sequence=%llu desktop=%s",
+                boundaryTimeout,
+                static_cast<unsigned int>(msg),
+                static_cast<unsigned long long>(motionBoundarySequence),
+                desk->m_name.c_str()));
+            requestInputRecovery(
+                msg, "mouse motion boundary timeout",
+                isOrderedInputCommand(msg));
+            return false;
+        }
     }
 
     DeskCommand* command = new DeskCommand(msg, wParam, lParam, sequence);
+    if (motionCommand) {
+        Lock lock(&m_mutex);
+        desk->m_lastMotionCommandSequence = sequence;
+        if (asyncMotionCommand) {
+            desk->m_pendingMotionCommand = command;
+        }
+    }
     if (PostThreadMessage(desk->m_threadID, BARRIER_MSG_DESK_COMMAND,
                           reinterpret_cast<WPARAM>(command), 0) == 0) {
         const DWORD error = GetLastError();
-        delete command;
         {
             Lock lock(&m_mutex);
+            if (desk->m_pendingMotionCommand == command) {
+                desk->m_pendingMotionCommand = NULL;
+            }
+            if (desk->m_lastMotionCommandSequence == sequence) {
+                desk->m_lastMotionCommandSequence =
+                    desk->m_completedCommandSequence;
+            }
             if (desk == m_activeDesk && desk->m_commandResponsive) {
                 ++m_inputDesktopGeneration;
             }
@@ -615,26 +1048,47 @@ MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
                 desk->m_cancelledCommandSequence = sequence;
             }
         }
+        delete command;
         LOG((CLOG_WARN
             "cannot post Windows input command message=%u sequence=%llu error=%lu",
             static_cast<unsigned int>(msg),
             static_cast<unsigned long long>(sequence),
             static_cast<unsigned long>(error)));
+        if (dispatch == kPostDeskCommand) {
+            requestInputRecovery(
+                msg, "PostThreadMessage failure", isOrderedInputCommand(msg));
+        }
         return false;
     }
 
-    if (!waitForDeskCommand(desk, sequence, kDeskCommandTimeout)) {
-        bool commandIsExecuting = false;
+    if (dispatch == kPostDeskCommand) {
+        return true;
+    }
+
+    const double commandTimeout =
+        deskCommandAckTimeoutForTest(m_lowLatencyMode, m_nestedRemoteMode);
+    const double commandExecutionGrace =
+        deskCommandExecutionGraceForTest(
+            m_lowLatencyMode, m_nestedRemoteMode);
+
+    const DeskCommandWaitResult initialResult =
+        waitForDeskCommand(desk, sequence, commandTimeout);
+    if (initialResult == kDeskCommandFailed) {
+        return false;
+    }
+    if (initialResult == kDeskCommandTimedOut) {
+        bool commandRequiresGrace = false;
         {
             Lock lock(&m_mutex);
             if (isDeskCommandCompleteForTest(
                     sequence, desk->m_completedCommandSequence,
                     desk->m_threadRunning)) {
-                return true;
+                return desk->m_failedCommandSequence != sequence;
             }
-            commandIsExecuting = !canCancelTimedOutDeskCommandForTest(
-                sequence, desk->m_executingCommandSequence);
-            if (!commandIsExecuting) {
+            commandRequiresGrace = !canCancelTimedOutDeskCommandForTest(
+                sequence, desk->m_executingCommandSequence,
+                isOrderedInputCommand(msg));
+            if (!commandRequiresGrace) {
                 if (desk == m_activeDesk && desk->m_commandResponsive) {
                     ++m_inputDesktopGeneration;
                 }
@@ -645,16 +1099,20 @@ MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
             }
         }
 
-        if (commandIsExecuting) {
+        if (commandRequiresGrace) {
             LOG((CLOG_WARN
-                "Windows input command exceeded %.3fs after execution began; allowing %.3fs recovery grace message=%u sequence=%llu desktop=%s",
-                kDeskCommandTimeout, kDeskCommandExecutionGrace,
+                "Windows input command exceeded %.3fs; allowing %.3fs completion grace message=%u sequence=%llu desktop=%s",
+                commandTimeout, commandExecutionGrace,
                 static_cast<unsigned int>(msg),
                 static_cast<unsigned long long>(sequence),
                 desk->m_name.c_str()));
-            if (waitForDeskCommand(
-                    desk, sequence, kDeskCommandExecutionGrace)) {
+            const DeskCommandWaitResult graceResult = waitForDeskCommand(
+                desk, sequence, commandExecutionGrace);
+            if (graceResult == kDeskCommandSucceeded) {
                 return true;
+            }
+            if (graceResult == kDeskCommandFailed) {
+                return false;
             }
 
             {
@@ -662,7 +1120,7 @@ MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
                 if (isDeskCommandCompleteForTest(
                         sequence, desk->m_completedCommandSequence,
                         desk->m_threadRunning)) {
-                    return true;
+                    return desk->m_failedCommandSequence != sequence;
                 }
                 if (desk == m_activeDesk && desk->m_commandResponsive) {
                     ++m_inputDesktopGeneration;
@@ -677,7 +1135,8 @@ MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
                 static_cast<unsigned int>(msg),
                 static_cast<unsigned long long>(sequence),
                 desk->m_name.c_str()));
-            m_events->addEvent(Event(Event::kQuit));
+            requestInputRecovery(
+                msg, "command completion timeout", isOrderedInputCommand(msg));
             return false;
         }
 
@@ -689,6 +1148,47 @@ MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
     }
 
     return true;
+}
+
+void
+MSWindowsDesks::requestInputRecovery(UINT msg, const char* reason,
+                                     bool orderedCommand) const
+{
+    bool startRecovery = false;
+    {
+        Lock lock(&m_mutex);
+        startRecovery =
+            beginInputRecoveryForTest(m_inputRecoveryRequested);
+    }
+    if (!startRecovery) {
+        return;
+    }
+
+    LOG((CLOG_ERR
+        "Windows %sinput command failed; requesting supervised process recovery message=%u reason=%s",
+        orderedCommand ? "ordered " : "async ",
+        static_cast<unsigned int>(msg),
+        reason != NULL ? reason : "<unknown>"));
+
+    // The normal path is Event::kQuit followed by watchdog restart. If a desk
+    // thread is stuck inside Windows and removeDesks() cannot join it, force
+    // only this process down so the external supervisor can replace it. The
+    // callback owns no object state and disappears with a normal process exit.
+    HANDLE hardExitThread = CreateThread(
+        NULL, 0, terminateInputProcessAfterRecoveryDeadline,
+        NULL, 0, NULL);
+    if (hardExitThread != NULL) {
+        CloseHandle(hardExitThread);
+    }
+    else {
+        LOG((CLOG_ERR
+            "could not arm Windows input recovery hard-exit deadline error=%lu",
+            static_cast<unsigned long>(GetLastError())));
+        TerminateProcess(GetCurrentProcess(), ERROR_PROCESS_ABORTED);
+        ExitProcess(ERROR_PROCESS_ABORTED);
+    }
+
+    m_events->addEvent(Event(Event::kQuit));
 }
 
 HCURSOR
@@ -805,7 +1305,7 @@ MSWindowsDesks::secondaryDeskProc(
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-void
+bool
 MSWindowsDesks::deskMouseMove(SInt32 x, SInt32 y) const
 {
     SInt32 originX = 0;
@@ -825,14 +1325,14 @@ MSWindowsDesks::deskMouseMove(SInt32 x, SInt32 y) const
         flags |= MOUSEEVENTF_MOVE_NOCOALESCE;
     }
 
-    sendMouseInput(
+    return sendMouseInput(
         normalizeMouseCoordinate(x, originX, width),
         normalizeMouseCoordinate(y, originY, height),
         flags,
         0);
 }
 
-void
+bool
 MSWindowsDesks::deskMouseRelativeMove(SInt32 dx, SInt32 dy) const
 {
     // relative moves are subject to cursor acceleration which we don't
@@ -869,12 +1369,13 @@ MSWindowsDesks::deskMouseRelativeMove(SInt32 dx, SInt32 dy) const
     if (m_lowLatencyMode || m_nestedRemoteMode) {
         flags |= MOUSEEVENTF_MOVE_NOCOALESCE;
     }
-    sendMouseInput(dx, dy, flags, 0);
+    const bool injected = sendMouseInput(dx, dy, flags, 0);
 
     if (manageAccelerationPerMove && accelChanged) {
         SystemParametersInfo(SPI_SETMOUSE, 0, oldSpeed, 0);
         SystemParametersInfo(SPI_SETMOUSESPEED, 0, oldSpeed + 3, 0);
     }
+    return injected;
 }
 
 void
@@ -907,7 +1408,7 @@ MSWindowsDesks::deskEnter(Desk* desk)
     desk->m_foregroundWindow = NULL;
 }
 
-void
+bool
 MSWindowsDesks::deskLeave(Desk* desk, HKL keyLayout)
 {
     ShowCursor(FALSE);
@@ -948,6 +1449,7 @@ MSWindowsDesks::deskLeave(Desk* desk, HKL keyLayout)
 
         // switch to requested keyboard layout
         ActivateKeyboardLayout(keyLayout, 0);
+        return true;
     }
     else {
         beginLowLatencyRelativeMoves();
@@ -965,7 +1467,7 @@ MSWindowsDesks::deskLeave(Desk* desk, HKL keyLayout)
 
         // warp the mouse to the cursor center
         LOG((CLOG_DEBUG2 "warping cursor to center: %+d,%+d", m_xCenter, m_yCenter));
-        deskMouseMove(m_xCenter, m_yCenter);
+        return deskMouseMove(m_xCenter, m_yCenter);
     }
 }
 
@@ -974,19 +1476,23 @@ void MSWindowsDesks::desk_thread(Desk* desk)
     MSG msg;
 
     // use given desktop for this thread
-    desk->m_threadID         = GetCurrentThreadId();
-    desk->m_window           = NULL;
+    {
+        Lock lock(&m_mutex);
+        desk->m_threadID = GetCurrentThreadId();
+    }
     desk->m_foregroundWindow = NULL;
     const bool threadAttached =
         desk->m_desk != NULL && SetThreadDesktop(desk->m_desk) != 0;
-    if (threadAttached) {
-        // create a message queue
-        PeekMessage(&msg, NULL, 0,0, PM_NOREMOVE);
 
+    // Create the thread message queue before advertising startup completion.
+    // removeDesks() can then safely post WM_QUIT once startup is complete.
+    PeekMessage(&msg, NULL, 0, 0, PM_NOREMOVE);
+    HWND window = NULL;
+    if (threadAttached) {
         // create a window.  we use this window to hide the cursor.
         try {
-            desk->m_window = createWindow(m_deskClass, "BarrierDesk");
-            LOG((CLOG_DEBUG "desk %s window is 0x%08x", desk->m_name.c_str(), desk->m_window));
+            window = createWindow(m_deskClass, "BarrierDesk");
+            LOG((CLOG_DEBUG "desk %s window is 0x%08x", desk->m_name.c_str(), window));
         }
         catch (...) {
             // ignore
@@ -996,32 +1502,45 @@ void MSWindowsDesks::desk_thread(Desk* desk)
 
     // Report capability, not just thread startup. A desktop without a
     // successful attachment and message window cannot accept input safely.
+    bool shutdownRequested = false;
     {
         Lock lock(&m_mutex);
+        desk->m_window = window;
         desk->m_threadAttached = threadAttached;
-        desk->m_windowReady = desk->m_window != NULL;
+        desk->m_windowReady = window != NULL;
         desk->m_startupComplete = true;
         desk->m_threadRunning = true;
+        shutdownRequested = desk->m_shutdownRequested;
         m_deskReady = true;
         m_deskReady.broadcast();
     }
 
     BOOL messageResult = 0;
-    while ((messageResult = GetMessage(&msg, NULL, 0, 0)) > 0) {
+    while (!shutdownRequested &&
+           (messageResult = GetMessage(&msg, NULL, 0, 0)) > 0) {
+        if (msg.message == BARRIER_MSG_DESK_STOP) {
+            break;
+        }
+
         DeskCommand* command = NULL;
         if (msg.message == BARRIER_MSG_DESK_COMMAND) {
             command = reinterpret_cast<DeskCommand*>(msg.wParam);
             if (command == NULL) {
                 continue;
             }
-            msg.message = command->message;
-            msg.wParam = command->wParam;
-            msg.lParam = command->lParam;
         }
 
         bool processCommand = true;
+        bool commandSucceeded = true;
+        DWORD commandError = ERROR_SUCCESS;
         if (command != NULL) {
             Lock lock(&m_mutex);
+            if (desk->m_pendingMotionCommand == command) {
+                desk->m_pendingMotionCommand = NULL;
+            }
+            msg.message = command->message;
+            msg.wParam = command->wParam;
+            msg.lParam = command->lParam;
             processCommand = shouldProcessDeskCommandForTest(
                 command->sequence, desk->m_cancelledCommandSequence);
             if (processCommand) {
@@ -1030,9 +1549,17 @@ void MSWindowsDesks::desk_thread(Desk* desk)
         }
 
         if (!processCommand) {
-            LOG((CLOG_DEBUG1
-                "dropping expired Windows input command sequence=%llu",
-                static_cast<unsigned long long>(command->sequence)));
+            if (isOrderedInputCommand(command->message)) {
+                LOG((CLOG_WARN
+                    "dropping expired ordered Windows input command message=%u sequence=%llu",
+                    static_cast<unsigned int>(command->message),
+                    static_cast<unsigned long long>(command->sequence)));
+            }
+            else {
+                LOG((CLOG_DEBUG1
+                    "dropping expired Windows input command sequence=%llu",
+                    static_cast<unsigned long long>(command->sequence)));
+            }
         }
         else switch (msg.message) {
         default:
@@ -1088,39 +1615,63 @@ void MSWindowsDesks::desk_thread(Desk* desk)
                 m_isOnScreen = false;
                 m_keyLayout = keyLayout;
             }
-            deskLeave(desk, keyLayout);
+            commandSucceeded = deskLeave(desk, keyLayout);
+            if (!commandSucceeded) {
+                commandError = GetLastError();
+            }
             break;
         }
 
         case BARRIER_MSG_FAKE_KEY:
-            sendKeyboardInput(HIBYTE(msg.lParam), LOBYTE(msg.lParam), (DWORD)msg.wParam);
+            commandSucceeded = sendKeyboardInput(
+                HIBYTE(msg.lParam), LOBYTE(msg.lParam), (DWORD)msg.wParam);
+            if (!commandSucceeded) {
+                commandError = GetLastError();
+            }
             break;
 
         case BARRIER_MSG_FAKE_BUTTON:
             if (msg.wParam != 0) {
-                sendMouseInput(0, 0, static_cast<DWORD>(msg.wParam),
-                                static_cast<DWORD>(msg.lParam));
+                commandSucceeded = sendMouseInput(
+                    0, 0, static_cast<DWORD>(msg.wParam),
+                    static_cast<DWORD>(msg.lParam));
+                if (!commandSucceeded) {
+                    commandError = GetLastError();
+                }
             }
             break;
 
         case BARRIER_MSG_FAKE_MOVE:
-            deskMouseMove(static_cast<SInt32>(msg.wParam),
-                            static_cast<SInt32>(msg.lParam));
+            commandSucceeded = deskMouseMove(
+                static_cast<SInt32>(msg.wParam),
+                static_cast<SInt32>(msg.lParam));
+            if (!commandSucceeded) {
+                commandError = GetLastError();
+            }
             break;
 
         case BARRIER_MSG_FAKE_REL_MOVE:
-            deskMouseRelativeMove(static_cast<SInt32>(msg.wParam),
-                            static_cast<SInt32>(msg.lParam));
+            commandSucceeded = deskMouseRelativeMove(
+                static_cast<SInt32>(msg.wParam),
+                static_cast<SInt32>(msg.lParam));
+            if (!commandSucceeded) {
+                commandError = GetLastError();
+            }
             break;
 
         case BARRIER_MSG_FAKE_WHEEL:
             if (msg.lParam != 0) {
-                sendMouseInput(0, 0, MOUSEEVENTF_WHEEL,
-                                static_cast<DWORD>(msg.lParam));
+                commandSucceeded = sendMouseInput(
+                    0, 0, MOUSEEVENTF_WHEEL,
+                    static_cast<DWORD>(msg.lParam));
             }
             else if (IsWindowsVistaOrGreater() && msg.wParam != 0) {
-                sendMouseInput(0, 0, MOUSEEVENTF_HWHEEL,
-                                static_cast<DWORD>(msg.wParam));
+                commandSucceeded = sendMouseInput(
+                    0, 0, MOUSEEVENTF_HWHEEL,
+                    static_cast<DWORD>(msg.wParam));
+            }
+            if (!commandSucceeded) {
+                commandError = GetLastError();
             }
             break;
 
@@ -1153,13 +1704,19 @@ void MSWindowsDesks::desk_thread(Desk* desk)
             break;
 
         case BARRIER_MSG_FAKE_INPUT:
-            sendKeyboardInput(BARRIER_HOOK_FAKE_INPUT_VIRTUAL_KEY,
-                                BARRIER_HOOK_FAKE_INPUT_SCANCODE,
-                                msg.wParam ? 0 : KEYEVENTF_KEYUP);
+            commandSucceeded = sendKeyboardInput(
+                BARRIER_HOOK_FAKE_INPUT_VIRTUAL_KEY,
+                BARRIER_HOOK_FAKE_INPUT_SCANCODE,
+                msg.wParam ? 0 : KEYEVENTF_KEYUP);
+            if (!commandSucceeded) {
+                commandError = GetLastError();
+            }
             break;
         }
 
         if (command != NULL) {
+            const bool commandInjectionFailed =
+                processCommand && !commandSucceeded;
             {
                 Lock lock(&m_mutex);
                 desk->m_completedCommandSequence = command->sequence;
@@ -1167,14 +1724,32 @@ void MSWindowsDesks::desk_thread(Desk* desk)
                     desk->m_executingCommandSequence = 0;
                 }
                 if (commandCompletionProvesResponsiveForTest(
-                        processCommand, command->sequence,
+                        processCommand, commandSucceeded, command->sequence,
                         desk->m_poisonedThroughCommandSequence)) {
                     desk->m_commandResponsive = true;
+                }
+                else if (commandInjectionFailed) {
+                    if (desk == m_activeDesk && desk->m_commandResponsive) {
+                        ++m_inputDesktopGeneration;
+                    }
+                    desk->m_commandResponsive = false;
+                    desk->m_failedCommandSequence = command->sequence;
                 }
                 m_deskReady = true;
                 m_deskReady.broadcast();
             }
+            const std::uint64_t completedSequence = command->sequence;
             delete command;
+            if (commandInjectionFailed) {
+                LOG((CLOG_ERR
+                    "Windows SendInput failed message=%u sequence=%llu error=%lu; rejecting input lease",
+                    static_cast<unsigned int>(msg.message),
+                    static_cast<unsigned long long>(completedSequence),
+                    static_cast<unsigned long>(commandError)));
+                requestInputRecovery(
+                    msg.message, "SendInput rejected input injection",
+                    isOrderedInputCommand(msg.message));
+            }
         }
     }
 
@@ -1185,7 +1760,14 @@ void MSWindowsDesks::desk_thread(Desk* desk)
 
     while (PeekMessage(&msg, NULL, BARRIER_MSG_DESK_COMMAND,
                        BARRIER_MSG_DESK_COMMAND, PM_REMOVE)) {
-        delete reinterpret_cast<DeskCommand*>(msg.wParam);
+        DeskCommand* command = reinterpret_cast<DeskCommand*>(msg.wParam);
+        {
+            Lock lock(&m_mutex);
+            if (desk->m_pendingMotionCommand == command) {
+                desk->m_pendingMotionCommand = NULL;
+            }
+        }
+        delete command;
     }
 
     // clean up
@@ -1196,12 +1778,19 @@ void MSWindowsDesks::desk_thread(Desk* desk)
         desk->m_threadAttached = false;
         desk->m_commandResponsive = false;
         desk->m_executingCommandSequence = 0;
+        desk->m_pendingMotionCommand = NULL;
         desk->m_threadRunning = false;
         m_deskReady.broadcast();
     }
     deskEnter(desk);
-    if (desk->m_window != NULL) {
-        DestroyWindow(desk->m_window);
+    if (window != NULL) {
+        DestroyWindow(window);
+    }
+    {
+        Lock lock(&m_mutex);
+        if (desk->m_window == window) {
+            desk->m_window = NULL;
+        }
     }
     if (desk->m_desk != NULL) {
         closeDesktop(desk->m_desk);
@@ -1222,17 +1811,19 @@ MSWindowsDesks::Desk* MSWindowsDesks::addDesk(const std::string& name, HDESK hde
     desk->m_windowReady = false;
     desk->m_hookInstalled = false;
     desk->m_startupComplete = false;
+    desk->m_startupDeadline =
+        static_cast<std::uint64_t>(GetTickCount64() + kDeskStartupDeadline);
+    desk->m_shutdownRequested = false;
     desk->m_threadRunning = false;
     desk->m_commandResponsive = false;
     desk->m_completedCommandSequence = 0;
     desk->m_cancelledCommandSequence = 0;
     desk->m_executingCommandSequence = 0;
     desk->m_poisonedThroughCommandSequence = 0;
+    desk->m_failedCommandSequence = 0;
+    desk->m_lastMotionCommandSequence = 0;
+    desk->m_pendingMotionCommand = NULL;
     desk->m_thread   = new Thread([this, desk]() { desk_thread(desk); });
-    if (!waitForDeskStartup(desk, kDeskStartupTimeout)) {
-        LOG((CLOG_WARN "Windows input desktop thread startup timed out: %s",
-            name.empty() ? "<unavailable>" : name.c_str()));
-    }
     m_desks.insert(std::make_pair(name, desk));
     return desk;
 }
@@ -1245,12 +1836,51 @@ MSWindowsDesks::removeDesks()
         Lock lock(&m_mutex);
         m_activeDesk = NULL;
         m_activeDeskName = "";
+        m_observedDeskName = "";
     }
 
     for (Desks::iterator index = m_desks.begin();
                             index != m_desks.end(); ++index) {
         Desk* desk = index->second;
-        PostThreadMessage(desk->m_threadID, WM_QUIT, 0, 0);
+        DWORD threadID = 0;
+        HWND window = NULL;
+        bool postQuit = false;
+        {
+            Lock lock(&m_mutex);
+            desk->m_shutdownRequested = true;
+            postQuit = shouldPostDeskQuitForTest(
+                desk->m_startupComplete, desk->m_threadID);
+            threadID = desk->m_threadID;
+            window = desk->m_threadRunning && desk->m_windowReady ?
+                desk->m_window : NULL;
+        }
+        bool stopPosted = !postQuit;
+        DWORD postError = ERROR_SUCCESS;
+        for (int attempt = 0;
+             postQuit && !stopPosted && attempt < kDeskStopPostRetries;
+             ++attempt) {
+            if (PostThreadMessage(threadID, WM_QUIT, 0, 0) != 0) {
+                stopPosted = true;
+                break;
+            }
+            postError = GetLastError();
+            if (window != NULL &&
+                PostMessage(window, BARRIER_MSG_DESK_STOP, 0, 0) != 0) {
+                stopPosted = true;
+                break;
+            }
+            if (desk->m_thread->wait(0.0)) {
+                stopPosted = true;
+                break;
+            }
+            Sleep(1);
+        }
+        if (!stopPosted) {
+            LOG((CLOG_ERR
+                "could not signal Windows input desktop thread shutdown id=%lu error=%lu; waiting for safe teardown",
+                static_cast<unsigned long>(threadID),
+                static_cast<unsigned long>(postError)));
+        }
         desk->m_thread->wait();
         delete desk->m_thread;
         delete desk;
@@ -1277,6 +1907,10 @@ MSWindowsDesks::checkDesk()
     Desk* desk;
     HDESK hdesk  = openInputDesktop();
     std::string name = getDesktopName(hdesk);
+    {
+        Lock lock(&m_mutex);
+        m_observedDeskName = name;
+    }
     Desks::const_iterator index = m_desks.find(name);
     if (index == m_desks.end()) {
         desk = addDesk(name, hdesk);
@@ -1296,15 +1930,83 @@ MSWindowsDesks::checkDesk()
         return;
     }
 
+    const bool inputLeaseActive = activeDesk != NULL && wasOnScreen;
+    const bool screensaverActive = m_screensaver->isActive();
+    if (name != activeDeskName && screensaverActive) {
+        if (inputLeaseActive) {
+            requestInputRecovery(
+                BARRIER_MSG_SWITCH,
+                "desktop changed during input lease while switching is blocked",
+                false);
+        }
+        else {
+            // screen saver might have started
+            PostThreadMessage(
+                m_threadID, BARRIER_MSG_SCREEN_SAVER, TRUE, 0);
+        }
+        return;
+    }
+
     // if active desktop changed then tell the old and new desk threads
     // about the change.  don't switch desktops when the screensaver is
     // active because we'd most likely switch to the screensaver desktop
     // which would have the side effect of forcing the screensaver to
     // stop.
-    if (name != activeDeskName && !m_screensaver->isActive()) {
-        // show cursor on previous desk
-        if (!wasOnScreen) {
-            sendMessage(BARRIER_MSG_ENTER, 0, 0);
+    if (name != activeDeskName) {
+        bool startupComplete = false;
+        std::uint64_t startupDeadline = 0;
+        bool canActivate = false;
+        {
+            Lock lock(&m_mutex);
+            startupComplete = desk->m_startupComplete;
+            startupDeadline = desk->m_startupDeadline;
+            canActivate = canActivateDesktopForTest(
+                desk->m_startupComplete,
+                desk->m_threadRunning,
+                desk->m_threadAttached,
+                desk->m_windowReady);
+        }
+        const std::uint64_t now =
+            static_cast<std::uint64_t>(GetTickCount64());
+        const DesktopTransitionAction transition =
+            desktopTransitionActionForTest(
+                false, canActivate, inputLeaseActive,
+                startupComplete, now, startupDeadline);
+        if (transition == kRecoverInputProcess) {
+            const char* reason = inputLeaseActive ?
+                "desktop changed before replacement helper was ready" :
+                (startupComplete ?
+                    "desktop helper startup capability failure" :
+                    "desktop helper startup timed out");
+            LOG((CLOG_ERR
+                "Windows input desktop cannot be activated safely; requesting recovery current=%s observed=%s lease=%d startupComplete=%d deadlineExpired=%d",
+                activeDeskName.empty() ?
+                    "<none>" : activeDeskName.c_str(),
+                name.empty() ? "<unavailable>" : name.c_str(),
+                inputLeaseActive ? 1 : 0,
+                startupComplete ? 1 : 0,
+                now >= startupDeadline ? 1 : 0));
+            requestInputRecovery(BARRIER_MSG_SWITCH, reason, false);
+            return;
+        }
+        if (transition == kWaitForObservedDesktop) {
+            LOG((CLOG_DEBUG1
+                "Windows input desktop is still starting without an active input lease current=%s pending=%s",
+                activeDeskName.empty() ?
+                    "<none>" : activeDeskName.c_str(),
+                name.empty() ? "<unavailable>" : name.c_str()));
+            return;
+        }
+
+        // Stop the old helper at an acknowledged control boundary before
+        // publishing the replacement. ENTER safely supersedes any queued
+        // motion and restores the old desktop's local cursor state.
+        if (activeDesk != NULL &&
+            !sendMessage(BARRIER_MSG_ENTER, 0, 0)) {
+            requestInputRecovery(
+                BARRIER_MSG_ENTER,
+                "could not stop old desktop input before handoff", false);
+            return;
         }
 
         // check for desk accessibility change.  we don't get events
@@ -1340,7 +2042,24 @@ MSWindowsDesks::checkDesk()
         }
         m_nextDeskRecoveryProbe =
             GetTickCount64() + kDeskRecoveryProbeInterval;
-        sendMessage(BARRIER_MSG_SWITCH, 0, 0);
+        if (!sendMessage(BARRIER_MSG_SWITCH, 0, 0)) {
+            {
+                Lock sendLock(&m_sendMutex);
+                Lock lock(&m_mutex);
+                if (m_activeDesk == desk) {
+                    m_activeDesk = activeDesk;
+                    m_activeDeskName = activeDeskName;
+                    ++m_inputDesktopGeneration;
+                }
+            }
+            LOG((CLOG_WARN
+                "Windows input desktop activation failed; restored desktop %s",
+                activeDeskName.empty() ? "<none>" : activeDeskName.c_str()));
+            if (!wasOnScreen && activeDesk != NULL) {
+                leave(keyLayout);
+            }
+            return;
+        }
 
         const DeskReadinessSnapshot readiness = getDeskReadiness(desk);
         if (readiness.ready) {
@@ -1363,7 +2082,7 @@ MSWindowsDesks::checkDesk()
 
         // hide cursor on new desk
         if (!wasOnScreen) {
-            sendMessage(BARRIER_MSG_LEAVE, reinterpret_cast<WPARAM>(keyLayout), 0);
+            leave(keyLayout);
         }
 
         // update keys if necessary
@@ -1371,11 +2090,7 @@ MSWindowsDesks::checkDesk()
             updateKeys();
         }
     }
-    else if (name != activeDeskName) {
-        // screen saver might have started
-        PostThreadMessage(m_threadID, BARRIER_MSG_SCREEN_SAVER, TRUE, 0);
-    }
-    else if (!m_screensaver->isActive() && !isDeskReady(desk) &&
+    else if (!screensaverActive && !isDeskReady(desk) &&
              GetTickCount64() >= m_nextDeskRecoveryProbe) {
         m_nextDeskRecoveryProbe =
             GetTickCount64() + kDeskRecoveryProbeInterval;
@@ -1430,20 +2145,7 @@ MSWindowsDesks::getDeskReadiness(const Desk* desk) const
     return snapshot;
 }
 
-bool
-MSWindowsDesks::waitForDeskStartup(const Desk* desk, double timeout) const
-{
-    Stopwatch timer;
-    Lock lock(&m_mutex);
-    while (!desk->m_startupComplete) {
-        if (!m_deskReady.wait(timer, timeout)) {
-            break;
-        }
-    }
-    return desk->m_startupComplete;
-}
-
-bool
+MSWindowsDesks::DeskCommandWaitResult
 MSWindowsDesks::waitForDeskCommand(const Desk* desk,
                                    std::uint64_t sequence,
                                    double timeout) const
@@ -1462,8 +2164,14 @@ MSWindowsDesks::waitForDeskCommand(const Desk* desk,
             break;
         }
     }
-    return isDeskCommandCompleteForTest(
-        sequence, desk->m_completedCommandSequence, desk->m_threadRunning);
+    if (!isDeskCommandCompleteForTest(
+            sequence, desk->m_completedCommandSequence,
+            desk->m_threadRunning)) {
+        return kDeskCommandTimedOut;
+    }
+    return commandInjectionSucceededForTest(
+        sequence, desk->m_failedCommandSequence) ?
+            kDeskCommandSucceeded : kDeskCommandFailed;
 }
 
 void

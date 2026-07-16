@@ -44,6 +44,22 @@ TEST(XWindowsScreenTests, clipboardCheckObservesOwnerChangesWithXFixes)
 		true, None, 0x200, 0x100));
 }
 
+TEST(XWindowsScreenTests, primaryLeaveGrabTimeoutForTest_lowLatencyFailsFast)
+{
+	EXPECT_LT(XWindowsScreen::primaryLeaveGrabTimeoutForTest(true), 0.1);
+}
+
+TEST(XWindowsScreenTests, primaryLeaveGrabTimeoutForTest_normalModeKeepsRecoveryWindow)
+{
+	EXPECT_GE(XWindowsScreen::primaryLeaveGrabTimeoutForTest(false), 1.0);
+}
+
+TEST(XWindowsScreenTests, primaryLeaveGrabRetrySleepForTest_lowLatencyKeepsQuickRetryCadence)
+{
+	EXPECT_LT(XWindowsScreen::primaryLeaveGrabRetrySleepForTest(true),
+		XWindowsScreen::primaryLeaveGrabTimeoutForTest(true));
+}
+
 #ifdef HAVE_XI2
 TEST(XWindowsScreenTests, xInputCookieUsableForTest_rejectsNullEventData)
 {

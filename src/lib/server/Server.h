@@ -141,6 +141,7 @@ public:
         m_inputHandoffPending(false),
         m_inputHandoffCommitReady(false),
         m_inputHandoffCommitted(false),
+        m_inputHandoffCommitAckPending(false),
         m_inputHandoffSource(NULL),
         m_inputHandoffTarget(NULL),
         m_inputHandoffSeqNum(0),
@@ -350,11 +351,19 @@ private:
     // change the active screen
     bool                switchScreen(BaseClientProxy*,
 		                            SInt32 x, SInt32 y, bool forScreenSaver,
-                                EDirection guardDir = kNoDirection);
+                                EDirection guardDir = kNoDirection,
+                                bool trackDirectCommit = true);
     bool                beginInputHandoff(BaseClientProxy*, SInt32, SInt32,
                                 EDirection);
     void                cancelInputHandoff(const char* reason, bool reanchor,
                                 bool notifyTarget = true);
+    void                trackCommittedInputHandoff(BaseClientProxy* source,
+                                BaseClientProxy* target, UInt32 seqNum,
+                                SInt32 sourceX, SInt32 sourceY,
+                                EDirection guardDir);
+    void                startInputHandoffCommitAckTimer();
+    void                finishCommittedInputHandoff();
+    void                rollbackCommittedInputHandoff(const char* reason);
     void                cleanupInputHandoffTimer();
 
     // jump to screen
@@ -674,6 +683,7 @@ private:
     bool                  m_inputHandoffPending;
     bool                  m_inputHandoffCommitReady;
     bool                  m_inputHandoffCommitted;
+    bool                  m_inputHandoffCommitAckPending;
     BaseClientProxy*      m_inputHandoffSource;
     BaseClientProxy*      m_inputHandoffTarget;
     UInt32                m_inputHandoffSeqNum;

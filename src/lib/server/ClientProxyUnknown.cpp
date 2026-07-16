@@ -29,6 +29,7 @@
 #include "server/ClientProxy1_7.h"
 #include "server/ClientProxy1_8.h"
 #include "server/ClientProxy1_9.h"
+#include "server/ClientProxy1_10.h"
 #include "barrier/protocol_types.h"
 #include "barrier/ProtocolUtil.h"
 #include "barrier/XBarrier.h"
@@ -297,6 +298,10 @@ ClientProxyUnknown::handleData(const Event&, void*)
 
             case 9:
                 m_proxy = new ClientProxy1_9(name, m_stream, m_server, m_events);
+                break;
+
+            case 10:
+                m_proxy = new ClientProxy1_10(name, m_stream, m_server, m_events);
                 break;
             }
         }

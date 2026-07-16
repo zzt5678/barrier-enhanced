@@ -139,6 +139,10 @@ public:
 	                            Window owner,
 	                            Window knownOwner,
 	                            Window ownWindow);
+	static double       primaryLeaveGrabTimeoutForTest(
+	                            bool lowLatencyMode);
+	static double       primaryLeaveGrabRetrySleepForTest(
+	                            bool lowLatencyMode);
 #ifdef HAVE_XI2
 	static bool         xInputCookieUsableForTest(
 	                            const XGenericEventCookie& cookie,

@@ -86,6 +86,7 @@ public:
                             bool forScreensaver) = 0;
     virtual bool        leave() = 0;
     virtual bool        supportsInputHandoff() const { return false; }
+    virtual bool        supportsInputHandoffCommitAck() const { return false; }
     virtual bool        supportsBulkChannel() const { return false; }
     virtual void        offerBulkChannel(const std::string&) { }
     virtual bool        attachBulkChannel(barrier::IStream*) { return false; }

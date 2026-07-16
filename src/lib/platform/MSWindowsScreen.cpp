@@ -110,6 +110,7 @@ MSWindowsScreen::MSWindowsScreen(
     m_markReceived(0),
     m_fixTimer(NULL),
     m_pendingShapeRefresh(false),
+    m_initialMouseMovePending(false),
     m_keyLayout(NULL),
     m_screensaver(NULL),
     m_screensaverNotify(false),
@@ -291,6 +292,7 @@ MSWindowsScreen::disable()
     }
 
     m_isOnScreen = m_isPrimary;
+    m_initialMouseMovePending = false;
     forceShowCursor();
 }
 
@@ -338,6 +340,7 @@ MSWindowsScreen::tryEnter()
 
     // now on screen
     m_isOnScreen = true;
+    m_initialMouseMovePending = !m_isPrimary;
     forceShowCursor();
     return true;
 }
@@ -354,8 +357,16 @@ MSWindowsScreen::leave()
     // tell the key mapper about the keyboard layout
     m_keyState->setKeyLayout(m_keyLayout);
 
-    // tell desk that we're leaving and tell it the keyboard layout
-    m_desks->leave(m_keyLayout);
+    // Do not publish an off-screen state unless the desktop helper has
+    // actually completed leave. The supervisor will replace a poisoned
+    // helper after a bounded command failure.
+    if (!m_desks->leave(m_keyLayout)) {
+        const std::string desktop = inputDesktopName();
+        LOG((CLOG_ERR
+            "Windows input desktop rejected screen leave desktop=%s",
+            desktop.empty() ? "<unknown>" : desktop.c_str()));
+        return false;
+    }
 
     if (m_isPrimary) {
 
@@ -386,6 +397,7 @@ MSWindowsScreen::leave()
 
     // now off screen
     m_isOnScreen = false;
+    m_initialMouseMovePending = false;
     forceShowCursor();
 
     if (isDraggingStarted() && !m_isPrimary) {
@@ -910,9 +922,11 @@ MSWindowsScreen::tryFakeMouseMove(SInt32 x, SInt32 y)
     x = (x < minX) ? minX : ((x > maxX) ? maxX : x);
     y = (y < minY) ? minY : ((y > maxY) ? maxY : y);
 
-    if (!m_desks->fakeMouseMove(x, y)) {
+    const bool waitForPlacement = m_initialMouseMovePending;
+    if (!m_desks->fakeMouseMove(x, y, waitForPlacement)) {
         return false;
     }
+    m_initialMouseMovePending = false;
     if (m_buttons[kButtonLeft]) {
         m_draggingStarted = true;
     }
@@ -1706,7 +1720,11 @@ MSWindowsScreen::warpCursorNoFlush(SInt32 x, SInt32 y)
             // returns to the center of the screen. this could have something to do with
             // the center screen warping technique used (see comments for onMouseMove
             // definition).
-            fakeMouseMove(x, y);
+            if (!m_desks->fakeMouseMove(x, y, true)) {
+                LOG((CLOG_ERR
+                    "synchronous Windows cursor warp fallback failed at %d,%d",
+                    x, y));
+            }
         }
     }
 

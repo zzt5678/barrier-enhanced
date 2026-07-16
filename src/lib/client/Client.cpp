@@ -488,9 +488,12 @@ Client::enterInputLease(SInt32 xAbs, SInt32 yAbs, UInt32 seqNum,
 bool
 Client::leave()
 {
-    m_active = false;
+    if (!m_screen->leave()) {
+        LOG((CLOG_ERR "input backend rejected leave; retaining active lease"));
+        return false;
+    }
 
-    m_screen->leave();
+    m_active = false;
 
     if (m_enableClipboard && m_server != NULL) {
         // Windows can miss the clipboard-viewer notification and only

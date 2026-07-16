@@ -288,6 +288,7 @@ private:
     // timer for periodically checking stuff that requires polling
     EventQueueTimer*    m_fixTimer;
     bool                m_pendingShapeRefresh;
+    bool                m_initialMouseMovePending;
 
     // the keyboard layout to use when off primary screen
     HKL                    m_keyLayout;

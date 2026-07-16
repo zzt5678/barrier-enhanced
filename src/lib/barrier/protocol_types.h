@@ -35,9 +35,10 @@
 // 1.8:  adds input epochs, per-connection input sequence, and explicit
 //       keyboard broadcast routing
 // 1.9:  adds a separately authenticated bulk payload connection
+// 1.10: adds positive acknowledgment after a committed input handoff
 // NOTE: with new version, barrier minor version should increment
 static const SInt16        kProtocolMajorVersion = 1;
-static const SInt16        kProtocolMinorVersion = 9;
+static const SInt16        kProtocolMinorVersion = 10;
 static const SInt16        kProtocolMinimumMinorVersion = 6;
 
 // default contact port number
@@ -292,8 +293,9 @@ extern const char*        kMsgDMouseWheel1_8;
 
 // response to kMsgCPrepareEnter: secondary -> primary.  A secondary that
 // becomes unavailable between prepare and commit sends a second rejection for
-// the same sequence.  $1 = sequence number, $2 = 1 when ready and 0 when
-// rejected.
+// the same sequence. Protocol 1.10 sends a second positive response only after
+// the input backend has committed the lease. $1 = sequence number, $2 = 1 when
+// ready/committed and 0 when rejected.
 extern const char*        kMsgDEnterReady;
 
 // clipboard data:  primary <-> secondary

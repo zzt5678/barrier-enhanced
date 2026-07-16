@@ -974,8 +974,22 @@ ServerProxy::enter()
         LOG((CLOG_WARN "replacing active input lease %u with %u", m_seqNum, seqNum));
         discardCompressedMouse();
         releaseEpochPressedInput();
+        if (!m_client->leave()) {
+            LOG((CLOG_ERR
+                "input backend could not release active lease %u before enter %u",
+                m_seqNum, seqNum));
+            m_hasPreparedEnter = false;
+            m_preparedEnterReady = false;
+            m_preparedInputGeneration = 0;
+            if (m_protocolMinorVersion >= 7) {
+                ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
+                                     static_cast<UInt8>(0));
+                return true;
+            }
+            m_client->disconnect("input backend could not replace active lease");
+            return false;
+        }
         m_inputActive = false;
-        m_client->leave();
     }
 
     // discard old compressed mouse motion, if any
@@ -1007,6 +1021,10 @@ ServerProxy::enter()
     }
     else {
         LOG((CLOG_INFO "input backend committed enter sequence %u", seqNum));
+        if (m_protocolMinorVersion >= 10) {
+            ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
+                                 static_cast<UInt8>(1));
+        }
     }
     return true;
 }
@@ -1069,12 +1087,20 @@ ServerProxy::leave()
     flushCompressedMouse();
     releaseEpochPressedInput();
 
-    // forward
+    // Keep the proxy and client ownership state aligned. COUT has no response,
+    // so a failed platform leave must tear down the connection and let the
+    // supervisor reclaim the input backend instead of silently losing it.
+    if (!m_client->leave()) {
+        LOG((CLOG_ERR
+            "input backend could not release active lease %u; disconnecting",
+            m_seqNum));
+        m_client->disconnect("input backend rejected screen leave");
+        return;
+    }
     m_inputActive = false;
     m_hasPreparedEnter = false;
     m_preparedEnterReady = false;
     m_preparedInputGeneration = 0;
-    m_client->leave();
 }
 
 void

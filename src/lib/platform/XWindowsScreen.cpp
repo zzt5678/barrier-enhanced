@@ -76,6 +76,10 @@ const double kClipboardSnapshotReadDeadlineSeconds = 2.0;
 const double kClipboardSnapshotShutdownWaitSeconds = 0.5;
 const double kClipboardSnapshotRetryBackoffSeconds = 0.05;
 const UInt32 kClipboardSnapshotMaxRetryAttempts = 2;
+const double kPrimaryLeaveGrabTimeoutSeconds = 1.0;
+const double kLowLatencyPrimaryLeaveGrabTimeoutSeconds = 0.025;
+const double kPrimaryLeaveGrabRetrySleepSeconds = 0.05;
+const double kLowLatencyPrimaryLeaveGrabRetrySleepSeconds = 0.005;
 
 class SnapshotDisplay {
 public:
@@ -1266,6 +1270,22 @@ XWindowsScreen::shouldObserveClipboardOnCheckForTest(
 {
 	const bool external = owner != None && owner != ownWindow;
 	return owner != knownOwner || (!hasXFixes && external);
+}
+
+double
+XWindowsScreen::primaryLeaveGrabTimeoutForTest(bool lowLatencyMode)
+{
+	return lowLatencyMode ?
+		kLowLatencyPrimaryLeaveGrabTimeoutSeconds :
+		kPrimaryLeaveGrabTimeoutSeconds;
+}
+
+double
+XWindowsScreen::primaryLeaveGrabRetrySleepForTest(bool lowLatencyMode)
+{
+	return lowLatencyMode ?
+		kLowLatencyPrimaryLeaveGrabRetrySleepSeconds :
+		kPrimaryLeaveGrabRetrySleepSeconds;
 }
 
 #ifdef HAVE_XI2
@@ -3255,12 +3275,10 @@ XWindowsScreen::grabMouseAndKeyboard()
 
 	// grab the mouse and keyboard.  keep trying until we get them.
 	// if we can't grab one after grabbing the other then ungrab
-	// and wait before retrying.  give up after s_timeout seconds.
-	static const double s_timeout = 1.0;
-	// In low latency mode, reduce sleep time for faster grab recovery
-	static const double kNormalSleep = 0.05;
-	static const double kLowLatencySleep = 0.005;  // 5ms instead of 50ms
-	double sleepTime = m_lowLatencyMode ? kLowLatencySleep : kNormalSleep;
+	// and wait before retrying.  Give up after the grab retry timeout.
+	// Display wake-up, when needed, is a separate step before this budget.
+	const double timeout = primaryLeaveGrabTimeoutForTest(m_lowLatencyMode);
+	const double sleepTime = primaryLeaveGrabRetrySleepForTest(m_lowLatencyMode);
 
 	int result;
 	Stopwatch timer;
@@ -3273,7 +3291,7 @@ XWindowsScreen::grabMouseAndKeyboard()
 			if (result != GrabSuccess) {
 				LOG((CLOG_DEBUG2 "waiting to grab keyboard"));
 				ARCH->sleep(sleepTime);
-				if (timer.getTime() >= s_timeout) {
+				if (timer.getTime() >= timeout) {
 					LOG((CLOG_DEBUG2 "grab keyboard timed out"));
 					return false;
 				}
@@ -3291,7 +3309,7 @@ XWindowsScreen::grabMouseAndKeyboard()
             m_impl->XUngrabKeyboard(m_display, CurrentTime);
 			LOG((CLOG_DEBUG2 "ungrabbed keyboard, waiting to grab pointer"));
 			ARCH->sleep(sleepTime);
-			if (timer.getTime() >= s_timeout) {
+			if (timer.getTime() >= timeout) {
 				LOG((CLOG_DEBUG2 "grab pointer timed out"));
 				return false;
 			}
