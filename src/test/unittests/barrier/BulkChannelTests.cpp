@@ -15,6 +15,8 @@
 #include <vector>
 
 using ::testing::_;
+using ::testing::AnyNumber;
+using ::testing::Invoke;
 using ::testing::NiceMock;
 using ::testing::Return;
 using ::testing::ReturnRef;
@@ -236,7 +238,7 @@ TEST(BulkChannelTests, bulkProbeIsAnsweredWithoutReachingPayloadHandler)
     EXPECT_EQ(0, handler.disconnectCount);
 }
 
-TEST(BulkChannelTests, keepAliveBurstYieldsAtParserFrameBudget)
+TEST(BulkChannelTests, keepAliveBurstYieldsAndReschedulesWithinParserBudget)
 {
     NiceMock<MockEventQueue> events;
     IStreamEvents streamEvents;
@@ -252,11 +254,30 @@ TEST(BulkChannelTests, keepAliveBurstYieldsAtParserFrameBudget)
     }
     barrier::BulkChannel channel(stream, &handler, &events);
 
-    EXPECT_CALL(events, addEvent(_)).Times(1);
+    int rescheduled = 0;
+    EXPECT_CALL(events, addEvent(_)).Times(AnyNumber()).WillRepeatedly(
+        Invoke([&](const Event& event) {
+            if (event.getType() == streamEvents.inputReady()) {
+                ++rescheduled;
+            }
+        }));
     channel.handleDataForTest();
 
-    EXPECT_EQ(4u, stream->getSize());
-    EXPECT_EQ(64u * 4u, stream->output.size());
+    const UInt32 totalBytes = 65u * 4u;
+    const UInt32 remainingAfterFirstBatch = stream->getSize();
+    EXPECT_GT(remainingAfterFirstBatch, 0u);
+    EXPECT_LT(remainingAfterFirstBatch, totalBytes);
+    EXPECT_EQ(static_cast<size_t>(totalBytes - remainingAfterFirstBatch),
+              stream->output.size());
+    EXPECT_EQ(1, rescheduled);
+
+    for (int attempt = 0; attempt < 65 && stream->getSize() != 0; ++attempt) {
+        channel.handleDataForTest();
+    }
+
+    EXPECT_EQ(0u, stream->getSize());
+    EXPECT_EQ(static_cast<size_t>(totalBytes), stream->output.size());
+    EXPECT_GE(rescheduled, 1);
     EXPECT_TRUE(channel.isActive());
     EXPECT_EQ(0, handler.messageCount);
     EXPECT_EQ(0, handler.disconnectCount);

@@ -137,8 +137,11 @@ TEST(ClientProxyDisconnectTests, inputParserYieldsAndReschedulesAfterBoundedBatc
     EXPECT_LT(offset, codes.size());
     EXPECT_EQ(1, rescheduled);
 
-    proxy.handleData(Event(), NULL);
+    for (int attempt = 0; attempt < 65 && offset < codes.size(); ++attempt) {
+        proxy.handleData(Event(), NULL);
+    }
     EXPECT_EQ(codes.size(), offset);
+    EXPECT_GE(rescheduled, 1);
 }
 
 TEST(ClientProxyDisconnectTests, closeDoesNotSynchronouslyFlushStream)

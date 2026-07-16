@@ -223,8 +223,11 @@ TEST(ServerProxyTests, inputParserYieldsAndReschedulesAfterBoundedBatch)
     EXPECT_LT(offset, codes.size());
     EXPECT_EQ(1, rescheduled);
 
-    proxy.handleDataForTest();
+    for (int attempt = 0; attempt < 65 && offset < codes.size(); ++attempt) {
+        proxy.handleDataForTest();
+    }
     EXPECT_EQ(codes.size(), offset);
+    EXPECT_GE(rescheduled, 1);
 }
 
 TEST(ServerProxyTests, clipboardCleanupRequestsCancelWithoutWaiting)

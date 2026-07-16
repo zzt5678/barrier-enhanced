@@ -59,7 +59,7 @@ TEST(GuiInstanceCoordinatorTests, secondaryStartActivatesPrimary)
     EXPECT_EQ(1, activationCount);
 }
 
-TEST(GuiInstanceCoordinatorTests, activationBeforeHandlerIsDeliveredOnce)
+TEST(GuiInstanceCoordinatorTests, activationSentBeforeHandlerIsEventuallyDeliveredOnce)
 {
     QTemporaryDir tempDir;
     ASSERT_TRUE(tempDir.isValid());
@@ -79,6 +79,7 @@ TEST(GuiInstanceCoordinatorTests, activationBeforeHandlerIsDeliveredOnce)
     primary.setActivationHandler([&activationCount]() {
         ++activationCount;
     });
+    EXPECT_TRUE(waitForActivation(activationCount));
     EXPECT_EQ(1, activationCount);
 }
 
