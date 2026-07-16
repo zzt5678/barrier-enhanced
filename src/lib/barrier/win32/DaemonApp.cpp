@@ -536,12 +536,18 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
                 static_cast<IpcNodeReadyV2Message*>(m);
             const char* desktop = ready->desktopName().empty() ?
                 "<none>" : ready->desktopName().c_str();
-            if (ready->inputReady()) {
+            if (ready->inputReady() && ready->queryNonce() != 0) {
                 LOG((CLOG_INFO "ipc node input readiness pid=%u session=%u desktop=%s generation=%llu ready=yes build=%s query=%llu",
                     ready->processId(), ready->sessionId(), desktop,
                     static_cast<unsigned long long>(ready->inputGeneration()),
                     ready->buildId().c_str(),
                     static_cast<unsigned long long>(ready->queryNonce())));
+            }
+            else if (ready->inputReady()) {
+                LOG((CLOG_DEBUG2 "ipc node input readiness pid=%u session=%u desktop=%s generation=%llu ready=yes build=%s query=0",
+                    ready->processId(), ready->sessionId(), desktop,
+                    static_cast<unsigned long long>(ready->inputGeneration()),
+                    ready->buildId().c_str()));
             }
             else {
                 LOG((CLOG_WARN "ipc node input readiness pid=%u session=%u desktop=%s generation=%llu ready=no build=%s query=%llu",
