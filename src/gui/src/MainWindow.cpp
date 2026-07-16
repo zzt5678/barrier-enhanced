@@ -365,6 +365,11 @@ void MainWindow::open()
     }
 }
 
+void MainWindow::activateFromSecondaryInstance()
+{
+    showControlCenter();
+}
+
 void MainWindow::setStatus(const QString &status)
 {
     m_pStatusLabel->setText(status);

@@ -11,6 +11,7 @@ set(GUI_COMMON_SOURCE_FILES
     src/Action.cpp
     src/CommandLine.cpp
     src/ElidingLabel.cpp
+    src/GuiInstanceCoordinator.cpp
     src/Hotkey.cpp
     src/KeySequence.cpp
     src/WindowLifecyclePolicy.cpp
@@ -20,6 +21,7 @@ set(GUI_COMMON_HEADER_FILES
     src/Action.h
     src/CommandLine.h
     src/ElidingLabel.h
+    src/GuiInstanceCoordinator.h
     src/Hotkey.h
     src/KeySequence.h
     src/WindowLifecyclePolicy.h
@@ -211,6 +213,7 @@ if (BARRIER_BUILD_TESTS)
         test/AppConfigTests.cpp
         test/ElidingLabelTests.cpp
         test/SettingsDialogTests.cpp
+        test/GuiInstanceCoordinatorTests.cpp
         test/WindowLifecyclePolicyTests.cpp
         test/main.cpp
         src/AppConfig.cpp

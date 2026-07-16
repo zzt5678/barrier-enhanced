@@ -21,12 +21,12 @@
 #include "AppConfig.h"
 #include "SetupWizard.h"
 #include "DisplayIsValid.h"
+#include "GuiInstanceCoordinator.h"
 
 #include <QtCore>
 #include <QtGui>
 #include <QSettings>
 #include <QMessageBox>
-#include <QLockFile>
 #include <QDir>
 #include <QFileInfo>
 #include <QSocketNotifier>
@@ -46,15 +46,6 @@
 #ifdef Q_OS_DARWIN
 #include <cstdlib>
 #endif
-
-class QThreadImpl : public QThread
-{
-public:
-	static void msleep(unsigned long msecs)
-	{
-		QThread::msleep(msecs);
-	}
-};
 
 #if defined(Q_OS_MAC)
 bool checkMacAssistiveDevices();
@@ -159,21 +150,16 @@ int main(int argc, char* argv[])
     installUnixSignalHandlers(app);
 #endif
 
-	// Single instance lock - prevent multiple barrier GUI instances
-	// This fixes the tray icon duplication issue when restarting barrier
-	QLockFile lockFile(QDir::temp().absoluteFilePath("weave-gui.lock"));
-	lockFile.setStaleLockTime(30000);
-    bool locked = false;
-    for (int attempt = 0; attempt < 20 && !locked; ++attempt) {
-        locked = lockFile.tryLock(100);
-        if (!locked) {
-            QThreadImpl::msleep(100);
-        }
-    }
-	if (!locked) {
-		QMessageBox::warning(nullptr, "Weave",
-			"Weave is already running.\n\n"
-			"If you need to restart, please quit the existing instance first.");
+	GuiInstanceCoordinator instanceCoordinator(
+		GuiInstanceCoordinator::defaultLockPath(),
+		GuiInstanceCoordinator::defaultServerName());
+	const GuiInstanceCoordinator::StartResult instanceResult =
+		instanceCoordinator.start();
+	if (instanceResult == GuiInstanceCoordinator::StartResult::ExistingActivated) {
+		return 0;
+	}
+	if (instanceResult != GuiInstanceCoordinator::StartResult::Primary) {
+		fprintf(stderr, "Unable to start or activate the Weave GUI.\n");
 		return 1;
 	}
 
@@ -223,6 +209,17 @@ int main(int argc, char* argv[])
 	{
 		mainWindow.open();
 	}
+
+	instanceCoordinator.setActivationHandler([&mainWindow, &setupWizard]() {
+		if (setupWizard.isVisible()) {
+			setupWizard.showNormal();
+			setupWizard.raise();
+			setupWizard.activateWindow();
+		}
+		else {
+			mainWindow.activateFromSecondaryInstance();
+		}
+	});
 
 	return app.exec();
 }

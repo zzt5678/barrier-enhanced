@@ -107,6 +107,7 @@ class MainWindow : public QMainWindow, public Ui::MainWindowBase
         QString address();
         QString appPath(const QString& name);
         void open();
+        void activateFromSecondaryInstance();
         VersionChecker& versionChecker() { return m_VersionChecker; }
         QString getScreenName();
         ServerConfig& serverConfig() { return m_ServerConfig; }
