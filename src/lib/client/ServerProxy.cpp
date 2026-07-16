@@ -427,7 +427,9 @@ ServerProxy::parseMessage(const UInt8* code)
     }
 
     else if (memcmp(code, kMsgCEnter, 4) == 0) {
-        enter();
+        if (!enter()) {
+            return kDisconnect;
+        }
     }
 
     else if (m_protocolMinorVersion >= 7 &&
@@ -930,7 +932,7 @@ ServerProxy::translateModifierMask(KeyModifierMask mask) const
     return newMask;
 }
 
-void
+bool
 ServerProxy::enter()
 {
     // parse
@@ -942,17 +944,17 @@ ServerProxy::enter()
 
     if (m_hasEnterSequence && !isNewerInputSequence(seqNum, m_seqNum)) {
         LOG((CLOG_WARN "ignoring stale enter sequence %u; current=%u", seqNum, m_seqNum));
-        return;
+        return true;
     }
 
     if (m_hasPreparedEnter && seqNum != m_preparedEnterSequence) {
         LOG((CLOG_WARN "ignoring enter sequence %u while prepared sequence %u is pending",
             seqNum, m_preparedEnterSequence));
-        return;
+        return true;
     }
     if (m_hasPreparedEnter && !m_preparedEnterReady) {
         LOG((CLOG_WARN "ignoring rejected enter sequence %u", seqNum));
-        return;
+        return true;
     }
     if (m_hasPreparedEnter &&
         (m_client->inputHandoffGeneration() != m_preparedInputGeneration ||
@@ -965,7 +967,7 @@ ServerProxy::enter()
         m_preparedInputGeneration = 0;
         ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
                              static_cast<UInt8>(0));
-        return;
+        return true;
     }
 
     if (m_inputActive) {
@@ -981,15 +983,32 @@ ServerProxy::enter()
     m_seqNum                = seqNum;
     m_hasEnterSequence      = true;
     m_ignoreMouse           = false;
-    m_inputActive           = true;
     m_hasPreparedEnter      = false;
     m_preparedEnterReady    = false;
     m_preparedInputGeneration = 0;
     m_lastInputSequence     = 0;
     m_hasInputSequence      = false;
 
-    // forward
-    m_client->enter(x, y, seqNum, static_cast<KeyModifierMask>(mask), false);
+    // Do not publish the lease until the platform input backend confirms that
+    // it accepted the commit.  A failed Windows desktop command must roll the
+    // server handoff back instead of leaving both peers without the pointer.
+    m_inputActive = m_client->enterInputLease(
+        x, y, seqNum, static_cast<KeyModifierMask>(mask), false);
+    if (!m_inputActive) {
+        LOG((CLOG_ERR "input backend rejected committed enter sequence %u", seqNum));
+        if (m_protocolMinorVersion >= 7) {
+            ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
+                                 static_cast<UInt8>(0));
+        }
+        else {
+            m_client->disconnect("input backend rejected screen enter");
+            return false;
+        }
+    }
+    else {
+        LOG((CLOG_INFO "input backend committed enter sequence %u", seqNum));
+    }
+    return true;
 }
 
 void

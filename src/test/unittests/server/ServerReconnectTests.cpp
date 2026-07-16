@@ -361,9 +361,13 @@ public:
 class EnterablePrimaryClient : public PrimaryClient
 {
 public:
-    explicit EnterablePrimaryClient(barrier::Screen* screen = NULL) :
-        PrimaryClient("primary", screen),
-        enterCount(0),
+	explicit EnterablePrimaryClient(barrier::Screen* screen = NULL) :
+		PrimaryClient("primary", screen),
+		shapeX(0),
+		shapeY(0),
+		shapeW(1024),
+		shapeH(768),
+		enterCount(0),
         enterX(0),
         enterY(0),
         enterSeqNum(0),
@@ -388,12 +392,12 @@ public:
         enterMask = mask;
         enterForScreensaver = forScreensaver;
     }
-    void getShape(SInt32& x, SInt32& y, SInt32& width, SInt32& height) const override
-    {
-        x = 0;
-        y = 0;
-        width = 1024;
-        height = 768;
+	void getShape(SInt32& x, SInt32& y, SInt32& width, SInt32& height) const override
+	{
+		x = shapeX;
+		y = shapeY;
+		width = shapeW;
+		height = shapeH;
     }
     void getCursorPos(SInt32& x, SInt32& y) const override
     {
@@ -401,7 +405,11 @@ public:
         y = 100;
     }
 
-    UInt32 enterCount;
+	SInt32 shapeX;
+	SInt32 shapeY;
+	SInt32 shapeW;
+	SInt32 shapeH;
+	UInt32 enterCount;
     SInt32 enterX;
     SInt32 enterY;
     UInt32 enterSeqNum;
@@ -431,6 +439,39 @@ public:
     UInt32 mouseMoveCount;
     SInt32 mouseMoveX;
     SInt32 mouseMoveY;
+};
+
+class LeaveFailsOncePrimaryClient : public LeavingFailsPrimaryClient
+{
+public:
+    explicit LeaveFailsOncePrimaryClient(barrier::Screen* screen) :
+        LeavingFailsPrimaryClient(screen),
+        leaveCount(0)
+    {
+    }
+
+    bool leave() override
+    {
+        ++leaveCount;
+        return leaveCount > 1;
+    }
+
+    UInt32 leaveCount;
+};
+
+class InvalidCursorPrimaryClient : public EnterablePrimaryClient
+{
+public:
+    explicit InvalidCursorPrimaryClient(barrier::Screen* screen) :
+        EnterablePrimaryClient(screen)
+    {
+    }
+
+    void getCursorPos(SInt32& x, SInt32& y) const override
+    {
+        x = -1;
+        y = -1;
+    }
 };
 
 class ClipboardPrimaryClient : public PrimaryClient
@@ -478,7 +519,8 @@ class DragPlatformScreen : public IPlatformScreen
 public:
     DragPlatformScreen() :
         IPlatformScreen(NULL),
-        draggingStarted(false)
+        draggingStarted(false),
+        asyncClipboardSnapshots(false)
     {
     }
 
@@ -488,6 +530,10 @@ public:
     bool leave() override { return true; }
     bool setClipboard(ClipboardID, const IClipboard*) override { return true; }
     void checkClipboards() override { }
+    bool hasAsyncClipboardSnapshots() const override
+    {
+        return asyncClipboardSnapshots;
+    }
     void openScreensaver(bool) override { }
     void closeScreensaver() override { }
     void screensaver(bool) override { }
@@ -550,6 +596,7 @@ public:
     void handleSystemEvent(const Event&, void*) override { }
 
     bool draggingStarted;
+    bool asyncClipboardSnapshots;
     String draggingFilename;
     String dropTarget;
 };
@@ -640,6 +687,7 @@ void initializeServer(Server& server, Config& config, PrimaryClient& primary,
     server.m_recentSwitchEntryY = 0;
     server.m_primaryReturnAnchorActive = false;
     server.m_primaryReturnAnchorClientName.clear();
+    server.m_primaryReturnAnchorDir = kNoDirection;
     server.m_primaryReturnAnchorX = 0;
     server.m_primaryReturnAnchorY = 0;
     server.m_switchWaitDelay = 0.0;
@@ -1858,12 +1906,83 @@ TEST(ServerReconnectTests, activeClientDisconnectEntersPrimaryAndClearsPendingSw
     EXPECT_EQ(&primary, server.m_active);
     EXPECT_EQ(NULL, server.m_switchScreen);
     EXPECT_EQ(1u, primary.enterCount);
-    EXPECT_EQ(512, primary.enterX);
-    EXPECT_EQ(384, primary.enterY);
+    EXPECT_EQ(100, primary.enterX);
+    EXPECT_EQ(100, primary.enterY);
     EXPECT_EQ(7u, primary.enterSeqNum);
     EXPECT_EQ(0u, primary.enterMask);
     EXPECT_FALSE(primary.enterForScreensaver);
     EXPECT_EQ(1u, screenSwitchedCount);
+}
+
+TEST(ServerReconnectTests, activeClientDisconnectRecoversNearRememberedPhysicalEdge)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient* client = new RecordingClient("client");
+    Server server;
+    initializeServer(server, config, primary, events, *client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.rememberPrimaryReturnAnchor(client, 0, 137, kLeft);
+
+    server.handleClientDisconnected(Event(), client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(16, primary.enterX);
+    EXPECT_EQ(137, primary.enterY);
+}
+
+TEST(ServerReconnectTests, activeClientDisconnectUsesCenterOnlyAfterInvalidLocalPoint)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    InvalidCursorPrimaryClient primary(&screen);
+    RecordingClient* client = new RecordingClient("client");
+    Server server;
+    initializeServer(server, config, primary, events, *client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+
+    server.handleClientDisconnected(Event(), client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(512, primary.enterX);
+    EXPECT_EQ(384, primary.enterY);
 }
 
 TEST(ServerReconnectTests, activeClientDisconnectDoesNotEnterUnavailablePrimary)
@@ -1953,9 +2072,47 @@ TEST(ServerReconnectTests, activeClientShapeChangedToUnusableRecoversToPrimary)
     EXPECT_EQ(&primary, server.m_active);
     EXPECT_EQ(NULL, server.m_switchScreen);
     EXPECT_EQ(1u, primary.enterCount);
-    EXPECT_EQ(512, primary.enterX);
-    EXPECT_EQ(384, primary.enterY);
+	EXPECT_EQ(100, primary.enterX);
+	EXPECT_EQ(100, primary.enterY);
     EXPECT_EQ(1u, screenSwitchedCount);
+}
+
+TEST(ServerReconnectTests, activeClientShapeRecoveryUsesRememberedPhysicalEdge)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.rememberPrimaryReturnAnchor(&client, 0, 137, kLeft);
+
+    client.shapeW = 0;
+    client.shapeH = 0;
+    server.handleShapeChanged(Event(), &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(16, primary.enterX);
+    EXPECT_EQ(137, primary.enterY);
 }
 
 TEST(ServerReconnectTests, adoptClient_replacesActiveSameNameClient_entersNewClient)
@@ -2002,6 +2159,59 @@ TEST(ServerReconnectTests, adoptClient_replacesActiveSameNameClient_entersNewCli
     EXPECT_EQ(KeyModifierCapsLock, newClient.enterMask);
     EXPECT_FALSE(newClient.enterForScreensaver);
     EXPECT_TRUE(connectedEventOwnsData);
+}
+
+TEST(ServerReconnectTests, activeClientReentryRejectionRestoresPrimaryLease)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient oldClient("client");
+    TransactionalRecordingClient newClient("client");
+    Server server;
+    initializeServer(server, config, primary, events, oldClient);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.rememberPrimaryReturnAnchor(&oldClient, 0, 137, kLeft);
+
+    server.adoptClient(&newClient);
+
+    ASSERT_EQ(&newClient, server.m_active);
+    ASSERT_EQ(1u, newClient.enterCount);
+    ASSERT_TRUE(server.m_inputHandoffCommitted);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&newClient, server.m_inputHandoffTarget);
+    EXPECT_EQ(newClient.enterSeqNum, server.m_inputHandoffSeqNum);
+
+    BaseClientProxy::InputHandoffReadyInfo rejected(
+        newClient.enterSeqNum, false);
+    Event rejectedEvent(Event::kUnknown, &newClient, &rejected,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(rejectedEvent, &newClient);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(16, primary.enterX);
+    EXPECT_EQ(137, primary.enterY);
 }
 
 TEST(ServerReconnectTests, adoptClientReplacingSameNameInterruptsOldSendTarget)
@@ -2391,7 +2601,7 @@ TEST(ServerReconnectTests, recentReverseSwitchGuardConsumesOnlyOneBounceEvent)
     EXPECT_EQ(1u, primary.enterCount);
 }
 
-TEST(ServerReconnectTests, repeatedRoundTripCanLeavePrimaryAfterInteriorReturn)
+TEST(ServerReconnectTests, repeatedRoundTripReturnsAtOriginalPrimaryEdge)
 {
     Config config;
     config.addScreen("primary");
@@ -2424,15 +2634,15 @@ TEST(ServerReconnectTests, repeatedRoundTripCanLeavePrimaryAfterInteriorReturn)
     ASSERT_EQ(&client, server.m_active);
     ASSERT_EQ(1u, client.enterCount);
 
-    // Move inward to confirm the first entry, then cross back with enough
-    // relative-motion overshoot to land inside the primary instead of at its edge.
+	// Move inward to confirm the first entry, then cross back with a large
+	// relative-motion overshoot. The source-space overshoot must not strand the
+	// pointer in the middle of an aggregate primary desktop.
     server.onMouseMoveSecondary(-160, 0);
     ASSERT_EQ(&client, server.m_active);
     server.onMouseMoveSecondary(660, 0);
     ASSERT_EQ(&primary, server.m_active);
     ASSERT_EQ(1u, primary.enterCount);
-    ASSERT_GT(primary.enterX, 96);
-    ASSERT_LT(primary.enterX, 1024 - 96);
+	ASSERT_EQ(16, primary.enterX);
 
     EXPECT_TRUE(server.onMouseMovePrimary(0, 100));
     EXPECT_EQ(&client, server.m_active);
@@ -2479,6 +2689,146 @@ TEST(ServerReconnectTests, nearEdgePrimaryReturnAllowsImmediateIntentionalRecros
 
     EXPECT_TRUE(server.onMouseMovePrimary(0, 100));
     EXPECT_EQ(&client, server.m_active);
+}
+
+TEST(ServerReconnectTests, repeatedEdgeRoundTripsRemainUsable)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1;
+    server.m_y = 100;
+
+    for (UInt32 round = 0; round < 100; ++round) {
+        ASSERT_TRUE(server.onMouseMovePrimary(0, 100)) << "round " << round;
+        ASSERT_EQ(&client, server.m_active) << "round " << round;
+
+        server.onMouseMoveSecondary(-160, 0);
+        server.onMouseMoveSecondary(177, 0);
+
+        ASSERT_EQ(&primary, server.m_active) << "round " << round;
+        ASSERT_EQ(16, primary.enterX) << "round " << round;
+        ASSERT_FALSE(server.m_recentSwitchGuardActive) << "round " << round;
+    }
+
+    EXPECT_EQ(100u, client.enterCount);
+    EXPECT_EQ(100u, primary.enterCount);
+}
+
+TEST(ServerReconnectTests, primaryReturnOvershootStaysAtOriginalExitEdge)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 0;
+    server.m_y = 100;
+
+    ASSERT_TRUE(server.switchScreen(&client, 1022, 100, false, kLeft));
+    ASSERT_EQ(&client, server.m_active);
+
+    // A large relative delta from the client can map to the opposite side of
+    // the aggregate primary desktop. Return to the edge that was actually
+    // used to leave instead of stranding the pointer across two monitors.
+    ASSERT_TRUE(server.switchScreen(&primary, 1022, 100, false, kRight));
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(16, primary.enterX);
+
+    EXPECT_TRUE(server.onMouseMovePrimary(0, 100));
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(2u, client.enterCount);
+}
+
+TEST(ServerReconnectTests, primaryReturnOvershootUsesPhysicalEdgeOnWideAggregateDesktop)
+{
+	Config config;
+	config.addScreen("primary");
+	config.addScreen("client");
+	ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+		"client", 0.0f, 1.0f));
+	ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+		"primary", 0.0f, 1.0f));
+
+	NiceMock<MockEventQueue> events;
+	ClientProxyEvents clientProxyEvents;
+	IScreenEvents screenEvents;
+	ClipboardEvents clipboardEvents;
+	ServerEvents serverEvents;
+	setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+		clipboardEvents, serverEvents);
+
+	AnchoringPlatformScreen* platformScreen = new AnchoringPlatformScreen();
+	platformScreen->areas.push_back(
+		AnchoringPlatformScreen::Area(0, 0, 5120, 2880));
+	platformScreen->areas.push_back(
+		AnchoringPlatformScreen::Area(5120, 0, 5120, 2880));
+	barrier::Screen screen(platformScreen, &events);
+	EnterablePrimaryClient primary(&screen);
+	primary.shapeW = 10240;
+	primary.shapeH = 2880;
+	RecordingClient client("client");
+	client.shapeW = 2560;
+	client.shapeH = 1440;
+
+	Server server;
+	initializeServer(server, config, primary, events, client);
+	server.m_screen = &screen;
+	server.m_active = &primary;
+	server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+	server.m_clientSet.insert(&primary);
+	server.m_x = 0;
+	server.m_y = 720;
+
+	ASSERT_TRUE(server.switchScreen(&client, 2542, 720, false, kLeft));
+	ASSERT_TRUE(server.switchScreen(&primary, 2542, 720, false, kRight));
+
+	EXPECT_EQ(&primary, server.m_active);
+	EXPECT_EQ(16, primary.enterX);
+	EXPECT_EQ(720, primary.enterY);
 }
 
 TEST(ServerReconnectTests, primaryReturnUsesLastPrimaryOutputAnchor)
@@ -2962,7 +3312,58 @@ TEST(ServerReconnectTests, failedPrimaryLeaveRecoversNearAttemptedRightEdge)
     EXPECT_EQ(&primary, server.m_active);
 }
 
-TEST(ServerReconnectTests, switchScreenDefersPrimaryClipboardReadAndReplay)
+TEST(ServerReconnectTests, failedEdgeGateClearsAfterMovingAwayWithoutTimeDelay)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kRight, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    LeaveFailsOncePrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    EXPECT_FALSE(server.onMouseMovePrimary(1023, 137));
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(1u, primary.leaveCount);
+    ASSERT_TRUE(server.m_primaryLeaveFailedRecently);
+    ASSERT_EQ(kRight, server.m_primaryLeaveFailureDir);
+
+    // Continued pressure at the same edge is the synthetic loop this gate is
+    // meant to absorb. It must not issue another leave immediately.
+    EXPECT_FALSE(server.onMouseMovePrimary(1023, 137));
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.leaveCount);
+
+    // Moving inward expresses release of that edge. A new push can retry
+    // immediately; no fixed two-second blackout is involved.
+    EXPECT_FALSE(server.onMouseMovePrimary(900, 137));
+    EXPECT_FALSE(server.m_primaryLeaveFailedRecently);
+    EXPECT_TRUE(server.onMouseMovePrimary(1023, 137));
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(2u, primary.leaveCount);
+    EXPECT_EQ(1u, client.enterCount);
+}
+
+TEST(ServerReconnectTests, switchScreenDoesNotReadPrimaryClipboardDuringDeferredSync)
 {
     Config config;
     config.addScreen("primary");
@@ -2993,6 +3394,8 @@ TEST(ServerReconnectTests, switchScreenDefersPrimaryClipboardReadAndReplay)
     clipboard.m_clipboardOwner = primary.getName();
     clipboard.m_clipboardSeqNum = 10;
     clipboard.m_pendingClipboardFetch = true;
+    clipboard.m_clipboard = makeTextClipboard("last committed clipboard");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
     primary.sourceClipboard = makeTextClipboard("clipboard read must be deferred");
     primary.clipboardAvailable = true;
 
@@ -3001,11 +3404,164 @@ TEST(ServerReconnectTests, switchScreenDefersPrimaryClipboardReadAndReplay)
     EXPECT_EQ(0u, primary.getClipboardCount);
     EXPECT_EQ(0u, client.setClipboardCount);
     EXPECT_EQ(&client, server.m_active);
+    EXPECT_TRUE(server.m_clipboardSyncTimer != NULL);
+    EXPECT_FALSE(server.m_clipboardFetchPending);
 
     server.handleClipboardSync(Event(), NULL);
 
-    EXPECT_GT(primary.getClipboardCount, 0u);
+    EXPECT_EQ(0u, primary.getClipboardCount);
     EXPECT_GT(client.setClipboardCount, 0u);
+}
+
+TEST(ServerReconnectTests, asyncPrimaryClipboardGrabNeverSchedulesProviderRead)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    platformScreen->asyncClipboardSnapshots = true;
+    barrier::Screen screen(platformScreen, &events);
+    ClipboardPrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_enableClipboard = true;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboard = makeTextClipboard("stale clipboard");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+    primary.sourceClipboard = makeTextClipboard("fresh clipboard");
+    primary.clipboardAvailable = true;
+
+    IScreen::ClipboardInfo eventInfo;
+    eventInfo.m_id = kClipboardClipboard;
+    eventInfo.m_sequenceNumber = 10;
+    server.handleClipboardGrabbed(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &primary);
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+    EXPECT_EQ(NULL, server.m_clipboardSyncTimer);
+    EXPECT_EQ(0u, primary.getClipboardCount);
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 100, false, kRight));
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+    EXPECT_EQ(0u, primary.getClipboardCount);
+
+    // The platform emits this only after its isolated worker has populated
+    // getClipboard's in-memory snapshot cache.
+    server.handleClipboardChanged(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &primary);
+    EXPECT_EQ(1u, primary.getClipboardCount);
+
+    server.handleClipboardSync(Event(), NULL);
+
+    EXPECT_EQ(1u, primary.getClipboardCount);
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    EXPECT_NE(client.setClipboardIds.end(),
+              std::find(client.setClipboardIds.begin(),
+                        client.setClipboardIds.end(), kClipboardClipboard));
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("fresh clipboard", clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
+}
+
+TEST(ServerReconnectTests, supersededAsyncClipboardChangedDoesNotRetryOnEventQueue)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    platformScreen->asyncClipboardSnapshots = true;
+    barrier::Screen screen(platformScreen, &events);
+    ClipboardPrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_enableClipboard = true;
+    primary.clipboardAvailable = false;
+
+    IScreen::ClipboardInfo eventInfo;
+    eventInfo.m_id = kClipboardClipboard;
+    eventInfo.m_sequenceNumber = 10;
+    server.handleClipboardGrabbed(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &primary);
+    server.handleClipboardChanged(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &primary);
+
+    EXPECT_EQ(1u, primary.getClipboardCount);
+    EXPECT_TRUE(
+        server.m_clipboards[kClipboardClipboard].m_pendingClipboardFetch);
+    EXPECT_EQ(NULL, server.m_clipboardSyncTimer);
+}
+
+TEST(ServerReconnectTests, staleClipboardCompletionFromPreviousOwnerIsRejected)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+
+    Server::ClipboardInfo& clipboard =
+        server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_clipboard = makeTextClipboard("current owner data");
+    primary.sourceClipboard = makeTextClipboard("stale primary data");
+    primary.clipboardAvailable = true;
+
+    EXPECT_FALSE(server.onClipboardChanged(
+        &primary, kClipboardClipboard, 10));
+    EXPECT_EQ(0u, primary.getClipboardCount);
+    EXPECT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("current owner data",
+              clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
 }
 
 TEST(ServerReconnectTests, fileChunkSendingUsesTransferTargetWhenActiveChanges)
@@ -3189,7 +3745,7 @@ TEST(ServerReconnectTests, onClipboardChangedCachesLocalFileListForActiveReplay)
 	EXPECT_EQ("/tmp/local-file.txt", remoteFileClipboard.paths[0].u8string());
 }
 
-TEST(ServerReconnectTests, handleClipboardGrabbedDefersReadAndDoesNotPreGrabOtherScreens)
+TEST(ServerReconnectTests, handlePrimaryClipboardGrabSchedulesSnapshotOutsideInputHandoff)
 {
     Config config;
     config.addScreen("primary");
@@ -3214,7 +3770,7 @@ TEST(ServerReconnectTests, handleClipboardGrabbedDefersReadAndDoesNotPreGrabOthe
     server.m_readyFileClipboardSession = "ready-session";
     server.m_readyFileClipboardPaths.push_back(
         barrier::fs::u8path("/tmp/stale").u8string());
-    primary.sourceClipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/local-file.txt"));
+    primary.sourceClipboard = makeTextClipboard("fresh local clipboard");
     primary.clipboardAvailable = true;
 
     IScreen::ClipboardInfo eventInfo;
@@ -3228,11 +3784,31 @@ TEST(ServerReconnectTests, handleClipboardGrabbedDefersReadAndDoesNotPreGrabOthe
     EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
     EXPECT_EQ(10u, clipboard.m_clipboardSeqNum);
     EXPECT_TRUE(clipboard.m_pendingClipboardFetch);
+    EXPECT_TRUE(server.m_clipboardSyncTimer != NULL);
+    EXPECT_TRUE(server.m_clipboardFetchPending);
     EXPECT_EQ(0u, primary.getClipboardCount);
     EXPECT_EQ(0u, client.grabClipboardCount);
     EXPECT_EQ(0u, client.clipboardDirtyCount);
     EXPECT_EQ(0u, client.setClipboardCount);
     EXPECT_EQ(0u, primary.clipboardDirtyCount);
+
+    server.handleClipboardSync(Event(), NULL);
+
+    EXPECT_EQ(NULL, server.m_clipboardSyncTimer);
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    EXPECT_EQ(1u, primary.getClipboardCount);
+    EXPECT_EQ(1u, client.clipboardDirtyCount);
+    EXPECT_TRUE(client.lastClipboardDirty);
+    EXPECT_GT(client.setClipboardCount, 0u);
+    EXPECT_NE(client.setClipboardIds.end(),
+              std::find(client.setClipboardIds.begin(),
+                        client.setClipboardIds.end(), kClipboardClipboard));
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("fresh local clipboard",
+              clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
 }
 
 TEST(ServerReconnectTests, handleClipboardGrabbedOnActivePrimaryDefersReadAndBroadcast)
@@ -3270,12 +3846,51 @@ TEST(ServerReconnectTests, handleClipboardGrabbedOnActivePrimaryDefersReadAndBro
     EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
     EXPECT_EQ(10u, clipboard.m_clipboardSeqNum);
     EXPECT_TRUE(clipboard.m_pendingClipboardFetch);
+    EXPECT_TRUE(server.m_clipboardSyncTimer != NULL);
+    EXPECT_TRUE(server.m_clipboardFetchPending);
     EXPECT_EQ(0u, primary.getClipboardCount);
     EXPECT_EQ(0u, primary.clipboardDirtyCount);
     EXPECT_EQ(0u, primary.setClipboardCount);
     EXPECT_EQ(0u, client.grabClipboardCount);
     EXPECT_EQ(0u, client.clipboardDirtyCount);
     EXPECT_EQ(0u, client.setClipboardCount);
+}
+
+TEST(ServerReconnectTests, remoteClipboardGrabDoesNotSchedulePrimarySnapshot)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    IScreen::ClipboardInfo eventInfo;
+    eventInfo.m_id = kClipboardClipboard;
+    eventInfo.m_sequenceNumber = 10;
+    server.handleClipboardGrabbed(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &client);
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    EXPECT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    EXPECT_TRUE(clipboard.m_pendingClipboardFetch);
+    EXPECT_EQ(NULL, server.m_clipboardSyncTimer);
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+    EXPECT_EQ(0u, primary.getClipboardCount);
 }
 
 TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsCapturesTextWithoutGrabEvent)
@@ -3313,7 +3928,7 @@ TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsCapturesTextWithoutGrabE
 
     server.fetchPendingPrimaryClipboards();
 
-    EXPECT_GT(primary.getClipboardCount, 0u);
+    EXPECT_EQ(1u, primary.getClipboardCount);
     EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
     EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
     ASSERT_TRUE(clipboard.m_clipboard.open(0));

@@ -268,10 +268,10 @@ MSWindowsDesks::disable()
     m_isOnScreen = m_isPrimary;
 }
 
-void
+bool
 MSWindowsDesks::enter()
 {
-    sendMessage(BARRIER_MSG_ENTER, 0, 0);
+    return sendMessage(BARRIER_MSG_ENTER, 0, 0);
 }
 
 void
@@ -490,12 +490,12 @@ MSWindowsDesks::fakeMouseButton(ButtonID button, bool press)
     sendMessage(BARRIER_MSG_FAKE_BUTTON, flags, data);
 }
 
-void
+bool
 MSWindowsDesks::fakeMouseMove(SInt32 x, SInt32 y) const
 {
-    sendMessage(BARRIER_MSG_FAKE_MOVE,
-                            static_cast<WPARAM>(x),
-                            static_cast<LPARAM>(y));
+    return sendMessage(BARRIER_MSG_FAKE_MOVE,
+                       static_cast<WPARAM>(x),
+                       static_cast<LPARAM>(y));
 }
 
 void
@@ -586,6 +586,15 @@ MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam) const
         if (desk == NULL || !desk->m_threadRunning ||
             !desk->m_threadAttached || !desk->m_windowReady ||
             (!desk->m_commandResponsive && msg != BARRIER_MSG_SWITCH)) {
+            if (msg == BARRIER_MSG_ENTER) {
+                LOG((CLOG_WARN
+                    "Windows input enter rejected before dispatch desktop=%s running=%d attached=%d windowReady=%d responsive=%d",
+                    desk == NULL ? "<none>" : desk->m_name.c_str(),
+                    desk != NULL && desk->m_threadRunning ? 1 : 0,
+                    desk != NULL && desk->m_threadAttached ? 1 : 0,
+                    desk != NULL && desk->m_windowReady ? 1 : 0,
+                    desk != NULL && desk->m_commandResponsive ? 1 : 0));
+            }
             return false;
         }
         sequence = ++m_nextDeskCommandSequence;

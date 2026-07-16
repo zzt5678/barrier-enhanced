@@ -93,6 +93,7 @@ public:
     // ISecondaryScreen overrides
     virtual void        fakeMouseButton(ButtonID id, bool press) override;
     virtual void        fakeMouseMove(SInt32 x, SInt32 y) override;
+    virtual bool        tryFakeMouseMove(SInt32 x, SInt32 y) override;
     virtual void        fakeMouseRelativeMove(SInt32 dx, SInt32 dy) const override;
     virtual void        fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const override;
 
@@ -110,6 +111,7 @@ public:
     virtual bool        prepareInputBackend() override;
     virtual void        disable() override;
     virtual void        enter() override;
+    virtual bool        tryEnter() override;
     virtual bool        leave() override;
     virtual bool        setClipboard(ClipboardID, const IClipboard*) override;
     virtual void        checkClipboards() override;

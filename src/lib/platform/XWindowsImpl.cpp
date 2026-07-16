@@ -495,6 +495,23 @@ int XWindowsImpl::XISelectEvents(Display* display, Window w, XIEventMask* masks,
     return ::XISelectEvents(display, w, masks, num_masks);
 }
 
+#ifdef HAVE_XFIXES
+Bool XWindowsImpl::XFixesQueryExtension(Display* display,
+                                        int* event_base_return,
+                                        int* error_base_return)
+{
+    return ::XFixesQueryExtension(display, event_base_return,
+                                  error_base_return);
+}
+
+void XWindowsImpl::XFixesSelectSelectionInput(Display* display, Window window,
+                                              Atom selection,
+                                              unsigned long event_mask)
+{
+    ::XFixesSelectSelectionInput(display, window, selection, event_mask);
+}
+#endif
+
 Atom XWindowsImpl::XInternAtom(Display* display, _Xconst char* atom_name,
                                Bool only_if_exists)
 {

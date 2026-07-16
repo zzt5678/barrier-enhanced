@@ -97,6 +97,8 @@ public:
         getClipboardCount(0),
         lastSetClipboardWasNull(false),
         enterable(true),
+        failDuringEnter(false),
+        failMouseMove(false),
         inputBackendGeneration(1),
         clipboardAvailable(false),
         clipboardContainsFileList(false),
@@ -106,7 +108,18 @@ public:
 
     void enable() override { }
     void disable() override { }
-    void enter() override { ++enterCount; }
+    void enter() override
+    {
+        ++enterCount;
+        if (failDuringEnter) {
+            enterable = false;
+        }
+    }
+    bool tryEnter() override
+    {
+        enter();
+        return enterable;
+    }
     bool leave() override
     {
         ++leaveCount;
@@ -191,6 +204,11 @@ public:
         }
     }
     void fakeMouseMove(SInt32, SInt32) override { ++mouseMoveCount; }
+    bool tryFakeMouseMove(SInt32, SInt32) override
+    {
+        ++mouseMoveCount;
+        return !failMouseMove;
+    }
     void fakeMouseRelativeMove(SInt32, SInt32) const override { ++mouseRelativeMoveCount; }
     void fakeMouseWheel(SInt32, SInt32) const override { ++mouseWheelCount; }
     void updateKeyMap() override { }
@@ -238,6 +256,8 @@ public:
     mutable UInt32 getClipboardCount;
     bool lastSetClipboardWasNull;
     bool enterable;
+    bool failDuringEnter;
+    bool failMouseMove;
     std::uint64_t inputBackendGeneration;
     Clipboard lastSetClipboard;
     bool clipboardAvailable;
@@ -1575,6 +1595,139 @@ TEST(ClientDisconnectTests, changedInputGenerationRejectsPreparedCommit)
                                     &rejectedSeqNum, &commitReady));
     EXPECT_EQ(44u, rejectedSeqNum);
     EXPECT_EQ(0u, commitReady);
+}
+
+TEST(ClientDisconnectTests, failedPlatformEnterRejectsPreparedCommit)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->failDuringEnter = true;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 7);
+    client.handshakeComplete();
+
+    ProtocolUtil::writef(&stream, kMsgCPrepareEnter + 4, 10, 20, 45, 0);
+    proxy.prepareEnter();
+
+    UInt32 readySeqNum = 0;
+    UInt8 ready = 0;
+    ASSERT_TRUE(ProtocolUtil::readf(&stream, kMsgDEnterReady,
+                                    &readySeqNum, &ready));
+    ASSERT_EQ(45u, readySeqNum);
+    ASSERT_EQ(1u, ready);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 45, 0);
+    proxy.enter();
+
+    EXPECT_EQ(1u, platform->enterCount);
+    EXPECT_EQ(0u, platform->mouseMoveCount);
+    EXPECT_FALSE(proxy.m_inputActive);
+
+    UInt32 rejectedSeqNum = 0;
+    UInt8 commitReady = 1;
+    ASSERT_TRUE(ProtocolUtil::readf(&stream, kMsgDEnterReady,
+                                    &rejectedSeqNum, &commitReady));
+    EXPECT_EQ(45u, rejectedSeqNum);
+    EXPECT_EQ(0u, commitReady);
+}
+
+TEST(ClientDisconnectTests, failedInitialMousePositionRollsBackCommittedEnter)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->failMouseMove = true;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 7);
+    client.handshakeComplete();
+
+    ProtocolUtil::writef(&stream, kMsgCPrepareEnter + 4, 10, 20, 46, 0);
+    proxy.prepareEnter();
+    UInt32 preparedSeqNum = 0;
+    UInt8 prepared = 0;
+    ASSERT_TRUE(ProtocolUtil::readf(&stream, kMsgDEnterReady,
+                                    &preparedSeqNum, &prepared));
+    ASSERT_EQ(46u, preparedSeqNum);
+    ASSERT_EQ(1u, prepared);
+
+    stream.clearData();
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 46, 0);
+    EXPECT_TRUE(proxy.enter());
+
+    EXPECT_EQ(1u, platform->enterCount);
+    EXPECT_EQ(1u, platform->mouseMoveCount);
+    EXPECT_EQ(1u, platform->leaveCount);
+    EXPECT_FALSE(proxy.m_inputActive);
+
+    UInt32 rejectedSeqNum = 0;
+    UInt8 committed = 1;
+    ASSERT_TRUE(ProtocolUtil::readf(&stream, kMsgDEnterReady,
+                                    &rejectedSeqNum, &committed));
+    EXPECT_EQ(46u, rejectedSeqNum);
+    EXPECT_EQ(0u, committed);
+}
+
+TEST(ClientDisconnectTests, legacyProtocolDisconnectsWhenInitialPositionFails)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->failMouseMove = true;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 6);
+    client.handshakeComplete();
+
+    ProtocolUtil::writef(&stream, kMsgCEnter + 4, 10, 20, 47, 0);
+    EXPECT_FALSE(proxy.enter());
+
+    EXPECT_EQ(1u, platform->enterCount);
+    EXPECT_EQ(1u, platform->mouseMoveCount);
+    EXPECT_EQ(1u, platform->leaveCount);
+    EXPECT_FALSE(proxy.m_inputActive);
 }
 
 TEST(ClientDisconnectTests, protocol18RejectsStaleEpochAndReplayedInput)

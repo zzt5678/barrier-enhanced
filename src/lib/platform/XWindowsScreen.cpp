@@ -19,11 +19,13 @@
 #include "platform/XWindowsScreen.h"
 
 #include "platform/XWindowsClipboard.h"
+#include "platform/XWindowsClipboardSnapshotState.h"
 #include "platform/XWindowsEventQueueBuffer.h"
 #include "platform/XWindowsKeyState.h"
 #include "platform/XWindowsScreenSaver.h"
 #include "platform/XWindowsUtil.h"
 #include "barrier/Clipboard.h"
+#include "barrier/ClipboardChunk.h"
 #include "barrier/KeyMap.h"
 #include "barrier/XScreen.h"
 #include "arch/XArch.h"
@@ -32,18 +34,222 @@
 #include "base/Stopwatch.h"
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
+#include "mt/Thread.h"
 
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <condition_variable>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
 
 static int xi_opcode;
 
+struct XWindowsClipboardSnapshotWorkerContext {
+    XWindowsClipboardSnapshotWorkerContext(
+        const String& displayName_, IEventQueue* events_, void* eventTarget_) :
+        displayName(displayName_),
+        events(events_),
+        eventTarget(eventTarget_),
+        clipboardChangedEvent(Event::kUnknown),
+        stopping(false)
+    {
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    XWindowsClipboardSnapshotState snapshots;
+    String displayName;
+    IEventQueue* events;
+    void* eventTarget;
+    Event::Type clipboardChangedEvent;
+    bool stopping;
+};
+
 namespace {
+
+const double kClipboardSnapshotReadDeadlineSeconds = 2.0;
+const double kClipboardSnapshotShutdownWaitSeconds = 0.5;
+const double kClipboardSnapshotRetryBackoffSeconds = 0.05;
+const UInt32 kClipboardSnapshotMaxRetryAttempts = 2;
+
+class SnapshotDisplay {
+public:
+    explicit SnapshotDisplay(const String& displayName) :
+        display(NULL),
+        window(None)
+    {
+        display = impl.XOpenDisplay(
+            displayName.empty() ? NULL : displayName.c_str());
+        if (display == NULL) {
+            return;
+        }
+
+        XSetWindowAttributes attributes = {};
+        attributes.event_mask = PropertyChangeMask;
+        window = impl.XCreateWindow(
+            display, impl.do_DefaultRootWindow(display), 0, 0, 1, 1, 0, 0,
+            InputOnly, CopyFromParent, CWEventMask, &attributes);
+    }
+
+    ~SnapshotDisplay()
+    {
+        if (display != NULL) {
+            if (window != None) {
+                impl.XDestroyWindow(display, window);
+            }
+            impl.XCloseDisplay(display);
+        }
+    }
+
+    XWindowsImpl impl;
+    Display* display;
+    Window window;
+};
+
+bool
+readClipboardSnapshot(
+    const std::shared_ptr<XWindowsClipboardSnapshotWorkerContext>& context,
+    XWindowsClipboardSnapshotState::Request* request,
+    std::shared_ptr<const String>* snapshot, Window* currentOwner,
+    bool* ownerObserved)
+{
+    *snapshot = std::shared_ptr<const String>();
+    *currentOwner = None;
+    *ownerObserved = false;
+
+    SnapshotDisplay workerDisplay(context->displayName);
+    if (workerDisplay.display == NULL || workerDisplay.window == None) {
+        LOG((CLOG_WARN "could not open an independent X11 clipboard display"));
+        return false;
+    }
+
+    XWindowsClipboard source(
+        &workerDisplay.impl, workerDisplay.display, workerDisplay.window,
+        request->id, ARCH->time() + kClipboardSnapshotReadDeadlineSeconds);
+    *currentOwner = workerDisplay.impl.XGetSelectionOwner(
+        workerDisplay.display, source.getSelection());
+    *ownerObserved = true;
+    if (*currentOwner != request->owner) {
+        return false;
+    }
+
+    if (request->timestamp == CurrentTime) {
+        request->timestamp = XWindowsUtil::getCurrentTime(
+            workerDisplay.display, workerDisplay.window);
+    }
+    Clipboard clipboard;
+    const bool copiedToMemory = Clipboard::copy(
+        &clipboard, &source, request->timestamp);
+    const bool copied = copiedToMemory && source.wasLastReadValid();
+    if (copiedToMemory && !copied) {
+        LOG((CLOG_DEBUG
+            "rejecting X11 clipboard snapshot without provider-read evidence"));
+    }
+    *currentOwner = workerDisplay.impl.XGetSelectionOwner(
+        workerDisplay.display, source.getSelection());
+    if (!copied || *currentOwner != request->owner) {
+        return false;
+    }
+
+    std::shared_ptr<String> marshalled(
+        new String(clipboard.marshall()));
+    if (marshalled->size() > ClipboardChunk::kMaxReceiveSize) {
+        LOG((CLOG_WARN
+            "refusing oversized local clipboard snapshot: size=%lu limit=%lu",
+            static_cast<unsigned long>(marshalled->size()),
+            static_cast<unsigned long>(ClipboardChunk::kMaxReceiveSize)));
+        return false;
+    }
+
+    *snapshot = marshalled;
+    return true;
+}
+
+void
+runClipboardSnapshotWorker(
+    const std::shared_ptr<XWindowsClipboardSnapshotWorkerContext>& context)
+{
+    for (;;) {
+        Thread::testCancel();
+
+        XWindowsClipboardSnapshotState::Request request;
+        {
+            std::unique_lock<std::mutex> lock(context->mutex);
+            context->wake.wait(lock, [&context]() {
+                return context->stopping || context->snapshots.hasPending();
+            });
+            if (context->stopping) {
+                return;
+            }
+            if (!context->snapshots.takeNext(&request)) {
+                continue;
+            }
+        }
+
+        std::shared_ptr<const String> snapshot;
+        Window currentOwner = None;
+        bool ownerObserved = false;
+        const bool copied = readClipboardSnapshot(
+            context, &request, &snapshot, &currentOwner, &ownerObserved);
+
+        bool retryQueued = false;
+        {
+            std::lock_guard<std::mutex> lock(context->mutex);
+            if (context->stopping) {
+                return;
+            }
+            if (!copied || !context->snapshots.complete(
+                    request, currentOwner, snapshot)) {
+                retryQueued = ownerObserved ?
+                    context->snapshots.retry(
+                        request, currentOwner,
+                        kClipboardSnapshotMaxRetryAttempts) :
+                    context->snapshots.retryWithoutOwnerObservation(
+                        request, kClipboardSnapshotMaxRetryAttempts);
+                if (!retryQueued) {
+                    if (ownerObserved) {
+                        context->snapshots.fail(request, currentOwner);
+                    }
+                    else {
+                        context->snapshots.failWithoutOwnerObservation(
+                            request);
+                    }
+                }
+                LOG((CLOG_DEBUG
+                    "%s unavailable or stale X11 clipboard snapshot: id=%d generation=%llu attempt=%u owner=0x%lx current=%s0x%lx",
+                    retryQueued ? "retrying" : "discarded",
+                    request.id,
+                    static_cast<unsigned long long>(request.generation),
+                    request.attempt,
+                    static_cast<unsigned long>(request.owner),
+                    ownerObserved ? "" : "unobserved/",
+                    static_cast<unsigned long>(currentOwner)));
+            }
+            else {
+                IScreen::ClipboardInfo* info =
+                    static_cast<IScreen::ClipboardInfo*>(
+                        std::malloc(sizeof(IScreen::ClipboardInfo)));
+                if (info != NULL) {
+                    info->m_id = request.id;
+                    info->m_sequenceNumber = request.sequenceNumber;
+                    context->events->addEvent(Event(
+                        context->clipboardChangedEvent,
+                        context->eventTarget, info));
+                }
+            }
+        }
+
+        if (retryQueued) {
+            ARCH->sleep(kClipboardSnapshotRetryBackoffSeconds);
+            context->wake.notify_one();
+        }
+    }
+}
 
 bool
 normalizeToScreenShape(const char* operation,
@@ -441,6 +647,10 @@ XWindowsScreen::XWindowsScreen(
 	m_ic(NULL),
 	m_lastKeycode(0),
 	m_sequenceNumber(0),
+	m_clipboardSnapshotContext(),
+	m_clipboardSnapshotThread(NULL),
+	m_clipboardSnapshotsBootstrapped(false),
+	m_clipboardSnapshotThreadingEnabled(!disableXInitThreads),
     m_dropTargetPath(),
 	m_screensaver(NULL),
 	m_screensaverNotify(false),
@@ -454,6 +664,8 @@ XWindowsScreen::XWindowsScreen(
 	m_lowLatencyMode(false),
 	m_xrandr(false),
 	m_xrandrEventBase(0),
+	m_xfixes(false),
+	m_xfixesEventBase(0),
 	m_events(events)
 {
 	for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
@@ -523,6 +735,16 @@ XWindowsScreen::XWindowsScreen(
 			m_clipboard[id] = new XWindowsClipboard(m_impl, m_display,
 				m_window, id);
 		}
+		if (m_clipboardSnapshotThreadingEnabled) {
+			m_clipboardSnapshotContext.reset(
+				new XWindowsClipboardSnapshotWorkerContext(
+					DisplayString(m_display), m_events, getEventTarget()));
+		}
+		else {
+			LOG((CLOG_WARN
+				"asynchronous X11 clipboard snapshots are disabled by --no-xinitthreads; provider isolation is unavailable"));
+		}
+		m_xfixes = detectXFixesSelectionNotifications();
 
 		// install event handlers
 		m_events->adoptHandler(Event::kSystem, m_events->getSystemTarget(),
@@ -563,6 +785,7 @@ void
 XWindowsScreen::releaseResources(bool eventBufferInstalled,
 	bool systemHandlerInstalled)
 {
+	stopClipboardSnapshotWorker();
 	if (eventBufferInstalled) {
 		m_events->adoptBuffer(NULL);
 	}
@@ -615,6 +838,8 @@ XWindowsScreen::enable()
 		// warp the mouse to the cursor center
 		fakeMouseMove(m_xCenter, m_yCenter);
 	}
+
+	bootstrapClipboardSnapshots();
 }
 
 void
@@ -781,30 +1006,69 @@ XWindowsScreen::setClipboard(ClipboardID id, const IClipboard* clipboard)
 	if (m_clipboard[id] == NULL) {
 		return false;
 	}
+	if (m_clipboardSnapshotContext) {
+		std::lock_guard<std::mutex> lock(m_clipboardSnapshotContext->mutex);
+		// A remote clipboard is about to become our selection. Revoke any
+		// external-owner snapshot before its worker can publish stale data.
+		m_clipboardSnapshotContext->snapshots.invalidate(id, m_window);
+	}
 
 	// get the actual time.  ICCCM does not allow CurrentTime.
 	Time timestamp = XWindowsUtil::getCurrentTime(
 								m_display, m_clipboard[id]->getWindow());
 
+	bool copied = false;
 	if (clipboard != NULL) {
 		// save clipboard data
-		return Clipboard::copy(m_clipboard[id], clipboard, timestamp);
+		copied = Clipboard::copy(m_clipboard[id], clipboard, timestamp);
 	}
 	else {
 		// assert clipboard ownership
 		if (!m_clipboard[id]->open(timestamp)) {
 			return false;
 		}
-		m_clipboard[id]->empty();
+		copied = m_clipboard[id]->empty();
 		m_clipboard[id]->close();
-		return true;
 	}
+	return copied;
 }
 
 void
 XWindowsScreen::checkClipboards()
 {
-	// do nothing, we're always up to date
+	if (!m_clipboardSnapshotContext) {
+		return;
+	}
+
+	// This is only an owner query, never a provider data read. It supplies a
+	// safe leave-time fallback when XFixes is unavailable.
+	for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+		const Window owner = m_impl->XGetSelectionOwner(
+			m_display, m_clipboard[id]->getSelection());
+		Window knownOwner = None;
+		{
+			std::lock_guard<std::mutex> lock(
+				m_clipboardSnapshotContext->mutex);
+			knownOwner =
+				m_clipboardSnapshotContext->snapshots.currentOwner(id);
+		}
+		const bool external = owner != None && owner != m_window;
+		if (shouldObserveClipboardOnCheckForTest(
+				m_xfixes, owner, knownOwner, m_window)) {
+			// Without XFixes, a selection owner can update its payload while
+			// keeping the same owner window. Re-snapshot at this safe leave-time
+			// check, but only re-announce ownership when the owner changed.
+			observeClipboardOwner(
+				id, owner, CurrentTime, !m_xfixes && external,
+				external && owner != knownOwner);
+		}
+	}
+}
+
+bool
+XWindowsScreen::hasAsyncClipboardSnapshots() const
+{
+	return m_clipboardSnapshotContext != NULL;
 }
 
 void
@@ -987,6 +1251,23 @@ XWindowsScreen::visibleAreaTopologiesEqualForTest(
 	return visibleAreaTopologiesEqual(first, second);
 }
 
+bool
+XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+	int eventType, int selectionEventType, int subtype, int setOwnerSubtype,
+	Window owner, Window ownWindow)
+{
+	return eventType == selectionEventType && subtype == setOwnerSubtype &&
+		owner != None && owner != ownWindow;
+}
+
+bool
+XWindowsScreen::shouldObserveClipboardOnCheckForTest(
+	bool hasXFixes, Window owner, Window knownOwner, Window ownWindow)
+{
+	const bool external = owner != None && owner != ownWindow;
+	return owner != knownOwner || (!hasXFixes && external);
+}
+
 #ifdef HAVE_XI2
 bool
 XWindowsScreen::xInputCookieUsableForTest(
@@ -1011,12 +1292,198 @@ XWindowsScreen::getEventTarget() const
 }
 
 bool
+XWindowsScreen::queueClipboardSnapshot(ClipboardID id, Window owner,
+	Time timestamp, bool announceGrab)
+{
+	if (!m_clipboardSnapshotContext || owner == None || owner == m_window) {
+		return false;
+	}
+
+	if (m_clipboardSnapshotThread == NULL) {
+		const std::shared_ptr<XWindowsClipboardSnapshotWorkerContext> context =
+			m_clipboardSnapshotContext;
+		m_clipboardSnapshotThread = new Thread([context]() {
+			runClipboardSnapshotWorker(context);
+		});
+	}
+
+	std::lock_guard<std::mutex> lock(m_clipboardSnapshotContext->mutex);
+	if (m_clipboardSnapshotContext->stopping) {
+		return false;
+	}
+	if (m_clipboardSnapshotContext->clipboardChangedEvent == Event::kUnknown) {
+		m_clipboardSnapshotContext->clipboardChangedEvent =
+			m_events->forClipboard().clipboardChanged();
+	}
+	// Enqueue ownership before making the snapshot visible. The worker takes
+	// this same mutex, so even a spurious condition-variable wake cannot post
+	// clipboardChanged ahead of clipboardGrabbed.
+	if (announceGrab) {
+		sendClipboardEvent(m_events->forClipboard().clipboardGrabbed(), id);
+	}
+	m_clipboardSnapshotContext->snapshots.queue(
+		id, owner, timestamp, m_sequenceNumber);
+	return true;
+}
+
+void
+XWindowsScreen::wakeClipboardSnapshotWorker()
+{
+	if (m_clipboardSnapshotContext) {
+		m_clipboardSnapshotContext->wake.notify_one();
+	}
+}
+
+void
+XWindowsScreen::observeClipboardOwner(ClipboardID id, Window owner,
+	Time timestamp, bool contentChanged, bool announceGrab)
+{
+	if (id >= kClipboardEnd) {
+		return;
+	}
+
+	if (!m_clipboardSnapshotContext) {
+		// --no-xinitthreads cannot safely run Xlib on a worker. Suppress the
+		// notification instead of causing Server to read an arbitrary provider
+		// on its input EventQueue.
+		return;
+	}
+
+	Window knownOwner = None;
+	{
+		std::lock_guard<std::mutex> lock(
+			m_clipboardSnapshotContext->mutex);
+		knownOwner = m_clipboardSnapshotContext->snapshots.currentOwner(id);
+	}
+	if (!contentChanged && owner == knownOwner) {
+		return;
+	}
+
+	if (owner == None || owner == m_window) {
+		std::lock_guard<std::mutex> lock(
+			m_clipboardSnapshotContext->mutex);
+		m_clipboardSnapshotContext->snapshots.invalidate(id, owner);
+		return;
+	}
+
+	m_clipboard[id]->lost(timestamp);
+	const bool queued = queueClipboardSnapshot(
+		id, owner, timestamp, announceGrab);
+	if (queued) {
+		wakeClipboardSnapshotWorker();
+	}
+}
+
+void
+XWindowsScreen::bootstrapClipboardSnapshots()
+{
+	if (m_clipboardSnapshotsBootstrapped) {
+		return;
+	}
+	m_clipboardSnapshotsBootstrapped = true;
+
+	if (!m_clipboardSnapshotContext) {
+		return;
+	}
+	for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+		const Window owner = m_impl->XGetSelectionOwner(
+			m_display, m_clipboard[id]->getSelection());
+		observeClipboardOwner(
+			id, owner, CurrentTime, true,
+			owner != None && owner != m_window);
+	}
+}
+
+void
+XWindowsScreen::stopClipboardSnapshotWorker()
+{
+	const std::shared_ptr<XWindowsClipboardSnapshotWorkerContext> context =
+		m_clipboardSnapshotContext;
+	if (context) {
+		{
+			std::lock_guard<std::mutex> lock(context->mutex);
+			context->stopping = true;
+			for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+				context->snapshots.invalidate(id, None);
+			}
+		}
+		context->wake.notify_all();
+	}
+
+	if (m_clipboardSnapshotThread != NULL) {
+		m_clipboardSnapshotThread->cancel();
+		if (!m_clipboardSnapshotThread->wait(
+				kClipboardSnapshotShutdownWaitSeconds)) {
+			LOG((CLOG_WARN
+				"X11 clipboard snapshot worker did not stop within %.3fs; detaching its isolated context",
+				kClipboardSnapshotShutdownWaitSeconds));
+		}
+		delete m_clipboardSnapshotThread;
+		m_clipboardSnapshotThread = NULL;
+	}
+	m_clipboardSnapshotContext.reset();
+}
+
+bool
 XWindowsScreen::getClipboard(ClipboardID id, IClipboard* clipboard) const
 {
 	assert(clipboard != NULL);
 
 	// fail if we don't have the requested clipboard
 	if (m_clipboard[id] == NULL) {
+		return false;
+	}
+
+	if (m_clipboardSnapshotContext) {
+		std::shared_ptr<const String> snapshot;
+		Window snapshotOwner = None;
+		Time snapshotTime = CurrentTime;
+		bool blocksSynchronousRead = false;
+		{
+			std::lock_guard<std::mutex> lock(
+				m_clipboardSnapshotContext->mutex);
+			m_clipboardSnapshotContext->snapshots.copyReady(
+				id, &snapshot, &snapshotOwner, &snapshotTime);
+			blocksSynchronousRead =
+				m_clipboardSnapshotContext->snapshots.blocksSynchronousRead(id);
+		}
+
+		if (snapshot) {
+			// A worker can finish just before the main queue receives the next
+			// XFixes event. Verify the owner with the X server before exposing
+			// the cached bytes; this query never calls the clipboard provider.
+			const Window currentOwner = m_impl->XGetSelectionOwner(
+				m_display, m_clipboard[id]->getSelection());
+			if (currentOwner != snapshotOwner) {
+				std::lock_guard<std::mutex> lock(
+					m_clipboardSnapshotContext->mutex);
+				m_clipboardSnapshotContext->snapshots.invalidate(
+					id, currentOwner);
+				return false;
+			}
+
+			IClipboard::unmarshall(clipboard, *snapshot, snapshotTime);
+			return true;
+		}
+		if (blocksSynchronousRead) {
+			// Once an external-owner read enters the isolated path, failure and
+			// retries remain isolated too. Falling back here would put the same
+			// provider stall back onto the input event queue.
+			return false;
+		}
+
+		const Window currentOwner = m_impl->XGetSelectionOwner(
+			m_display, m_clipboard[id]->getSelection());
+		if (currentOwner != m_window) {
+			// A caller reached us before bootstrap/XFixes. Start the same isolated
+			// path and ask it to retry later; never discover an external provider
+			// by synchronously reading it here.
+			const_cast<XWindowsScreen*>(this)->observeClipboardOwner(
+				id, currentOwner, CurrentTime, true, false);
+			return false;
+		}
+	}
+	else if (!m_clipboardSnapshotThreadingEnabled) {
 		return false;
 	}
 
@@ -1862,6 +2329,31 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 	XEvent* xevent = static_cast<XEvent*>(event.getData());
 	assert(xevent != NULL);
 
+#ifdef HAVE_XFIXES
+	if (m_xfixes &&
+		xevent->type == m_xfixesEventBase + XFixesSelectionNotify) {
+		const XFixesSelectionNotifyEvent* selectionEvent =
+			reinterpret_cast<const XFixesSelectionNotifyEvent*>(xevent);
+		const ClipboardID id = getClipboardID(selectionEvent->selection);
+		if (id != kClipboardEnd &&
+			selectionEvent->subtype == XFixesSetSelectionOwnerNotify) {
+			const bool external = isExternalSelectionOwnerChangeForTest(
+				selectionEvent->type,
+				m_xfixesEventBase + XFixesSelectionNotify,
+				selectionEvent->subtype,
+				XFixesSetSelectionOwnerNotify,
+				selectionEvent->owner,
+				m_window);
+			// Self and None ownership changes still advance the generation so
+			// an old external snapshot can never overwrite a remote clipboard.
+			observeClipboardOwner(
+				id, selectionEvent->owner, selectionEvent->timestamp, true,
+				external);
+		}
+		return;
+	}
+#endif
+
 	// update key state
 	bool isRepeat = false;
 	if (m_isPrimary) {
@@ -2033,8 +2525,16 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 			// selection owner.  report that to the receiver.
 			ClipboardID id = getClipboardID(xevent->xselectionclear.selection);
 			if (id != kClipboardEnd) {
-				m_clipboard[id]->lost(xevent->xselectionclear.time);
-				sendClipboardEvent(m_events->forClipboard().clipboardGrabbed(), id);
+				if (!m_xfixes) {
+					const Window owner = m_impl->XGetSelectionOwner(
+						m_display, m_clipboard[id]->getSelection());
+					observeClipboardOwner(
+						id, owner, xevent->xselectionclear.time, true,
+						owner != None && owner != m_window);
+				}
+				else {
+					m_clipboard[id]->lost(xevent->xselectionclear.time);
+				}
 				return;
 			}
 		}
@@ -2855,6 +3355,29 @@ XWindowsScreen::detectXI2()
 	int event, error;
     return m_impl->XQueryExtension(m_display,
 			"XInputExtension", &xi_opcode, &event, &error);
+}
+
+bool
+XWindowsScreen::detectXFixesSelectionNotifications()
+{
+#ifdef HAVE_XFIXES
+	int errorBase = 0;
+	if (!m_impl->XFixesQueryExtension(
+		m_display, &m_xfixesEventBase, &errorBase)) {
+		LOG((CLOG_DEBUG "XFixes selection notifications are unavailable"));
+		return false;
+	}
+
+	for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+		m_impl->XFixesSelectSelectionInput(
+			m_display, m_window, m_clipboard[id]->getSelection(),
+			XFixesSetSelectionOwnerNotifyMask);
+	}
+	LOG((CLOG_DEBUG "using XFixes selection owner notifications"));
+	return true;
+#else
+	return false;
+#endif
 }
 
 #ifdef HAVE_XI2

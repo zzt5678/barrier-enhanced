@@ -143,7 +143,7 @@ private:
     void                handleKeepAliveEvent(const Event&, void*);
 
     // message handlers
-    void                enter();
+    bool                enter();
     void                prepareEnter();
     void                abortEnter();
     void                leave();

@@ -30,6 +30,9 @@
 #ifdef HAVE_XI2
 #	include <X11/extensions/XInput2.h>
 #endif
+#ifdef HAVE_XFIXES
+#	include <X11/extensions/Xfixes.h>
+#endif
 
 // XIRawButtonEvent may not exist in older XInput2 versions
 // Provide a fallback definition if not available
@@ -214,6 +217,13 @@ public:
     virtual int XRefreshKeyboardMapping(XMappingEvent* event_map) = 0;
     virtual int XISelectEvents(Display* display, Window w, XIEventMask* masks,
                                int num_masks) = 0;
+#ifdef HAVE_XFIXES
+    virtual Bool XFixesQueryExtension(Display* display, int* event_base_return,
+                                      int* error_base_return) = 0;
+    virtual void XFixesSelectSelectionInput(Display* display, Window window,
+                                            Atom selection,
+                                            unsigned long event_mask) = 0;
+#endif
     virtual Atom XInternAtom(Display* display, _Xconst char* atom_name,
                              Bool only_if_exists) = 0;
     virtual int XGetScreenSaver(Display* display, int* timeout_return,

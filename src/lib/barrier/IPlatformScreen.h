@@ -70,6 +70,18 @@ public:
     */
     virtual void        enter() = 0;
 
+    //! Enter screen and report whether the platform accepted input ownership.
+    /*!
+    Existing platform implementations are assumed to succeed.  Platforms with
+    a fallible input backend override this method so a prepared handoff is not
+    committed before the backend has actually accepted the enter command.
+    */
+    virtual bool        tryEnter()
+    {
+        enter();
+        return true;
+    }
+
     //! Leave screen
     /*!
     Called when the user navigates off the screen.  Returns true on
@@ -92,6 +104,13 @@ public:
     reliably report clipboard ownership changes.
     */
     virtual void        checkClipboards() = 0;
+
+    //! Whether clipboard owner notifications are completed by an isolated
+    //! snapshot worker before clipboardChanged is emitted.
+    virtual bool        hasAsyncClipboardSnapshots() const
+    {
+        return false;
+    }
 
     //! Open screen saver
     /*!
@@ -189,6 +208,11 @@ public:
     // ISecondaryScreen overrides
     virtual void        fakeMouseButton(ButtonID id, bool press) = 0;
     virtual void        fakeMouseMove(SInt32 x, SInt32 y) = 0;
+    virtual bool        tryFakeMouseMove(SInt32 x, SInt32 y)
+    {
+        fakeMouseMove(x, y);
+        return true;
+    }
     virtual void        fakeMouseRelativeMove(SInt32 dx, SInt32 dy) const = 0;
     virtual void        fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const = 0;
 

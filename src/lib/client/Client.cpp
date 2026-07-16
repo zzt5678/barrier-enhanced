@@ -452,15 +452,37 @@ Client::getCursorPos(SInt32& x, SInt32& y) const
 void
 Client::enter(SInt32 xAbs, SInt32 yAbs, UInt32 seqNum, KeyModifierMask mask, bool)
 {
-    m_active = true;
+    enterInputLease(xAbs, yAbs, seqNum, mask, false);
+}
+
+bool
+Client::enterInputLease(SInt32 xAbs, SInt32 yAbs, UInt32 seqNum,
+                        KeyModifierMask mask, bool)
+{
     m_screen->setSequenceNumber(seqNum);
-    m_screen->enter(mask);
-    m_screen->mouseMove(xAbs, yAbs);
+    if (!m_screen->enter(mask)) {
+        LOG((CLOG_WARN "input backend rejected enter sequence %u", seqNum));
+        return false;
+    }
+
+    if (!m_screen->tryMouseMove(xAbs, yAbs)) {
+        LOG((CLOG_WARN "input backend rejected initial position for enter sequence %u",
+            seqNum));
+        if (!m_screen->leave()) {
+            LOG((CLOG_ERR "input backend could not roll back failed enter sequence %u",
+                seqNum));
+        }
+        return false;
+    }
+
+    m_active = true;
 
     if (m_sendFileChunker && !m_sendFileIsClipboardPrefetch) {
         m_sendFileChunker->interruptFile();
         reapSendFileThreadIfReady();
     }
+
+    return true;
 }
 
 bool

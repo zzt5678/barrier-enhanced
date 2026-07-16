@@ -74,7 +74,7 @@ public:
     Called when the user navigates to this screen.  \p toggleMask has the
     toggle keys that should be turned on on the secondary screen.
     */
-    void                enter(KeyModifierMask toggleMask);
+    bool                enter(KeyModifierMask toggleMask);
 
     //! Leave screen
     /*!
@@ -164,6 +164,7 @@ public:
     screen position \c xAbs,yAbs.
     */
     void                mouseMove(SInt32 xAbs, SInt32 yAbs);
+    bool                tryMouseMove(SInt32 xAbs, SInt32 yAbs);
 
     //! Notify of mouse motion
     /*!

@@ -37,7 +37,7 @@ public:
     clipboard identified by \c id.
     */
     XWindowsClipboard(IXWindowsImpl* impl, Display*, Window window,
-                      ClipboardID id);
+                      ClipboardID id, double absoluteReadDeadline = 0.0);
     virtual ~XWindowsClipboard();
 
     //! Notify clipboard was lost
@@ -93,7 +93,14 @@ public:
     virtual bool        has(EFormat) const;
     virtual std::string get(EFormat) const;
 
+    // True only when the most recent external cache fill received enough
+    // provider evidence to distinguish a valid empty selection from timeout.
+    bool                wasLastReadValid() const;
+
     static bool shouldSuppressPngTextFallbackForTest(const std::string& text);
+    static bool isProviderReadValidForTest(bool targetsRead,
+                                           bool advertisedSupportedTarget,
+                                           bool formatRead);
 
 private:
     // remove all converters from our list
@@ -138,7 +145,8 @@ private:
     // read an ICCCM conforming selection
     class CICCCMGetClipboard {
     public:
-        CICCCMGetClipboard(Window requestor, Time time, Atom property);
+        CICCCMGetClipboard(Window requestor, Time time, Atom property,
+                           double absoluteReadDeadline);
         ~CICCCMGetClipboard();
 
         // convert the given selection to the given type.  returns
@@ -172,6 +180,7 @@ private:
         // the actual type of the data.  if this is None then the
         // selection owner cannot convert to the requested type.
         Atom*            m_actualTarget;
+        double           m_absoluteReadDeadline;
 
     public:
         // true iff the selection owner didn't follow ICCCM conventions
@@ -293,6 +302,8 @@ private:
     bool                m_owner;
     mutable Time        m_timeOwned;
     Time                m_timeLost;
+    double              m_absoluteReadDeadline;
+    bool                m_readValid;
 
     // true iff open and clipboard owned by a motif app
     mutable bool        m_motif;

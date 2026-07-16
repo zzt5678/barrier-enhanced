@@ -207,6 +207,7 @@ if (UNIX)
         check_include_files ("${XKBlib};X11/extensions/XKBstr.h" HAVE_X11_EXTENSIONS_XKBSTR_H)
         check_include_files ("X11/extensions/XKB.h" HAVE_XKB_EXTENSION)
         check_include_files ("X11/extensions/XTest.h" HAVE_X11_EXTENSIONS_XTEST_H)
+        check_include_files ("X11/extensions/Xfixes.h" HAVE_X11_EXTENSIONS_XFIXES_H)
         check_include_files ("${XKBlib}" HAVE_X11_XKBLIB_H)
         check_include_files ("X11/extensions/XInput2.h" HAVE_XI2)
         check_include_files ("dns_sd.h" HAVE_DNSSD)
@@ -235,6 +236,7 @@ if (UNIX)
         check_library_exists ("Xinerama" XineramaQueryExtension "${CMAKE_SOURCE_DIR}/extlibs" HAVE_Xinerama)
         check_library_exists ("Xi" XISelectEvents "${CMAKE_SOURCE_DIR}/extlibs" HAVE_Xi)
         check_library_exists ("Xrandr" XRRQueryExtension "${CMAKE_SOURCE_DIR}/extlibs" HAVE_Xrandr)
+        check_library_exists ("Xfixes;X11" XFixesQueryExtension "${CMAKE_SOURCE_DIR}/extlibs" HAVE_Xfixes)
 
         if (HAVE_ICE)
 
@@ -271,6 +273,11 @@ if (UNIX)
 
         if (HAVE_Xrandr)
             list (APPEND libs Xrandr)
+        endif()
+
+        if (HAVE_X11_EXTENSIONS_XFIXES_H AND HAVE_Xfixes)
+            set (HAVE_XFIXES 1)
+            list (APPEND libs Xfixes)
         endif()
 
         # this was outside of the linux scope,

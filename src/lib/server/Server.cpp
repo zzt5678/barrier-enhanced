@@ -276,6 +276,7 @@ Server::Server(
 	m_recentSwitchEntryX(0),
 	m_recentSwitchEntryY(0),
 	m_primaryReturnAnchorActive(false),
+	m_primaryReturnAnchorDir(kNoDirection),
 	m_primaryReturnAnchorX(0),
 	m_primaryReturnAnchorY(0),
 	m_switchWaitDelay(0.0),
@@ -331,7 +332,7 @@ Server::Server(
 	m_lowLatencyMode(false),
 	m_nestedRemoteMode(false),
 	m_primaryLeaveFailedRecently(false),
-	m_primaryLeaveFailureTimer(true),
+	m_primaryLeaveFailureDir(kNoDirection),
 	m_args(args)
 {
 	// must have a primary client and it must have a canonical name
@@ -669,6 +670,20 @@ Server::adoptClient(BaseClientProxy* client)
 
 	if (replaceActive && m_activeSaver == NULL) {
 		++m_seqNum;
+		if (client->supportsInputHandoff()) {
+			SInt32 sourceX = 0;
+			SInt32 sourceY = 0;
+			getPrimaryRecoveryPoint(client, sourceX, sourceY);
+			m_inputHandoffCommitted = true;
+			m_inputHandoffSource = m_primaryClient;
+			m_inputHandoffTarget = client;
+			m_inputHandoffSeqNum = m_seqNum;
+			m_inputHandoffSourceX = sourceX;
+			m_inputHandoffSourceY = sourceY;
+			LOG((CLOG_INFO
+				"tracking active-client re-entry for \"%s\", seq=%u; rollback=%d,%d",
+				getName(client).c_str(), m_seqNum, sourceX, sourceY));
+		}
 		client->enter(m_x, m_y, m_seqNum,
 			m_primaryClient->getToggleMask(), false);
 		replayClipboardsToActive();
@@ -900,7 +915,7 @@ Server::switchScreen(BaseClientProxy* dst,
 	}
 
 	if (m_active == m_primaryClient && dst != m_primaryClient &&
-		!canLeavePrimaryNow("screen switch")) {
+		!canLeavePrimaryNow("screen switch", guardDir)) {
 		return false;
 	}
 
@@ -934,7 +949,7 @@ Server::switchScreen(BaseClientProxy* dst,
 		const SInt32 oldX = m_x;
 		const SInt32 oldY = m_y;
 		if (oldActive == m_primaryClient && dst != m_primaryClient) {
-			rememberPrimaryReturnAnchor(dst, oldX, oldY);
+			rememberPrimaryReturnAnchor(dst, oldX, oldY, guardDir);
 		}
 
 			// leave active screen
@@ -948,7 +963,7 @@ Server::switchScreen(BaseClientProxy* dst,
 				m_xDelta2 = 0;
 				m_yDelta2 = 0;
 				if (oldActive == m_primaryClient) {
-					recoverPrimaryAfterSwitchFailure(oldX, oldY);
+					recoverPrimaryAfterSwitchFailure(oldX, oldY, guardDir);
 				}
 				return false;
 			}
@@ -960,6 +975,7 @@ Server::switchScreen(BaseClientProxy* dst,
 		}
 
 		m_primaryLeaveFailedRecently = false;
+		m_primaryLeaveFailureDir = kNoDirection;
 		if (oldActive == m_primaryClient) {
 			m_screen->fakeAllKeysUp();
 		}
@@ -971,9 +987,6 @@ Server::switchScreen(BaseClientProxy* dst,
 		m_yDelta  = 0;
 		m_xDelta2 = 0;
 		m_yDelta2 = 0;
-
-		const bool fetchPrimaryClipboard =
-			m_active == m_primaryClient && m_enableClipboard;
 
 		// cut over
 		m_active = dst;
@@ -995,7 +1008,9 @@ Server::switchScreen(BaseClientProxy* dst,
 		}
 
 		if (m_enableClipboard) {
-			scheduleClipboardSync(fetchPrimaryClipboard);
+			// Only replay the last committed revision after a switch. Reading the
+			// OS clipboard here can block the input event queue for seconds.
+			scheduleClipboardSync(false);
 		}
 
 		Server::SwitchToScreenInfo* info =
@@ -1075,6 +1090,7 @@ Server::cancelInputHandoff(const char* reason, bool reanchor, bool notifyTarget)
 	BaseClientProxy* source = m_inputHandoffSource;
 	BaseClientProxy* target = m_inputHandoffTarget;
 	const UInt32 seqNum = m_inputHandoffSeqNum;
+	const EDirection guardDir = m_inputHandoffGuardDir;
 	LOG((CLOG_WARN "canceling input handoff to \"%s\", seq=%u: %s",
 		target != NULL ? getName(target).c_str() : "unknown", seqNum, reason));
 
@@ -1092,7 +1108,7 @@ Server::cancelInputHandoff(const char* reason, bool reanchor, bool notifyTarget)
 
 	if (reanchor && source != NULL && m_active == source) {
 		if (source == m_primaryClient) {
-			recoverPrimaryAfterSwitchFailure(m_x, m_y);
+			recoverPrimaryAfterSwitchFailure(m_x, m_y, guardDir);
 		}
 		else {
 			reanchorActiveAfterFailedSwitch(target);
@@ -1121,9 +1137,15 @@ Server::handleInputHandoffReady(const Event& event, void* vclient)
 		LOG((CLOG_WARN
 			"target rejected committed input handoff, seq=%u; restoring source lease",
 			info->m_seqNum));
-		if (source != NULL && m_clientSet.count(source) != 0 &&
-			!switchScreen(source, sourceX, sourceY, false, kNoDirection)) {
-			reanchorActiveAfterFailedSwitch(client);
+		bool restored = false;
+		if (source != NULL && m_clientSet.count(source) != 0) {
+			restored = switchScreen(source, sourceX, sourceY, false,
+				kNoDirection);
+		}
+		if (!restored && m_active == client) {
+			LOG((CLOG_WARN
+				"committed handoff rollback could not switch to its source; forcing local recovery"));
+			forceLeaveClient(client);
 		}
 		return;
 	}
@@ -1174,32 +1196,80 @@ Server::handleInputHandoffTimeout(const Event&, void*)
 }
 
 bool
-Server::canLeavePrimaryNow(const char* reason)
+Server::canLeavePrimaryNow(const char* reason, EDirection dir)
 {
 	if (m_active != m_primaryClient || !m_primaryLeaveFailedRecently) {
 		return true;
 	}
 
-	if (m_primaryLeaveFailureTimer.getTime() < 2.0) {
-		LOG((CLOG_WARN "suppressing %s while primary input recovery settles", reason));
-		stopSwitch();
-		return false;
+	// Only suppress a repeated push against the edge whose handoff just
+	// failed.  Explicit switches and a different edge express a new intent and
+	// must not inherit an arbitrary time blackout.
+	if (dir == kNoDirection || m_primaryLeaveFailureDir == kNoDirection ||
+		dir != m_primaryLeaveFailureDir) {
+		return true;
 	}
 
-	m_primaryLeaveFailedRecently = false;
-	return true;
+	LOG((CLOG_WARN "suppressing %s while pointer remains on failed %s edge",
+		reason, Config::dirName(dir)));
+	stopSwitch();
+	return false;
 }
 
 void
-Server::recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y)
+Server::clearPrimaryLeaveFailureIfMovedAway(SInt32 x, SInt32 y)
+{
+	if (!m_primaryLeaveFailedRecently ||
+		m_primaryLeaveFailureDir == kNoDirection) {
+		return;
+	}
+
+	SInt32 ax, ay, aw, ah;
+	m_primaryClient->getShape(ax, ay, aw, ah);
+	if (aw < kMinUsableScreenDimension || ah < kMinUsableScreenDimension) {
+		return;
+	}
+
+	const SInt32 margin = (std::max)(
+		static_cast<SInt32>(getJumpZoneSize(m_primaryClient) + 8),
+		kSwitchEdgeHysteresisInset);
+	bool movedAway = false;
+	switch (m_primaryLeaveFailureDir) {
+	case kLeft:
+		movedAway = x >= ax + margin;
+		break;
+	case kRight:
+		movedAway = x <= ax + aw - margin - 1;
+		break;
+	case kTop:
+		movedAway = y >= ay + margin;
+		break;
+	case kBottom:
+		movedAway = y <= ay + ah - margin - 1;
+		break;
+	case kNoDirection:
+		break;
+	}
+
+	if (movedAway) {
+		LOG((CLOG_DEBUG1 "clearing failed %s edge gate after pointer moved to %d,%d",
+			Config::dirName(m_primaryLeaveFailureDir), x, y));
+		m_primaryLeaveFailedRecently = false;
+		m_primaryLeaveFailureDir = kNoDirection;
+	}
+}
+
+void
+Server::recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y,
+										  EDirection dir)
 {
 	SInt32 ax, ay, aw, ah;
 	m_primaryClient->getShape(ax, ay, aw, ah);
 	if (aw < kMinUsableScreenDimension || ah < kMinUsableScreenDimension) {
 		LOG((CLOG_WARN "cannot reanchor primary after failed leave; unusable primary shape %d,%d %dx%d",
 			ax, ay, aw, ah));
-		m_primaryLeaveFailedRecently = true;
-		m_primaryLeaveFailureTimer.reset();
+		m_primaryLeaveFailedRecently = false;
+		m_primaryLeaveFailureDir = kNoDirection;
 		return;
 	}
 
@@ -1229,8 +1299,34 @@ Server::recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y)
 	m_primaryClient->mouseMove(m_x, m_y);
 	m_primaryClient->refreshKeyState();
 	noSwitch(m_x, m_y);
-	m_primaryLeaveFailedRecently = true;
-	m_primaryLeaveFailureTimer.reset();
+
+	if (dir == kNoDirection) {
+		const SInt32 leftDistance = (std::max)(x - ax, static_cast<SInt32>(0));
+		const SInt32 rightDistance = (std::max)(
+			ax + aw - 1 - x, static_cast<SInt32>(0));
+		const SInt32 topDistance = (std::max)(y - ay, static_cast<SInt32>(0));
+		const SInt32 bottomDistance = (std::max)(
+			ay + ah - 1 - y, static_cast<SInt32>(0));
+		SInt32 nearestDistance = margin + 1;
+		if (leftDistance <= margin && leftDistance < nearestDistance) {
+			dir = kLeft;
+			nearestDistance = leftDistance;
+		}
+		if (rightDistance <= margin && rightDistance < nearestDistance) {
+			dir = kRight;
+			nearestDistance = rightDistance;
+		}
+		if (topDistance <= margin && topDistance < nearestDistance) {
+			dir = kTop;
+			nearestDistance = topDistance;
+		}
+		if (bottomDistance <= margin && bottomDistance < nearestDistance) {
+			dir = kBottom;
+		}
+	}
+
+	m_primaryLeaveFailedRecently = dir != kNoDirection;
+	m_primaryLeaveFailureDir = dir;
 }
 
 void
@@ -1326,7 +1422,8 @@ Server::fetchPendingPrimaryClipboards()
 
             clipboard.m_clipboardOwner = primaryName;
             clipboard.m_pendingClipboardFetch = true;
-            if (!onClipboardChanged(m_primaryClient, id, clipboard.m_clipboardSeqNum)) {
+            if (!onClipboardChanged(m_primaryClient, id,
+                    clipboard.m_clipboardSeqNum, &observedClipboard)) {
                 clipboard.m_clipboardOwner = previousOwner;
                 clipboard.m_pendingClipboardFetch = previousPendingFetch;
             }
@@ -1422,8 +1519,7 @@ Server::recoverToPrimaryFromActive(const char* reason)
 	stopSwitch();
 
 	SInt32 x, y;
-	m_primaryClient->getCursorCenter(x, y);
-	if (clampToClientShape(m_primaryClient, x, y)) {
+	if (getPrimaryRecoveryPoint(m_active, x, y)) {
 		if (!switchScreen(m_primaryClient, x, y, false)) {
 			reanchorActiveAfterFailedSwitch(m_primaryClient);
 		}
@@ -1434,8 +1530,8 @@ Server::recoverToPrimaryFromActive(const char* reason)
 		forceLeaveClient(m_active);
 	}
 
-	m_primaryLeaveFailedRecently = true;
-	m_primaryLeaveFailureTimer.reset();
+	m_primaryLeaveFailedRecently = false;
+	m_primaryLeaveFailureDir = kNoDirection;
 }
 
 void
@@ -1869,16 +1965,19 @@ Server::isRecentReverseSwitch(BaseClientProxy* dst, EDirection dir)
 }
 
 void
-Server::rememberPrimaryReturnAnchor(BaseClientProxy* dst, SInt32 x, SInt32 y)
+Server::rememberPrimaryReturnAnchor(BaseClientProxy* dst, SInt32 x, SInt32 y,
+									 EDirection dir)
 {
 	if (dst == NULL) {
 		m_primaryReturnAnchorActive = false;
 		m_primaryReturnAnchorClientName.clear();
+		m_primaryReturnAnchorDir = kNoDirection;
 		return;
 	}
 
 	m_primaryReturnAnchorActive = true;
 	m_primaryReturnAnchorClientName = getName(dst);
+	m_primaryReturnAnchorDir = dir;
 	m_primaryReturnAnchorX = x;
 	m_primaryReturnAnchorY = y;
 	LOG((CLOG_INFO "remembered primary return anchor for \"%s\" at %d,%d",
@@ -1889,21 +1988,104 @@ void
 Server::adjustPrimaryReturnPoint(BaseClientProxy* src, SInt32& x, SInt32& y)
 {
 	if (!m_primaryReturnAnchorActive || src == NULL ||
-		getName(src) != m_primaryReturnAnchorClientName ||
-		m_screen == NULL || m_screen->getPlatformScreen() == NULL) {
+		getName(src) != m_primaryReturnAnchorClientName) {
 		return;
 	}
 
 	const SInt32 originalX = x;
 	const SInt32 originalY = y;
-	if (m_screen->getPlatformScreen()->adjustPointToVisibleAreaNearAnchor(
-			m_primaryReturnAnchorX, m_primaryReturnAnchorY, x, y)) {
-		if (x != originalX || y != originalY) {
-			LOG((CLOG_INFO "anchored primary return from \"%s\" at %d,%d to %d,%d using primary exit %d,%d",
-				getName(src).c_str(), originalX, originalY, x, y,
-				m_primaryReturnAnchorX, m_primaryReturnAnchorY));
+	SInt32 ax, ay, aw, ah;
+	m_primaryClient->getShape(ax, ay, aw, ah);
+	if (m_primaryReturnAnchorDir != kNoDirection &&
+		aw >= kMinUsableScreenDimension && ah >= kMinUsableScreenDimension) {
+		const SInt32 maxInset = (std::max)(static_cast<SInt32>(1),
+			static_cast<SInt32>((std::min)(aw, ah) / 8));
+		const SInt32 inset = (std::min)(kSwitchEdgeHysteresisInset, maxInset);
+		// A relative-motion overshoot is expressed in the source screen's
+		// coordinate space.  Carrying it into an aggregate multi-monitor primary
+		// can land thousands of pixels away from the physical edge that the user
+		// crossed.  Re-enter at the remembered physical edge and preserve only
+		// the orthogonal coordinate.
+		switch (m_primaryReturnAnchorDir) {
+		case kLeft:
+			x = m_primaryReturnAnchorX + inset;
+			break;
+		case kRight:
+			x = m_primaryReturnAnchorX - inset;
+			break;
+		case kTop:
+			y = m_primaryReturnAnchorY + inset;
+			break;
+		case kBottom:
+			y = m_primaryReturnAnchorY - inset;
+			break;
+		case kNoDirection:
+			break;
 		}
 	}
+
+	bool adjustedToOutput = false;
+	if (m_screen != NULL && m_screen->getPlatformScreen() != NULL) {
+		adjustedToOutput =
+			m_screen->getPlatformScreen()->adjustPointToVisibleAreaNearAnchor(
+				m_primaryReturnAnchorX, m_primaryReturnAnchorY, x, y);
+	}
+	if (!adjustedToOutput && aw >= kMinUsableScreenDimension &&
+		ah >= kMinUsableScreenDimension) {
+		x = (std::max)(ax, (std::min)(x, ax + aw - 1));
+		y = (std::max)(ay, (std::min)(y, ay + ah - 1));
+	}
+
+	if (x != originalX || y != originalY) {
+		LOG((CLOG_INFO "anchored primary return from \"%s\" at %d,%d to %d,%d using primary exit %d,%d",
+			getName(src).c_str(), originalX, originalY, x, y,
+			m_primaryReturnAnchorX, m_primaryReturnAnchorY));
+	}
+}
+
+bool
+Server::getPrimaryRecoveryPoint(BaseClientProxy* src, SInt32& x, SInt32& y)
+{
+	if (m_primaryClient == NULL) {
+		return false;
+	}
+	SInt32 sx, sy, sw, sh;
+	m_primaryClient->getShape(sx, sy, sw, sh);
+	if (sw < kMinUsableScreenDimension || sh < kMinUsableScreenDimension) {
+		return false;
+	}
+
+	if (m_primaryReturnAnchorActive && src != NULL &&
+		getName(src) == m_primaryReturnAnchorClientName) {
+		x = m_primaryReturnAnchorX;
+		y = m_primaryReturnAnchorY;
+		adjustPrimaryReturnPoint(src, x, y);
+		if (clampToClientShape(m_primaryClient, x, y)) {
+			LOG((CLOG_INFO "recovering primary near remembered edge at %d,%d",
+				x, y));
+			return true;
+		}
+	}
+
+	x = 0;
+	y = 0;
+	m_primaryClient->getCursorPos(x, y);
+	if (x >= sx && x < sx + sw && y >= sy && y < sy + sh) {
+		LOG((CLOG_INFO "recovering primary at last local cursor position %d,%d",
+			x, y));
+		return true;
+	}
+
+	x = 0;
+	y = 0;
+	m_primaryClient->getCursorCenter(x, y);
+	if (clampToClientShape(m_primaryClient, x, y)) {
+		LOG((CLOG_WARN "falling back to primary center for recovery at %d,%d",
+			x, y));
+		return true;
+	}
+
+	return false;
 }
 
 bool
@@ -1913,7 +2095,7 @@ Server::isSwitchOkay(BaseClientProxy* newScreen,
 {
 	LOG((CLOG_DEBUG1 "try to leave \"%s\" on %s", getName(m_active).c_str(), Config::dirName(dir)));
 
-	if (!canLeavePrimaryNow("edge switch")) {
+	if (!canLeavePrimaryNow("edge switch", dir)) {
 		return false;
 	}
 
@@ -2481,8 +2663,26 @@ Server::handleClipboardGrabbed(const Event& event, void* vclient)
 	clipboard.m_clipboardSeqNum = info->m_sequenceNumber;
 	clipboard.m_pendingClipboardFetch = true;
 
-	LOG((CLOG_DEBUG "deferred clipboard %d fetch from \"%s\" until screen leave",
-		info->m_id, getName(grabber).c_str()));
+	if (grabber == m_primaryClient) {
+		const bool asyncSnapshot =
+			m_screen != NULL && m_screen->getPlatformScreen() != NULL &&
+			m_screen->getPlatformScreen()->hasAsyncClipboardSnapshots();
+		if (asyncSnapshot) {
+			// The platform will emit clipboardChanged only after its isolated
+			// worker has committed this owner generation.
+			LOG((CLOG_DEBUG "waiting for clipboard %d snapshot from primary \"%s\"",
+				info->m_id, getName(grabber).c_str()));
+		}
+		else {
+			// Legacy platforms retain their deferred main-thread read until they
+			// gain an isolated snapshot implementation.
+			scheduleClipboardSync(true);
+		}
+	}
+	else {
+		LOG((CLOG_DEBUG "waiting for clipboard %d payload from remote \"%s\"",
+			info->m_id, getName(grabber).c_str()));
+	}
 }
 
 void
@@ -2859,7 +3059,8 @@ Server::handleFileKeepAliveEvent(const Event&, void*)
 
 bool
 Server::onClipboardChanged(BaseClientProxy* sender,
-					ClipboardID id, UInt32 seqNum)
+					ClipboardID id, UInt32 seqNum,
+					const Clipboard* snapshot)
 {
 	ClipboardInfo& clipboard = m_clipboards[id];
 
@@ -2869,12 +3070,41 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 		return false;
 	}
 
-	// should be the expected client
-	assert(sender == m_clients.find(clipboard.m_clipboardOwner)->second);
+	// An asynchronous platform completion can arrive after another screen has
+	// taken ownership with the same sequence number. Assertions disappear in
+	// release builds, so reject by runtime identity before reading any payload.
+	const ClientList::const_iterator owner =
+		m_clients.find(clipboard.m_clipboardOwner);
+	if (owner == m_clients.end() || owner->second != sender) {
+		LOG((CLOG_INFO
+			"ignored screen \"%s\" update of clipboard %d (current owner is \"%s\")",
+			getName(sender).c_str(), id, clipboard.m_clipboardOwner.c_str()));
+		return false;
+	}
 
 	// get data
-	if (!readClipboardWithRetry(sender, id, clipboard.m_clipboard)) {
-		return false;
+	if (snapshot != NULL) {
+		if (!Clipboard::copy(&clipboard.m_clipboard, snapshot)) {
+			return false;
+		}
+	}
+	else {
+		const bool asyncPrimarySnapshot =
+			sender == m_primaryClient && m_screen != NULL &&
+			m_screen->getPlatformScreen() != NULL &&
+			m_screen->getPlatformScreen()->hasAsyncClipboardSnapshots();
+		if (asyncPrimarySnapshot) {
+			// clipboardChanged means the platform cache is already committed.
+			// A miss indicates a superseded owner generation; retry sleeps here
+			// would stall input without making that stale revision valid again.
+			if (!sender->getClipboard(id, &clipboard.m_clipboard)) {
+				return false;
+			}
+		}
+		else if (!readClipboardWithRetry(
+				sender, id, clipboard.m_clipboard)) {
+			return false;
+		}
 	}
 	RemoteFileClipboard::AutomaticSharingStatus clipboardSharingStatus =
 		RemoteFileClipboard::AutomaticSharingStatus::Safe;
@@ -3250,6 +3480,7 @@ Server::onMouseMovePrimary(SInt32 x, SInt32 y)
 	// save position
 	m_x       = x;
 	m_y       = y;
+	clearPrimaryLeaveFailureIfMovedAway(m_x, m_y);
 	clearRecentSwitchGuardIfMovedAway();
 
 	// get screen shape
@@ -4271,9 +4502,11 @@ Server::forceLeaveClient(BaseClientProxy* client)
 	BaseClientProxy* active =
 		(m_activeSaver != NULL) ? m_activeSaver : m_active;
 	if (active == client) {
-		// record new position (center of primary screen)
-		m_primaryClient->getCursorCenter(m_x, m_y);
-		const bool primaryUsable = clampToClientShape(m_primaryClient, m_x, m_y);
+		// Prefer the physical edge used to leave the primary.  If no edge
+		// lease exists, retain the platform's last valid local point; the center
+		// is only a final fallback inside getPrimaryRecoveryPoint().
+		const bool primaryUsable =
+			getPrimaryRecoveryPoint(active, m_x, m_y);
 		const bool primaryEnterable = canEnterScreen(m_primaryClient);
 
 		// stop waiting to switch to this client
@@ -4290,8 +4523,6 @@ Server::forceLeaveClient(BaseClientProxy* client)
 			m_xDelta2 = 0;
 			m_yDelta2 = 0;
 			replayClipboardsToActive();
-			m_primaryLeaveFailedRecently = true;
-			m_primaryLeaveFailureTimer.reset();
 		}
 		else {
 			// don't notify active screen since it has probably already
@@ -4314,6 +4545,8 @@ Server::forceLeaveClient(BaseClientProxy* client)
 				Server::SwitchToScreenInfo::alloc(m_active->getName());
 			m_events->addEvent(Event(m_events->forServer().screenSwitched(), this, info));
 		}
+		m_primaryLeaveFailedRecently = false;
+		m_primaryLeaveFailureDir = kNoDirection;
 	}
 
 	// if this screen had the cursor when the screen saver activated

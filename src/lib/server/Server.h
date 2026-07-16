@@ -169,6 +169,7 @@ public:
         m_recentSwitchEntryX(0),
         m_recentSwitchEntryY(0),
         m_primaryReturnAnchorActive(false),
+        m_primaryReturnAnchorDir(kNoDirection),
         m_primaryReturnAnchorX(0),
         m_primaryReturnAnchorY(0),
         m_switchWaitDelay(0.0),
@@ -219,7 +220,7 @@ public:
         m_lowLatencyMode(false),
         m_nestedRemoteMode(false),
         m_primaryLeaveFailedRecently(false),
-        m_primaryLeaveFailureTimer(true),
+        m_primaryLeaveFailureDir(kNoDirection),
         m_clientListener(NULL)
     { }
     void setActive(BaseClientProxy* active) {    m_active = active; }
@@ -402,8 +403,11 @@ private:
     bool                isRecentReverseSwitch(BaseClientProxy* dst,
                             EDirection dir);
     void                rememberPrimaryReturnAnchor(BaseClientProxy* dst,
-                            SInt32 x, SInt32 y);
+                            SInt32 x, SInt32 y,
+                            EDirection dir = kNoDirection);
     void                adjustPrimaryReturnPoint(BaseClientProxy* src,
+                            SInt32& x, SInt32& y);
+    bool                getPrimaryRecoveryPoint(BaseClientProxy* src,
                             SInt32& x, SInt32& y);
 
     // update switch state due to a mouse move at \p x, \p y that
@@ -489,15 +493,20 @@ private:
     void                handleFileKeepAliveEvent(const Event&, void*);
 
     // event processing
-    bool                canLeavePrimaryNow(const char* reason);
+    bool                canLeavePrimaryNow(const char* reason,
+                            EDirection dir);
+    void                clearPrimaryLeaveFailureIfMovedAway(
+                            SInt32 x, SInt32 y);
     void                recoverToPrimaryFromActive(const char* reason);
-    void                recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y);
+    void                recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y,
+                            EDirection dir = kNoDirection);
     void                reanchorActiveAfterFailedSwitch(BaseClientProxy* dst);
     void                fetchPendingPrimaryClipboards();
     void                replayClipboardsToActive();
     void                scheduleClipboardSync(bool fetchPrimary);
     bool                onClipboardChanged(BaseClientProxy* sender,
-                            ClipboardID id, UInt32 seqNum);
+                            ClipboardID id, UInt32 seqNum,
+                            const Clipboard* snapshot = NULL);
     void                onScreensaver(bool activated);
     void                onKeyDown(KeyID, KeyModifierMask, KeyButton,
                             const char* screens);
@@ -713,6 +722,7 @@ private:
     SInt32              m_recentSwitchEntryY;
     bool                m_primaryReturnAnchorActive;
     std::string         m_primaryReturnAnchorClientName;
+    EDirection          m_primaryReturnAnchorDir;
     SInt32              m_primaryReturnAnchorX;
     SInt32              m_primaryReturnAnchorY;
 
@@ -801,7 +811,7 @@ private:
     bool                m_lowLatencyMode;
     bool                m_nestedRemoteMode;
     bool                m_primaryLeaveFailedRecently;
-    Stopwatch           m_primaryLeaveFailureTimer;
+    EDirection          m_primaryLeaveFailureDir;
 
     ClientListener*        m_clientListener;
     ServerArgs            m_args;

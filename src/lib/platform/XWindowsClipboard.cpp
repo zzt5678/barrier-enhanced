@@ -135,7 +135,7 @@ void suppressImagePathTextFallback(bool* added, std::string* data)
 //
 
 XWindowsClipboard::XWindowsClipboard(IXWindowsImpl* impl, Display* display,
-                Window window, ClipboardID id) :
+                Window window, ClipboardID id, double absoluteReadDeadline) :
     m_display(display),
     m_window(window),
     m_id(id),
@@ -143,7 +143,9 @@ XWindowsClipboard::XWindowsClipboard(IXWindowsImpl* impl, Display* display,
     m_time(0),
     m_owner(false),
     m_timeOwned(0),
-    m_timeLost(0)
+    m_timeLost(0),
+    m_absoluteReadDeadline(absoluteReadDeadline),
+    m_readValid(false)
 {
     m_impl = impl;
     // get some atoms
@@ -224,6 +226,13 @@ bool
 XWindowsClipboard::shouldSuppressPngTextFallbackForTest(const std::string& text)
 {
     return looksLikeImagePathOrUri(text) || looksLikePngPayload(text);
+}
+
+bool
+XWindowsClipboard::isProviderReadValidForTest(
+    bool targetsRead, bool advertisedSupportedTarget, bool formatRead)
+{
+    return formatRead || (targetsRead && !advertisedSupportedTarget);
 }
 
 void
@@ -525,6 +534,12 @@ std::string XWindowsClipboard::get(EFormat format) const
     return m_data[format];
 }
 
+bool
+XWindowsClipboard::wasLastReadValid() const
+{
+    return m_readValid;
+}
+
 void
 XWindowsClipboard::clearConverters()
 {
@@ -601,6 +616,7 @@ XWindowsClipboard::doClearCache()
 {
     m_checkCache = false;
     m_cached     = false;
+    m_readValid  = false;
     for (SInt32 index = 0; index < kNumFormats; ++index) {
         m_data[index]  = "";
         m_added[index] = false;
@@ -620,8 +636,15 @@ XWindowsClipboard::fillCache() const
 void
 XWindowsClipboard::doFillCache()
 {
+    m_readValid = false;
     if (m_motif) {
         motifFillCache();
+        for (SInt32 format = 0; format < kNumFormats; ++format) {
+            if (m_added[format]) {
+                m_readValid = true;
+                break;
+            }
+        }
     }
     else {
         icccmFillCache();
@@ -643,8 +666,10 @@ XWindowsClipboard::icccmFillCache()
     const Atom atomTargets = m_atomTargets;
     Atom target;
     std::string data;
-    if (!icccmGetSelection(atomTargets, &target, &data) ||
-        (target != m_atomAtom && target != m_atomTargets)) {
+    const bool targetsRead =
+        icccmGetSelection(atomTargets, &target, &data) &&
+        (target == m_atomAtom || target == m_atomTargets);
+    if (!targetsRead) {
         LOG((CLOG_DEBUG1 "selection doesn't support TARGETS"));
         data = "";
         XWindowsUtil::appendAtomData(data, XA_STRING);
@@ -655,57 +680,56 @@ XWindowsClipboard::icccmFillCache()
     const UInt32 numTargets = data.size() / sizeof(Atom);
     LOG((CLOG_DEBUG "  available targets: %s", XWindowsUtil::atomsToString(m_display, targets, numTargets).c_str()));
 
-    // try each converter in order (because they're in order of
-    // preference).
-    for (ConverterList::const_iterator index = m_converters.begin();
-                                index != m_converters.end(); ++index) {
-        IXWindowsClipboardConverter* converter = *index;
+    bool advertisedSupportedTarget = false;
+    bool formatRead = false;
 
-        // skip already handled targets
-        if (m_added[converter->getFormat()]) {
-            continue;
-        }
-
-        // see if atom is in target list
-        Atom target = None;
-        // XXX -- just ask for the converter's target to see if it's
-        // available rather than checking TARGETS.  i've seen clipboard
-        // owners that don't report all the targets they support.
-        target = converter->getAtom();
-        /*
-        for (UInt32 i = 0; i < numTargets; ++i) {
-            if (converter->getAtom() == targets[i]) {
-                target = targets[i];
-                break;
+    // Read advertised formats first so a slow owner cannot spend the whole
+    // deadline on compatibility probes. Then probe omitted formats because
+    // several common owners under-report conversions in TARGETS.
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool probeAdvertised = pass == 0;
+        for (ConverterList::const_iterator index = m_converters.begin();
+                                    index != m_converters.end(); ++index) {
+            IXWindowsClipboardConverter* converter = *index;
+            bool advertised = false;
+            for (UInt32 i = 0; i < numTargets; ++i) {
+                if (converter->getAtom() == targets[i]) {
+                    advertised = true;
+                    break;
+                }
             }
-        }
-        */
-        if (target == None) {
-            continue;
-        }
+            advertisedSupportedTarget |= advertised;
+            if (advertised != probeAdvertised ||
+                m_added[converter->getFormat()]) {
+                continue;
+            }
 
-        // get the data
-        Atom actualTarget;
-        std::string targetData;
-        if (!icccmGetSelection(target, &actualTarget, &targetData)) {
-            LOG((CLOG_DEBUG1 "  no data for target %s", XWindowsUtil::atomToString(m_display, target).c_str()));
-            continue;
-        }
+            const Atom target = converter->getAtom();
+            Atom actualTarget;
+            std::string targetData;
+            if (!icccmGetSelection(target, &actualTarget, &targetData)) {
+                LOG((CLOG_DEBUG1 "  no data for target %s", XWindowsUtil::atomToString(m_display, target).c_str()));
+                continue;
+            }
+            formatRead = true;
 
-        IClipboard::EFormat format = converter->getFormat();
-        std::string convertedData = converter->toIClipboard(targetData);
-        if (!shouldStoreConvertedClipboardData(format, convertedData, targetData)) {
-            LOG((CLOG_DEBUG1 "skipping empty conversion for target %s", XWindowsUtil::atomToString(m_display, target).c_str()));
-            continue;
-        }
+            IClipboard::EFormat format = converter->getFormat();
+            std::string convertedData = converter->toIClipboard(targetData);
+            if (!shouldStoreConvertedClipboardData(
+                    format, convertedData, targetData)) {
+                LOG((CLOG_DEBUG1 "skipping empty conversion for target %s", XWindowsUtil::atomToString(m_display, target).c_str()));
+                continue;
+            }
 
-        // add to clipboard and note we've done it
-        m_data[format]  = convertedData;
-        m_added[format] = true;
-        LOG((CLOG_DEBUG "added format %d for target %s (%u %s)", format, XWindowsUtil::atomToString(m_display, target).c_str(), targetData.size(), targetData.size() == 1 ? "byte" : "bytes"));
+            m_data[format]  = convertedData;
+            m_added[format] = true;
+            LOG((CLOG_DEBUG "added format %d for target %s (%u %s)", format, XWindowsUtil::atomToString(m_display, target).c_str(), targetData.size(), targetData.size() == 1 ? "byte" : "bytes"));
+        }
     }
 
     suppressImagePathTextFallback(m_added, m_data);
+    m_readValid = isProviderReadValidForTest(
+        targetsRead, advertisedSupportedTarget, formatRead);
 }
 
 bool
@@ -716,7 +740,8 @@ XWindowsClipboard::icccmGetSelection(Atom target,
     assert(data         != NULL);
 
     // request data conversion
-    CICCCMGetClipboard getter(m_window, m_time, m_atomData);
+    CICCCMGetClipboard getter(m_window, m_time, m_atomData,
+                              m_absoluteReadDeadline);
     if (!getter.readClipboard(m_display, m_selection,
                                 target, actualTarget, data)) {
         LOG((CLOG_DEBUG1 "can't get data for selection target %s", XWindowsUtil::atomToString(m_display, target).c_str()));
@@ -1411,7 +1436,8 @@ Atom XWindowsClipboard::getTimestampData(std::string& data, int* format) const
 //
 
 XWindowsClipboard::CICCCMGetClipboard::CICCCMGetClipboard(
-                Window requestor, Time time, Atom property) :
+                Window requestor, Time time, Atom property,
+                double absoluteReadDeadline) :
     m_requestor(requestor),
     m_time(time),
     m_property(property),
@@ -1421,6 +1447,7 @@ XWindowsClipboard::CICCCMGetClipboard::CICCCMGetClipboard(
     m_reading(false),
     m_data(NULL),
     m_actualTarget(NULL),
+    m_absoluteReadDeadline(absoluteReadDeadline),
     m_error(false)
 {
     // do nothing
@@ -1477,8 +1504,12 @@ XWindowsClipboard::CICCCMGetClipboard::readClipboard(Display* display,
     Stopwatch timeout(false);    // timer not stopped, not triggered
     static const double s_timeout = 0.25;    // FIXME -- is this too short?
     while (!m_done && !m_failed) {
+        Thread::testCancel();
+
         // fail if timeout has expired
-        if (timeout.getTime() >= s_timeout) {
+        if (timeout.getTime() >= s_timeout ||
+            (m_absoluteReadDeadline > 0.0 &&
+             ARCH->time() >= m_absoluteReadDeadline)) {
             m_failed = true;
             break;
         }
@@ -1486,6 +1517,7 @@ XWindowsClipboard::CICCCMGetClipboard::readClipboard(Display* display,
         // process events if any otherwise sleep
         if (XPending(display) > 0) {
             while (!m_done && !m_failed && XPending(display) > 0) {
+                Thread::testCancel();
                 XNextEvent(display, &xevent);
                 if (!processEvent(display, &xevent)) {
                     // not processed so save it

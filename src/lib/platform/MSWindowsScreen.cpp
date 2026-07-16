@@ -297,7 +297,21 @@ MSWindowsScreen::disable()
 void
 MSWindowsScreen::enter()
 {
-    m_desks->enter();
+    if (!tryEnter()) {
+        LOG((CLOG_WARN "Windows screen enter failed"));
+    }
+}
+
+bool
+MSWindowsScreen::tryEnter()
+{
+    if (!m_desks->enter()) {
+        const std::string desktop = inputDesktopName();
+        LOG((CLOG_WARN "Windows input desktop rejected screen enter desktop=%s",
+            desktop.empty() ? "<unknown>" : desktop.c_str()));
+        return false;
+    }
+
     if (m_isPrimary) {
         // enable special key sequences on win95 family
         enableSpecialKeys(true);
@@ -325,6 +339,7 @@ MSWindowsScreen::enter()
     // now on screen
     m_isOnScreen = true;
     forceShowCursor();
+    return true;
 }
 
 bool
@@ -850,6 +865,14 @@ MSWindowsScreen::fakeMouseButton(ButtonID id, bool press)
 void
 MSWindowsScreen::fakeMouseMove(SInt32 x, SInt32 y)
 {
+    if (!tryFakeMouseMove(x, y)) {
+        LOG((CLOG_WARN "Windows input desktop rejected mouse move"));
+    }
+}
+
+bool
+MSWindowsScreen::tryFakeMouseMove(SInt32 x, SInt32 y)
+{
     if (m_pendingShapeRefresh) {
         LOG((CLOG_DEBUG "refreshing pending Windows screen shape before mouse move"));
         onDisplayChange();
@@ -862,7 +885,7 @@ MSWindowsScreen::fakeMouseMove(SInt32 x, SInt32 y)
         if (m_w < 64 || m_h < 64) {
             LOG((CLOG_WARN "ignoring mouse move for invalid Windows screen shape: %+d,%+d %dx%d",
                 m_x, m_y, m_w, m_h));
-            return;
+            return false;
         }
     }
 
@@ -887,10 +910,13 @@ MSWindowsScreen::fakeMouseMove(SInt32 x, SInt32 y)
     x = (x < minX) ? minX : ((x > maxX) ? maxX : x);
     y = (y < minY) ? minY : ((y > maxY) ? maxY : y);
 
-    m_desks->fakeMouseMove(x, y);
+    if (!m_desks->fakeMouseMove(x, y)) {
+        return false;
+    }
     if (m_buttons[kButtonLeft]) {
         m_draggingStarted = true;
     }
+    return true;
 }
 
 void

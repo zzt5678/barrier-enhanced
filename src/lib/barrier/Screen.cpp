@@ -108,26 +108,36 @@ Screen::disable()
         disableSecondary();
     }
 
+    // Platform disable returns input ownership to the local primary and
+    // removes secondary injection state even when a final enter/leave command
+    // could not be acknowledged during teardown.
+    m_entered = m_isPrimary;
+
     // note deactivation
     m_enabled = false;
 }
 
-void
+bool
 Screen::enter(KeyModifierMask toggleMask)
 {
     assert(m_entered == false);
-    LOG((CLOG_INFO "entering screen"));
+    LOG((CLOG_DEBUG1 "requesting platform screen enter"));
 
-    // now on screen
-    m_entered = true;
-
-    m_screen->enter();
+    if (!m_screen->tryEnter()) {
+        LOG((CLOG_WARN "platform rejected screen enter"));
+        return false;
+    }
     if (m_isPrimary) {
         enterPrimary();
     }
     else {
         enterSecondary(toggleMask);
     }
+
+    // now on screen
+    m_entered = true;
+    LOG((CLOG_INFO "platform screen enter applied"));
+    return true;
 }
 
 bool
@@ -250,6 +260,13 @@ Screen::mouseMove(SInt32 x, SInt32 y)
 {
     assert(!m_isPrimary);
     m_screen->fakeMouseMove(x, y);
+}
+
+bool
+Screen::tryMouseMove(SInt32 x, SInt32 y)
+{
+    assert(!m_isPrimary);
+    return m_screen->tryFakeMouseMove(x, y);
 }
 
 void

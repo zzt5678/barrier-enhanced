@@ -2,6 +2,48 @@
 
 #include "platform/XWindowsScreen.h"
 
+TEST(XWindowsScreenTests, externalSelectionOwnerChange_acceptsExternalSetOwner)
+{
+	EXPECT_TRUE(XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+		100, 100, 0, 0, 0x200, 0x100));
+}
+
+TEST(XWindowsScreenTests, externalSelectionOwnerChange_rejectsSelfAndNoOwner)
+{
+	EXPECT_FALSE(XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+		100, 100, 0, 0, 0x100, 0x100));
+	EXPECT_FALSE(XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+		100, 100, 0, 0, None, 0x100));
+}
+
+TEST(XWindowsScreenTests, externalSelectionOwnerChange_rejectsOtherEvents)
+{
+	EXPECT_FALSE(XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+		101, 100, 0, 0, 0x200, 0x100));
+	EXPECT_FALSE(XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+		100, 100, 1, 0, 0x200, 0x100));
+}
+
+TEST(XWindowsScreenTests, clipboardCheckWithoutXFixesResnapshotsSameExternalOwner)
+{
+	EXPECT_TRUE(XWindowsScreen::shouldObserveClipboardOnCheckForTest(
+		false, 0x200, 0x200, 0x100));
+}
+
+TEST(XWindowsScreenTests, clipboardCheckWithXFixesSkipsSameExternalOwner)
+{
+	EXPECT_FALSE(XWindowsScreen::shouldObserveClipboardOnCheckForTest(
+		true, 0x200, 0x200, 0x100));
+}
+
+TEST(XWindowsScreenTests, clipboardCheckObservesOwnerChangesWithXFixes)
+{
+	EXPECT_TRUE(XWindowsScreen::shouldObserveClipboardOnCheckForTest(
+		true, 0x300, 0x200, 0x100));
+	EXPECT_TRUE(XWindowsScreen::shouldObserveClipboardOnCheckForTest(
+		true, None, 0x200, 0x100));
+}
+
 #ifdef HAVE_XI2
 TEST(XWindowsScreenTests, xInputCookieUsableForTest_rejectsNullEventData)
 {

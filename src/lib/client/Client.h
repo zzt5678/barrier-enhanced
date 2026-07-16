@@ -143,6 +143,11 @@ public:
     //! Return true when the enabled local screen can accept a new input lease.
     bool                canAcceptInputHandoff() const;
 
+    //! Commit a prepared input lease only after the platform accepts entry.
+    bool                enterInputLease(SInt32 xAbs, SInt32 yAbs,
+                            UInt32 seqNum, KeyModifierMask mask,
+                            bool forScreensaver);
+
     //! Return the input backend generation used to validate a prepared lease.
     std::uint64_t       inputHandoffGeneration() const;
 

@@ -95,7 +95,7 @@ public:
     /*!
     Prepares a desk for when the cursor enters it.
     */
-    void                enter();
+    bool                enter();
 
     //! Notify of leaving a desk
     /*!
@@ -178,7 +178,7 @@ public:
     /*!
     Synthesize a mouse move to the absolute coordinates \c x,y.
     */
-    void                fakeMouseMove(SInt32 x, SInt32 y) const;
+    bool                fakeMouseMove(SInt32 x, SInt32 y) const;
 
     //! Fake mouse move
     /*!
