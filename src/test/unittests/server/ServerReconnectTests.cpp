@@ -2669,6 +2669,60 @@ TEST(ServerReconnectTests, transactionalSwitchKeepsSourceLeaseUntilTargetReady)
     EXPECT_EQ(1u, client.enterCount);
 }
 
+TEST(ServerReconnectTests, repeatedSameEdgeMotionKeepsPreparedHandoff)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    const UInt32 preparedSeqNum = client.preparedSeqNum;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 140, false, kRight));
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_TRUE(server.m_inputHandoffPending);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&client, server.m_inputHandoffTarget);
+    EXPECT_EQ(preparedSeqNum, server.m_inputHandoffSeqNum);
+    EXPECT_EQ(1u, client.prepareCount);
+    EXPECT_EQ(0u, client.abortCount);
+    EXPECT_EQ(137, client.preparedY);
+
+    BaseClientProxy::InputHandoffReadyInfo ready(preparedSeqNum, true);
+    Event readyEvent(Event::kUnknown, &client, &ready, Event::kDontFreeData);
+    server.handleInputHandoffReady(readyEvent, &client);
+
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_EQ(preparedSeqNum, client.enterSeqNum);
+    EXPECT_EQ(0u, client.abortCount);
+    EXPECT_TRUE(server.m_inputHandoffCommitted);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&client, server.m_inputHandoffTarget);
+}
+
 TEST(ServerReconnectTests, rejectedTransactionalSwitchKeepsSourceAndIgnoresLateReady)
 {
     Config config;

@@ -922,8 +922,6 @@ Server::switchScreen(BaseClientProxy* dst,
 		guardDir != kNoDirection && dst != m_primaryClient &&
 		dst->supportsInputHandoff()) {
 		m_inputHandoffCommitted = false;
-		m_inputHandoffSource = NULL;
-		m_inputHandoffTarget = NULL;
 		return beginInputHandoff(dst, x, y, guardDir);
 	}
 
