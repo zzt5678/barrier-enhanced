@@ -1747,6 +1747,16 @@ Server::armRecentSwitchGuard(BaseClientProxy* from, BaseClientProxy* to,
 		return;
 	}
 
+	// The local primary screen already filters its own warp events. Keeping a
+	// reverse guard after returning locally can consume the only edge event
+	// available when the pointer lands near the desktop boundary, leaving the
+	// cursor unable to cross again until it is moved well into the screen.
+	// Remote clients still need the guard for platform-generated edge bounce.
+	if (to == m_primaryClient) {
+		m_recentSwitchGuardActive = false;
+		return;
+	}
+
 	const EDirection reverseDir = oppositeDirection(dir);
 	SInt32 x, y, width, height;
 	to->getShape(x, y, width, height);

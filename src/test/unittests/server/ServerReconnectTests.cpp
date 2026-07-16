@@ -2395,7 +2395,7 @@ TEST(ServerReconnectTests, repeatedRoundTripCanLeavePrimaryAfterInteriorReturn)
     EXPECT_EQ(2u, client.enterCount);
 }
 
-TEST(ServerReconnectTests, nearEdgeReturnStillSuppressesBounceUntilInwardMotion)
+TEST(ServerReconnectTests, nearEdgePrimaryReturnAllowsImmediateIntentionalRecross)
 {
     Config config;
     config.addScreen("primary");
@@ -2430,14 +2430,9 @@ TEST(ServerReconnectTests, nearEdgeReturnStillSuppressesBounceUntilInwardMotion)
     ASSERT_EQ(&client, server.m_active);
     server.onMouseMoveSecondary(177, 0);
     ASSERT_EQ(&primary, server.m_active);
-    ASSERT_TRUE(server.m_recentSwitchGuardActive);
-    ASSERT_EQ(kLeft, server.m_recentSwitchReverseDir);
+    ASSERT_EQ(16, primary.enterX);
+    ASSERT_FALSE(server.m_recentSwitchGuardActive);
 
-    EXPECT_FALSE(server.onMouseMovePrimary(0, 100));
-    EXPECT_EQ(&primary, server.m_active);
-
-    EXPECT_FALSE(server.onMouseMovePrimary(160, 100));
-    EXPECT_FALSE(server.m_recentSwitchGuardActive);
     EXPECT_TRUE(server.onMouseMovePrimary(0, 100));
     EXPECT_EQ(&client, server.m_active);
 }
