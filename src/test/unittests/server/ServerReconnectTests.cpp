@@ -2347,6 +2347,101 @@ TEST(ServerReconnectTests, recentReverseSwitchGuardKeepsClientActiveUntilMovedIn
     EXPECT_EQ(100, primary.enterY);
 }
 
+TEST(ServerReconnectTests, repeatedRoundTripCanLeavePrimaryAfterInteriorReturn)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1;
+    server.m_y = 100;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 100));
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_EQ(1u, client.enterCount);
+
+    // Move inward to confirm the first entry, then cross back with enough
+    // relative-motion overshoot to land inside the primary instead of at its edge.
+    server.onMouseMoveSecondary(-160, 0);
+    ASSERT_EQ(&client, server.m_active);
+    server.onMouseMoveSecondary(660, 0);
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(1u, primary.enterCount);
+    ASSERT_GT(primary.enterX, 96);
+    ASSERT_LT(primary.enterX, 1024 - 96);
+
+    EXPECT_TRUE(server.onMouseMovePrimary(0, 100));
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(2u, client.enterCount);
+}
+
+TEST(ServerReconnectTests, nearEdgeReturnStillSuppressesBounceUntilInwardMotion)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1;
+    server.m_y = 100;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 100));
+    ASSERT_EQ(&client, server.m_active);
+    server.onMouseMoveSecondary(-160, 0);
+    ASSERT_EQ(&client, server.m_active);
+    server.onMouseMoveSecondary(177, 0);
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_TRUE(server.m_recentSwitchGuardActive);
+    ASSERT_EQ(kLeft, server.m_recentSwitchReverseDir);
+
+    EXPECT_FALSE(server.onMouseMovePrimary(0, 100));
+    EXPECT_EQ(&primary, server.m_active);
+
+    EXPECT_FALSE(server.onMouseMovePrimary(160, 100));
+    EXPECT_FALSE(server.m_recentSwitchGuardActive);
+    EXPECT_TRUE(server.onMouseMovePrimary(0, 100));
+    EXPECT_EQ(&client, server.m_active);
+}
+
 TEST(ServerReconnectTests, primaryReturnUsesLastPrimaryOutputAnchor)
 {
     Config config;

@@ -1747,11 +1747,44 @@ Server::armRecentSwitchGuard(BaseClientProxy* from, BaseClientProxy* to,
 		return;
 	}
 
+	const EDirection reverseDir = oppositeDirection(dir);
+	SInt32 x, y, width, height;
+	to->getShape(x, y, width, height);
+	const SInt32 edgeDistance = (std::max)(
+		kSwitchReverseClearDistance, getJumpZoneSize(to));
+	bool nearReverseEdge = false;
+	if (width >= kMinUsableScreenDimension &&
+		height >= kMinUsableScreenDimension) {
+		switch (reverseDir) {
+		case kLeft:
+			nearReverseEdge = m_x <= x + edgeDistance;
+			break;
+		case kRight:
+			nearReverseEdge = m_x >= x + width - 1 - edgeDistance;
+			break;
+		case kTop:
+			nearReverseEdge = m_y <= y + edgeDistance;
+			break;
+		case kBottom:
+			nearReverseEdge = m_y >= y + height - 1 - edgeDistance;
+			break;
+		case kNoDirection:
+			break;
+		}
+	}
+
+	if (!nearReverseEdge) {
+		m_recentSwitchGuardActive = false;
+		LOG((CLOG_DEBUG1 "not arming reverse switch guard for interior entry into \"%s\" at %d,%d",
+			getName(to).c_str(), m_x, m_y));
+		return;
+	}
+
 	m_recentSwitchGuardActive = true;
 	m_recentSwitchGuardLogged = false;
 	m_recentSwitchFromName = getName(from);
 	m_recentSwitchToName = getName(to);
-	m_recentSwitchReverseDir = oppositeDirection(dir);
+	m_recentSwitchReverseDir = reverseDir;
 	m_recentSwitchEntryX = m_x;
 	m_recentSwitchEntryY = m_y;
 	m_recentSwitchGuardTimer.reset();
