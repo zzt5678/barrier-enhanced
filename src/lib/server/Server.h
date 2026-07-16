@@ -165,10 +165,6 @@ public:
         m_ySaver(0),
         m_switchDir(kNoDirection),
         m_switchScreen(NULL),
-        m_recentSwitchGuardActive(false),
-        m_recentSwitchReverseDir(kNoDirection),
-        m_recentSwitchEntryX(0),
-        m_recentSwitchEntryY(0),
         m_primaryReturnAnchorActive(false),
         m_primaryReturnAnchorDir(kNoDirection),
         m_primaryReturnAnchorX(0),
@@ -406,11 +402,6 @@ private:
     // implement them.  returns true iff a switch is permitted.
     bool                isSwitchOkay(BaseClientProxy* dst, EDirection,
                             SInt32 x, SInt32 y, SInt32 xActive, SInt32 yActive);
-    void                armRecentSwitchGuard(BaseClientProxy* from,
-                            BaseClientProxy* to, EDirection dir);
-    void                clearRecentSwitchGuardIfMovedAway();
-    bool                isRecentReverseSwitch(BaseClientProxy* dst,
-                            EDirection dir);
     void                rememberPrimaryReturnAnchor(BaseClientProxy* dst,
                             SInt32 x, SInt32 y,
                             EDirection dir = kNoDirection);
@@ -723,13 +714,6 @@ private:
     // trying to reach the same screen in the same direction.
     EDirection            m_switchDir;
     BaseClientProxy*    m_switchScreen;
-    bool                m_recentSwitchGuardActive;
-    Stopwatch           m_recentSwitchGuardTimer;
-    std::string         m_recentSwitchFromName;
-    std::string         m_recentSwitchToName;
-    EDirection          m_recentSwitchReverseDir;
-    SInt32              m_recentSwitchEntryX;
-    SInt32              m_recentSwitchEntryY;
     bool                m_primaryReturnAnchorActive;
     std::string         m_primaryReturnAnchorClientName;
     EDirection          m_primaryReturnAnchorDir;

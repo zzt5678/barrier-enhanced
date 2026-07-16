@@ -70,8 +70,6 @@ const double kBulkBindingLifetimeSeconds = 30.0;
 
 const SInt32 kMinUsableScreenDimension = 64;
 const SInt32 kSwitchEdgeHysteresisInset = 16;
-const SInt32 kSwitchReverseClearDistance = 96;
-const double kSwitchReverseGuardMaxSeconds = 2.0;
 const double kInputHandoffTimeoutSeconds = 0.5;
 const double kInputHandoffCommitAckTimeoutSeconds = 0.75;
 const int kClipboardReadAttempts = 8;
@@ -82,24 +80,6 @@ const UInt32 kDefaultHeartbeatMilliseconds = 10000;
 const double kMouseMoveIntervalSeconds = 1.0 / 240.0;
 const size_t kMaxPendingDropDirTransfers = 4;
 const size_t kMaxPendingDropDirTransferMemoryBytes = 32 * 1024 * 1024;
-
-EDirection
-oppositeDirection(EDirection dir)
-{
-	switch (dir) {
-	case kLeft:
-		return kRight;
-	case kRight:
-		return kLeft;
-	case kTop:
-		return kBottom;
-	case kBottom:
-		return kTop;
-	case kNoDirection:
-		break;
-	}
-	return kNoDirection;
-}
 
 bool prepareTransferSource(const char* filename,
                            barrier::fs::path& sourcePath,
@@ -273,10 +253,6 @@ Server::Server(
 	m_activeSaver(NULL),
 	m_switchDir(kNoDirection),
 	m_switchScreen(NULL),
-	m_recentSwitchGuardActive(false),
-	m_recentSwitchReverseDir(kNoDirection),
-	m_recentSwitchEntryX(0),
-	m_recentSwitchEntryY(0),
 	m_primaryReturnAnchorActive(false),
 	m_primaryReturnAnchorDir(kNoDirection),
 	m_primaryReturnAnchorX(0),
@@ -1045,9 +1021,6 @@ Server::switchScreen(BaseClientProxy* dst,
 		Server::SwitchToScreenInfo* info =
 			Server::SwitchToScreenInfo::alloc(m_active->getName());
 		m_events->addEvent(Event(m_events->forServer().screenSwitched(), this, info));
-		if (!forScreensaver && guardDir != kNoDirection) {
-			armRecentSwitchGuard(oldActive, m_active, guardDir);
-		}
 		}
 		else {
 			m_x       = x;
@@ -1960,139 +1933,6 @@ Server::avoidJumpZone(BaseClientProxy* dst,
 }
 
 void
-Server::armRecentSwitchGuard(BaseClientProxy* from, BaseClientProxy* to,
-				EDirection dir)
-{
-	if (from == NULL || to == NULL || from == to) {
-		m_recentSwitchGuardActive = false;
-		return;
-	}
-
-	// The local primary screen already filters its own warp events. Keeping a
-	// reverse guard after returning locally can consume the only edge event
-	// available when the pointer lands near the desktop boundary, leaving the
-	// cursor unable to cross again until it is moved well into the screen.
-	// Remote clients still need the guard for platform-generated edge bounce.
-	if (to == m_primaryClient) {
-		m_recentSwitchGuardActive = false;
-		return;
-	}
-
-	const EDirection reverseDir = oppositeDirection(dir);
-	SInt32 x, y, width, height;
-	to->getShape(x, y, width, height);
-	const SInt32 edgeDistance = (std::max)(
-		kSwitchReverseClearDistance, getJumpZoneSize(to));
-	bool nearReverseEdge = false;
-	if (width >= kMinUsableScreenDimension &&
-		height >= kMinUsableScreenDimension) {
-		switch (reverseDir) {
-		case kLeft:
-			nearReverseEdge = m_x <= x + edgeDistance;
-			break;
-		case kRight:
-			nearReverseEdge = m_x >= x + width - 1 - edgeDistance;
-			break;
-		case kTop:
-			nearReverseEdge = m_y <= y + edgeDistance;
-			break;
-		case kBottom:
-			nearReverseEdge = m_y >= y + height - 1 - edgeDistance;
-			break;
-		case kNoDirection:
-			break;
-		}
-	}
-
-	if (!nearReverseEdge) {
-		m_recentSwitchGuardActive = false;
-		LOG((CLOG_DEBUG1 "not arming reverse switch guard for interior entry into \"%s\" at %d,%d",
-			getName(to).c_str(), m_x, m_y));
-		return;
-	}
-
-	m_recentSwitchGuardActive = true;
-	m_recentSwitchFromName = getName(from);
-	m_recentSwitchToName = getName(to);
-	m_recentSwitchReverseDir = reverseDir;
-	m_recentSwitchEntryX = m_x;
-	m_recentSwitchEntryY = m_y;
-	m_recentSwitchGuardTimer.reset();
-	LOG((CLOG_INFO "armed reverse switch guard from \"%s\" to \"%s\" reverse=%s entry=%d,%d",
-		m_recentSwitchFromName.c_str(),
-		m_recentSwitchToName.c_str(),
-		Config::dirName(m_recentSwitchReverseDir),
-		m_recentSwitchEntryX,
-		m_recentSwitchEntryY));
-}
-
-void
-Server::clearRecentSwitchGuardIfMovedAway()
-{
-	if (!m_recentSwitchGuardActive || m_active == NULL ||
-		getName(m_active) != m_recentSwitchToName) {
-		return;
-	}
-
-	switch (m_recentSwitchReverseDir) {
-	case kLeft:
-		if (m_x >= m_recentSwitchEntryX + kSwitchReverseClearDistance) {
-			m_recentSwitchGuardActive = false;
-		}
-		break;
-
-	case kRight:
-		if (m_x <= m_recentSwitchEntryX - kSwitchReverseClearDistance) {
-			m_recentSwitchGuardActive = false;
-		}
-		break;
-
-	case kTop:
-		if (m_y >= m_recentSwitchEntryY + kSwitchReverseClearDistance) {
-			m_recentSwitchGuardActive = false;
-		}
-		break;
-
-	case kBottom:
-		if (m_y <= m_recentSwitchEntryY - kSwitchReverseClearDistance) {
-			m_recentSwitchGuardActive = false;
-		}
-		break;
-
-	case kNoDirection:
-		m_recentSwitchGuardActive = false;
-		break;
-	}
-}
-
-bool
-Server::isRecentReverseSwitch(BaseClientProxy* dst, EDirection dir)
-{
-	if (!m_recentSwitchGuardActive || m_active == NULL || dst == NULL) {
-		return false;
-	}
-	if (m_recentSwitchGuardTimer.getTime() > kSwitchReverseGuardMaxSeconds) {
-		m_recentSwitchGuardActive = false;
-		return false;
-	}
-	if (getName(m_active) != m_recentSwitchToName ||
-		getName(dst) != m_recentSwitchFromName) {
-		return false;
-	}
-
-	if (dir != m_recentSwitchReverseDir) {
-		return false;
-	}
-
-	// A platform warp can produce one motion in the reverse direction after
-	// entry. Consuming every reverse motion for a time window also consumes
-	// real user input and can pin the hidden primary cursor at the edge. One
-	// event is enough to absorb the warp; the next motion must remain usable.
-	m_recentSwitchGuardActive = false;
-	return true;
-}
-
-void
 Server::rememberPrimaryReturnAnchor(BaseClientProxy* dst, SInt32 x, SInt32 y,
 									 EDirection dir)
 {
@@ -2236,14 +2076,9 @@ Server::isSwitchOkay(BaseClientProxy* newScreen,
 		return false;
 	}
 
-	if (isRecentReverseSwitch(newScreen, dir)) {
-		LOG((CLOG_INFO "suppressing one stale reverse motion from \"%s\" to \"%s\" on %s after screen entry",
-			getName(m_active).c_str(),
-			getName(newScreen).c_str(),
-			Config::dirName(dir)));
-		stopSwitch();
-		return false;
-	}
+	// Platform backends must filter their own warp artifacts. The first
+	// reverse motion here may be the user's only attempt to return, so the
+	// routing layer must never discard it based on timing or direction.
 
 	// should we switch or not?
 	bool preventSwitch = false;
@@ -3639,7 +3474,6 @@ Server::onMouseMovePrimary(SInt32 x, SInt32 y)
 	m_x       = x;
 	m_y       = y;
 	clearPrimaryLeaveFailureIfMovedAway(m_x, m_y);
-	clearRecentSwitchGuardIfMovedAway();
 
 	// get screen shape
 	SInt32 ax, ay, aw, ah;
@@ -3803,7 +3637,6 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 	// accumulate motion
 	m_x      += dx;
 	m_y      += dy;
-	clearRecentSwitchGuardIfMovedAway();
 
 	// get screen shape
 	SInt32 ax, ay, aw, ah;

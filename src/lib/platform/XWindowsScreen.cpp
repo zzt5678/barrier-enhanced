@@ -3233,6 +3233,12 @@ XWindowsScreen::warpCursorNoFlush(SInt32 x, SInt32 y)
     m_impl->XSendEvent(m_display, m_window, False, 0, &eventAfter);
     m_impl->XSync(m_display, False);
 
+	// XI2 raw-motion notifications can be dispatched before the synthetic
+	// markers above. Keep the software position synchronized with the warp so
+	// a pointer query at the destination cannot become reverse user motion.
+	m_xCursor = x;
+	m_yCursor = y;
+
 	LOG((CLOG_DEBUG2 "warped to %d,%d", x, y));
 }
 

@@ -692,12 +692,6 @@ void initializeServer(Server& server, Config& config, PrimaryClient& primary,
     server.m_active = &active;
     server.m_activeSaver = NULL;
     server.m_switchScreen = NULL;
-    server.m_recentSwitchGuardActive = false;
-    server.m_recentSwitchFromName.clear();
-    server.m_recentSwitchToName.clear();
-    server.m_recentSwitchReverseDir = kNoDirection;
-    server.m_recentSwitchEntryX = 0;
-    server.m_recentSwitchEntryY = 0;
     server.m_primaryReturnAnchorActive = false;
     server.m_primaryReturnAnchorClientName.clear();
     server.m_primaryReturnAnchorDir = kNoDirection;
@@ -2515,7 +2509,7 @@ TEST(ServerReconnectTests, avoidJumpZoneInsetsSecondaryScreenAwayFromReverseEdge
     EXPECT_EQ(100, y);
 }
 
-TEST(ServerReconnectTests, recentReverseSwitchGuardKeepsClientActiveUntilMovedInward)
+TEST(ServerReconnectTests, firstLeftReverseMotionAfterEntryReturnsImmediately)
 {
     Config config;
     config.addScreen("primary");
@@ -2548,32 +2542,16 @@ TEST(ServerReconnectTests, recentReverseSwitchGuardKeepsClientActiveUntilMovedIn
     EXPECT_EQ(&client, server.m_active);
     EXPECT_EQ(16, client.enterX);
     EXPECT_EQ(100, client.enterY);
-    EXPECT_TRUE(server.m_recentSwitchGuardActive);
-    EXPECT_EQ("primary", server.m_recentSwitchFromName);
-    EXPECT_EQ("client", server.m_recentSwitchToName);
-    EXPECT_EQ(kLeft, server.m_recentSwitchReverseDir);
-    EXPECT_EQ(16, server.m_recentSwitchEntryX);
-    EXPECT_EQ(100, server.m_recentSwitchEntryY);
-
-    server.onMouseMoveSecondary(-40, 0);
-    EXPECT_EQ(&client, server.m_active);
-    EXPECT_EQ(0, server.m_x);
-    EXPECT_EQ(1u, client.enterCount);
-    EXPECT_EQ(0u, primary.enterCount);
-
-    server.onMouseMoveSecondary(160, 0);
-    EXPECT_EQ(&client, server.m_active);
-    EXPECT_GE(server.m_x, 96);
-
-    server.onMouseMoveSecondary(-300, 0);
+    server.onMouseMoveSecondary(-17, 0);
     EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.enterCount);
     EXPECT_EQ(1u, primary.enterCount);
     EXPECT_GE(primary.enterX, 0);
     EXPECT_LT(primary.enterX, 1024);
     EXPECT_EQ(100, primary.enterY);
 }
 
-TEST(ServerReconnectTests, recentReverseSwitchGuardConsumesOnlyOneBounceEvent)
+TEST(ServerReconnectTests, firstRightReverseMotionAfterEntryReturnsImmediately)
 {
     Config config;
     config.addScreen("primary");
@@ -2604,18 +2582,16 @@ TEST(ServerReconnectTests, recentReverseSwitchGuardConsumesOnlyOneBounceEvent)
 
     ASSERT_TRUE(server.onMouseMovePrimary(0, 100));
     ASSERT_EQ(&client, server.m_active);
-    ASSERT_TRUE(server.m_recentSwitchGuardActive);
-
-    // A platform warp can report one reverse-edge event immediately after
-    // entry. Suppress that event, but never trap subsequent user motion at
-    // the edge while waiting for an inward move or a wall-clock timeout.
-    server.onMouseMoveSecondary(40, 0);
-    ASSERT_EQ(&client, server.m_active);
-    EXPECT_FALSE(server.m_recentSwitchGuardActive);
-
-    server.onMouseMoveSecondary(1, 0);
+    server.onMouseMoveSecondary(17, 0);
     EXPECT_EQ(&primary, server.m_active);
     EXPECT_EQ(1u, primary.enterCount);
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 100));
+    ASSERT_EQ(&client, server.m_active);
+
+    server.onMouseMoveSecondary(256, 0);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(2u, primary.enterCount);
 }
 
 TEST(ServerReconnectTests, repeatedRoundTripReturnsAtOriginalPrimaryEdge)
@@ -2702,8 +2678,6 @@ TEST(ServerReconnectTests, nearEdgePrimaryReturnAllowsImmediateIntentionalRecros
     server.onMouseMoveSecondary(177, 0);
     ASSERT_EQ(&primary, server.m_active);
     ASSERT_EQ(16, primary.enterX);
-    ASSERT_FALSE(server.m_recentSwitchGuardActive);
-
     EXPECT_TRUE(server.onMouseMovePrimary(0, 100));
     EXPECT_EQ(&client, server.m_active);
 }
@@ -2749,7 +2723,6 @@ TEST(ServerReconnectTests, repeatedEdgeRoundTripsRemainUsable)
 
         ASSERT_EQ(&primary, server.m_active) << "round " << round;
         ASSERT_EQ(16, primary.enterX) << "round " << round;
-        ASSERT_FALSE(server.m_recentSwitchGuardActive) << "round " << round;
     }
 
     EXPECT_EQ(100u, client.enterCount);
@@ -2886,7 +2859,7 @@ TEST(ServerReconnectTests, primaryReturnUsesLastPrimaryOutputAnchor)
     EXPECT_EQ(100, primary.enterY);
 }
 
-TEST(ServerReconnectTests, delayedSwitchGuardConsumesOnlyOneBounceEvent)
+TEST(ServerReconnectTests, delayedSwitchAllowsImmediateReverseMotion)
 {
     Config config;
     config.addScreen("primary");
@@ -2922,22 +2895,9 @@ TEST(ServerReconnectTests, delayedSwitchGuardConsumesOnlyOneBounceEvent)
     server.handleSwitchWaitTimeout(Event(Event::kUnknown), NULL);
 
     EXPECT_EQ(&client, server.m_active);
-    EXPECT_TRUE(server.m_recentSwitchGuardActive);
-    EXPECT_EQ("primary", server.m_recentSwitchFromName);
-    EXPECT_EQ("client", server.m_recentSwitchToName);
-    EXPECT_EQ(kLeft, server.m_recentSwitchReverseDir);
-    EXPECT_EQ(16, server.m_recentSwitchEntryX);
-    EXPECT_EQ(100, server.m_recentSwitchEntryY);
-
-    server.onMouseMoveSecondary(-40, 0);
-    EXPECT_EQ(&client, server.m_active);
-    EXPECT_EQ(0, server.m_x);
-    EXPECT_EQ(1u, client.enterCount);
-    EXPECT_EQ(0u, primary.enterCount);
-    EXPECT_FALSE(server.m_recentSwitchGuardActive);
-
-    server.onMouseMoveSecondary(-40, 0);
+    server.onMouseMoveSecondary(-17, 0);
     EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.enterCount);
     EXPECT_EQ(1u, primary.enterCount);
     EXPECT_GE(primary.enterX, 0);
     EXPECT_LT(primary.enterX, 1024);
@@ -3706,6 +3666,72 @@ TEST(ServerReconnectTests, switchBackToSourceDuringCommitWaitRollsBackImmediatel
     EXPECT_EQ(NULL, server.m_inputHandoffTimer);
     EXPECT_EQ(NULL, server.m_inputHandoffSource);
     EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+}
+
+TEST(ServerReconnectTests, largeReverseMotionReturnsPrimaryDuringCommitAckWait)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
+    const UInt32 seqNum = client.preparedSeqNum;
+    BaseClientProxy::InputHandoffReadyInfo prepared(seqNum, true);
+    Event preparedEvent(Event::kUnknown, &client, &prepared,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(preparedEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    // A deliberate return must not wait for the commit acknowledgment or a
+    // second motion event. This is the live path that previously stranded the
+    // hidden primary cursor at its center warp.
+    server.onMouseMoveSecondary(256, 0);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+
+    BaseClientProxy::InputHandoffReadyInfo lateAck(seqNum, true);
+    Event lateAckEvent(Event::kUnknown, &client, &lateAck,
+                       Event::kDontFreeData);
+    server.handleInputHandoffReady(lateAckEvent, &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
 }
 
 TEST(ServerReconnectTests, staleCommitAckCannotBreakImmediateSecondHandoff)

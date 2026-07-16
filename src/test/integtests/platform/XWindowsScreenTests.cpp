@@ -29,6 +29,7 @@
 
 using ::testing::_;
 using ::testing::Invoke;
+using ::testing::ReturnRef;
 
 namespace {
 
@@ -209,4 +210,84 @@ TEST(CXWindowsScreenTests, primaryEnter_releasesPointerGrabBeforeReturning)
     XCloseDisplay(probeDisplay);
 
     EXPECT_EQ(GrabSuccess, grabResult);
+}
+
+TEST(CXWindowsScreenTests, offscreenRecenter_doesNotEmitReverseMotionAtCenter)
+{
+    const char* displayName = std::getenv("DISPLAY");
+    if (displayName == NULL) {
+        displayName = ":0.0";
+    }
+
+    Display* probeDisplay = XOpenDisplay(displayName);
+    ASSERT_NE(static_cast<Display*>(NULL), probeDisplay);
+
+    MockEventQueue eventQueue;
+    IPrimaryScreenEvents primaryScreenEvents;
+    primaryScreenEvents.setEvents(&eventQueue);
+    ON_CALL(eventQueue, forIPrimaryScreen())
+        .WillByDefault(ReturnRef(primaryScreenEvents));
+
+    std::unique_ptr<IEventJob> systemHandler;
+    std::vector<std::unique_ptr<IEventJob> > otherHandlers;
+    std::unique_ptr<IEventQueueBuffer> buffer;
+    EXPECT_CALL(eventQueue, adoptHandler(_, _, _))
+        .Times(2)
+        .WillRepeatedly(Invoke([&](Event::Type type, void*, IEventJob* handler) {
+            if (type == Event::kSystem) {
+                systemHandler.reset(handler);
+            }
+            else {
+                otherHandlers.emplace_back(handler);
+            }
+        }));
+    EXPECT_CALL(eventQueue, adoptBuffer(_))
+        .Times(2)
+        .WillRepeatedly(Invoke([&](IEventQueueBuffer* adoptedBuffer) {
+            buffer.reset(adoptedBuffer);
+        }));
+    EXPECT_CALL(eventQueue, removeHandler(_, _)).Times(2);
+
+    XWindowsScreen screen(new XWindowsImpl(), displayName, true, false, 0,
+        &eventQueue);
+    ASSERT_NE(static_cast<IEventJob*>(NULL), systemHandler.get());
+    ASSERT_TRUE(screen.leave());
+
+    SInt32 centerX = 0;
+    SInt32 centerY = 0;
+    screen.getCursorCenter(centerX, centerY);
+
+    const Event::Type motionType = primaryScreenEvents.motionOnSecondary();
+    EXPECT_CALL(eventQueue, addEvent(_))
+        .Times(1)
+        .WillOnce(Invoke([&](const Event& event) {
+            EXPECT_EQ(motionType, event.getType());
+            const IPrimaryScreen::MotionInfo* motion =
+                static_cast<const IPrimaryScreen::MotionInfo*>(event.getData());
+            ASSERT_NE(static_cast<const IPrimaryScreen::MotionInfo*>(NULL), motion);
+            EXPECT_EQ(40, motion->m_x);
+            EXPECT_EQ(0, motion->m_y);
+            Event::deleteData(event);
+        }));
+
+    XEvent xevent = {};
+    xevent.type = MotionNotify;
+    xevent.xmotion.type = MotionNotify;
+    xevent.xmotion.display = probeDisplay;
+    xevent.xmotion.window = DefaultRootWindow(probeDisplay);
+    xevent.xmotion.root = DefaultRootWindow(probeDisplay);
+    xevent.xmotion.x_root = centerX + 40;
+    xevent.xmotion.y_root = centerY;
+    xevent.xmotion.same_screen = True;
+    Event firstMotion(Event::kSystem, NULL, &xevent, Event::kDontFreeData);
+    systemHandler->run(firstMotion);
+
+    // XI2 can report another raw-motion notification before the synthetic
+    // marker events are consumed. Its pointer query then observes the warp
+    // destination and must not turn the recenter into reverse user motion.
+    xevent.xmotion.x_root = centerX;
+    Event recenterSample(Event::kSystem, NULL, &xevent, Event::kDontFreeData);
+    systemHandler->run(recenterSample);
+
+    XCloseDisplay(probeDisplay);
 }
