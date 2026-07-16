@@ -31,12 +31,16 @@
 #include "arch/Arch.h"
 #include "base/log_outputters.h"
 #include "base/Log.h"
+#include "base/XBase.h"
 #include "common/Version.h"
 
 #include <sstream>
+#include <atomic>
+#include <cstdint>
 #include <UserEnv.h>
 #include <Shellapi.h>
 #include <Tlhelp32.h>
+#include <Wincrypt.h>
 #include <vector>
 
 #define MAXIMUM_WAIT_TIME 3
@@ -49,6 +53,7 @@ static const double kDesktopRelaunchSettleSeconds = 0.25;
 static const double kDesktopRelaunchDebounceSeconds = 2.0;
 static const double kProcessReadyTimeoutSeconds = 10.0;
 static const double kProcessReadyPollSeconds = 0.05;
+static const double kReadinessProofWaitSeconds = 0.5;
 
 typedef VOID (WINAPI *SendSas)(BOOL asUser);
 
@@ -186,6 +191,29 @@ isProcessHandleActive(HANDLE process)
         return false;
     }
     return exitCode == STILL_ACTIVE;
+}
+
+std::uint64_t
+nextReadinessQueryNonce()
+{
+    std::uint64_t nonce = 0;
+    HCRYPTPROV provider = 0;
+    if (CryptAcquireContextA(&provider, NULL, NULL, PROV_RSA_FULL,
+                             CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
+        CryptGenRandom(provider, sizeof(nonce),
+                       reinterpret_cast<BYTE*>(&nonce));
+        CryptReleaseContext(provider, 0);
+    }
+
+    if (nonce == 0) {
+        static std::atomic<std::uint64_t> sequence(1);
+        LARGE_INTEGER counter;
+        QueryPerformanceCounter(&counter);
+        nonce = static_cast<std::uint64_t>(counter.QuadPart) ^
+            (static_cast<std::uint64_t>(GetCurrentProcessId()) << 32) ^
+            GetTickCount64() ^ sequence.fetch_add(1);
+    }
+    return nonce == 0 ? 1 : nonce;
 }
 
 }
@@ -640,6 +668,7 @@ MSWindowsWatchdog::startProcess()
     std::string command = state.command;
 
     m_session.updateActiveSession();
+    const UInt32 expectedSessionId = m_session.getActiveSessionId();
 
     DWORD desktopError = ERROR_SUCCESS;
     const std::string observedDesktopName = m_daemonized
@@ -647,6 +676,7 @@ MSWindowsWatchdog::startProcess()
         : activeDesktopNameWithRetry(m_monitoring);
     std::string desktopName = DesktopSwitchPolicy::launchDesktopName(
         observedDesktopName, m_daemonized);
+    const bool expectedDesktopKnown = !observedDesktopName.empty();
     if (observedDesktopName.empty() && !desktopName.empty()) {
         LOG((CLOG_WARN
             "active input desktop is unavailable to the service, error=%lu; "
@@ -657,8 +687,6 @@ MSWindowsWatchdog::startProcess()
         throw XMSWindowsWatchdogError(
             "active input desktop is unavailable; delaying relaunch");
     }
-    rememberDesktopName(desktopName);
-
     BOOL createRet;
     bool autoElevated = false;
     PROCESS_INFORMATION newProcessInfo;
@@ -703,6 +731,7 @@ MSWindowsWatchdog::startProcess()
     }
     else {
         bool processReady = false;
+        std::string reportedDesktopName = desktopName;
         if (!m_daemonized) {
             // Foreground relaunches do not use daemon IPC. Preserve the startup
             // crash observation window before adopting the process.
@@ -711,29 +740,79 @@ MSWindowsWatchdog::startProcess()
         }
         else {
             const double readyStart = ARCH->time();
-            do {
+            while (m_monitoring.load() &&
+                   ARCH->time() - readyStart < kProcessReadyTimeoutSeconds) {
                 if (!isProcessHandleActive(newProcessInfo.hProcess)) {
                     break;
                 }
 
-                processReady = m_ipcServer.hasReadyClientProcess(
-                    kIpcClientNode, newProcessInfo.dwProcessId);
-                if (processReady || !m_monitoring.load()) {
-                    break;
+                if (!m_ipcServer.hasClientProcess(
+                        kIpcClientNode, newProcessInfo.dwProcessId)) {
+                    ARCH->sleep(kProcessReadyPollSeconds);
+                    continue;
                 }
 
-                ARCH->sleep(kProcessReadyPollSeconds);
-            } while (ARCH->time() - readyStart < kProcessReadyTimeoutSeconds);
+                const std::uint64_t queryNonce = nextReadinessQueryNonce();
+                IpcInputReadyQueryMessage query(queryNonce);
+                bool querySent = false;
+                try {
+                    querySent = m_ipcServer.sendToProcess(
+                        query, kIpcClientNode, newProcessInfo.dwProcessId);
+                }
+                catch (const XBase& e) {
+                    LOG((CLOG_WARN
+                        "could not query process %lu input readiness: %s",
+                        newProcessInfo.dwProcessId, e.what()));
+                }
+                if (!querySent) {
+                    ARCH->sleep(kProcessReadyPollSeconds);
+                    continue;
+                }
+
+                LOG((CLOG_DEBUG
+                    "challenging process %lu local input readiness query=%llu",
+                    newProcessInfo.dwProcessId,
+                    static_cast<unsigned long long>(queryNonce)));
+                const double proofDeadline = ARCH->time() +
+                    kReadinessProofWaitSeconds;
+                do {
+                    processReady = m_ipcServer.hasInputReadyClientProcess(
+                        kIpcClientNode, newProcessInfo.dwProcessId,
+                        expectedSessionId, desktopName, kBuildId,
+                        queryNonce, expectedDesktopKnown,
+                        &reportedDesktopName);
+                    if (processReady || !m_monitoring.load() ||
+                        !isProcessHandleActive(newProcessInfo.hProcess)) {
+                        break;
+                    }
+                    ARCH->sleep(kProcessReadyPollSeconds);
+                } while (ARCH->time() < proofDeadline &&
+                         ARCH->time() - readyStart <
+                             kProcessReadyTimeoutSeconds);
+
+                if (processReady) {
+                    break;
+                }
+            }
         }
 
         if (!processReady) {
-            LOG((CLOG_ERR "process %lu did not complete IPC readiness within %.1f seconds",
-                newProcessInfo.dwProcessId, kProcessReadyTimeoutSeconds));
+            LOG((CLOG_ERR
+                "process %lu did not prove local input readiness for session=%lu desktop=%s within %.1f seconds",
+                newProcessInfo.dwProcessId,
+                static_cast<unsigned long>(expectedSessionId),
+                expectedDesktopKnown ? desktopName.c_str() : "<service-unavailable>",
+                kProcessReadyTimeoutSeconds));
             shutdownProcess(newProcessInfo.hProcess, newProcessInfo.dwProcessId, 3,
                             true, newProcessInfo.dwProcessId);
             closeProcessInfo(newProcessInfo);
             throw XMSWindowsWatchdogError("process did not become ready");
         }
+
+        if (!reportedDesktopName.empty()) {
+            desktopName = reportedDesktopName;
+        }
+        rememberDesktopName(desktopName);
 
         PROCESS_INFORMATION previousProcessInfo = m_processInfo;
         const bool hadRunningProcess = m_processRunning &&
@@ -753,7 +832,7 @@ MSWindowsWatchdog::startProcess()
 
         LOG((CLOG_INFO "started ready process, pid=%lu, session=%i, desktop=%s, "
             "generation=%llu, elevated=%s, command=%s",
-            m_processInfo.dwProcessId, m_session.getActiveSessionId(), desktopName.c_str(),
+            m_processInfo.dwProcessId, expectedSessionId, desktopName.c_str(),
             state.generation,
             (shouldElevateProcess(state.elevateMode) || autoElevated) ? "yes" : "no",
             command.c_str()));

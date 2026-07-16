@@ -48,6 +48,36 @@ IpcNodeReadyMessage::~IpcNodeReadyMessage()
 {
 }
 
+IpcNodeReadyV2Message::IpcNodeReadyV2Message(
+    UInt32 processId, UInt32 sessionId, std::uint64_t inputGeneration,
+    bool inputReady, const std::string& desktopName,
+    const std::string& buildId, std::uint64_t queryNonce) :
+    IpcMessage(kIpcReadyV2),
+    m_processId(processId),
+    m_sessionId(sessionId),
+    m_inputGeneration(inputGeneration),
+    m_inputReady(inputReady),
+    m_desktopName(desktopName),
+    m_buildId(buildId),
+    m_queryNonce(queryNonce)
+{
+}
+
+IpcNodeReadyV2Message::~IpcNodeReadyV2Message()
+{
+}
+
+IpcInputReadyQueryMessage::IpcInputReadyQueryMessage(
+    std::uint64_t queryNonce) :
+    IpcMessage(kIpcReadyQuery),
+    m_queryNonce(queryNonce)
+{
+}
+
+IpcInputReadyQueryMessage::~IpcInputReadyQueryMessage()
+{
+}
+
 IpcShutdownMessage::IpcShutdownMessage() :
 IpcMessage(kIpcShutdown)
 {

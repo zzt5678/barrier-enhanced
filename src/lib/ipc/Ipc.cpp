@@ -20,6 +20,8 @@
 
 const char*                kIpcMsgHello        = "IHEL%1i%4i";
 const char*                kIpcMsgReady        = "IRDY";
+const char*                kIpcMsgReadyV2      = "IRV2%4i%4i%4i%4i%1i%s%s%4i%4i";
+const char*                kIpcMsgReadyQuery   = "IRQP%4i%4i";
 const char*                kIpcMsgLogLine        = "ILOG%s";
 const char*                kIpcMsgCommand        = "ICMD%s%1i";
 const char*                kIpcMsgShutdown        = "ISDN";

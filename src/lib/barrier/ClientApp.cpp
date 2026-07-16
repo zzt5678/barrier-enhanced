@@ -394,6 +394,10 @@ ClientApp::startClient()
             LOG((CLOG_NOTE "started client"));
         }
 
+        if (!m_clientScreen->prepareInputBackend()) {
+            LOG((CLOG_WARN
+                "local input backend is not ready yet; continuing connection retry while it recovers"));
+        }
         m_client->connect();
 
         updateStatus();
@@ -551,4 +555,23 @@ ClientApp::startNode()
     if (!startClient()) {
         m_bye(kExitFailed);
     }
+}
+
+bool
+ClientApp::ipcInputReady() const
+{
+    return m_clientScreen != NULL && m_clientScreen->canEnter();
+}
+
+std::uint64_t
+ClientApp::ipcInputGeneration() const
+{
+    return m_clientScreen == NULL ? 0 : m_clientScreen->inputGeneration();
+}
+
+std::string
+ClientApp::ipcInputDesktopName() const
+{
+    return m_clientScreen == NULL ? std::string() :
+        m_clientScreen->inputDesktopName();
 }

@@ -52,6 +52,9 @@ public:
     //! Sends a message to the server.
     void                send(const IpcMessage& message);
 
+    UInt32              processId() const { return m_processId; }
+    UInt32              sessionId() const { return m_sessionId; }
+
     //@}
 
 private:
@@ -65,5 +68,7 @@ private:
     IpcServerProxy*    m_server;
     IEventQueue*        m_events;
     EIpcClientType      m_clientType;
+    UInt32              m_processId;
+    UInt32              m_sessionId;
     bool                m_connectAttempted;
 };

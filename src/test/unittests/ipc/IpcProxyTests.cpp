@@ -3,12 +3,14 @@
 #include "ipc/IpcMessage.h"
 #include "ipc/IpcServer.h"
 #include "ipc/IpcServerProxy.h"
+#include "barrier/protocol_types.h"
 
 #include "test/global/gmock.h"
 #include "test/global/gtest.h"
 #include "test/mock/barrier/MockEventQueue.h"
 #include "test/mock/io/MockStream.h"
 
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -71,6 +73,55 @@ void appendUInt32(std::vector<UInt8>& bytes, UInt32 value)
     bytes.push_back(static_cast<UInt8>((value >> 16) & 0xff));
     bytes.push_back(static_cast<UInt8>((value >> 8) & 0xff));
     bytes.push_back(static_cast<UInt8>(value & 0xff));
+}
+
+void appendUInt64(std::vector<UInt8>& bytes, std::uint64_t value)
+{
+    appendUInt32(bytes, static_cast<UInt32>(value >> 32));
+    appendUInt32(bytes, static_cast<UInt32>(value & 0xffffffffu));
+}
+
+void appendString(std::vector<UInt8>& bytes, const std::string& value)
+{
+    appendUInt32(bytes, static_cast<UInt32>(value.size()));
+    appendBytes(bytes, value.data(), value.size());
+}
+
+void appendReadyV2Frame(std::vector<UInt8>& bytes,
+                        UInt32 readyProcessId,
+                        UInt32 sessionId,
+                        std::uint64_t inputGeneration,
+                        bool inputReady,
+                        const std::string& desktopName,
+                        const std::string& buildId,
+                        std::uint64_t queryNonce = 0)
+{
+    appendBytes(bytes, "IRV2", 4);
+    appendUInt32(bytes, readyProcessId);
+    appendUInt32(bytes, sessionId);
+    appendUInt64(bytes, inputGeneration);
+    bytes.push_back(inputReady ? 1 : 0);
+    appendString(bytes, desktopName);
+    appendString(bytes, buildId);
+    appendUInt64(bytes, queryNonce);
+}
+
+std::vector<UInt8> nodeReadyV2Frames(UInt32 helloProcessId,
+                                     UInt32 readyProcessId,
+                                     UInt32 sessionId,
+                                     std::uint64_t inputGeneration,
+                                     bool inputReady,
+                                     const std::string& desktopName,
+                                     const std::string& buildId,
+                                     std::uint64_t queryNonce = 0)
+{
+    std::vector<UInt8> bytes;
+    appendBytes(bytes, "IHEL", 4);
+    bytes.push_back(static_cast<UInt8>(kIpcClientNode));
+    appendUInt32(bytes, helloProcessId);
+    appendReadyV2Frame(bytes, readyProcessId, sessionId, inputGeneration,
+                       inputReady, desktopName, buildId, queryNonce);
+    return bytes;
 }
 
 std::vector<UInt8> clientCommandFrames(EIpcClientType clientType,
@@ -358,7 +409,420 @@ TEST(IpcProxyTests, clientProxyRequiresNodeReadyAfterHello)
 	proxy.handleData(Event(Event::kUnknown), NULL);
 	EXPECT_EQ(2, messageEvents);
 	EXPECT_TRUE(sawReady);
-	EXPECT_TRUE(proxy.m_ready);
+    EXPECT_TRUE(proxy.m_ready);
+}
+
+TEST(IpcProxyTests, capabilityReadyMustMatchProcessSessionAndDesktop)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    const std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build");
+    size_t offset = 0;
+    int messageEvents = 0;
+    bool sawCapabilityReady = false;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke([&](const Event& event) {
+        ++messageEvents;
+        IpcMessage* message = static_cast<IpcMessage*>(event.getDataObject());
+        if (message->type() == kIpcReadyV2) {
+            IpcNodeReadyV2Message* ready =
+                static_cast<IpcNodeReadyV2Message*>(message);
+            EXPECT_EQ(12345u, ready->processId());
+            EXPECT_EQ(7u, ready->sessionId());
+            EXPECT_EQ(42u, ready->inputGeneration());
+            EXPECT_TRUE(ready->inputReady());
+            EXPECT_EQ("Default", ready->desktopName());
+            EXPECT_EQ("test-build", ready->buildId());
+            sawCapabilityReady = true;
+        }
+        delete message;
+    }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_EQ(2, messageEvents);
+    EXPECT_TRUE(sawCapabilityReady);
+    EXPECT_TRUE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build"));
+    EXPECT_FALSE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 8, "Default", "test-build"));
+    EXPECT_FALSE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Winlogon", "test-build"));
+    EXPECT_FALSE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "other-build"));
+
+    std::string reportedDesktop;
+    EXPECT_TRUE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Winlogon", "test-build",
+        0, false, &reportedDesktop));
+    EXPECT_EQ("Default", reportedDesktop);
+}
+
+TEST(IpcProxyTests, capabilityProofMustMatchWatchdogQueryNonce)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    const std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build", 77);
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [](const Event& event) { delete event.getDataObject(); }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_FALSE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build", 76));
+    EXPECT_TRUE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build", 77));
+}
+
+TEST(IpcProxyTests, periodicInvalidationRetiresWatchdogQueryProof)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build", 77);
+    appendReadyV2Frame(
+        bytes, 12345, 7, 43, false, "Default", "test-build");
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [](const Event& event) { delete event.getDataObject(); }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_FALSE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build"));
+    EXPECT_FALSE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build", 77));
+}
+
+TEST(IpcProxyTests, matchingPeriodicLeasePreservesWatchdogQueryProof)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build", 77);
+    appendReadyV2Frame(
+        bytes, 12345, 7, 42, true, "Default", "test-build");
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [](const Event& event) { delete event.getDataObject(); }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_TRUE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build"));
+    EXPECT_TRUE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build", 77));
+}
+
+TEST(IpcProxyTests, capabilityReadyFalseCannotBeAdopted)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    const std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, false, "Default", "test-build");
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [](const Event& event) { delete event.getDataObject(); }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_TRUE(proxy.m_ready.load());
+    EXPECT_FALSE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build"));
+}
+
+TEST(IpcProxyTests, capabilityReadinessUsesLatestRecoveryUpdate)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 0, false, "Default", "test-build");
+    appendReadyV2Frame(
+        bytes, 12345, 7, 43, true, "Default", "test-build");
+    size_t offset = 0;
+    int readinessUpdates = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke([&](const Event& event) {
+        IpcMessage* message = static_cast<IpcMessage*>(event.getDataObject());
+        if (message->type() == kIpcReadyV2) {
+            ++readinessUpdates;
+            EXPECT_EQ(readinessUpdates == 2,
+                server.hasInputReadyClientProcess(
+                    kIpcClientNode, 12345, 7, "Default", "test-build"));
+        }
+        delete message;
+    }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_EQ(2, readinessUpdates);
+    EXPECT_TRUE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build"));
+}
+
+TEST(IpcProxyTests, capabilityReadinessUsesLatestInvalidationUpdate)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build");
+    appendReadyV2Frame(
+        bytes, 12345, 7, 43, false, "Default", "test-build");
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [](const Event& event) { delete event.getDataObject(); }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_FALSE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build"));
+}
+
+TEST(IpcProxyTests, expiredCapabilityReadinessCannotBeAdopted)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    const std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build");
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [](const Event& event) { delete event.getDataObject(); }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    proxy.m_readyReceivedAt = std::chrono::steady_clock::now() -
+        std::chrono::seconds(10);
+    EXPECT_FALSE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build"));
+}
+
+TEST(IpcProxyTests, expiredCapabilityProofCannotBeAdopted)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    const std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build", 77);
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [](const Event& event) { delete event.getDataObject(); }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    proxy.m_proofReceivedAt = std::chrono::steady_clock::now() -
+        std::chrono::seconds(10);
+    EXPECT_FALSE(server.hasInputReadyClientProcess(
+        kIpcClientNode, 12345, 7, "Default", "test-build", 77));
+}
+
+TEST(IpcProxyTests, oversizedCapabilityStringDisconnectsWithoutThrowing)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    const Event::Type messageType = ipcEvents.messageReceived();
+    const Event::Type disconnectedType = ipcEvents.disconnected();
+    std::vector<UInt8> bytes;
+    appendBytes(bytes, "IHEL", 4);
+    bytes.push_back(static_cast<UInt8>(kIpcClientNode));
+    appendUInt32(bytes, 12345);
+    appendBytes(bytes, "IRV2", 4);
+    appendUInt32(bytes, 12345);
+    appendUInt32(bytes, 7);
+    appendUInt64(bytes, 42);
+    bytes.push_back(1);
+    appendUInt32(bytes, PROTOCOL_MAX_STRING_LENGTH + 1);
+    size_t offset = 0;
+    int messageEvents = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke([&](const Event& event) {
+        if (event.getType() == messageType) {
+            ++messageEvents;
+            delete event.getDataObject();
+        }
+        else {
+            EXPECT_EQ(disconnectedType, event.getType());
+        }
+    }));
+
+    EXPECT_NO_THROW(proxy.handleData(Event(Event::kUnknown), NULL));
+    EXPECT_EQ(1, messageEvents);
+    EXPECT_TRUE(proxy.m_disconnecting.load());
+}
+
+TEST(IpcProxyTests, capabilityReadyWithDifferentProcessIdIsRejected)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(*stream, &events);
+    const Event::Type messageType = ipcEvents.messageReceived();
+    const Event::Type disconnectedType = ipcEvents.disconnected();
+    const std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 54321, 7, 42, true, "Default", "test-build");
+    size_t offset = 0;
+    int messageEvents = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke([&](const Event& event) {
+        if (event.getType() == messageType) {
+            ++messageEvents;
+            delete event.getDataObject();
+        }
+        else {
+            EXPECT_EQ(disconnectedType, event.getType());
+        }
+    }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_EQ(1, messageEvents);
+    EXPECT_FALSE(proxy.m_ready.load());
 }
 
 TEST(IpcProxyTests, clientProxyRejectsReadyBeforeNodeHello)
@@ -417,4 +881,119 @@ TEST(IpcProxyTests, serverProxyInvalidHeaderDisconnectsWithoutNullMessageEvent)
 
     proxy.handleData(Event(Event::kUnknown), NULL);
     EXPECT_NE(Event::kUnknown, messageType);
+}
+
+TEST(IpcProxyTests, serverProxySerializesCapabilityReadyAsOneMessage)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcServerProxyEvents ipcEvents;
+    setupServerProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Invoke([&stream]() { return &stream; }));
+
+    std::vector<UInt8> expected;
+    appendBytes(expected, "IRV2", 4);
+    appendUInt32(expected, 12345);
+    appendUInt32(expected, 7);
+    appendUInt64(expected, 42);
+    expected.push_back(1);
+    appendString(expected, "Default");
+    appendString(expected, "test-build");
+    appendUInt64(expected, 0);
+
+    EXPECT_CALL(stream, write(_, static_cast<UInt32>(expected.size())))
+        .WillOnce(Invoke([&](const void* data, UInt32 size) {
+            const UInt8* begin = static_cast<const UInt8*>(data);
+            EXPECT_EQ(expected, std::vector<UInt8>(begin, begin + size));
+        }));
+
+    IpcServerProxy proxy(stream, &events);
+    IpcNodeReadyV2Message ready(
+        12345, 7, 42, true, "Default", "test-build");
+    proxy.send(ready);
+}
+
+TEST(IpcProxyTests, serverProxyParsesInputReadinessQuery)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcServerProxyEvents ipcEvents;
+    setupServerProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Invoke([&stream]() { return &stream; }));
+    IpcServerProxy proxy(stream, &events);
+    const Event::Type messageType = ipcEvents.messageReceived();
+    std::vector<UInt8> bytes;
+    appendBytes(bytes, "IRQP", 4);
+    appendUInt64(bytes, 91);
+    size_t offset = 0;
+    bool sawQuery = false;
+
+    EXPECT_CALL(stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke([&](const Event& event) {
+        EXPECT_EQ(messageType, event.getType());
+        IpcInputReadyQueryMessage* query =
+            static_cast<IpcInputReadyQueryMessage*>(event.getDataObject());
+        EXPECT_EQ(kIpcReadyQuery, query->type());
+        EXPECT_EQ(91u, query->queryNonce());
+        sawQuery = true;
+        delete query;
+    }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_TRUE(sawQuery);
+}
+
+TEST(IpcProxyTests, truncatedInputReadinessQueryDisconnectsWithoutEvent)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcServerProxyEvents ipcEvents;
+    setupServerProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Invoke([&stream]() { return &stream; }));
+    IpcServerProxy proxy(stream, &events);
+    std::vector<UInt8> bytes;
+    appendBytes(bytes, "IRQP", 4);
+    appendUInt32(bytes, 0);
+    size_t offset = 0;
+
+    EXPECT_CALL(stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).Times(0);
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+}
+
+TEST(IpcProxyTests, clientProxySerializesInputReadinessQuery)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+    std::vector<UInt8> expected;
+    appendBytes(expected, "IRQP", 4);
+    appendUInt64(expected, 91);
+    EXPECT_CALL(*stream, write(_, static_cast<UInt32>(expected.size())))
+        .WillOnce(Invoke([&](const void* data, UInt32 size) {
+            const UInt8* begin = static_cast<const UInt8*>(data);
+            EXPECT_EQ(expected, std::vector<UInt8>(begin, begin + size));
+        }));
+
+    IpcClientProxy proxy(*stream, &events);
+    IpcInputReadyQueryMessage query(91);
+    proxy.send(query);
 }

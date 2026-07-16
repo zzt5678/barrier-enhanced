@@ -27,6 +27,8 @@ enum EIpcMessage {
     kIpcCommand,
     kIpcShutdown,
     kIpcReady,
+    kIpcReadyV2,
+    kIpcReadyQuery,
 };
 
 enum EIpcClientType {
@@ -43,6 +45,17 @@ extern const char*        kIpcMsgHello;
 // ready: node -> daemon
 // Sent only after node startup has completed and its IPC event loop is active.
 extern const char*        kIpcMsgReady;
+
+// capability ready: node -> daemon
+// $1 = process id; $2 = session id; $3/$4 = input generation high/low;
+// $5 = input backend ready; $6 = desktop name; $7 = build id;
+// $8/$9 = watchdog query nonce high/low, or zero for a periodic lease.
+extern const char*        kIpcMsgReadyV2;
+
+// readiness query: daemon -> node
+// $1/$2 = nonce high/low. The node responds immediately with IRV2 carrying
+// the same nonce so process adoption uses a post-query backend snapshot.
+extern const char*        kIpcMsgReadyQuery;
 
 // log line: daemon -> gui
 // $1 = aggregate log lines collected from barriers/c or the daemon itself.

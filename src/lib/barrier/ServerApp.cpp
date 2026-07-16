@@ -924,3 +924,22 @@ ServerApp::startNode()
         m_bye(kExitFailed);
     }
 }
+
+bool
+ServerApp::ipcInputReady() const
+{
+    return m_serverScreen != NULL && m_serverScreen->canEnter();
+}
+
+std::uint64_t
+ServerApp::ipcInputGeneration() const
+{
+    return m_serverScreen == NULL ? 0 : m_serverScreen->inputGeneration();
+}
+
+std::string
+ServerApp::ipcInputDesktopName() const
+{
+    return m_serverScreen == NULL ? std::string() :
+        m_serverScreen->inputDesktopName();
+}

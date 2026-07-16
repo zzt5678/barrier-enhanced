@@ -70,6 +70,9 @@ public:
     void stopClient();
     int mainLoop();
     void startNode();
+    bool ipcInputReady() const override;
+    std::uint64_t ipcInputGeneration() const override;
+    std::string ipcInputDesktopName() const override;
 
     static ClientApp& instance() { return (ClientApp&)App::instance(); }
 

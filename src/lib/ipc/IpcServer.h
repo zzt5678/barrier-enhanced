@@ -24,8 +24,10 @@
 #include "arch/Arch.h"
 #include "base/EventTypes.h"
 
+#include <cstdint>
 #include <list>
 #include <mutex>
+#include <string>
 
 class Event;
 class IpcClientProxy;
@@ -65,6 +67,14 @@ public:
     virtual bool        hasClients(EIpcClientType clientType) const;
     virtual bool        hasClientProcess(EIpcClientType clientType, UInt32 processId) const;
     virtual bool        hasReadyClientProcess(EIpcClientType clientType, UInt32 processId) const;
+    virtual bool        hasInputReadyClientProcess(EIpcClientType clientType,
+                                                   UInt32 processId,
+                                                   UInt32 sessionId,
+                                                   const std::string& desktopName,
+                                                   const std::string& buildId,
+                                                   std::uint64_t queryNonce = 0,
+                                                   bool requireDesktopMatch = true,
+                                                   std::string* reportedDesktopName = nullptr) const;
 
     //@}
 

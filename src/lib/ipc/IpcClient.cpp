@@ -43,6 +43,19 @@ currentProcessId()
 #endif
 }
 
+UInt32
+currentSessionId(UInt32 processId)
+{
+#if SYSAPI_WIN32
+    DWORD sessionId = 0;
+    return ProcessIdToSessionId(processId, &sessionId) ?
+        static_cast<UInt32>(sessionId) : 0;
+#else
+    (void)processId;
+    return 0;
+#endif
+}
+
 }
 
 //
@@ -56,6 +69,8 @@ IpcClient::IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer,
     m_server(nullptr),
     m_events(events),
     m_clientType(clientType),
+    m_processId(currentProcessId()),
+    m_sessionId(currentSessionId(m_processId)),
     m_connectAttempted(false)
 {
     init();
@@ -68,6 +83,8 @@ IpcClient::IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer, 
     m_server(nullptr),
     m_events(events),
     m_clientType(clientType),
+    m_processId(currentProcessId()),
+    m_sessionId(currentSessionId(m_processId)),
     m_connectAttempted(false)
 {
     init();
@@ -154,7 +171,7 @@ IpcClient::handleConnected(const Event&, void*)
     m_events->addEvent(Event(
         m_events->forIpcClient().connected(), this, m_server, Event::kDontFreeData));
 
-    IpcHelloMessage message(m_clientType, currentProcessId());
+    IpcHelloMessage message(m_clientType, m_processId);
     send(message);
 }
 

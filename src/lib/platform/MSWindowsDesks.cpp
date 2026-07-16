@@ -232,6 +232,10 @@ MSWindowsDesks::~MSWindowsDesks()
 void
 MSWindowsDesks::enable()
 {
+    if (m_threadID != 0) {
+        return;
+    }
+
     m_threadID = GetCurrentThreadId();
 
     // set the active desk and (re)install the hooks
@@ -520,6 +524,13 @@ MSWindowsDesks::inputDesktopGeneration() const
 {
     Lock lock(&m_mutex);
     return m_inputDesktopGeneration;
+}
+
+std::string
+MSWindowsDesks::inputDesktopName() const
+{
+    Lock lock(&m_mutex);
+    return m_activeDeskName;
 }
 
 bool

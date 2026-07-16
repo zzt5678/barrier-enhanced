@@ -198,6 +198,9 @@ public:
     //! Monotonically increasing identity for the active desktop backend.
     std::uint64_t       inputDesktopGeneration() const;
 
+    //! Name of the active Windows input desktop.
+    std::string         inputDesktopName() const;
+
     static bool         isDesktopReadyForTest(bool isPrimary, bool noHooks,
                             bool threadAttached, bool windowReady,
                             bool hookInstalled,

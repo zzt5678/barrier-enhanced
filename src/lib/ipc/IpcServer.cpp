@@ -173,7 +173,7 @@ IpcServer::hasClients(EIpcClientType clientType) const
     for (it = m_clients.begin(); it != m_clients.end(); it++) {
         // at least one client is alive and type matches, there are clients.
         IpcClientProxy* p = *it;
-        if (!p->m_disconnecting && p->m_clientType == clientType) {
+        if (!p->m_disconnecting && p->m_clientType.load() == clientType) {
             return true;
         }
     }
@@ -192,8 +192,9 @@ IpcServer::hasClientProcess(EIpcClientType clientType, UInt32 processId) const
     std::lock_guard<std::mutex> lock(m_clientsMutex);
     for (ClientList::const_iterator it = m_clients.begin(); it != m_clients.end(); ++it) {
         IpcClientProxy* proxy = *it;
-        if (!proxy->m_disconnecting && proxy->m_clientType == clientType &&
-            proxy->m_processId == processId) {
+        if (!proxy->m_disconnecting &&
+            proxy->m_clientType.load() == clientType &&
+            proxy->m_processId.load() == processId) {
             return true;
         }
     }
@@ -212,7 +213,33 @@ IpcServer::hasReadyClientProcess(EIpcClientType clientType, UInt32 processId) co
     for (ClientList::const_iterator it = m_clients.begin(); it != m_clients.end(); ++it) {
         IpcClientProxy* proxy = *it;
         if (!proxy->m_disconnecting.load() && proxy->m_ready.load() &&
-            proxy->m_clientType == clientType && proxy->m_processId == processId) {
+            proxy->m_clientType.load() == clientType &&
+            proxy->m_processId.load() == processId) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool
+IpcServer::hasInputReadyClientProcess(EIpcClientType clientType,
+                                      UInt32 processId, UInt32 sessionId,
+                                      const std::string& desktopName,
+                                      const std::string& buildId,
+                                      std::uint64_t queryNonce,
+                                      bool requireDesktopMatch,
+                                      std::string* reportedDesktopName) const
+{
+    if (processId == 0 || clientType != kIpcClientNode) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (ClientList::const_iterator it = m_clients.begin(); it != m_clients.end(); ++it) {
+        if ((*it)->matchesInputReadiness(
+                processId, sessionId, desktopName, buildId, queryNonce,
+                requireDesktopMatch, reportedDesktopName)) {
             return true;
         }
     }
@@ -231,7 +258,8 @@ IpcServer::send(const IpcMessage& message, EIpcClientType filterType)
         ClientList::iterator it;
         for (it = m_clients.begin(); it != m_clients.end(); it++) {
             IpcClientProxy* proxy = *it;
-            if (proxy->m_clientType == filterType && proxy->tryAddSendRef()) {
+            if (proxy->m_clientType.load() == filterType &&
+                proxy->tryAddSendRef()) {
                 recipients.push_back(proxy);
             }
         }
@@ -267,8 +295,8 @@ IpcServer::sendToProcess(const IpcMessage& message, EIpcClientType filterType,
         ClientList::iterator it;
         for (it = m_clients.begin(); it != m_clients.end(); it++) {
             IpcClientProxy* proxy = *it;
-            if (proxy->m_clientType == filterType &&
-                proxy->m_processId == processId &&
+            if (proxy->m_clientType.load() == filterType &&
+                proxy->m_processId.load() == processId &&
                 proxy->tryAddSendRef()) {
                 recipients.push_back(proxy);
             }

@@ -59,6 +59,9 @@ public:
     */
     virtual void        enable();
 
+    //! Prepare the platform input backend without enabling clipboard/network state.
+    bool                prepareInputBackend();
+
     //! Deactivate screen
     /*!
     Undoes the operations in activate() and events are no longer
@@ -256,6 +259,9 @@ public:
 
     //! Return the current platform input backend generation.
     std::uint64_t       inputGeneration() const;
+
+    //! Return the platform desktop currently backing input injection.
+    std::string         inputDesktopName() const;
 
     //! Get jump zone size
     /*!

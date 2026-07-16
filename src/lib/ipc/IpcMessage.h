@@ -21,6 +21,7 @@
 #include "ipc/Ipc.h"
 #include "base/EventTypes.h"
 #include "base/Event.h"
+#include <cstdint>
 #include <string>
 
 class IpcMessage : public EventData {
@@ -61,6 +62,44 @@ class IpcNodeReadyMessage : public IpcMessage {
 public:
     IpcNodeReadyMessage();
     virtual ~IpcNodeReadyMessage();
+};
+
+class IpcNodeReadyV2Message : public IpcMessage {
+public:
+    IpcNodeReadyV2Message(UInt32 processId, UInt32 sessionId,
+                          std::uint64_t inputGeneration, bool inputReady,
+                          const std::string& desktopName,
+                          const std::string& buildId,
+                          std::uint64_t queryNonce = 0);
+    virtual ~IpcNodeReadyV2Message();
+
+    UInt32 processId() const { return m_processId; }
+    UInt32 sessionId() const { return m_sessionId; }
+    std::uint64_t inputGeneration() const { return m_inputGeneration; }
+    bool inputReady() const { return m_inputReady; }
+    const std::string& desktopName() const { return m_desktopName; }
+    const std::string& buildId() const { return m_buildId; }
+    std::uint64_t queryNonce() const { return m_queryNonce; }
+
+private:
+    UInt32 m_processId;
+    UInt32 m_sessionId;
+    std::uint64_t m_inputGeneration;
+    bool m_inputReady;
+    std::string m_desktopName;
+    std::string m_buildId;
+    std::uint64_t m_queryNonce;
+};
+
+class IpcInputReadyQueryMessage : public IpcMessage {
+public:
+    explicit IpcInputReadyQueryMessage(std::uint64_t queryNonce);
+    virtual ~IpcInputReadyQueryMessage();
+
+    std::uint64_t queryNonce() const { return m_queryNonce; }
+
+private:
+    std::uint64_t m_queryNonce;
 };
 
 

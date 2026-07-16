@@ -83,6 +83,12 @@ Screen::enable()
     m_enabled = true;
 }
 
+bool
+Screen::prepareInputBackend()
+{
+    return m_screen->prepareInputBackend();
+}
+
 void
 Screen::disable()
 {
@@ -411,6 +417,12 @@ std::uint64_t
 Screen::inputGeneration() const
 {
     return m_screen->inputGeneration();
+}
+
+std::string
+Screen::inputDesktopName() const
+{
+    return m_screen->inputDesktopName();
 }
 
 SInt32

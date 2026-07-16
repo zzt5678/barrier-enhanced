@@ -40,6 +40,12 @@
 #include <iostream>
 #include <stdio.h>
 
+namespace {
+
+const double kIpcInputReadinessIntervalSeconds = 0.25;
+
+}
+
 #if WINAPI_CARBON
 #include <ApplicationServices/ApplicationServices.h>
 #endif
@@ -64,6 +70,10 @@ App::App(IEventQueue* events, CreateTaskBarReceiverFunc createTaskBarReceiver, A
     m_createTaskBarReceiver(createTaskBarReceiver),
     m_appUtil(events),
     m_ipcClient(nullptr),
+    m_ipcReadinessTimer(nullptr),
+    m_hasReportedIpcReadiness(false),
+    m_lastIpcInputReady(false),
+    m_lastIpcInputGeneration(0),
     m_socketMultiplexer(nullptr)
 {
     assert(s_instance == nullptr);
@@ -229,6 +239,8 @@ App::initIpcClient()
 void
 App::cleanupIpcClient()
 {
+    stopIpcReadinessTimer();
+
     IpcClient* client = m_ipcClient;
     m_ipcClient = nullptr;
     if (client == nullptr) {
@@ -243,8 +255,95 @@ App::cleanupIpcClient()
 void
 App::handleIpcConnected(const Event&, void*)
 {
-    IpcNodeReadyMessage ready;
-    m_ipcClient->send(ready);
+    stopIpcReadinessTimer();
+    if (!sendIpcInputReadiness()) {
+        return;
+    }
+
+    m_ipcReadinessTimer = m_events->newTimer(
+        kIpcInputReadinessIntervalSeconds, NULL);
+    if (m_ipcReadinessTimer != NULL) {
+        m_events->adoptHandler(
+            Event::kTimer, m_ipcReadinessTimer,
+            new TMethodEventJob<App>(
+                this, &App::handleIpcReadinessTimer));
+    }
+}
+
+void
+App::handleIpcReadinessTimer(const Event&, void*)
+{
+    if (!sendIpcInputReadiness()) {
+        stopIpcReadinessTimer();
+    }
+}
+
+bool
+App::sendIpcInputReadiness(std::uint64_t queryNonce)
+{
+    if (m_ipcClient == NULL) {
+        return false;
+    }
+
+    const std::uint64_t generationBefore = ipcInputGeneration();
+    std::string desktopName = ipcInputDesktopName();
+    bool inputReady = ipcInputReady();
+    const std::uint64_t generationAfter = ipcInputGeneration();
+    const std::uint64_t inputGeneration = generationAfter;
+    if (generationBefore != generationAfter) {
+        // A desktop transition happened while taking the snapshot. A later
+        // lease tick will report the stable state; never advertise a mixed one.
+        inputReady = false;
+        desktopName = ipcInputDesktopName();
+    }
+
+    IpcNodeReadyV2Message ready(
+        m_ipcClient->processId(), m_ipcClient->sessionId(),
+        inputGeneration, inputReady, desktopName, kBuildId, queryNonce);
+    const bool changed = !m_hasReportedIpcReadiness ||
+        ready.inputReady() != m_lastIpcInputReady ||
+        ready.inputGeneration() != m_lastIpcInputGeneration ||
+        ready.desktopName() != m_lastIpcInputDesktopName;
+    if (changed) {
+        LOG((CLOG_INFO
+            "reporting local input readiness: pid=%u session=%u desktop=%s generation=%llu ready=%s build=%s",
+            ready.processId(), ready.sessionId(),
+            ready.desktopName().empty() ? "<none>" : ready.desktopName().c_str(),
+            static_cast<unsigned long long>(ready.inputGeneration()),
+            ready.inputReady() ? "yes" : "no", ready.buildId().c_str()));
+    }
+    if (queryNonce != 0) {
+        LOG((CLOG_DEBUG
+            "answering local input readiness query=%llu generation=%llu ready=%s",
+            static_cast<unsigned long long>(queryNonce),
+            static_cast<unsigned long long>(ready.inputGeneration()),
+            ready.inputReady() ? "yes" : "no"));
+    }
+
+    try {
+        m_ipcClient->send(ready);
+        m_hasReportedIpcReadiness = true;
+        m_lastIpcInputReady = ready.inputReady();
+        m_lastIpcInputGeneration = ready.inputGeneration();
+        m_lastIpcInputDesktopName = ready.desktopName();
+        return true;
+    }
+    catch (const XBase& e) {
+        LOG((CLOG_WARN "stopping local input readiness lease: %s", e.what()));
+        return false;
+    }
+}
+
+void
+App::stopIpcReadinessTimer()
+{
+    if (m_ipcReadinessTimer == NULL) {
+        return;
+    }
+
+    m_events->removeHandler(Event::kTimer, m_ipcReadinessTimer);
+    m_events->deleteTimer(m_ipcReadinessTimer);
+    m_ipcReadinessTimer = NULL;
 }
 
 void
@@ -259,6 +358,15 @@ App::handleIpcMessage(const Event& e, void*)
     if (m->type() == kIpcShutdown) {
         LOG((CLOG_INFO "got ipc shutdown message"));
         m_events->addEvent(Event(Event::kQuit));
+    }
+    else if (m->type() == kIpcReadyQuery) {
+        const IpcInputReadyQueryMessage* query =
+            static_cast<const IpcInputReadyQueryMessage*>(m);
+        if (query->queryNonce() == 0) {
+            LOG((CLOG_WARN "ignoring invalid zero local input readiness query"));
+            return;
+        }
+        sendIpcInputReadiness(query->queryNonce());
     }
 }
 

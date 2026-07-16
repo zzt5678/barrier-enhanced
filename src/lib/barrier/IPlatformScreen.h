@@ -27,6 +27,7 @@
 #include "barrier/option_types.h"
 
 #include <cstdint>
+#include <string>
 
 class IClipboard;
 
@@ -52,6 +53,9 @@ public:
     and hiding the cursor.
     */
     virtual void        enable() = 0;
+
+    //! Prepare only the platform input backend before remote handshaking.
+    virtual bool        prepareInputBackend() { return true; }
 
     //! Disable screen
     /*!
@@ -156,6 +160,9 @@ public:
 
     //! Identity of the input backend validated by a prepared handoff.
     virtual std::uint64_t inputGeneration() const { return 0; }
+
+    //! Platform desktop currently backing input injection.
+    virtual std::string inputDesktopName() const { return std::string(); }
 
     //@}
 

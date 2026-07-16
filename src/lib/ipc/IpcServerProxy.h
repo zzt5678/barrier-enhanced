@@ -24,6 +24,7 @@
 namespace barrier { class IStream; }
 class IpcMessage;
 class IpcLogLineMessage;
+class IpcInputReadyQueryMessage;
 class IEventQueue;
 
 class IpcServerProxy {
@@ -42,6 +43,7 @@ private:
 
     void                handleData(const Event&, void*);
     IpcLogLineMessage*    parseLogLine();
+    IpcInputReadyQueryMessage* parseInputReadyQuery();
     void                disconnect();
 
 #if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)

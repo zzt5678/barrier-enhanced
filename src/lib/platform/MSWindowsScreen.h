@@ -107,6 +107,7 @@ public:
 
     // IPlatformScreen overrides
     virtual void        enable() override;
+    virtual bool        prepareInputBackend() override;
     virtual void        disable() override;
     virtual void        enter() override;
     virtual bool        leave() override;
@@ -121,6 +122,7 @@ public:
     virtual bool        isPrimary() const override;
     virtual bool        canEnter() const override;
     virtual std::uint64_t inputGeneration() const override;
+    virtual std::string inputDesktopName() const override;
     virtual void        fakeDraggingFiles(DragFileList fileList) override;
     virtual std::string& getDraggingFilename() override;
     virtual const std::string& getDropTarget() const override;

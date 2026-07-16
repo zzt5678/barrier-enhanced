@@ -21,6 +21,7 @@
 #include "ipc/IpcMessage.h"
 #include "ipc/Ipc.h"
 #include "barrier/ProtocolUtil.h"
+#include "barrier/XBarrier.h"
 #include "io/IStream.h"
 #include "base/TMethodEventJob.h"
 #include "base/Log.h"
@@ -58,15 +59,29 @@ IpcServerProxy::handleData(const Event&, void*)
             code[0], code[1], code[2], code[3]));
 
         IpcMessage* m = nullptr;
-        if (memcmp(code, kIpcMsgLogLine, 4) == 0) {
-            m = parseLogLine();
+        try {
+            if (memcmp(code, kIpcMsgLogLine, 4) == 0) {
+                m = parseLogLine();
+            }
+            else if (memcmp(code, kIpcMsgShutdown, 4) == 0) {
+                m = new IpcShutdownMessage();
+            }
+            else if (memcmp(code, kIpcMsgReadyQuery, 4) == 0) {
+                m = parseInputReadyQuery();
+            }
+            else {
+                LOG((CLOG_ERR "invalid ipc message"));
+                disconnect();
+                return;
+            }
         }
-        else if (memcmp(code, kIpcMsgShutdown, 4) == 0) {
-            m = new IpcShutdownMessage();
-        }
-        else {
-            LOG((CLOG_ERR "invalid ipc message"));
+        catch (const XBase& e) {
+            LOG((CLOG_WARN "rejecting malformed ipc message: %s", e.what()));
             disconnect();
+            return;
+        }
+
+        if (m == nullptr) {
             return;
         }
 
@@ -97,6 +112,28 @@ IpcServerProxy::send(const IpcMessage& message)
         ProtocolUtil::writef(&m_stream, kIpcMsgReady);
         break;
 
+    case kIpcReadyV2: {
+        const IpcNodeReadyV2Message& ready =
+            static_cast<const IpcNodeReadyV2Message&>(message);
+        const UInt32 generationHigh =
+            static_cast<UInt32>(ready.inputGeneration() >> 32);
+        const UInt32 generationLow =
+            static_cast<UInt32>(ready.inputGeneration() & 0xffffffffu);
+        const UInt32 queryNonceHigh =
+            static_cast<UInt32>(ready.queryNonce() >> 32);
+        const UInt32 queryNonceLow =
+            static_cast<UInt32>(ready.queryNonce() & 0xffffffffu);
+        std::string desktopName = ready.desktopName();
+        std::string buildId = ready.buildId();
+        ProtocolUtil::writef(&m_stream, kIpcMsgReadyV2,
+                             ready.processId(), ready.sessionId(),
+                             generationHigh, generationLow,
+                             ready.inputReady() ? 1u : 0u,
+                             &desktopName, &buildId,
+                             queryNonceHigh, queryNonceLow);
+        break;
+    }
+
     case kIpcCommand: {
         const IpcCommandMessage& cm = static_cast<const IpcCommandMessage&>(message);
         std::string command = cm.command();
@@ -118,6 +155,24 @@ IpcServerProxy::parseLogLine()
 
     // must be deleted by event handler.
     return new IpcLogLineMessage(logLine);
+}
+
+IpcInputReadyQueryMessage*
+IpcServerProxy::parseInputReadyQuery()
+{
+    UInt32 queryNonceHigh = 0;
+    UInt32 queryNonceLow = 0;
+    if (!ProtocolUtil::readf(&m_stream, kIpcMsgReadyQuery + 4,
+                             &queryNonceHigh, &queryNonceLow)) {
+        LOG((CLOG_WARN "incomplete ipc input readiness query"));
+        disconnect();
+        return nullptr;
+    }
+
+    const std::uint64_t queryNonce =
+        (static_cast<std::uint64_t>(queryNonceHigh) << 32) |
+        queryNonceLow;
+    return new IpcInputReadyQueryMessage(queryNonce);
 }
 
 void

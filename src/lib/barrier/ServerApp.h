@@ -100,6 +100,9 @@ public:
     int standardStartup(int argc, char** argv);
     int foregroundStartup(int argc, char** argv);
     void startNode();
+    bool ipcInputReady() const override;
+    std::uint64_t ipcInputGeneration() const override;
+    std::string ipcInputDesktopName() const override;
 
     static ServerApp& instance() { return (ServerApp&)App::instance(); }
 

@@ -526,7 +526,22 @@ DaemonApp::handleIpcMessage(const Event& e, void*)
         }
 
         case kIpcReady:
-            LOG((CLOG_DEBUG "ipc node reported ready"));
+            LOG((CLOG_WARN
+                "ipc node reported legacy readiness without input capabilities; "
+                "service and node builds must be deployed together"));
             break;
+
+        case kIpcReadyV2: {
+            IpcNodeReadyV2Message* ready =
+                static_cast<IpcNodeReadyV2Message*>(m);
+            LOG((ready->inputReady() ? CLOG_INFO : CLOG_WARN,
+                "ipc node input readiness pid=%u session=%u desktop=%s generation=%llu ready=%s build=%s query=%llu",
+                ready->processId(), ready->sessionId(),
+                ready->desktopName().empty() ? "<none>" : ready->desktopName().c_str(),
+                static_cast<unsigned long long>(ready->inputGeneration()),
+                ready->inputReady() ? "yes" : "no", ready->buildId().c_str(),
+                static_cast<unsigned long long>(ready->queryNonce())));
+            break;
+        }
     }
 }

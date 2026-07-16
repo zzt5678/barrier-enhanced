@@ -21,10 +21,19 @@
 #include "ipc/Ipc.h"
 #include "ipc/IpcMessage.h"
 #include "barrier/ProtocolUtil.h"
+#include "barrier/XBarrier.h"
 #include "io/IStream.h"
 #include "arch/Arch.h"
 #include "base/TMethodEventJob.h"
 #include "base/Log.h"
+
+#include <chrono>
+
+namespace {
+
+const std::chrono::milliseconds kInputReadinessLeaseLifetime(2000);
+
+}
 
 //
 // IpcClientProxy
@@ -35,9 +44,16 @@ IpcClientProxy::IpcClientProxy(barrier::IStream& stream, IEventQueue* events) :
     m_clientType(kIpcClientUnknown),
     m_processId(0),
     m_ready(false),
+    m_inputReady(false),
     m_disconnecting(false),
     m_deleting(false),
     m_sendRefCount(0),
+    m_readySessionId(0),
+    m_readyInputGeneration(0),
+    m_proofInputReady(false),
+    m_proofSessionId(0),
+    m_proofInputGeneration(0),
+    m_proofQueryNonce(0),
     m_events(events)
 {
     m_events->adoptHandler(
@@ -143,22 +159,36 @@ IpcClientProxy::handleData(const Event&, void*)
             code[0], code[1], code[2], code[3]));
 
         IpcMessage* m = nullptr;
-        if (memcmp(code, kIpcMsgHello, 4) == 0) {
-            m = parseHello();
-        }
-        else if (memcmp(code, kIpcMsgReady, 4) == 0) {
-            m = parseReady();
-        }
-        else if (memcmp(code, kIpcMsgCommand, 4) == 0) {
-            if (m_clientType != kIpcClientGui) {
-                LOG((CLOG_WARN "rejecting ipc command from non-gui client type=%d", m_clientType));
+        try {
+            if (memcmp(code, kIpcMsgHello, 4) == 0) {
+                m = parseHello();
+            }
+            else if (memcmp(code, kIpcMsgReady, 4) == 0) {
+                m = parseReady();
+            }
+            else if (memcmp(code, kIpcMsgReadyV2, 4) == 0) {
+                m = parseReadyV2();
+            }
+            else if (memcmp(code, kIpcMsgCommand, 4) == 0) {
+                const EIpcClientType clientType =
+                    m_clientType.load(std::memory_order_acquire);
+                if (clientType != kIpcClientGui) {
+                    LOG((CLOG_WARN
+                        "rejecting ipc command from non-gui client type=%d",
+                        static_cast<int>(clientType)));
+                    disconnect();
+                    return;
+                }
+                m = parseCommand();
+            }
+            else {
+                LOG((CLOG_ERR "invalid ipc message"));
                 disconnect();
                 return;
             }
-            m = parseCommand();
         }
-        else {
-            LOG((CLOG_ERR "invalid ipc message"));
+        catch (const XBase& e) {
+            LOG((CLOG_WARN "rejecting malformed ipc message: %s", e.what()));
             disconnect();
             return;
         }
@@ -200,6 +230,18 @@ IpcClientProxy::send(const IpcMessage& message)
         ProtocolUtil::writef(&m_stream, kIpcMsgShutdown);
         break;
 
+    case kIpcReadyQuery: {
+        const IpcInputReadyQueryMessage& query =
+            static_cast<const IpcInputReadyQueryMessage&>(message);
+        const UInt32 queryNonceHigh =
+            static_cast<UInt32>(query.queryNonce() >> 32);
+        const UInt32 queryNonceLow =
+            static_cast<UInt32>(query.queryNonce() & 0xffffffffu);
+        ProtocolUtil::writef(&m_stream, kIpcMsgReadyQuery,
+                             queryNonceHigh, queryNonceLow);
+        break;
+    }
+
     default:
         LOG((CLOG_ERR "ipc message not supported: %d", message.type()));
         break;
@@ -215,23 +257,25 @@ IpcClientProxy::parseHello()
 
     if (type != kIpcClientGui && type != kIpcClientNode) {
         LOG((CLOG_WARN "rejecting invalid ipc client type=%d", type));
-        m_clientType = kIpcClientUnknown;
-        m_processId = 0;
+        m_clientType.store(kIpcClientUnknown, std::memory_order_release);
+        m_processId.store(0, std::memory_order_release);
         disconnect();
         return nullptr;
     }
 
-    m_clientType = static_cast<EIpcClientType>(type);
-    m_processId = processId;
+    const EIpcClientType clientType = static_cast<EIpcClientType>(type);
+    m_clientType.store(clientType, std::memory_order_release);
+    m_processId.store(processId, std::memory_order_release);
 
     // must be deleted by event handler.
-    return new IpcHelloMessage(m_clientType, m_processId);
+    return new IpcHelloMessage(clientType, processId);
 }
 
 IpcMessage*
 IpcClientProxy::parseReady()
 {
-    if (m_clientType != kIpcClientNode || m_processId == 0) {
+    if (m_clientType.load(std::memory_order_acquire) != kIpcClientNode ||
+        m_processId.load(std::memory_order_acquire) == 0) {
         LOG((CLOG_WARN "rejecting ipc ready before a valid node hello"));
         disconnect();
         return nullptr;
@@ -239,6 +283,142 @@ IpcClientProxy::parseReady()
 
     m_ready = true;
     return new IpcNodeReadyMessage();
+}
+
+IpcNodeReadyV2Message*
+IpcClientProxy::parseReadyV2()
+{
+    const EIpcClientType clientType =
+        m_clientType.load(std::memory_order_acquire);
+    const UInt32 expectedProcessId =
+        m_processId.load(std::memory_order_acquire);
+    if (clientType != kIpcClientNode || expectedProcessId == 0) {
+        LOG((CLOG_WARN "rejecting ipc capability ready before a valid node hello"));
+        disconnect();
+        return nullptr;
+    }
+
+    UInt32 processId = 0;
+    UInt32 sessionId = 0;
+    UInt32 generationHigh = 0;
+    UInt32 generationLow = 0;
+    UInt8 inputReady = 0;
+    std::string desktopName;
+    std::string buildId;
+    UInt32 queryNonceHigh = 0;
+    UInt32 queryNonceLow = 0;
+    if (!ProtocolUtil::readf(&m_stream, kIpcMsgReadyV2 + 4,
+                             &processId, &sessionId,
+                             &generationHigh, &generationLow,
+                             &inputReady, &desktopName, &buildId,
+                             &queryNonceHigh, &queryNonceLow)) {
+        LOG((CLOG_WARN "incomplete ipc capability ready message"));
+        disconnect();
+        return nullptr;
+    }
+
+    if (processId != expectedProcessId || inputReady > 1) {
+        LOG((CLOG_WARN
+            "rejecting invalid ipc capability ready process=%u expected=%u ready=%u",
+            processId, expectedProcessId, inputReady));
+        disconnect();
+        return nullptr;
+    }
+
+    const std::uint64_t inputGeneration =
+        (static_cast<std::uint64_t>(generationHigh) << 32) | generationLow;
+    const std::uint64_t queryNonce =
+        (static_cast<std::uint64_t>(queryNonceHigh) << 32) | queryNonceLow;
+    {
+        std::lock_guard<std::mutex> lock(m_readyMutex);
+        const std::chrono::steady_clock::time_point receivedAt =
+            std::chrono::steady_clock::now();
+        if (queryNonce == 0) {
+            const bool invalidatesProof = m_proofQueryNonce != 0 &&
+                (!inputReady ||
+                 m_proofSessionId != sessionId ||
+                 m_proofInputGeneration != inputGeneration ||
+                 m_proofDesktopName != desktopName ||
+                 m_proofBuildId != buildId);
+            if (invalidatesProof) {
+                m_proofInputReady = false;
+                m_proofQueryNonce = 0;
+                m_proofReceivedAt =
+                    std::chrono::steady_clock::time_point();
+            }
+            m_readySessionId = sessionId;
+            m_readyInputGeneration = inputGeneration;
+            m_readyDesktopName = desktopName;
+            m_readyBuildId = buildId;
+            m_readyReceivedAt = receivedAt;
+            m_inputReady.store(inputReady != 0, std::memory_order_release);
+        }
+        else {
+            m_proofInputReady = inputReady != 0;
+            m_proofSessionId = sessionId;
+            m_proofInputGeneration = inputGeneration;
+            m_proofDesktopName = desktopName;
+            m_proofBuildId = buildId;
+            m_proofQueryNonce = queryNonce;
+            m_proofReceivedAt = receivedAt;
+        }
+    }
+    m_ready.store(true, std::memory_order_release);
+
+    return new IpcNodeReadyV2Message(
+        processId, sessionId, inputGeneration, inputReady != 0,
+        desktopName, buildId, queryNonce);
+}
+
+bool
+IpcClientProxy::matchesInputReadiness(UInt32 processId, UInt32 sessionId,
+                                      const std::string& desktopName,
+                                      const std::string& buildId,
+                                      std::uint64_t queryNonce,
+                                      bool requireDesktopMatch,
+                                      std::string* reportedDesktopName) const
+{
+    if (m_disconnecting.load(std::memory_order_acquire) ||
+        m_clientType.load(std::memory_order_acquire) != kIpcClientNode ||
+        m_processId.load(std::memory_order_acquire) != processId) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_readyMutex);
+    const std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+    const bool useProof = queryNonce != 0;
+    const bool inputReady = useProof
+        ? m_proofInputReady
+        : m_inputReady.load(std::memory_order_relaxed);
+    const UInt32 readySessionId = useProof
+        ? m_proofSessionId : m_readySessionId;
+    const std::uint64_t inputGeneration = useProof
+        ? m_proofInputGeneration : m_readyInputGeneration;
+    const std::string& readyDesktopName = useProof
+        ? m_proofDesktopName : m_readyDesktopName;
+    const std::string& readyBuildId = useProof
+        ? m_proofBuildId : m_readyBuildId;
+    const std::uint64_t readyQueryNonce = useProof
+        ? m_proofQueryNonce : 0;
+    const std::chrono::steady_clock::time_point receivedAt = useProof
+        ? m_proofReceivedAt : m_readyReceivedAt;
+    const bool desktopMatches = requireDesktopMatch
+        ? readyDesktopName == desktopName
+        : !readyDesktopName.empty();
+
+    const bool matches = inputReady &&
+        readySessionId == sessionId &&
+        desktopMatches &&
+        inputGeneration != 0 &&
+        readyBuildId == buildId &&
+        readyQueryNonce == queryNonce &&
+        receivedAt != std::chrono::steady_clock::time_point() &&
+        now - receivedAt <= kInputReadinessLeaseLifetime;
+    if (matches && reportedDesktopName != NULL) {
+        *reportedDesktopName = readyDesktopName;
+    }
+    return matches;
 }
 
 IpcCommandMessage*
