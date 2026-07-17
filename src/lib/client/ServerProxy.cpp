@@ -797,9 +797,10 @@ bool
 ServerProxy::shouldCompressMouseMoves() const
 {
     // Callers also require a complete message to be waiting. Coalescing only
-    // after input is already backlogged preserves immediate delivery while
-    // preventing motion floods from delaying control and keepalive messages.
-    return true;
+    // after input is already backlogged prevents motion floods from delaying
+    // control messages in normal mode. Immediate-delivery modes already apply
+    // their own pacing and must not lose another set of coordinates here.
+    return !m_lowLatencyMode && !m_nestedRemoteMode;
 }
 
 void
@@ -1638,7 +1639,7 @@ ServerProxy::setOptions()
         LOG((CLOG_NOTE "server requested low latency mode - immediate mouse delivery enabled while input is current"));
     }
     if (m_nestedRemoteMode) {
-        LOG((CLOG_NOTE "server requested nested remote mode - adaptive backlog compression remains enabled"));
+        LOG((CLOG_NOTE "server requested nested remote mode - immediate mouse delivery enabled while input is current"));
     }
 }
 

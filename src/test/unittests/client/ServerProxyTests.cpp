@@ -20,10 +20,12 @@
 #include "test/mock/barrier/MockEventQueue.h"
 #include "test/mock/io/MockStream.h"
 
+#include <algorithm>
 #include <chrono>
 #include <atomic>
 #include <cstring>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using ::testing::_;
@@ -59,6 +61,22 @@ public:
     {
         return const_cast<TestScreen*>(this);
     }
+};
+
+class RecordingMouseClient : public Client {
+public:
+    RecordingMouseClient(IEventQueue* events, barrier::Screen* screen) :
+        Client(events, "client", NetworkAddress(), new DummySocketFactory(),
+               screen, ClientArgs())
+    {
+    }
+
+    void mouseMove(SInt32 x, SInt32 y) override
+    {
+        moves.push_back(std::make_pair(x, y));
+    }
+
+    std::vector<std::pair<SInt32, SInt32> > moves;
 };
 
 class CountingClipboard : public IClipboard {
@@ -287,7 +305,7 @@ TEST(ServerProxyTests, setKeepAliveRateAllowsTransientSchedulingPause)
     proxy.setKeepAliveRate(1.0);
 }
 
-TEST(ServerProxyTests, backloggedMouseMovesCompressInLowLatencyNestedRemoteMode)
+TEST(ServerProxyTests, mouseMoveCompressionIsDisabledForImmediateDeliveryModes)
 {
     NiceMock<MockEventQueue> events;
     IStreamEvents streamEvents;
@@ -301,10 +319,65 @@ TEST(ServerProxyTests, backloggedMouseMovesCompressInLowLatencyNestedRemoteMode)
     ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0));
 
     ServerProxy proxy(reinterpret_cast<Client*>(1), &stream, &events);
-    proxy.m_lowLatencyMode = true;
-    proxy.m_nestedRemoteMode = true;
 
     EXPECT_TRUE(proxy.shouldCompressMouseMoves());
+
+    proxy.m_lowLatencyMode = true;
+    EXPECT_FALSE(proxy.shouldCompressMouseMoves());
+
+    proxy.m_lowLatencyMode = false;
+    proxy.m_nestedRemoteMode = true;
+    EXPECT_FALSE(proxy.shouldCompressMouseMoves());
+
+    proxy.m_lowLatencyMode = true;
+    EXPECT_FALSE(proxy.shouldCompressMouseMoves());
+}
+
+TEST(ServerProxyTests, lowLatencyMouseMovesDeliverEveryCoordinateInBackloggedBatch)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents, clientEvents, screenEvents);
+
+    TestScreen screen;
+    RecordingMouseClient client(&events, &screen);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Return(&stream));
+    ON_CALL(stream, isReady()).WillByDefault(Return(true));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0));
+
+    const UInt8 coordinates[] = { 0, 10, 0, 20, 0, 11, 0, 21 };
+    size_t offset = 0;
+    ON_CALL(stream, read(_, _)).WillByDefault(
+        Invoke([&](void* buffer, UInt32 count) -> UInt32 {
+            const size_t remaining = sizeof(coordinates) - offset;
+            const UInt32 copied = static_cast<UInt32>(
+                std::min<size_t>(remaining, count));
+            std::memcpy(buffer, coordinates + offset, copied);
+            offset += copied;
+            return copied;
+        }));
+
+    ServerProxy proxy(&client, &stream, &events);
+    proxy.m_lowLatencyMode = true;
+    proxy.m_nestedRemoteMode = true;
+    proxy.m_inputActive = true;
+    proxy.m_inputFrameAccepted = true;
+
+    proxy.mouseMove();
+    proxy.mouseMove();
+
+    ASSERT_EQ(2u, client.moves.size());
+    EXPECT_EQ(10, client.moves[0].first);
+    EXPECT_EQ(20, client.moves[0].second);
+    EXPECT_EQ(11, client.moves[1].first);
+    EXPECT_EQ(21, client.moves[1].second);
 }
 
 TEST(ServerProxyTests, ordinaryMessageResetsKeepAliveAlarm)
