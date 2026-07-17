@@ -147,6 +147,8 @@ public:
     virtual Status XkbRefreshKeyboardMapping(XkbMapNotifyEvent* event);
     virtual int XRefreshKeyboardMapping(XMappingEvent* event_map);
 #ifdef HAVE_XI2
+    virtual int XIQueryVersion(Display* display, int* major_version,
+                               int* minor_version);
     virtual int XISelectEvents(Display* display, Window w, XIEventMask* masks,
                                int num_masks);
 #endif

@@ -490,6 +490,12 @@ int XWindowsImpl::XRefreshKeyboardMapping(XMappingEvent* event_map)
 }
 
 #ifdef HAVE_XI2
+int XWindowsImpl::XIQueryVersion(Display* display, int* major_version,
+                                 int* minor_version)
+{
+    return ::XIQueryVersion(display, major_version, minor_version);
+}
+
 int XWindowsImpl::XISelectEvents(Display* display, Window w, XIEventMask* masks,
                                  int num_masks)
 {

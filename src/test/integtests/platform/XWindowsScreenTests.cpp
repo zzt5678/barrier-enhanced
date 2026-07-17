@@ -63,6 +63,51 @@ public:
 private:
 	bool* m_requestQueued;
 };
+
+struct XIQueryVersionCapture {
+	explicit XIQueryVersionCapture(int negotiatedMinor) :
+		calls(0),
+		requestedMajor(0),
+		requestedMinor(0),
+		negotiatedMinor(negotiatedMinor),
+		selectCalls(0)
+	{
+	}
+
+	int calls;
+	int requestedMajor;
+	int requestedMinor;
+	int negotiatedMinor;
+	int selectCalls;
+};
+
+class XIQueryVersionTrackingXWindowsImpl : public XWindowsImpl {
+public:
+	explicit XIQueryVersionTrackingXWindowsImpl(
+		XIQueryVersionCapture* capture) :
+		m_capture(capture)
+	{
+	}
+
+	int XIQueryVersion(Display*, int* major, int* minor) override
+	{
+		++m_capture->calls;
+		m_capture->requestedMajor = *major;
+		m_capture->requestedMinor = *minor;
+		*major = 2;
+		*minor = m_capture->negotiatedMinor;
+		return Success;
+	}
+
+	int XISelectEvents(Display*, Window, XIEventMask*, int) override
+	{
+		++m_capture->selectCalls;
+		return Success;
+	}
+
+private:
+	XIQueryVersionCapture* m_capture;
+};
 #endif
 
 }
@@ -239,6 +284,63 @@ TEST(CXWindowsScreenTests, primaryEnter_releasesPointerGrabBeforeReturning)
 }
 
 #ifdef HAVE_XI2
+TEST(CXWindowsScreenTests, primaryScreenRequiresXi21BeforeSelectingRawMotion)
+{
+	const char* displayName = std::getenv("DISPLAY");
+	if (displayName == NULL) {
+		displayName = ":0.0";
+	}
+
+	std::unique_ptr<Display, int (*)(Display*)> probe(
+		XOpenDisplay(displayName), &XCloseDisplay);
+	ASSERT_NE(static_cast<Display*>(NULL), probe.get());
+	int xiOpcode = 0;
+	int xiEvent = 0;
+	int xiError = 0;
+	if (!XQueryExtension(probe.get(), "XInputExtension", &xiOpcode,
+			&xiEvent, &xiError)) {
+		GTEST_SKIP() << "XInputExtension is unavailable";
+	}
+
+	auto constructPrimary = [&](XIQueryVersionCapture& capture) {
+		MockEventQueue eventQueue;
+		std::vector<std::unique_ptr<IEventJob> > handlers;
+		std::unique_ptr<IEventQueueBuffer> buffer;
+		EXPECT_CALL(eventQueue, adoptHandler(_, _, _))
+			.Times(2)
+			.WillRepeatedly(Invoke(
+				[&](Event::Type, void*, IEventJob* handler) {
+					handlers.emplace_back(handler);
+				}));
+		EXPECT_CALL(eventQueue, adoptBuffer(_))
+			.Times(2)
+			.WillRepeatedly(Invoke(
+				[&](IEventQueueBuffer* adoptedBuffer) {
+					buffer.reset(adoptedBuffer);
+				}));
+		EXPECT_CALL(eventQueue, removeHandler(_, _)).Times(2);
+
+		XWindowsScreen screen(
+			new XIQueryVersionTrackingXWindowsImpl(&capture), displayName,
+			true, false, 0, &eventQueue);
+		return screen.xi2DetectedForTest();
+	};
+
+	XIQueryVersionCapture xi20(0);
+	EXPECT_FALSE(constructPrimary(xi20));
+	EXPECT_EQ(1, xi20.calls);
+	EXPECT_EQ(2, xi20.requestedMajor);
+	EXPECT_EQ(1, xi20.requestedMinor);
+	EXPECT_EQ(0, xi20.selectCalls);
+
+	XIQueryVersionCapture xi21(1);
+	EXPECT_TRUE(constructPrimary(xi21));
+	EXPECT_EQ(1, xi21.calls);
+	EXPECT_EQ(2, xi21.requestedMajor);
+	EXPECT_EQ(1, xi21.requestedMinor);
+	EXPECT_EQ(1, xi21.selectCalls);
+}
+
 TEST(CXWindowsScreenTests, xi2AsyncSelectionFailureKeepsCoreMotionFallback)
 {
     const char* displayName = std::getenv("DISPLAY");

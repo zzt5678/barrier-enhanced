@@ -3504,23 +3504,31 @@ XWindowsScreen::detectXI2()
 	int event, error;
 	if (!m_impl->XQueryExtension(m_display,
 			"XInputExtension", &xi_opcode, &event, &error)) {
+		LOG((CLOG_DEBUG "XInput2 extension is unavailable; using Core pointer input"));
 		return false;
 	}
 
 	int major = 2;
-	int minor = 0;
+	int minor = 1;
 	bool queryError = false;
 	int status = Success;
 	{
 		XWindowsUtil::ErrorLock lock(m_display, &queryError);
-		status = XIQueryVersion(m_display, &major, &minor);
+		status = m_impl->XIQueryVersion(m_display, &major, &minor);
 	}
 	if (status != Success || queryError || major < 2) {
 		LOG((CLOG_WARN "XInput2 is unavailable (status=%d, error=%s, version=%d.%d)",
 			status, queryError ? "true" : "false", major, minor));
 		return false;
 	}
+	if (major == 2 && minor < 1) {
+		LOG((CLOG_WARN "XInput2 2.1 is required for raw motion during active grabs; server reported %d.%d; using Core pointer input",
+			major, minor));
+		return false;
+	}
 
+	LOG((CLOG_DEBUG "negotiated XInput2 %d.%d (opcode=%d)",
+		major, minor, xi_opcode));
 	return true;
 #else
 	return false;
@@ -3582,6 +3590,8 @@ XWindowsScreen::selectXIRawMotion()
 			status, error ? "true" : "false"));
 		return false;
 	}
+	LOG((CLOG_INFO "selected XI2 RawMotion input on root window (opcode=%d)",
+		xi_opcode));
 	return true;
 }
 
