@@ -60,6 +60,21 @@ TEST(XWindowsScreenTests, primaryLeaveGrabRetrySleepForTest_lowLatencyKeepsQuick
 		XWindowsScreen::primaryLeaveGrabTimeoutForTest(true));
 }
 
+TEST(XWindowsScreenTests, coreMotionIsIgnoredWhenXi2OwnsPointerMotion)
+{
+	EXPECT_FALSE(XWindowsScreen::shouldProcessCoreMotionForTest(true, true));
+}
+
+TEST(XWindowsScreenTests, coreMotionIsProcessedForPrimaryXi2Fallback)
+{
+	EXPECT_TRUE(XWindowsScreen::shouldProcessCoreMotionForTest(true, false));
+}
+
+TEST(XWindowsScreenTests, coreMotionIsIgnoredForSecondaryScreen)
+{
+	EXPECT_FALSE(XWindowsScreen::shouldProcessCoreMotionForTest(false, false));
+}
+
 #ifdef HAVE_XI2
 TEST(XWindowsScreenTests, xInputCookieUsableForTest_rejectsNullEventData)
 {

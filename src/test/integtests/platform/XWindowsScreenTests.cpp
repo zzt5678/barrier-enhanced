@@ -18,6 +18,7 @@
 
 #include "test/mock/barrier/MockEventQueue.h"
 #include "barrier/XScreen.h"
+#include "base/EventTypes.h"
 #include "base/IEventJob.h"
 #include "base/IEventQueueBuffer.h"
 #include "platform/XWindowsScreen.h"
@@ -38,6 +39,31 @@ testIOErrorHandler(Display*)
 {
 	return 0;
 }
+
+#ifdef HAVE_XI2
+class AsyncXISelectFailureXWindowsImpl : public XWindowsImpl {
+public:
+	explicit AsyncXISelectFailureXWindowsImpl(bool* requestQueued) :
+		m_requestQueued(requestQueued)
+	{
+	}
+
+	int XISelectEvents(Display* display, Window, XIEventMask* masks,
+		int numMasks) override
+	{
+		// Queue a harmless BadWindow response after reporting synchronous
+		// success. ErrorLock must observe it during XSync and keep Core motion
+		// enabled. Sending a malformed XI2 request can terminate older Xvfb.
+		XSelectInput(display, None, PointerMotionMask);
+		const int status = Success;
+		*m_requestQueued = (status == Success);
+		return status;
+	}
+
+private:
+	bool* m_requestQueued;
+};
+#endif
 
 }
 
@@ -212,7 +238,8 @@ TEST(CXWindowsScreenTests, primaryEnter_releasesPointerGrabBeforeReturning)
     EXPECT_EQ(GrabSuccess, grabResult);
 }
 
-TEST(CXWindowsScreenTests, offscreenRecenter_doesNotEmitReverseMotionAtCenter)
+#ifdef HAVE_XI2
+TEST(CXWindowsScreenTests, xi2AsyncSelectionFailureKeepsCoreMotionFallback)
 {
     const char* displayName = std::getenv("DISPLAY");
     if (displayName == NULL) {
@@ -221,6 +248,88 @@ TEST(CXWindowsScreenTests, offscreenRecenter_doesNotEmitReverseMotionAtCenter)
 
     Display* probeDisplay = XOpenDisplay(displayName);
     ASSERT_NE(static_cast<Display*>(NULL), probeDisplay);
+    int xiOpcode = 0;
+    int xiEvent = 0;
+    int xiError = 0;
+    if (!XQueryExtension(probeDisplay, "XInputExtension", &xiOpcode,
+            &xiEvent, &xiError)) {
+        XCloseDisplay(probeDisplay);
+        GTEST_SKIP() << "XInputExtension is unavailable";
+    }
+
+    MockEventQueue eventQueue;
+    IPrimaryScreenEvents primaryScreenEvents;
+    primaryScreenEvents.setEvents(&eventQueue);
+    ON_CALL(eventQueue, forIPrimaryScreen())
+        .WillByDefault(ReturnRef(primaryScreenEvents));
+
+    std::unique_ptr<IEventJob> systemHandler;
+    std::vector<std::unique_ptr<IEventJob> > otherHandlers;
+    std::unique_ptr<IEventQueueBuffer> buffer;
+    EXPECT_CALL(eventQueue, adoptHandler(_, _, _))
+        .Times(2)
+        .WillRepeatedly(Invoke([&](Event::Type type, void*, IEventJob* handler) {
+            if (type == Event::kSystem) {
+                systemHandler.reset(handler);
+            }
+            else {
+                otherHandlers.emplace_back(handler);
+            }
+        }));
+    EXPECT_CALL(eventQueue, adoptBuffer(_))
+        .Times(2)
+        .WillRepeatedly(Invoke([&](IEventQueueBuffer* adoptedBuffer) {
+            buffer.reset(adoptedBuffer);
+        }));
+    EXPECT_CALL(eventQueue, removeHandler(_, _)).Times(2);
+
+    bool requestQueued = false;
+    XWindowsScreen screen(new AsyncXISelectFailureXWindowsImpl(&requestQueued),
+        displayName, true, false, 0, &eventQueue);
+    ASSERT_TRUE(requestQueued);
+    ASSERT_FALSE(screen.xi2DetectedForTest());
+    ASSERT_NE(static_cast<IEventJob*>(NULL), systemHandler.get());
+
+    const Event::Type motionType = primaryScreenEvents.motionOnPrimary();
+    EXPECT_CALL(eventQueue, addEvent(_))
+        .Times(1)
+        .WillOnce(Invoke([&](const Event& event) {
+            EXPECT_EQ(motionType, event.getType());
+            Event::deleteData(event);
+        }));
+
+    XEvent coreMotion = {};
+    coreMotion.type = MotionNotify;
+    coreMotion.xmotion.type = MotionNotify;
+    coreMotion.xmotion.display = probeDisplay;
+    coreMotion.xmotion.window = DefaultRootWindow(probeDisplay);
+    coreMotion.xmotion.root = DefaultRootWindow(probeDisplay);
+    coreMotion.xmotion.x_root = 100;
+    coreMotion.xmotion.y_root = 100;
+    coreMotion.xmotion.same_screen = True;
+    Event event(Event::kSystem, NULL, &coreMotion, Event::kDontFreeData);
+    systemHandler->run(event);
+
+    XCloseDisplay(probeDisplay);
+}
+TEST(CXWindowsScreenTests, xi2OffscreenIgnoresQueuedCoreMotionAcrossRecenter)
+{
+    const char* displayName = std::getenv("DISPLAY");
+    if (displayName == NULL) {
+        displayName = ":0.0";
+    }
+
+    Display* probeDisplay = XOpenDisplay(displayName);
+    ASSERT_NE(static_cast<Display*>(NULL), probeDisplay);
+
+    int xiOpcode = 0;
+    int xiEvent = 0;
+    int xiError = 0;
+    if (!XQueryExtension(probeDisplay, "XInputExtension", &xiOpcode,
+            &xiEvent, &xiError)) {
+        XCloseDisplay(probeDisplay);
+        GTEST_SKIP() << "XInputExtension is unavailable";
+    }
 
     MockEventQueue eventQueue;
     IPrimaryScreenEvents primaryScreenEvents;
@@ -251,12 +360,20 @@ TEST(CXWindowsScreenTests, offscreenRecenter_doesNotEmitReverseMotionAtCenter)
     XWindowsScreen screen(new XWindowsImpl(), displayName, true, false, 0,
         &eventQueue);
     ASSERT_NE(static_cast<IEventJob*>(NULL), systemHandler.get());
-    ASSERT_TRUE(screen.leave());
+    if (!screen.xi2DetectedForTest()) {
+        XCloseDisplay(probeDisplay);
+        GTEST_SKIP() << "XI2 RawMotion was not selected; Core motion fallback remains active";
+    }
+    if (!screen.leave()) {
+        XCloseDisplay(probeDisplay);
+        GTEST_SKIP() << "primary pointer/keyboard grab is unavailable";
+    }
 
     SInt32 centerX = 0;
     SInt32 centerY = 0;
     screen.getCursorCenter(centerX, centerY);
 
+    const SInt32 rawDeltaX = 40;
     const Event::Type motionType = primaryScreenEvents.motionOnSecondary();
     EXPECT_CALL(eventQueue, addEvent(_))
         .Times(1)
@@ -265,10 +382,24 @@ TEST(CXWindowsScreenTests, offscreenRecenter_doesNotEmitReverseMotionAtCenter)
             const IPrimaryScreen::MotionInfo* motion =
                 static_cast<const IPrimaryScreen::MotionInfo*>(event.getData());
             ASSERT_NE(static_cast<const IPrimaryScreen::MotionInfo*>(NULL), motion);
-            EXPECT_EQ(40, motion->m_x);
+            EXPECT_EQ(rawDeltaX, motion->m_x);
             EXPECT_EQ(0, motion->m_y);
             Event::deleteData(event);
         }));
+
+    XWarpPointer(probeDisplay, None, DefaultRootWindow(probeDisplay),
+        0, 0, 0, 0, centerX + rawDeltaX, centerY);
+    XSync(probeDisplay, False);
+
+    XEvent xiRawMotion = {};
+    xiRawMotion.type = GenericEvent;
+    xiRawMotion.xcookie.type = GenericEvent;
+    xiRawMotion.xcookie.send_event = False;
+    xiRawMotion.xcookie.display = probeDisplay;
+    xiRawMotion.xcookie.extension = xiOpcode;
+    xiRawMotion.xcookie.evtype = XI_RawMotion;
+    Event rawMotion(Event::kSystem, NULL, &xiRawMotion, Event::kDontFreeData);
+    systemHandler->run(rawMotion);
 
     XEvent xevent = {};
     xevent.type = MotionNotify;
@@ -276,18 +407,17 @@ TEST(CXWindowsScreenTests, offscreenRecenter_doesNotEmitReverseMotionAtCenter)
     xevent.xmotion.display = probeDisplay;
     xevent.xmotion.window = DefaultRootWindow(probeDisplay);
     xevent.xmotion.root = DefaultRootWindow(probeDisplay);
-    xevent.xmotion.x_root = centerX + 40;
+    xevent.xmotion.x_root = centerX + rawDeltaX;
     xevent.xmotion.y_root = centerY;
     xevent.xmotion.same_screen = True;
-    Event firstMotion(Event::kSystem, NULL, &xevent, Event::kDontFreeData);
-    systemHandler->run(firstMotion);
 
-    // XI2 can report another raw-motion notification before the synthetic
-    // marker events are consumed. Its pointer query then observes the warp
-    // destination and must not turn the recenter into reverse user motion.
-    xevent.xmotion.x_root = centerX;
-    Event recenterSample(Event::kSystem, NULL, &xevent, Event::kDontFreeData);
-    systemHandler->run(recenterSample);
+    // A Core sample queued before the XI2 recenter can arrive later with its
+    // old coordinate. XI2 owns motion delivery, so it must not be replayed as
+    // a second user move.
+    xevent.xmotion.x_root = centerX - 22;
+    Event delayedCoreMotion(Event::kSystem, NULL, &xevent, Event::kDontFreeData);
+    systemHandler->run(delayedCoreMotion);
 
     XCloseDisplay(probeDisplay);
 }
+#endif

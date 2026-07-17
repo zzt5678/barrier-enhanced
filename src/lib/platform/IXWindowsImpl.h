@@ -215,8 +215,10 @@ public:
     virtual int XPeekEvent(Display* display, XEvent* event_return) = 0;
     virtual Status XkbRefreshKeyboardMapping(XkbMapNotifyEvent* event) = 0;
     virtual int XRefreshKeyboardMapping(XMappingEvent* event_map) = 0;
+#ifdef HAVE_XI2
     virtual int XISelectEvents(Display* display, Window w, XIEventMask* masks,
                                int num_masks) = 0;
+#endif
 #ifdef HAVE_XFIXES
     virtual Bool XFixesQueryExtension(Display* display, int* event_base_return,
                                       int* error_base_return) = 0;

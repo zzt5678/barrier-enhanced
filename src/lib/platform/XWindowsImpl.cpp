@@ -489,11 +489,13 @@ int XWindowsImpl::XRefreshKeyboardMapping(XMappingEvent* event_map)
     return ::XRefreshKeyboardMapping(event_map);
 }
 
+#ifdef HAVE_XI2
 int XWindowsImpl::XISelectEvents(Display* display, Window w, XIEventMask* masks,
                                  int num_masks)
 {
     return ::XISelectEvents(display, w, masks, num_masks);
 }
+#endif
 
 #ifdef HAVE_XFIXES
 Bool XWindowsImpl::XFixesQueryExtension(Display* display,

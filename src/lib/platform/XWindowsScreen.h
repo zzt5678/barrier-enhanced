@@ -143,6 +143,10 @@ public:
 	                            bool lowLatencyMode);
 	static double       primaryLeaveGrabRetrySleepForTest(
 	                            bool lowLatencyMode);
+	static bool         shouldProcessCoreMotionForTest(
+	                            bool isPrimary,
+	                            bool xi2Detected);
+	bool                xi2DetectedForTest() const;
 #ifdef HAVE_XI2
 	static bool         xInputCookieUsableForTest(
 	                            const XGenericEventCookie& cookie,
@@ -231,8 +235,8 @@ private:
 
     bool                detectXI2();
     bool                detectXFixesSelectionNotifications();
-	#ifdef HAVE_XI2
-    void                selectXIRawMotion();
+#ifdef HAVE_XI2
+    bool                selectXIRawMotion();
     void                handleXIRawButtonEvent(const XIRawButtonEvent* event);
 #endif
     void                selectEvents(Window) const;

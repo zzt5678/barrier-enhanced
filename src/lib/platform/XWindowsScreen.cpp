@@ -716,10 +716,8 @@ XWindowsScreen::XWindowsScreen(
 		// primary/secondary screen only initialization
 		if (m_isPrimary) {
 #ifdef HAVE_XI2
-			m_xi2detected = detectXI2();
-			if (m_xi2detected) {
-				selectXIRawMotion();
-			} else
+			m_xi2detected = detectXI2() && selectXIRawMotion();
+			if (!m_xi2detected)
 #endif
 			{
 				// start watching for events on other windows
@@ -1286,6 +1284,22 @@ XWindowsScreen::primaryLeaveGrabRetrySleepForTest(bool lowLatencyMode)
 	return lowLatencyMode ?
 		kLowLatencyPrimaryLeaveGrabRetrySleepSeconds :
 		kPrimaryLeaveGrabRetrySleepSeconds;
+}
+
+bool
+XWindowsScreen::shouldProcessCoreMotionForTest(
+	bool isPrimary, bool xi2Detected)
+{
+	// XI2 RawMotion is the single source of pointer movement when available.
+	// Processing the corresponding Core MotionNotify again can replay a stale
+	// pre-warp coordinate after the off-screen cursor has been recentered.
+	return isPrimary && !xi2Detected;
+}
+
+bool
+XWindowsScreen::xi2DetectedForTest() const
+{
+	return m_xi2detected;
 }
 
 #ifdef HAVE_XI2
@@ -2629,7 +2643,7 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 		return;
 
 	case MotionNotify:
-		if (m_isPrimary) {
+		if (shouldProcessCoreMotionForTest(m_isPrimary, m_xi2detected)) {
 			onMouseMove(xevent->xmotion);
 		}
 		return;
@@ -3376,9 +3390,31 @@ XWindowsScreen::HotKeyItem::operator<(const HotKeyItem& x) const
 bool
 XWindowsScreen::detectXI2()
 {
+#ifdef HAVE_XI2
 	int event, error;
-    return m_impl->XQueryExtension(m_display,
-			"XInputExtension", &xi_opcode, &event, &error);
+	if (!m_impl->XQueryExtension(m_display,
+			"XInputExtension", &xi_opcode, &event, &error)) {
+		return false;
+	}
+
+	int major = 2;
+	int minor = 0;
+	bool queryError = false;
+	int status = Success;
+	{
+		XWindowsUtil::ErrorLock lock(m_display, &queryError);
+		status = XIQueryVersion(m_display, &major, &minor);
+	}
+	if (status != Success || queryError || major < 2) {
+		LOG((CLOG_WARN "XInput2 is unavailable (status=%d, error=%s, version=%d.%d)",
+			status, queryError ? "true" : "false", major, minor));
+		return false;
+	}
+
+	return true;
+#else
+	return false;
+#endif
 }
 
 bool
@@ -3405,7 +3441,7 @@ XWindowsScreen::detectXFixesSelectionNotifications()
 }
 
 #ifdef HAVE_XI2
-void
+bool
 XWindowsScreen::selectXIRawMotion()
 {
 	// Allocate mask large enough for all XI event types (up to XI_GenericEvent = 35).
@@ -3416,15 +3452,27 @@ XWindowsScreen::selectXIRawMotion()
 	mask.mask = (unsigned char*)calloc(mask.mask_len, sizeof(char));
 	if (mask.mask == NULL) {
 		LOG((CLOG_WARN "failed to allocate XI event mask"));
-		return;
+		return false;
 	}
 
 	XISetMask(mask.mask, XI_RawKeyRelease);
 	XISetMask(mask.mask, XI_RawMotion);
 	XISetMask(mask.mask, XI_RawButtonPress);
 	XISetMask(mask.mask, XI_RawButtonRelease);
-	m_impl->XISelectEvents(m_display, DefaultRootWindow(m_display), &mask, 1);
+	bool error = false;
+	int status = Success;
+	{
+		XWindowsUtil::ErrorLock lock(m_display, &error);
+		status = m_impl->XISelectEvents(
+			m_display, DefaultRootWindow(m_display), &mask, 1);
+	}
 	free(mask.mask);
+	if (status != Success || error) {
+		LOG((CLOG_WARN "failed to select XI2 raw input events (status=%d, error=%s); using Core motion fallback",
+			status, error ? "true" : "false"));
+		return false;
+	}
+	return true;
 }
 
 void
