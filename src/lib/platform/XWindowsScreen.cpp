@@ -40,7 +40,9 @@
 #include <cstdlib>
 #include <algorithm>
 #include <condition_variable>
+#include <cmath>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sys/stat.h>
@@ -80,6 +82,26 @@ const double kPrimaryLeaveGrabTimeoutSeconds = 1.0;
 const double kLowLatencyPrimaryLeaveGrabTimeoutSeconds = 0.025;
 const double kPrimaryLeaveGrabRetrySleepSeconds = 0.05;
 const double kLowLatencyPrimaryLeaveGrabRetrySleepSeconds = 0.005;
+SInt32 consumeXi2MotionDelta(double& remainder, double delta)
+{
+	const double total = remainder + delta;
+	const double maximum =
+		static_cast<double>(std::numeric_limits<SInt32>::max());
+	const double minimum =
+		static_cast<double>(std::numeric_limits<SInt32>::min());
+	if (total >= maximum) {
+		remainder = 0.0;
+		return std::numeric_limits<SInt32>::max();
+	}
+	if (total <= minimum) {
+		remainder = 0.0;
+		return std::numeric_limits<SInt32>::min();
+	}
+
+	const SInt32 whole = static_cast<SInt32>(total);
+	remainder = total - static_cast<double>(whole);
+	return whole;
+}
 
 class SnapshotDisplay {
 public:
@@ -665,6 +687,9 @@ XWindowsScreen::XWindowsScreen(
 	m_xkb(false),
 	m_xkbEventBase(0),
 	m_xi2detected(false),
+	m_xi2RawMotionOwned(false),
+	m_xi2MotionRemainderX(0.0),
+	m_xi2MotionRemainderY(0.0),
 	m_lowLatencyMode(false),
 	m_xrandr(false),
 	m_xrandrEventBase(0),
@@ -915,6 +940,9 @@ XWindowsScreen::enter()
 	}
 
 	// now on screen
+	m_xi2RawMotionOwned = false;
+	m_xi2MotionRemainderX = 0.0;
+	m_xi2MotionRemainderY = 0.0;
 	m_isOnScreen = true;
 }
 
@@ -975,6 +1003,9 @@ XWindowsScreen::leave()
 	}
 
 	// now off screen
+	m_xi2RawMotionOwned = false;
+	m_xi2MotionRemainderX = 0.0;
+	m_xi2MotionRemainderY = 0.0;
 	m_isOnScreen = false;
 
 	return true;
@@ -1288,12 +1319,14 @@ XWindowsScreen::primaryLeaveGrabRetrySleepForTest(bool lowLatencyMode)
 
 bool
 XWindowsScreen::shouldProcessCoreMotionForTest(
-	bool isPrimary, bool xi2Detected)
+	bool isPrimary, bool isOnScreen, bool xi2Detected,
+	bool xi2RawMotionOwned)
 {
-	// XI2 RawMotion is the single source of pointer movement when available.
-	// Processing the corresponding Core MotionNotify again can replay a stale
-	// pre-warp coordinate after the off-screen cursor has been recentered.
-	return isPrimary && !xi2Detected;
+	// XI2 owns on-screen wakeups once selected. Off-screen, suppress the paired
+	// Core event only after XI2 has produced a usable relative-motion payload,
+	// preserving fallback for servers that omit RawMotion valuators.
+	return isPrimary &&
+		(!xi2Detected || (!isOnScreen && !xi2RawMotionOwned));
 }
 
 bool
@@ -1314,8 +1347,45 @@ XWindowsScreen::xInputCookieUsableForTest(
 bool
 XWindowsScreen::xInputEventNeedsPayloadForTest(int eventType)
 {
-	return eventType == XI_RawButtonPress ||
+	return eventType == XI_RawMotion ||
+		eventType == XI_RawButtonPress ||
 		eventType == XI_RawButtonRelease;
+}
+
+bool
+XWindowsScreen::xInputRawMotionDeltasForTest(
+	const XIRawEvent& event, double& dx, double& dy)
+{
+	dx = 0.0;
+	dy = 0.0;
+	if (event.valuators.mask_len <= 0 || event.valuators.mask == NULL ||
+		event.valuators.values == NULL) {
+		return false;
+	}
+
+	bool hasPointerAxis = false;
+	int valueIndex = 0;
+	const int axisCount = event.valuators.mask_len * 8;
+	for (int axis = 0; axis < axisCount; ++axis) {
+		if (!XIMaskIsSet(event.valuators.mask, axis)) {
+			continue;
+		}
+
+		const double value = event.valuators.values[valueIndex++];
+		if (!std::isfinite(value)) {
+			return false;
+		}
+		if (axis == 0) {
+			dx = value;
+			hasPointerAxis = true;
+		}
+		else if (axis == 1) {
+			dy = value;
+			hasPointerAxis = true;
+		}
+	}
+
+	return hasPointerAxis;
 }
 #endif
 
@@ -2474,10 +2544,10 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 	if (m_xi2detected && xevent->type == GenericEvent &&
 		xevent->xcookie.extension == xi_opcode) {
 		XGenericEventCookie* cookie = &xevent->xcookie;
-		if (cookie->evtype == XI_RawMotion) {
-			// Relative movement only needs the current pointer position. Avoid
-			// depending on cookie payloads that some X servers omit for
-			// synthetic or coalesced raw-motion notifications.
+		if (cookie->evtype == XI_RawMotion && m_isOnScreen) {
+			// On the primary screen the server needs an absolute coordinate for
+			// edge detection. RawMotion wakes us promptly; XQueryPointer supplies
+			// the accelerated desktop coordinate.
 			XMotionEvent xmotion = {};
 			xmotion.type = MotionNotify;
 			xmotion.send_event = False;
@@ -2489,17 +2559,18 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 				&xmotion.x_root, &xmotion.y_root, &xmotion.x, &xmotion.y,
 				&msk);
 			if (!xmotion.same_screen) {
+				m_xi2RawMotionOwned = false;
 				LOG((CLOG_WARN "resynchronizing XI2 raw motion after XQueryPointer failed"));
 				m_xCursor = m_xCenter;
 				m_yCursor = m_yCenter;
-				if (!m_isOnScreen) {
-					m_impl->XMoveWindow(m_display, m_window, m_xCenter, m_yCenter);
-					fakeMouseMove(m_xCenter, m_yCenter);
-				}
 			}
 			else if (normalizeToScreenShape("XI2 raw motion",
 				m_x, m_y, m_w, m_h, xmotion.x_root, xmotion.y_root)) {
+				m_xi2RawMotionOwned = true;
 				onMouseMove(xmotion);
+			}
+			else {
+				m_xi2RawMotionOwned = false;
 			}
 			return;
 		}
@@ -2508,15 +2579,50 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 			return;
 		}
 
-		if (!m_impl->XGetEventData(m_display, cookie)) {
+		const bool callerOwnedCookieData = cookie->data != NULL;
+		if (!callerOwnedCookieData &&
+			!m_impl->XGetEventData(m_display, cookie)) {
 			LOG((CLOG_WARN "failed to acquire XI2 event data (type=%d)",
 				cookie->evtype));
 			return;
 		}
+		const bool releaseCookieData = !callerOwnedCookieData;
 		if (!xInputCookieUsableForTest(*cookie, xi_opcode)) {
 			LOG((CLOG_WARN "ignoring XI2 event with invalid data (type=%d)",
 				cookie->evtype));
-			m_impl->XFreeEventData(m_display, cookie);
+			if (releaseCookieData) {
+				m_impl->XFreeEventData(m_display, cookie);
+			}
+			return;
+		}
+
+		if (cookie->evtype == XI_RawMotion) {
+			const XIRawEvent* motion =
+				static_cast<const XIRawEvent*>(cookie->data);
+			double rawDx = 0.0;
+			double rawDy = 0.0;
+			const bool usable =
+				xInputRawMotionDeltasForTest(*motion, rawDx, rawDy);
+			if (releaseCookieData) {
+				m_impl->XFreeEventData(m_display, cookie);
+			}
+			if (!usable) {
+				LOG((CLOG_DEBUG2 "XI2 RawMotion omitted pointer valuators (%s)",
+					m_xi2RawMotionOwned ?
+						"keeping XI2 ownership" : "using Core motion fallback"));
+				return;
+			}
+
+			m_xi2RawMotionOwned = true;
+			const SInt32 dx =
+				consumeXi2MotionDelta(m_xi2MotionRemainderX, rawDx);
+			const SInt32 dy =
+				consumeXi2MotionDelta(m_xi2MotionRemainderY, rawDy);
+
+			if (dx != 0 || dy != 0) {
+				sendEvent(m_events->forIPrimaryScreen().motionOnSecondary(),
+					MotionInfo::alloc(dx, dy));
+			}
 			return;
 		}
 
@@ -2527,7 +2633,9 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 			handleXIRawButtonEvent(btn);
 		}
 
-		m_impl->XFreeEventData(m_display, cookie);
+		if (releaseCookieData) {
+			m_impl->XFreeEventData(m_display, cookie);
+		}
 		return;
 	}
 #endif
@@ -2643,7 +2751,9 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 		return;
 
 	case MotionNotify:
-		if (shouldProcessCoreMotionForTest(m_isPrimary, m_xi2detected)) {
+		if (shouldProcessCoreMotionForTest(
+			m_isPrimary, m_isOnScreen, m_xi2detected,
+			m_xi2RawMotionOwned)) {
 			onMouseMove(xevent->xmotion);
 		}
 		return;

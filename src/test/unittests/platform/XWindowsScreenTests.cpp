@@ -62,17 +62,37 @@ TEST(XWindowsScreenTests, primaryLeaveGrabRetrySleepForTest_lowLatencyKeepsQuick
 
 TEST(XWindowsScreenTests, coreMotionIsIgnoredWhenXi2OwnsPointerMotion)
 {
-	EXPECT_FALSE(XWindowsScreen::shouldProcessCoreMotionForTest(true, true));
+	EXPECT_FALSE(
+		XWindowsScreen::shouldProcessCoreMotionForTest(
+			true, false, true, true));
 }
 
 TEST(XWindowsScreenTests, coreMotionIsProcessedForPrimaryXi2Fallback)
 {
-	EXPECT_TRUE(XWindowsScreen::shouldProcessCoreMotionForTest(true, false));
+	EXPECT_TRUE(
+		XWindowsScreen::shouldProcessCoreMotionForTest(
+			true, false, false, false));
+}
+
+TEST(XWindowsScreenTests, coreMotionIsProcessedUntilXi2RawMotionTakesOwnership)
+{
+	EXPECT_TRUE(
+		XWindowsScreen::shouldProcessCoreMotionForTest(
+			true, false, true, false));
+}
+
+TEST(XWindowsScreenTests, coreMotionIsIgnoredOnPrimaryWhileXi2IsSelected)
+{
+	EXPECT_FALSE(
+		XWindowsScreen::shouldProcessCoreMotionForTest(
+			true, true, true, false));
 }
 
 TEST(XWindowsScreenTests, coreMotionIsIgnoredForSecondaryScreen)
 {
-	EXPECT_FALSE(XWindowsScreen::shouldProcessCoreMotionForTest(false, false));
+	EXPECT_FALSE(
+		XWindowsScreen::shouldProcessCoreMotionForTest(
+			false, false, false, false));
 }
 
 #ifdef HAVE_XI2
@@ -111,14 +131,45 @@ TEST(XWindowsScreenTests, xInputCookieUsableForTest_acceptsMatchingCookieWithDat
 	EXPECT_TRUE(XWindowsScreen::xInputCookieUsableForTest(cookie, 23));
 }
 
-TEST(XWindowsScreenTests, xInputEventPayload_rawMotionDoesNotNeedCookieData)
+TEST(XWindowsScreenTests, xInputEventPayload_rawMotionNeedsCookieData)
 {
-	EXPECT_FALSE(
+	EXPECT_TRUE(
 		XWindowsScreen::xInputEventNeedsPayloadForTest(XI_RawMotion));
 	EXPECT_TRUE(
 		XWindowsScreen::xInputEventNeedsPayloadForTest(XI_RawButtonPress));
 	EXPECT_TRUE(
 		XWindowsScreen::xInputEventNeedsPayloadForTest(XI_RawButtonRelease));
+}
+
+TEST(XWindowsScreenTests, xInputRawMotionDeltas_readsPackedPointerAxes)
+{
+	unsigned char mask[XIMaskLen(3)] = {};
+	XISetMask(mask, 0);
+	XISetMask(mask, 2);
+	double values[] = { 1.25, 9.0 };
+	XIRawEvent event = {};
+	event.valuators.mask_len = sizeof(mask);
+	event.valuators.mask = mask;
+	event.valuators.values = values;
+	double dx = 0.0;
+	double dy = 0.0;
+
+	EXPECT_TRUE(
+		XWindowsScreen::xInputRawMotionDeltasForTest(event, dx, dy));
+	EXPECT_DOUBLE_EQ(1.25, dx);
+	EXPECT_DOUBLE_EQ(0.0, dy);
+}
+
+TEST(XWindowsScreenTests, xInputRawMotionDeltas_rejectsMissingPayload)
+{
+	XIRawEvent event = {};
+	double dx = 1.0;
+	double dy = 1.0;
+
+	EXPECT_FALSE(
+		XWindowsScreen::xInputRawMotionDeltasForTest(event, dx, dy));
+	EXPECT_DOUBLE_EQ(0.0, dx);
+	EXPECT_DOUBLE_EQ(0.0, dy);
 }
 #endif
 

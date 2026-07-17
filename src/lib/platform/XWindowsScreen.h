@@ -145,13 +145,19 @@ public:
 	                            bool lowLatencyMode);
 	static bool         shouldProcessCoreMotionForTest(
 	                            bool isPrimary,
-	                            bool xi2Detected);
+	                            bool isOnScreen,
+	                            bool xi2Detected,
+	                            bool xi2RawMotionOwned);
 	bool                xi2DetectedForTest() const;
 #ifdef HAVE_XI2
 	static bool         xInputCookieUsableForTest(
 	                            const XGenericEventCookie& cookie,
 	                            int expectedExtension);
 	static bool         xInputEventNeedsPayloadForTest(int eventType);
+	static bool         xInputRawMotionDeltasForTest(
+	                            const XIRawEvent& event,
+	                            double& dx,
+	                            double& dy);
 #endif
 	virtual bool        adjustPointToVisibleAreaNearAnchor(
 	                            SInt32 anchorX, SInt32 anchorY,
@@ -358,6 +364,9 @@ private:
     int                    m_xkbEventBase;
 
     bool                m_xi2detected;
+    bool                m_xi2RawMotionOwned;
+    double              m_xi2MotionRemainderX;
+    double              m_xi2MotionRemainderY;
 
     // low latency mode - reduces sleep times and increases responsiveness
     bool                m_lowLatencyMode;

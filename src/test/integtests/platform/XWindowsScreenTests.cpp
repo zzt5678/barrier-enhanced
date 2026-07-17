@@ -387,18 +387,36 @@ TEST(CXWindowsScreenTests, xi2OffscreenIgnoresQueuedCoreMotionAcrossRecenter)
             Event::deleteData(event);
         }));
 
-    XWarpPointer(probeDisplay, None, DefaultRootWindow(probeDisplay),
-        0, 0, 0, 0, centerX + rawDeltaX, centerY);
-    XSync(probeDisplay, False);
-
     XEvent xiRawMotion = {};
+    unsigned char valuatorMask[XIMaskLen(1)] = {};
+    XISetMask(valuatorMask, 0);
+    double valuatorValues[] = { 0.5 };
+    XIRawEvent rawEvent = {};
+    rawEvent.type = GenericEvent;
+    rawEvent.extension = xiOpcode;
+    rawEvent.evtype = XI_RawMotion;
+    rawEvent.valuators.mask_len = sizeof(valuatorMask);
+    rawEvent.valuators.mask = valuatorMask;
+    rawEvent.valuators.values = valuatorValues;
+
     xiRawMotion.type = GenericEvent;
     xiRawMotion.xcookie.type = GenericEvent;
     xiRawMotion.xcookie.send_event = False;
     xiRawMotion.xcookie.display = probeDisplay;
     xiRawMotion.xcookie.extension = xiOpcode;
     xiRawMotion.xcookie.evtype = XI_RawMotion;
+    xiRawMotion.xcookie.data = &rawEvent;
     Event rawMotion(Event::kSystem, NULL, &xiRawMotion, Event::kDontFreeData);
+    systemHandler->run(rawMotion);
+    valuatorValues[0] = static_cast<double>(rawDeltaX) - valuatorValues[0];
+    systemHandler->run(rawMotion);
+
+    // Once a usable RawMotion event takes ownership for this off-screen
+    // epoch, a later malformed/scroll-only raw event must not re-enable Core
+    // motion and replay the absolute distance accumulated since recentering.
+    memset(valuatorMask, 0, sizeof(valuatorMask));
+    XISetMask(valuatorMask, 2);
+    valuatorValues[0] = 1.0;
     systemHandler->run(rawMotion);
 
     XEvent xevent = {};
