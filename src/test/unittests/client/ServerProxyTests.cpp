@@ -1263,7 +1263,11 @@ TEST(ServerProxyTests, legacyBulkPayloadDoesNotMutateExistingReceiveSession)
             }
         }));
 
-    channel->handleDataForTest();
+    // A legal parser-budget yield queues inputReady. Dispatch that continuation
+    // synchronously here because MockEventQueue does not run queued events.
+    for (int batch = 0; batch < 4 && bulkStream->getSize() != 0; ++batch) {
+        channel->handleDataForTest();
+    }
 
     EXPECT_TRUE(completionGenerations.empty());
     EXPECT_EQ(0u, bulkStream->getSize());
