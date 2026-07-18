@@ -37,6 +37,7 @@
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "base/TMethodEventJob.h"
+#include "base/finally.h"
 #include "common/Version.h"
 #include "common/DataDirectories.h"
 
@@ -61,6 +62,7 @@
 #include <iostream>
 #include <stdio.h>
 #include <fstream>
+#include <memory>
 #include <sstream>
 
 //
@@ -879,8 +881,17 @@ int
 ServerApp::runInner(int argc, char** argv, ILogOutputter* outputter, StartupFunc startup)
 {
     // general initialization
-    m_barrierAddress = new NetworkAddress;
-    args().m_config         = new Config(m_events);
+    std::unique_ptr<NetworkAddress> barrierAddress(new NetworkAddress);
+    std::unique_ptr<Config> config(new Config(m_events));
+    m_barrierAddress = barrierAddress.get();
+    args().m_config = config.get();
+    const auto releaseRunState = barrier::finally([this]() {
+        delete m_taskBarReceiver;
+        m_taskBarReceiver = NULL;
+        args().m_config = NULL;
+        m_barrierAddress = NULL;
+    });
+
     args().m_exename = ArgParser::parse_exename(argv[0]);
 
     // install caller's output filter
@@ -888,18 +899,7 @@ ServerApp::runInner(int argc, char** argv, ILogOutputter* outputter, StartupFunc
         CLOG->insert(outputter);
     }
 
-    // run
-    int result = startup(argc, argv);
-
-    if (m_taskBarReceiver)
-    {
-        // done with task bar receiver
-        delete m_taskBarReceiver;
-    }
-
-    delete args().m_config;
-    delete m_barrierAddress;
-    return result;
+    return startup(argc, argv);
 }
 
 int daemonMainLoopStatic(int argc, const char** argv) {

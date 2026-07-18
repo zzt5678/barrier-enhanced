@@ -83,6 +83,8 @@ public:
     Client* getClientPtr() { return m_client; }
 
 private:
+    friend class ClientAppTestAccess;
+
     Client*            m_client;
     barrier::Screen*m_clientScreen;
     NetworkAddress*    m_serverAddress;

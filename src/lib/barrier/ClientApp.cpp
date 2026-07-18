@@ -38,6 +38,7 @@
 #include "base/log_outputters.h"
 #include "base/EventQueue.h"
 #include "base/Log.h"
+#include "base/finally.h"
 #include "common/Version.h"
 
 #if WINAPI_MSWINDOWS
@@ -55,6 +56,7 @@
 #include <iostream>
 #include <stdio.h>
 #include <algorithm>
+#include <memory>
 #include <sstream>
 
 namespace {
@@ -582,7 +584,14 @@ int
 ClientApp::runInner(int argc, char** argv, ILogOutputter* outputter, StartupFunc startup)
 {
     // general initialization
-    m_serverAddress = new NetworkAddress;
+    std::unique_ptr<NetworkAddress> serverAddress(new NetworkAddress);
+    m_serverAddress = serverAddress.get();
+    const auto releaseRunState = barrier::finally([this]() {
+        delete m_taskBarReceiver;
+        m_taskBarReceiver = NULL;
+        m_serverAddress = NULL;
+    });
+
     argsBase().m_exename = ArgParser::parse_exename(argv[0]);
 
     // install caller's output filter
@@ -590,26 +599,7 @@ ClientApp::runInner(int argc, char** argv, ILogOutputter* outputter, StartupFunc
         CLOG->insert(outputter);
     }
 
-    int result;
-    try
-    {
-        // run
-        result = startup(argc, argv);
-    }
-    catch (...)
-    {
-        if (m_taskBarReceiver)
-        {
-            // done with task bar receiver
-            delete m_taskBarReceiver;
-        }
-
-        delete m_serverAddress;
-
-        throw;
-    }
-
-    return result;
+    return startup(argc, argv);
 }
 
 void

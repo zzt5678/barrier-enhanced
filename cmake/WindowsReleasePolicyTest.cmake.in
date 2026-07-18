@@ -175,6 +175,10 @@ assert_file_contains("${unit_test_cmake}"
         server/ServerReconnectTests.cpp
         PROPERTIES COMPILE_OPTIONS "/bigobj")]=])
 
+set(gtest_cmake "${SOURCE_ROOT}/cmake/gtest.cmake")
+assert_file_contains("${gtest_cmake}" "GIT_PROGRESS TRUE")
+assert_file_excludes("${gtest_cmake}" "GIT_SHOW_PROGRESS")
+
 set(gui_cmake "${SOURCE_ROOT}/src/gui/CMakeLists.txt")
 assert_file_contains("${gui_cmake}"
                      "-DBUILD_CONFIGURATION=$<CONFIG>")

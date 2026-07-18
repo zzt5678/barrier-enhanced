@@ -23,6 +23,7 @@
 #include "DisplayIsValid.h"
 #include "GuiInstanceCoordinator.h"
 #include "common/Version.h"
+#include "barrier/protocol_types.h"
 
 #include <QtCore>
 #include <QtGui>
@@ -129,6 +130,9 @@ int main(int argc, char* argv[])
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--version") == 0) {
             std::printf("Weave %s\n", kBuildId);
+            std::printf("Protocol version %d.%d\n",
+                        static_cast<int>(kProtocolMajorVersion),
+                        static_cast<int>(kProtocolMinorVersion));
             return 0;
         }
     }

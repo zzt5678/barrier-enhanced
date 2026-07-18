@@ -526,3 +526,22 @@ if (BARRIER_BUILD_TESTS)
 endif()
 
 add_subdirectory (src)
+
+if (BARRIER_BUILD_TESTS)
+    set (WEAVE_VERSION_TEST_TARGETS barrierc barriers)
+    if (BARRIER_BUILD_GUI)
+        list (APPEND WEAVE_VERSION_TEST_TARGETS barrier)
+    endif()
+
+    foreach (version_target IN LISTS WEAVE_VERSION_TEST_TARGETS)
+        add_test (
+            NAME ${version_target}_version_identity
+            COMMAND ${CMAKE_COMMAND}
+                -DPRODUCT_BINARY=$<TARGET_FILE:${version_target}>
+                -DEXPECTED_BUILD_ID=${BARRIER_VERSION}+${BARRIER_REVISION}.${BARRIER_BUILD_DATE}
+                -DEXPECTED_PROTOCOL=1.12
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/src/test/ProductVersionCommandTest.cmake.in)
+        set_tests_properties (${version_target}_version_identity
+                              PROPERTIES TIMEOUT 5)
+    endforeach()
+endif()
