@@ -8,6 +8,7 @@
 #include "barrier/FileChunk.h"
 #include "barrier/FileTransferProtocol.h"
 #include "barrier/FileTransferSendState.h"
+#include "barrier/ProtocolUtil.h"
 #include "barrier/TransferDigest.h"
 #include "barrier/RemoteFileClipboard.h"
 #include "barrier/ClientArgs.h"
@@ -91,6 +92,9 @@ public:
 
     void write(const void* buffer, UInt32 count) override
     {
+        if (failWrites) {
+            throw std::runtime_error("control write failed");
+        }
         const UInt8* bytes = static_cast<const UInt8*>(buffer);
         output.insert(output.end(), bytes, bytes + count);
     }
@@ -115,6 +119,7 @@ public:
     UInt32 getBufferedOutputSize() const override { return 0; }
 
     bool closed = false;
+    bool failWrites = false;
     std::vector<UInt8> output;
 
     void clearOutput()
@@ -138,6 +143,18 @@ std::vector<UInt8> encodeTransactionalFrame(
     EXPECT_TRUE(barrier::FileTransferProtocol::encode(
         &stream, frame, role));
     return stream.output;
+}
+
+std::vector<UInt8> expectedTransactionalControlOutput(
+    const barrier::FileTransferFrame& frame,
+    bool includesControlNoop)
+{
+    std::vector<UInt8> output = encodeTransactionalFrame(
+        frame, barrier::FileTransferRole::kPrimary);
+    if (includesControlNoop) {
+        output.insert(output.end(), kMsgCNoop, kMsgCNoop + 4);
+    }
+    return output;
 }
 
 ServerProxy::EResult dispatchTransactionalControlFrame(
@@ -175,6 +192,47 @@ barrier::FileTransferFrame decodeTransactionalOutput(
     EXPECT_TRUE(barrier::FileTransferProtocol::decode(
         encoded.data(), &stream, role, kTransactionalBinding, frame));
     return frame;
+}
+
+void expectAndClearControlNoop(DuplexMemoryStream& control)
+{
+    ASSERT_EQ(4u, control.output.size());
+    EXPECT_EQ(0, std::memcmp(control.output.data(), kMsgCNoop, 4));
+    control.clearOutput();
+}
+
+class ClientProxyLinkGuard {
+public:
+    explicit ClientProxyLinkGuard(Client& client) : m_client(client) { }
+    ~ClientProxyLinkGuard()
+    {
+        m_client.testSetServerProxy(NULL);
+        m_client.testSetStreamOnly(NULL);
+    }
+
+private:
+    Client& m_client;
+};
+
+DuplexMemoryStream* beginBoundBulkHandshake(Client& client)
+{
+    DuplexMemoryStream encodedHello;
+    ProtocolUtil::writef(
+        &encodedHello, kMsgHello, kProtocolMajorVersion, 12);
+    DuplexMemoryStream* handshake = new DuplexMemoryStream();
+    handshake->queueInput(encodedHello.output);
+    client.testSetBulkHandshake(handshake, "pending-bulk-token");
+    client.testHandleBulkHandshakeData();
+    return handshake;
+}
+
+void acknowledgeBoundBulkHandshake(
+    Client& client, DuplexMemoryStream* handshake)
+{
+    DuplexMemoryStream encodedAck;
+    ProtocolUtil::writef(&encodedAck, kMsgDBulkAccepted);
+    handshake->queueInput(encodedAck.output);
+    client.testHandleBulkHandshakeData();
 }
 
 std::string digestFor(const std::string& payload)
@@ -1564,9 +1622,11 @@ TEST(ServerProxyTests,
     Client client(&events, "client", NetworkAddress(),
                   new DummySocketFactory(), &screen, ClientArgs());
     client.testSetProtocolMinorVersion(12);
+    client.testSetControlConnectionBinding(kTransactionalBinding);
     DuplexMemoryStream control;
     ServerProxy proxy(&client, &control, &events, 12);
     client.testSetServerProxy(&proxy);
+    ClientProxyLinkGuard linkGuard(client);
     proxy.testBindTransactionalFileTransfer(kTransactionalBinding);
 
     const UInt32 rejectedId = barrier::FileTransferProtocol::makeTransferId(
@@ -1582,13 +1642,35 @@ TEST(ServerProxyTests,
     EXPECT_EQ(barrier::FileTransferFrameType::kStartAck, ack.type);
     EXPECT_EQ(rejectedId, ack.transferId);
     EXPECT_EQ(barrier::FileTransferReason::kConnectionLost, ack.reason);
+    EXPECT_FALSE(proxy.testHasPendingTransactionalStart());
     EXPECT_FALSE(proxy.testHasTransactionalReceive());
 
-    DuplexMemoryStream* bulk = new DuplexMemoryStream();
-    client.testAttachBulkStream(bulk);
+    DuplexMemoryStream* waitingHello = new DuplexMemoryStream();
+    client.testSetBulkHandshake(waitingHello, "waiting-hello-token");
+    control.clearOutput();
+    const UInt32 waitingHelloId =
+        barrier::FileTransferProtocol::makeTransferId(
+            barrier::FileTransferRole::kPrimary, 32);
+    ASSERT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control,
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, waitingHelloId, 1),
+        barrier::FileTransferRole::kPrimary));
+    ack = decodeTransactionalOutput(
+        control.output, barrier::FileTransferRole::kPrimary);
+    EXPECT_EQ(barrier::FileTransferReason::kConnectionLost, ack.reason);
+    EXPECT_FALSE(proxy.testHasPendingTransactionalStart());
+
+    DuplexMemoryStream handshakeInput;
+    ProtocolUtil::writef(
+        &handshakeInput, kMsgHello, kProtocolMajorVersion, 12);
+    ProtocolUtil::writef(&handshakeInput, kMsgDBulkAccepted);
+    waitingHello->queueInput(handshakeInput.output);
+    client.testHandleBulkHandshakeData();
+
     control.clearOutput();
     const UInt32 acceptedId = barrier::FileTransferProtocol::makeTransferId(
-        barrier::FileTransferRole::kPrimary, 32);
+        barrier::FileTransferRole::kPrimary, 41);
     ASSERT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
         proxy, control,
         barrier::FileTransferFrame::start(
@@ -1601,9 +1683,409 @@ TEST(ServerProxyTests,
     EXPECT_EQ(acceptedId, ack.transferId);
     EXPECT_EQ(barrier::FileTransferReason::kNone, ack.reason);
     EXPECT_EQ(acceptedId, proxy.testTransactionalReceiveId());
+}
 
-    client.testSetServerProxy(NULL);
-    client.testSetStreamOnly(NULL);
+TEST(ServerProxyTests,
+     transactionalStartWaitsForBoundBulkHandshakeAcknowledgment)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents,
+        clientEvents, screenEvents);
+
+    TestScreen screen;
+    Client client(&events, "client", NetworkAddress(),
+                  new DummySocketFactory(), &screen, ClientArgs());
+    client.testSetProtocolMinorVersion(12);
+    client.testSetControlConnectionBinding(kTransactionalBinding);
+    DuplexMemoryStream control;
+    ServerProxy proxy(&client, &control, &events, 12);
+    client.testSetServerProxy(&proxy);
+    ClientProxyLinkGuard linkGuard(client);
+    proxy.testBindTransactionalFileTransfer(kTransactionalBinding);
+
+    DuplexMemoryStream* handshake = beginBoundBulkHandshake(client);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 33);
+    const barrier::FileTransferFrame start =
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, transferId, 1);
+    ASSERT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control, start,
+        barrier::FileTransferRole::kPrimary));
+
+    expectAndClearControlNoop(control);
+    EXPECT_TRUE(proxy.testHasPendingTransactionalStart());
+    EXPECT_FALSE(proxy.testHasTransactionalReceive());
+
+    EXPECT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control, start, barrier::FileTransferRole::kPrimary));
+    expectAndClearControlNoop(control);
+
+    const UInt32 competingId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 34);
+    EXPECT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control,
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, competingId, 1),
+        barrier::FileTransferRole::kPrimary));
+    const barrier::FileTransferFrame busyAck =
+        barrier::FileTransferFrame::startAck(
+            kTransactionalBinding, competingId,
+            barrier::FileTransferReason::kBusy);
+    EXPECT_EQ(expectedTransactionalControlOutput(busyAck, true),
+              control.output);
+    barrier::FileTransferFrame ack = decodeTransactionalOutput(
+        control.output, barrier::FileTransferRole::kPrimary);
+    EXPECT_EQ(barrier::FileTransferFrameType::kStartAck, ack.type);
+    EXPECT_EQ(competingId, ack.transferId);
+    EXPECT_EQ(barrier::FileTransferReason::kBusy, ack.reason);
+    control.clearOutput();
+
+    acknowledgeBoundBulkHandshake(client, handshake);
+
+    EXPECT_FALSE(proxy.testHasPendingTransactionalStart());
+    EXPECT_TRUE(proxy.testHasTransactionalReceive());
+    EXPECT_EQ(transferId, proxy.testTransactionalReceiveId());
+    const barrier::FileTransferFrame startAck =
+        barrier::FileTransferFrame::startAck(
+            kTransactionalBinding, transferId,
+            barrier::FileTransferReason::kNone);
+    EXPECT_EQ(expectedTransactionalControlOutput(startAck, false),
+              control.output);
+    ack = decodeTransactionalOutput(
+        control.output, barrier::FileTransferRole::kPrimary);
+    EXPECT_EQ(barrier::FileTransferFrameType::kStartAck, ack.type);
+    EXPECT_EQ(transferId, ack.transferId);
+    EXPECT_EQ(barrier::FileTransferReason::kNone, ack.reason);
+
+    control.clearOutput();
+    const UInt32 activeCompetingId =
+        barrier::FileTransferProtocol::makeTransferId(
+            barrier::FileTransferRole::kPrimary, 37);
+    EXPECT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control,
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, activeCompetingId, 1),
+        barrier::FileTransferRole::kPrimary));
+    const barrier::FileTransferFrame activeBusyAck =
+        barrier::FileTransferFrame::startAck(
+            kTransactionalBinding, activeCompetingId,
+            barrier::FileTransferReason::kBusy);
+    EXPECT_EQ(expectedTransactionalControlOutput(activeBusyAck, true),
+              control.output);
+    EXPECT_EQ(transferId, proxy.testTransactionalReceiveId());
+}
+
+TEST(ServerProxyTests,
+     transactionalCancelClearsStartWaitingForBulkHandshake)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents,
+        clientEvents, screenEvents);
+
+    TestScreen screen;
+    Client client(&events, "client", NetworkAddress(),
+                  new DummySocketFactory(), &screen, ClientArgs());
+    client.testSetProtocolMinorVersion(12);
+    client.testSetControlConnectionBinding(kTransactionalBinding);
+    DuplexMemoryStream control;
+    ServerProxy proxy(&client, &control, &events, 12);
+    client.testSetServerProxy(&proxy);
+    ClientProxyLinkGuard linkGuard(client);
+    proxy.testBindTransactionalFileTransfer(kTransactionalBinding);
+    DuplexMemoryStream* handshake = beginBoundBulkHandshake(client);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 35);
+    ASSERT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control,
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, transferId, 1),
+        barrier::FileTransferRole::kPrimary));
+    ASSERT_TRUE(proxy.testHasPendingTransactionalStart());
+    expectAndClearControlNoop(control);
+
+    ASSERT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control,
+        barrier::FileTransferFrame::cancel(
+            kTransactionalBinding, transferId,
+            barrier::FileTransferReason::kCancelled),
+        barrier::FileTransferRole::kPrimary));
+    const barrier::FileTransferFrame expectedAck =
+        barrier::FileTransferFrame::cancelAck(
+            kTransactionalBinding, transferId,
+            barrier::FileTransferReason::kNone);
+    EXPECT_EQ(expectedTransactionalControlOutput(expectedAck, true),
+              control.output);
+    const barrier::FileTransferFrame ack = decodeTransactionalOutput(
+        control.output, barrier::FileTransferRole::kPrimary);
+    EXPECT_EQ(barrier::FileTransferFrameType::kCancelAck, ack.type);
+    EXPECT_EQ(transferId, ack.transferId);
+    EXPECT_EQ(barrier::FileTransferReason::kNone, ack.reason);
+    EXPECT_FALSE(proxy.testHasPendingTransactionalStart());
+    EXPECT_FALSE(proxy.testHasTransactionalReceive());
+
+    const std::size_t outputSize = control.output.size();
+    acknowledgeBoundBulkHandshake(client, handshake);
+    EXPECT_EQ(outputSize, control.output.size());
+    EXPECT_FALSE(proxy.testHasTransactionalReceive());
+
+}
+
+TEST(ServerProxyTests,
+     transactionalPendingStartFailsWithItsBulkHandshake)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    IDataSocketEvents dataSocketEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents,
+        clientEvents, screenEvents);
+    dataSocketEvents.setEvents(&events);
+    ON_CALL(events, forIDataSocket())
+        .WillByDefault(ReturnRef(dataSocketEvents));
+
+    TestScreen screen;
+    Client client(&events, "client", NetworkAddress(),
+                  new DummySocketFactory(), &screen, ClientArgs());
+    client.testSetProtocolMinorVersion(12);
+    client.testSetControlConnectionBinding(kTransactionalBinding);
+    DuplexMemoryStream control;
+    client.testSetStreamOnly(&control);
+    ServerProxy proxy(&client, &control, &events, 12);
+    client.testSetServerProxy(&proxy);
+    ClientProxyLinkGuard linkGuard(client);
+    proxy.testBindTransactionalFileTransfer(kTransactionalBinding);
+    DuplexMemoryStream* handshake = beginBoundBulkHandshake(client);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 36);
+    ASSERT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control,
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, transferId, 1),
+        barrier::FileTransferRole::kPrimary));
+    ASSERT_TRUE(proxy.testHasPendingTransactionalStart());
+    expectAndClearControlNoop(control);
+
+    handshake->queueInput(std::vector<UInt8>{'N', 'O', 'P', 'E'});
+    client.testHandleBulkHandshakeData();
+
+    EXPECT_FALSE(proxy.testHasPendingTransactionalStart());
+    EXPECT_FALSE(proxy.testHasTransactionalReceive());
+    const barrier::FileTransferFrame expectedFailure =
+        barrier::FileTransferFrame::startAck(
+            kTransactionalBinding, transferId,
+            barrier::FileTransferReason::kConnectionLost);
+    EXPECT_EQ(expectedTransactionalControlOutput(expectedFailure, false),
+              control.output);
+    const barrier::FileTransferFrame ack = decodeTransactionalOutput(
+        control.output, barrier::FileTransferRole::kPrimary);
+    EXPECT_EQ(barrier::FileTransferFrameType::kStartAck, ack.type);
+    EXPECT_EQ(transferId, ack.transferId);
+    EXPECT_EQ(barrier::FileTransferReason::kConnectionLost, ack.reason);
+    EXPECT_TRUE(client.testHasBulkRetryTimer());
+
+    control.clearOutput();
+    const UInt32 nextTransferId =
+        barrier::FileTransferProtocol::makeTransferId(
+            barrier::FileTransferRole::kPrimary, 38);
+    EXPECT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control,
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, nextTransferId, 1),
+        barrier::FileTransferRole::kPrimary));
+    const barrier::FileTransferFrame expectedRetryRejection =
+        barrier::FileTransferFrame::startAck(
+            kTransactionalBinding, nextTransferId,
+            barrier::FileTransferReason::kConnectionLost);
+    EXPECT_EQ(expectedTransactionalControlOutput(
+                  expectedRetryRejection, true), control.output);
+    EXPECT_FALSE(proxy.testHasPendingTransactionalStart());
+}
+
+TEST(ServerProxyTests,
+     replacingBulkHandshakeRejectsItsPendingStart)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    IDataSocketEvents dataSocketEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents,
+        clientEvents, screenEvents);
+    dataSocketEvents.setEvents(&events);
+    ON_CALL(events, forIDataSocket())
+        .WillByDefault(ReturnRef(dataSocketEvents));
+
+    TestScreen screen;
+    NetworkAddress address("127.0.0.1", 24800);
+    address.resolve();
+    Client client(&events, "client", address,
+                  new DummySocketFactory(), &screen, ClientArgs());
+    client.testSetProtocolMinorVersion(12);
+    client.testSetControlConnectionBinding(kTransactionalBinding);
+    DuplexMemoryStream control;
+    client.testSetStreamOnly(&control);
+    ServerProxy proxy(&client, &control, &events, 12);
+    client.testSetServerProxy(&proxy);
+    ClientProxyLinkGuard linkGuard(client);
+    proxy.testBindTransactionalFileTransfer(kTransactionalBinding);
+    beginBoundBulkHandshake(client);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 39);
+    ASSERT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control,
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, transferId, 1),
+        barrier::FileTransferRole::kPrimary));
+    ASSERT_TRUE(proxy.testHasPendingTransactionalStart());
+    expectAndClearControlNoop(control);
+
+    EXPECT_TRUE(client.testConnectBoundBulkChannel(
+        "replacement-token", kTransactionalBinding));
+
+    const barrier::FileTransferFrame expectedFailure =
+        barrier::FileTransferFrame::startAck(
+            kTransactionalBinding, transferId,
+            barrier::FileTransferReason::kConnectionLost);
+    EXPECT_EQ(expectedTransactionalControlOutput(expectedFailure, false),
+              control.output);
+    EXPECT_FALSE(proxy.testHasPendingTransactionalStart());
+    EXPECT_FALSE(proxy.testHasTransactionalReceive());
+    EXPECT_TRUE(client.testHasBulkRetryTimer());
+    EXPECT_EQ("replacement-token", client.testBulkRetryToken());
+}
+
+TEST(ServerProxyTests,
+     replacementBulkOfferDisconnectsWhenPendingStartAckCannotBeWritten)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents,
+        clientEvents, screenEvents);
+    dataSocketEvents.setEvents(&events);
+    socketEvents.setEvents(&events);
+    ON_CALL(events, forIDataSocket()).WillByDefault(ReturnRef(dataSocketEvents));
+    ON_CALL(events, forISocket()).WillByDefault(ReturnRef(socketEvents));
+    EXPECT_CALL(events, removeHandler(_, _)).Times(AnyNumber());
+    EXPECT_CALL(events, addEvent(_)).Times(AnyNumber()).WillRepeatedly(
+        Invoke(consumeClientFailureEvent));
+
+    TestScreen screen;
+    NetworkAddress address("127.0.0.1", 24800);
+    address.resolve();
+    Client client(&events, "client", address,
+                  new DummySocketFactory(), &screen, ClientArgs());
+    client.testSetProtocolMinorVersion(12);
+    client.testSetControlConnectionBinding(kTransactionalBinding);
+    DuplexMemoryStream* control = new DuplexMemoryStream();
+    ServerProxy* proxy = new ServerProxy(&client, control, &events, 12);
+    client.testSetStreamOnly(control);
+    client.testSetServerProxy(proxy);
+    proxy->testBindTransactionalFileTransfer(kTransactionalBinding);
+    proxy->testUseMessageParser();
+    beginBoundBulkHandshake(client);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 42);
+    std::vector<UInt8> encodedStart = encodeTransactionalFrame(
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, transferId, 1),
+        barrier::FileTransferRole::kPrimary);
+    control->queueInput(encodedStart);
+    proxy->handleDataForTest();
+    ASSERT_TRUE(proxy->testHasPendingTransactionalStart());
+    control->clearOutput();
+
+    const std::string replacementToken("replacement-token");
+    DuplexMemoryStream encodedOffer;
+    ProtocolUtil::writef(
+        &encodedOffer, kMsgCBulkOffer1_12,
+        &replacementToken, &kTransactionalBinding);
+    control->queueInput(encodedOffer.output);
+    control->failWrites = true;
+
+    EXPECT_NO_THROW(proxy->handleDataForTest());
+
+    EXPECT_FALSE(client.isConnected());
+    EXPECT_FALSE(client.testHasBulkRetryTimer());
+}
+
+TEST(ServerProxyTests,
+     pendingStartRejectsConflictingMetadataForSameTransferId)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    IDataSocketEvents dataSocketEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents,
+        clientEvents, screenEvents);
+    dataSocketEvents.setEvents(&events);
+    ON_CALL(events, forIDataSocket())
+        .WillByDefault(ReturnRef(dataSocketEvents));
+
+    TestScreen screen;
+    Client client(&events, "client", NetworkAddress(),
+                  new DummySocketFactory(), &screen, ClientArgs());
+    client.testSetProtocolMinorVersion(12);
+    client.testSetControlConnectionBinding(kTransactionalBinding);
+    DuplexMemoryStream control;
+    ServerProxy proxy(&client, &control, &events, 12);
+    client.testSetServerProxy(&proxy);
+    ClientProxyLinkGuard linkGuard(client);
+    proxy.testBindTransactionalFileTransfer(kTransactionalBinding);
+    beginBoundBulkHandshake(client);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 40);
+    ASSERT_EQ(ServerProxy::kOkay, dispatchTransactionalControlFrame(
+        proxy, control,
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, transferId, 1),
+        barrier::FileTransferRole::kPrimary));
+    expectAndClearControlNoop(control);
+
+    EXPECT_EQ(ServerProxy::kDisconnect, dispatchTransactionalControlFrame(
+        proxy, control,
+        barrier::FileTransferFrame::start(
+            kTransactionalBinding, transferId, 2),
+        barrier::FileTransferRole::kPrimary));
+    EXPECT_TRUE(control.output.empty());
+    EXPECT_TRUE(proxy.testHasPendingTransactionalStart());
+    EXPECT_FALSE(proxy.testHasTransactionalReceive());
 }
 
 TEST(ServerProxyTests,

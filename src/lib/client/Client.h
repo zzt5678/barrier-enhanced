@@ -109,6 +109,8 @@ public:
     bool                connectBulkChannel(const std::string& token,
                                            const std::string& connectionBinding);
     std::shared_ptr<barrier::BulkChannel> acquireBulkChannel() const;
+    bool                isBoundBulkHandshakeWaitingForAck(
+                            const std::string& connectionBinding) const;
 
     bool                handleBulkMessage(const UInt8* code,
                                           barrier::IStream* stream) override;
@@ -277,9 +279,10 @@ private:
     void                setupConnection();
     void                cleanupBulkConnection();
     void                cleanupBulkHandshake();
+    bool                abandonBulkHandshake();
     void                cleanupBulkRetry();
-    void                acceptBulkChannelOffer(const std::string& token);
-    void                startBulkConnection(const std::string& token);
+    bool                acceptBulkChannelOffer(const std::string& token);
+    bool                startBulkConnection(const std::string& token);
     void                scheduleBulkRetry(const std::string& token);
     void                handleBulkConnected(const Event&, void*);
     void                handleBulkConnectionFailed(const Event&, void*);

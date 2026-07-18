@@ -88,6 +88,8 @@ public:
     bool                handleBulkMessage(const UInt8* code,
                                           barrier::IStream* stream);
     void                handleBulkDisconnected(barrier::BulkChannel* channel);
+    bool                handleBulkChannelReady();
+    bool                handleBulkHandshakeFailed();
     bool                sendTransactionalFileTransferFrame(
                             const barrier::FileTransferFrame& frame);
 
@@ -112,6 +114,8 @@ public:
         return m_fileTransferReceiver &&
             m_fileTransferReceiver->hasActiveTransfer();
     }
+    bool                testHasPendingTransactionalStart() const
+                            { return m_hasPendingFileTransferStart; }
     bool                testTransactionalReceiveCleanupPending() const
     {
         return m_fileTransferReceiver &&
@@ -250,6 +254,9 @@ private:
     void                initializeTransactionalFileTransfer(
                             const std::string& connectionBinding);
     EResult             transactionalControlFrame(const UInt8* code);
+    EResult             processTransactionalFileStart(
+                            const barrier::FileTransferFrame& frame,
+                            const std::shared_ptr<barrier::BulkChannel>& channel);
     bool                transactionalBulkFrame(
                             const UInt8* code, barrier::IStream* stream);
     bool                handleTransactionalFileCancel(
@@ -264,6 +271,7 @@ private:
     bool                quarantineTransactionalFileReceive(
                             UInt32 transferId, bool cancelled);
     void                resetTransactionalFileReceive(bool notifyClient);
+    void                clearPendingTransactionalFileStart();
     void                dragInfoReceived();
     void                handleClipboardSendingEvent(const Event&, void*);
     void                handleClipboardSendingChunk(ClipboardChunk* chunk);
@@ -339,6 +347,8 @@ private:
     std::uint64_t       m_nextClipboardSendAttempt;
     std::uint64_t       m_latestClipboardSendAttempt[kClipboardEnd];
     std::unique_ptr<barrier::FileTransferReceiver> m_fileTransferReceiver;
+    bool                m_hasPendingFileTransferStart;
+    barrier::FileTransferFrame m_pendingFileTransferStart;
     std::shared_ptr<barrier::BulkChannel> m_fileTransferReceiveBulkChannel;
     EventQueueTimer*    m_fileTransferReceiveTimer;
     UInt32              m_fileTransferReceiveId;

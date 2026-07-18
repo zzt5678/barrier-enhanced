@@ -74,6 +74,21 @@ bool isTransactionalFileBulkCode(const UInt8* code)
         std::memcmp(code, kMsgDFileTransferEnd1_12, 4) == 0;
 }
 
+bool sameFileTransferStart(const barrier::FileTransferFrame& lhs,
+                           const barrier::FileTransferFrame& rhs)
+{
+    return lhs.type == rhs.type &&
+        lhs.connectionBinding == rhs.connectionBinding &&
+        lhs.transferId == rhs.transferId &&
+        lhs.totalSize == rhs.totalSize &&
+        lhs.offset == rhs.offset &&
+        lhs.payload == rhs.payload &&
+        lhs.reason == rhs.reason &&
+        lhs.kind == rhs.kind &&
+        lhs.clipboardRevision == rhs.clipboardRevision &&
+        lhs.clipboardSessionId == rhs.clipboardSessionId;
+}
+
 }
 
 //
@@ -130,6 +145,8 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_nextClipboardSendAttempt(0),
     m_latestClipboardSendAttempt(),
     m_fileTransferReceiver(),
+    m_hasPendingFileTransferStart(false),
+    m_pendingFileTransferStart(),
     m_fileTransferReceiveBulkChannel(),
     m_fileTransferReceiveTimer(NULL),
     m_fileTransferReceiveId(0),
@@ -167,6 +184,7 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
 
 ServerProxy::~ServerProxy()
 {
+    clearPendingTransactionalFileStart();
     resetTransactionalFileReceive(true);
     if (!cleanupClipboardSendThread(true) && m_clipboardSendThread != NULL) {
         LOG((CLOG_ERR "waiting for clipboard sender before destroying server proxy"));
@@ -316,7 +334,6 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
     else if (m_protocolMinorVersion >= 12 &&
              memcmp(code, kMsgCBulkOffer1_12, 4) == 0) {
         if (!bulkOffer1_12()) {
-            m_client->disconnect("invalid connection-bound bulk offer");
             return kDisconnect;
         }
     }
@@ -533,7 +550,6 @@ ServerProxy::parseMessage(const UInt8* code)
     else if (m_protocolMinorVersion >= 12 &&
              memcmp(code, kMsgCBulkOffer1_12, 4) == 0) {
         if (!bulkOffer1_12()) {
-            m_client->disconnect("invalid connection-bound bulk offer");
             return kDisconnect;
         }
     }
@@ -912,6 +928,46 @@ ServerProxy::handleBulkDisconnected(barrier::BulkChannel* channel)
     }
 }
 
+bool
+ServerProxy::handleBulkChannelReady()
+{
+    if (!m_hasPendingFileTransferStart) {
+        return true;
+    }
+
+    const barrier::FileTransferFrame frame = m_pendingFileTransferStart;
+    clearPendingTransactionalFileStart();
+    const std::shared_ptr<barrier::BulkChannel> channel =
+        m_client->acquireBulkChannel();
+    if (!channel || !channel->isActive()) {
+        const barrier::FileTransferFrame ack =
+            barrier::FileTransferFrame::startAck(
+                m_connectionBinding, frame.transferId,
+                barrier::FileTransferReason::kConnectionLost);
+        return writeTransactionalFileTransferFrame(
+            ack, barrier::FileTransferRole::kPrimary);
+    }
+
+    return processTransactionalFileStart(frame, channel) == kOkay;
+}
+
+bool
+ServerProxy::handleBulkHandshakeFailed()
+{
+    if (!m_hasPendingFileTransferStart) {
+        return true;
+    }
+
+    const UInt32 transferId = m_pendingFileTransferStart.transferId;
+    clearPendingTransactionalFileStart();
+    const barrier::FileTransferFrame ack =
+        barrier::FileTransferFrame::startAck(
+            m_connectionBinding, transferId,
+            barrier::FileTransferReason::kConnectionLost);
+    return writeTransactionalFileTransferFrame(
+        ack, barrier::FileTransferRole::kPrimary);
+}
+
 void
 ServerProxy::detachForDeferredCleanup()
 {
@@ -919,6 +975,7 @@ ServerProxy::detachForDeferredCleanup()
         return;
     }
 
+    clearPendingTransactionalFileStart();
     resetTransactionalFileReceive(true);
     setKeepAliveRate(-1.0);
     m_events->removeHandler(m_events->forIStream().inputReady(),
@@ -2053,6 +2110,7 @@ ServerProxy::initializeTransactionalFileTransfer(
     const std::string& connectionBinding)
 {
     if (!isValidConnectionBinding(connectionBinding)) {
+        clearPendingTransactionalFileStart();
         resetTransactionalFileReceive(true);
         m_fileTransferReceiver.reset();
         m_connectionBinding.clear();
@@ -2063,6 +2121,7 @@ ServerProxy::initializeTransactionalFileTransfer(
         return;
     }
 
+    clearPendingTransactionalFileStart();
     resetTransactionalFileReceive(true);
     m_connectionBinding = connectionBinding;
     m_fileTransferReceiver.reset(new barrier::FileTransferReceiver(
@@ -2126,9 +2185,33 @@ ServerProxy::transactionalControlFrame(const UInt8* code)
     }
 
     if (frame.type == barrier::FileTransferFrameType::kStart) {
+        if (m_hasPendingFileTransferStart) {
+            if (frame.transferId == m_pendingFileTransferStart.transferId) {
+                return sameFileTransferStart(
+                    frame, m_pendingFileTransferStart) ?
+                        kOkay : kDisconnect;
+            }
+            const barrier::FileTransferFrame ack =
+                barrier::FileTransferFrame::startAck(
+                    m_connectionBinding, frame.transferId,
+                    barrier::FileTransferReason::kBusy);
+            return writeTransactionalFileTransferFrame(
+                ack, barrier::FileTransferRole::kPrimary) ?
+                    kOkay : kDisconnect;
+        }
+
         std::shared_ptr<barrier::BulkChannel> bulkChannel =
             m_client->acquireBulkChannel();
         if (!bulkChannel || !bulkChannel->isActive()) {
+            if (m_client->isBoundBulkHandshakeWaitingForAck(
+                    frame.connectionBinding)) {
+                m_pendingFileTransferStart = frame;
+                m_hasPendingFileTransferStart = true;
+                LOG((CLOG_DEBUG1
+                    "deferring transactional file start until bound bulk handshake completes, transfer=%u",
+                    frame.transferId));
+                return kOkay;
+            }
             const barrier::FileTransferFrame ack =
                 barrier::FileTransferFrame::startAck(
                     m_connectionBinding, frame.transferId,
@@ -2138,51 +2221,82 @@ ServerProxy::transactionalControlFrame(const UInt8* code)
                     kOkay : kDisconnect;
         }
 
-        const barrier::FileTransferReceiveResult result =
-            m_fileTransferReceiver->handle(frame);
-        if (result.status ==
-                barrier::FileTransferReceiveStatus::kProtocolError) {
-            return kDisconnect;
-        }
-
-        barrier::FileTransferReason reason = result.reason;
-        if (result.status ==
-                barrier::FileTransferReceiveStatus::kStartAccepted) {
-            reason = m_client->beginTransactionalFileReceive(
-                frame);
-            if (reason == barrier::FileTransferReason::kNone) {
-                m_fileTransferReceiveId = frame.transferId;
-                m_fileTransferReceiveBulkChannel = bulkChannel;
-                m_fileTransferCancelAckPending = false;
-            }
-            else {
-                m_fileTransferReceiver->reset();
-            }
-        }
-        else if (result.status !=
-                     barrier::FileTransferReceiveStatus::kStartRejected) {
-            return kDisconnect;
-        }
-
-        const barrier::FileTransferFrame ack =
-            barrier::FileTransferFrame::startAck(
-                m_connectionBinding, frame.transferId, reason);
-        if (!writeTransactionalFileTransferFrame(
-                ack, barrier::FileTransferRole::kPrimary)) {
-            if (reason == barrier::FileTransferReason::kNone) {
-                resetTransactionalFileReceive(true);
-            }
-            return kDisconnect;
-        }
-        return kOkay;
+        return processTransactionalFileStart(frame, bulkChannel);
     }
 
     if (frame.type == barrier::FileTransferFrameType::kCancel) {
+        if (m_hasPendingFileTransferStart) {
+            if (frame.transferId != m_pendingFileTransferStart.transferId) {
+                return kDisconnect;
+            }
+            clearPendingTransactionalFileStart();
+            const barrier::FileTransferFrame ack =
+                barrier::FileTransferFrame::cancelAck(
+                    m_connectionBinding, frame.transferId,
+                    barrier::FileTransferReason::kNone);
+            return writeTransactionalFileTransferFrame(
+                ack, barrier::FileTransferRole::kPrimary) ?
+                    kOkay : kDisconnect;
+        }
         return handleTransactionalFileCancel(frame) ?
             kOkay : kDisconnect;
     }
 
     return kDisconnect;
+}
+
+ServerProxy::EResult
+ServerProxy::processTransactionalFileStart(
+    const barrier::FileTransferFrame& frame,
+    const std::shared_ptr<barrier::BulkChannel>& bulkChannel)
+{
+    if (!bulkChannel || !bulkChannel->isActive()) {
+        return kDisconnect;
+    }
+
+    const barrier::FileTransferReceiveResult result =
+        m_fileTransferReceiver->handle(frame);
+    if (result.status ==
+            barrier::FileTransferReceiveStatus::kProtocolError) {
+        return kDisconnect;
+    }
+
+    barrier::FileTransferReason reason = result.reason;
+    if (result.status ==
+            barrier::FileTransferReceiveStatus::kStartAccepted) {
+        reason = m_client->beginTransactionalFileReceive(frame);
+        if (reason == barrier::FileTransferReason::kNone) {
+            m_fileTransferReceiveId = frame.transferId;
+            m_fileTransferReceiveBulkChannel = bulkChannel;
+            m_fileTransferCancelAckPending = false;
+        }
+        else {
+            m_fileTransferReceiver->reset();
+        }
+    }
+    else if (result.status !=
+                 barrier::FileTransferReceiveStatus::kStartRejected) {
+        return kDisconnect;
+    }
+
+    const barrier::FileTransferFrame ack =
+        barrier::FileTransferFrame::startAck(
+            m_connectionBinding, frame.transferId, reason);
+    if (!writeTransactionalFileTransferFrame(
+            ack, barrier::FileTransferRole::kPrimary)) {
+        if (reason == barrier::FileTransferReason::kNone) {
+            resetTransactionalFileReceive(true);
+        }
+        return kDisconnect;
+    }
+    return kOkay;
+}
+
+void
+ServerProxy::clearPendingTransactionalFileStart()
+{
+    m_hasPendingFileTransferStart = false;
+    m_pendingFileTransferStart = barrier::FileTransferFrame();
 }
 
 bool

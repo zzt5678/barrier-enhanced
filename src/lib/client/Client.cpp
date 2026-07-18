@@ -378,7 +378,7 @@ Client::connectBulkChannel(const std::string& token)
         token.empty() || m_stream == NULL || m_server == NULL) {
         return;
     }
-    acceptBulkChannelOffer(token);
+    (void)acceptBulkChannelOffer(token);
 }
 
 bool
@@ -396,45 +396,48 @@ Client::connectBulkChannel(const std::string& token,
         return false;
     }
     m_controlConnectionBinding = connectionBinding;
-    acceptBulkChannelOffer(token);
-    return true;
+    return acceptBulkChannelOffer(token);
 }
 
-void
+bool
 Client::acceptBulkChannelOffer(const std::string& token)
 {
     if (m_bulkHandshakeStream != NULL && token == m_bulkBindingToken) {
         LOG((CLOG_DEBUG "ignoring duplicate offer for the in-flight bulk handshake"));
-        return;
+        return true;
     }
     if (m_bulkChannel && m_bulkChannel->isActive()) {
         if (token == m_bulkActiveToken) {
             LOG((CLOG_DEBUG "ignoring duplicate offer for the active bulk channel"));
-            return;
+            return true;
         }
         cleanupBulkRetry();
         m_bulkRetryToken = token;
         LOG((CLOG_DEBUG
             "remembering replacement bulk offer until the active route disconnects"));
-        return;
+        return true;
     }
 
     cleanupBulkRetry();
     m_bulkRetryToken = token;
-    startBulkConnection(token);
+    return startBulkConnection(token);
 }
 
-void
+bool
 Client::startBulkConnection(const std::string& token)
 {
     if (m_protocolMinorVersion < 9 || token.empty() || m_stream == NULL ||
         m_server == NULL || (m_bulkChannel && m_bulkChannel->isActive()) ||
         (m_protocolMinorVersion >= 12 &&
          !isValidConnectionBinding(m_controlConnectionBinding))) {
-        return;
+        return false;
     }
 
-    cleanupBulkHandshake();
+    if (!abandonBulkHandshake()) {
+        LOG((CLOG_ERR
+            "failed to replace bulk handshake after rejecting pending file start"));
+        return false;
+    }
     if (m_bulkChannel) {
         m_bulkChannel->close();
         m_bulkChannel.reset();
@@ -468,6 +471,7 @@ Client::startBulkConnection(const std::string& token)
 
         LOG((CLOG_DEBUG1 "connecting separate bulk channel"));
         socket->connect(m_serverAddress);
+        return true;
     }
     catch (const XBase& e) {
         LOG((CLOG_WARN "bulk connection setup failed; retry scheduled: %s",
@@ -475,6 +479,7 @@ Client::startBulkConnection(const std::string& token)
         const std::string failedToken = token;
         cleanupBulkHandshake();
         scheduleBulkRetry(failedToken);
+        return m_bulkRetryTimer != NULL;
     }
 }
 
@@ -485,6 +490,17 @@ Client::acquireBulkChannel() const
         return m_bulkChannel;
     }
     return std::shared_ptr<barrier::BulkChannel>();
+}
+
+bool
+Client::isBoundBulkHandshakeWaitingForAck(
+    const std::string& connectionBinding) const
+{
+    return m_protocolMinorVersion >= 12 &&
+        m_bulkHandshakeStream != NULL &&
+        m_bulkHandshakeState == kBulkWaitingForAck &&
+        isValidConnectionBinding(connectionBinding) &&
+        m_controlConnectionBinding == connectionBinding;
 }
 
 bool
@@ -1778,6 +1794,19 @@ Client::cleanupBulkHandshake()
     m_bulkBindingToken.clear();
 }
 
+bool
+Client::abandonBulkHandshake()
+{
+    bool controlRouteHealthy = true;
+    if (m_bulkHandshakeStream != NULL &&
+        m_bulkHandshakeState == kBulkWaitingForAck &&
+        m_server != NULL) {
+        controlRouteHealthy = m_server->handleBulkHandshakeFailed();
+    }
+    cleanupBulkHandshake();
+    return controlRouteHealthy;
+}
+
 void
 Client::cleanupBulkConnection()
 {
@@ -1836,7 +1865,7 @@ Client::handleBulkRetry(const Event&, void*)
         m_events->deleteTimer(timer);
     }
     const std::string token = m_bulkRetryToken;
-    startBulkConnection(token);
+    (void)startBulkConnection(token);
 }
 
 void
@@ -1870,7 +1899,12 @@ Client::handleBulkConnectionFailed(const Event& event, void*)
          info == NULL ? "unknown error" : info->m_what.c_str()));
     delete info;
     const std::string failedToken = m_bulkBindingToken;
-    cleanupBulkHandshake();
+    if (!abandonBulkHandshake()) {
+        LOG((CLOG_ERR
+            "failed to reject file start after bulk connection failure"));
+        disconnect("failed to reject file start after bulk connection failure");
+        return;
+    }
     scheduleBulkRetry(failedToken);
 }
 
@@ -1879,7 +1913,12 @@ Client::handleBulkHandshakeError(const Event&, void*)
 {
     LOG((CLOG_WARN "bulk handshake failed; retry scheduled"));
     const std::string failedToken = m_bulkBindingToken;
-    cleanupBulkHandshake();
+    if (!abandonBulkHandshake()) {
+        LOG((CLOG_ERR
+            "failed to reject file start after bulk handshake failure"));
+        disconnect("failed to reject file start after bulk handshake failure");
+        return;
+    }
     scheduleBulkRetry(failedToken);
 }
 
@@ -1943,6 +1982,10 @@ Client::handleBulkHandshakeData(const Event&, void*)
     m_bulkActiveToken = acceptedToken;
     cleanupBulkRetry();
     LOG((CLOG_NOTE "separate bulk channel is ready"));
+    if (m_server != NULL && !m_server->handleBulkChannelReady()) {
+        disconnect("failed to resume file transfer after bulk handshake");
+        return;
+    }
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         if (m_ownClipboard[id] && !m_sentClipboard[id]) {
             m_clipboardRetryCount[id] = 0;
