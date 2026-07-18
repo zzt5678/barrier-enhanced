@@ -27,6 +27,7 @@
 #include "barrier/INode.h"
 #include "barrier/DragInformation.h"
 #include "barrier/FileReceiveSession.h"
+#include "barrier/FileTransferProtocol.h"
 #include "barrier/ServerArgs.h"
 #include "base/Event.h"
 #include "base/Stopwatch.h"
@@ -36,6 +37,7 @@
 #include "common/stdvector.h"
 #include "io/filesystem.h"
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <vector>
@@ -47,8 +49,12 @@ class InputFilter;
 class StreamChunker;
 namespace barrier {
 class BulkChannel;
+struct CompletedFilePayload;
+struct FileTransferFrame;
+class FileTransferSendState;
 class IStream;
 class Screen;
+enum class FileTransferReason : UInt8;
 }
 class IEventQueue;
 class Thread;
@@ -142,16 +148,24 @@ public:
         m_inputHandoffCommitReady(false),
         m_inputHandoffCommitted(false),
         m_inputHandoffCommitAckPending(false),
+        m_inputHandoffSourceRevokePending(false),
+        m_inputHandoffSourceRevoked(false),
         m_inputHandoffSource(NULL),
         m_inputHandoffTarget(NULL),
         m_inputHandoffSeqNum(0),
+        m_inputHandoffSourceLeaseSeqNum(0),
         m_inputHandoffX(0),
         m_inputHandoffY(0),
         m_inputHandoffSourceX(0),
         m_inputHandoffSourceY(0),
         m_inputHandoffMask(0),
+        m_inputHandoffForScreensaver(false),
         m_inputHandoffGuardDir(kNoDirection),
         m_inputHandoffTimer(NULL),
+        m_activeReplacementSource(NULL),
+        m_activeReplacementTarget(NULL),
+        m_activeReplacementSeqNum(0),
+        m_activeReplacementTimer(NULL),
         m_x(0),
         m_y(0),
         m_xDelta(0),
@@ -174,6 +188,8 @@ public:
         m_primaryKeyStateTimer(NULL),
         m_mouseMoveTimer(NULL),
         m_clipboardSyncTimer(NULL),
+        m_fileReceiveCompletionTimer(NULL),
+        m_fileReceiveCompletionGeneration(0),
         m_clipboardFetchPending(false),
         m_pendingMouseMoveTarget(NULL),
         m_pendingMouseMove(false),
@@ -195,20 +211,46 @@ public:
         m_screen(NULL),
         m_events(NULL),
         m_fileReceiveSession(),
+        m_fileReceiveSource(NULL),
+        m_fileReceiveBulkChannel(NULL),
         m_sendFileThread(NULL),
         m_sendFileBulkChannel(),
+        m_sendFileTransactionState(),
         m_sendFileTarget(NULL),
         m_sendFileTransferId(0),
         m_sendFileCompletionPending(false),
         m_sendFileStarted(false),
+        m_sendFilePreflightFailed(false),
         m_sendFileCleanupPending(false),
         m_sendFileIsClipboardPrefetch(false),
+        m_sendFileCancelAckPending(false),
+        m_sendFileCancelAckTimeoutTimer(NULL),
+        m_sendFileCancelAckTimeoutTransferId(0),
+        m_sendFileReapTimer(NULL),
+        m_sendFileReapTransferId(0),
+        m_sendFileOutputDrainTransferId(0),
+        m_sendFileOutputDrainDeadline(0.0),
+        m_pendingManualFileSendTarget(NULL),
+        m_pendingManualFileSendPath(),
         m_pendingFileClipboardPrefetchTarget(NULL),
         m_pendingFileClipboardPrefetchPaths(),
+        m_pendingFileClipboardPrefetchSession(),
+        m_pendingFileClipboardPrefetchRevision(),
         m_writeToDropDirThread(NULL),
+        m_transactionalDragFileLists(),
         m_clipboardRevision(),
+        m_remoteFileClipboardSession(),
         m_remoteFileClipboardRevision(),
+        m_remoteFileClipboardOriginBinding(),
+        m_readyFileClipboardSession(),
+        m_readyFileClipboardPaths(),
         m_readyFileClipboardRevision(),
+        m_nextClipboardPublicationId(0),
+        m_pendingMaterializedClipboardPublicationId(0),
+        m_lastCommittedClipboardPublicationId(0),
+        m_pendingMaterializedClipboardData(),
+        m_pendingMaterializedClipboardSession(),
+        m_pendingMaterializedClipboardRevision(),
         m_fileReceiveClipboardGeneration(0),
         m_fileReceiveClipboardRevision(),
         m_ignoreFileTransfer(false),
@@ -225,9 +267,34 @@ public:
     {
         m_sendFileTarget = target;
         m_sendFileTransferId = transferId;
+        m_sendFileTransactionState.reset();
         m_sendFileCompletionPending = false;
         m_sendFileStarted = false;
+        m_sendFilePreflightFailed.store(false);
         m_sendFileCleanupPending = false;
+        m_sendFileCancelAckPending = false;
+        m_sendFileOutputDrainTransferId = 0;
+        m_sendFileOutputDrainDeadline = 0.0;
+    }
+    bool testHasSendFileCancelAckTimer() const
+    {
+        return m_sendFileCancelAckTimeoutTimer != NULL;
+    }
+    void testHandleSendFileCancelAckTimeout()
+    {
+        handleSendFileCancelAckTimeout(Event(), NULL);
+    }
+    bool testHasSendFileReapTimer() const
+    {
+        return m_sendFileReapTimer != NULL;
+    }
+    bool testCompletedSendFileMayRetire() const
+    {
+        return completedSendFileMayRetire();
+    }
+    void testHandleSendFileReap()
+    {
+        handleSendFileReap(Event(), NULL);
     }
     static void addDefaultConnectionOptionsForTest(OptionsList& optionsList)
     {
@@ -275,9 +342,50 @@ public:
     bool                attachBulkStream(const std::string& name,
                                          const std::string& token,
                                          barrier::IStream* stream);
+    bool                attachBulkStream(const std::string& name,
+                                         const std::string& token,
+                                         const std::string& connectionBinding,
+                                         barrier::IStream* stream);
 
     //! Replace a consumed or failed bulk binding token over control.
     void                renewBulkChannel(BaseClientProxy* client);
+    void                handleBulkDisconnected(
+                            BaseClientProxy* client,
+                            barrier::BulkChannel* channel,
+                            std::uint64_t pausedGeneration = 0);
+    void                handleBulkInputPauseFailed(
+                            BaseClientProxy* client,
+                            barrier::BulkChannel* channel,
+                            std::uint64_t generation);
+
+    struct TransactionalFileReceiveContext {
+        BaseClientProxy* source = NULL;
+        UInt32 transferId = 0;
+        std::string connectionBinding;
+        std::string dropTarget;
+        DragFileList dragFileList;
+        barrier::FileTransferKind kind = barrier::FileTransferKind::kManual;
+        std::uint64_t senderClipboardRevision = 0;
+        std::string clipboardSessionId;
+        barrier::ClipboardRevision clipboardRevision;
+    };
+
+    //! Freeze receive metadata before acknowledging a protocol 1.12 Start.
+    barrier::FileTransferReason prepareTransactionalFileReceive(
+                            BaseClientProxy* source,
+                            const barrier::FileTransferFrame& start,
+                            TransactionalFileReceiveContext& context);
+    //! Transfer payload ownership to the writer/its bounded queue.
+    barrier::FileTransferReason acceptTransactionalFileReceive(
+                            const TransactionalFileReceiveContext& context,
+                            barrier::CompletedFilePayload&& payload);
+    bool                handleTransactionalFileAck(
+                            BaseClientProxy* source,
+                            const barrier::FileTransferFrame& frame);
+    void                transactionalDragInfoReceived(
+                            BaseClientProxy* source,
+                            UInt32 fileNum,
+                            const std::string& content);
 
     //@}
     //! @name accessors
@@ -299,7 +407,19 @@ public:
     bool                isReceivedFileSizeValid();
 
     FileReceiveSession& getFileReceiveSession() { return m_fileReceiveSession; }
-    void                bindFileReceiveClipboardRevision();
+    bool                canReceiveFileChunk(
+                            BaseClientProxy* source,
+                            barrier::BulkChannel* channel) const;
+    void                bindFileReceiveClipboardRevision(
+                            BaseClientProxy* source = NULL,
+                            barrier::BulkChannel* channel = NULL);
+    void                completeFileReceiveRoute(
+                            BaseClientProxy* source,
+                            barrier::BulkChannel* channel);
+    void                abortFileReceiveRoute(
+                            BaseClientProxy* source,
+                            barrier::BulkChannel* channel);
+    void                abortFileReceiveSource(BaseClientProxy* source);
 
     //! Return fake drag file list
     DragFileList        getFakeDragFileList() { return m_fakeDragFileList; }
@@ -318,9 +438,15 @@ private:
         std::string dropTarget;
         DragFileList dragFileList;
         std::string remoteFileClipboardSession;
+        std::string remoteFileClipboardOrigin;
         barrier::ClipboardRevision clipboardRevision;
+        barrier::FileTransferKind kind;
 
-        CompletedFileTransfer() : expectedSize(0) { }
+        CompletedFileTransfer() :
+            expectedSize(0),
+            kind(barrier::FileTransferKind::kManual)
+        {
+        }
     };
 
     // get canonical name of client
@@ -350,7 +476,9 @@ private:
                                 EDirection guardDir = kNoDirection,
                                 bool trackDirectCommit = true);
     bool                beginInputHandoff(BaseClientProxy*, SInt32, SInt32,
-                                EDirection);
+                                EDirection, bool forScreensaver);
+    bool                requestInputHandoffSourceRevoke();
+    void                commitPreparedInputHandoff();
     void                cancelInputHandoff(const char* reason, bool reanchor,
                                 bool notifyTarget = true);
     void                trackCommittedInputHandoff(BaseClientProxy* source,
@@ -361,6 +489,15 @@ private:
     void                finishCommittedInputHandoff();
     void                rollbackCommittedInputHandoff(const char* reason);
     void                cleanupInputHandoffTimer();
+    bool                beginActiveClientReplacement(
+                            BaseClientProxy* source,
+                            BaseClientProxy* target);
+    void                completeActiveClientReplacement();
+    void                cancelActiveClientReplacement(
+                            const char* reason, bool closeTarget);
+    void                cleanupActiveClientReplacementTimer();
+    void                finishAdoptingClient(BaseClientProxy* client,
+                            bool replaceActive, bool replaceActiveSaver);
 
     // jump to screen
     void                jumpToScreen(BaseClientProxy*);
@@ -460,6 +597,7 @@ private:
     void                handleShapeChanged(const Event&, void*);
     void                handleClipboardGrabbed(const Event&, void*);
     void                handleClipboardChanged(const Event&, void*);
+    void                handleClipboardPublished(const Event&, void*);
     void                handleKeyDownEvent(const Event&, void*);
     void                handleKeyUpEvent(const Event&, void*);
     void                handleKeyRepeatEvent(const Event&, void*);
@@ -475,6 +613,8 @@ private:
     void                handleMouseMoveFlush(const Event&, void*);
     void                handleInputHandoffReady(const Event&, void*);
     void                handleInputHandoffTimeout(const Event&, void*);
+    void                handleActiveClientReplacementTimeout(
+                            const Event&, void*);
     void                handleClipboardSync(const Event&, void*);
     void                handleClientDisconnected(const Event&, void*);
     void                handleClientCloseTimeout(const Event&, void*);
@@ -491,6 +631,8 @@ private:
     void                handleFileClipboardReadyEvent(const Event&, void*);
     void                handleDropDirWriteFinishedEvent(const Event&, void*);
     void                handleFileKeepAliveEvent(const Event&, void*);
+    void                handleSendFileCancelAckTimeout(const Event&, void*);
+    void                handleSendFileReap(const Event&, void*);
 
     // event processing
     bool                canLeavePrimaryNow(const char* reason,
@@ -507,6 +649,8 @@ private:
     bool                onClipboardChanged(BaseClientProxy* sender,
                             ClipboardID id, UInt32 seqNum,
                             const Clipboard* snapshot = NULL);
+    void                commitClipboardFetch(ClipboardID id);
+    void                rollbackClipboardFetch(ClipboardID id);
     void                onScreensaver(bool activated);
     void                onKeyDown(KeyID, KeyModifierMask, KeyButton,
                             const char* screens);
@@ -528,8 +672,23 @@ private:
     void                supersedeFileClipboard(const char* reason);
     void                publishMaterializedFileClipboard(const std::vector<std::string>& paths,
                                                          const std::string& sessionId);
+    void                commitMaterializedFileClipboard(
+                            const std::shared_ptr<const String>& data,
+                            const std::string& sessionId,
+                            std::size_t pathCount,
+                            std::uint64_t publicationId);
+    void                clearMaterializedClipboardPublication();
+    std::uint64_t       allocateClipboardPublicationId();
     void                sendClipboardSelectionToClient(BaseClientProxy* target,
-                                                       const std::vector<barrier::fs::path>& sourcePaths);
+                                                       const std::vector<barrier::fs::path>& sourcePaths,
+                                                       const std::string& sessionId,
+                                                       const barrier::ClipboardRevision& revision);
+    void                startPendingManualFileSend();
+    void                startManualFileSend(
+                            BaseClientProxy* target,
+                            const std::string& filename,
+                            const std::shared_ptr<barrier::BulkChannel>& bulkChannel);
+    UInt32              allocateSendFileTransferId(BaseClientProxy* target);
     void                startPendingFileClipboardPrefetch();
     void                eraseBulkBindings(BaseClientProxy* client);
     std::string         generateBulkToken() const;
@@ -562,14 +721,25 @@ private:
     void                send_file_thread(barrier::IStream* stream,
                                          const std::string& filename,
                                          const std::shared_ptr<StreamChunker>& chunker,
-                                         UInt32 transferId);
+                                         UInt32 transferId,
+                                         const std::shared_ptr<barrier::FileTransferSendState>& transactionState);
 	void                send_clipboard_file_thread(barrier::IStream* stream,
                                                    const std::vector<barrier::fs::path>& sourcePaths,
                                                    const std::shared_ptr<StreamChunker>& chunker,
-                                                   UInt32 transferId);
+                                                   UInt32 transferId,
+                                                   const std::shared_ptr<barrier::FileTransferSendState>& transactionState);
 	bool                cleanupSendFileThread(bool cancel);
 	bool                reapSendFileThreadIfReady();
 	bool                finishCompletedSendFileIfReady();
+	void                serviceSendFileCompletion();
+	void                scheduleSendFileCancelAckTimeout();
+	void                cleanupSendFileCancelAckTimeout();
+	bool                scheduleSendFileReap();
+	void                cleanupSendFileReap();
+	bool                sendFileBulkOutputPending() const;
+	void                resetSendFileOutputDrainDeadline();
+	void                resetStalledSendFileBulkRoute();
+	bool                completedSendFileMayRetire() const;
 	bool                cleanupWriteToDropDirThread();
 	bool                reapWriteToDropDirThreadIfReady();
 	bool                deferDeleteIfSendingToClient(BaseClientProxy* client);
@@ -578,8 +748,8 @@ private:
 	void                deleteDeferredClient(BaseClientProxy* client);
 	void                deleteDeferredClients();
 	std::shared_ptr<CompletedFileTransfer> takeCompletedFileTransfer();
-	void                startDropDirTransfer(std::shared_ptr<CompletedFileTransfer> transfer);
-	void                queueDropDirTransfer(std::shared_ptr<CompletedFileTransfer> transfer);
+	bool                startDropDirTransfer(std::shared_ptr<CompletedFileTransfer> transfer);
+	bool                queueDropDirTransfer(std::shared_ptr<CompletedFileTransfer> transfer);
 	void                drainDropDirTransferQueue();
 	void                releasePendingDropDirTransfers();
 
@@ -603,8 +773,28 @@ public:
 		transfer->expectedSize = data.size();
 		transfer->data = data;
 		transfer->remoteFileClipboardSession = sessionId;
+		transfer->kind = barrier::FileTransferKind::kClipboard;
 		m_clipboardRevision.advance();
 		transfer->clipboardRevision = m_clipboardRevision;
+		write_to_drop_dir_thread(transfer);
+	}
+	void testWriteDroppedFileTransfer(
+		barrier::FileTransferKind kind,
+		const std::string& dropTarget,
+		const std::string& filename,
+		const std::string& data)
+	{
+		std::shared_ptr<CompletedFileTransfer> transfer(new CompletedFileTransfer());
+		transfer->expectedSize = data.size();
+		transfer->data = data;
+		transfer->dropTarget = dropTarget;
+		transfer->kind = kind;
+		DragInformation drag;
+		String mutableFilename(filename);
+		drag.setFilename(mutableFilename);
+		drag.setFilesize(data.size());
+		drag.setEntryType(DragInformation::File);
+		transfer->dragFileList.push_back(drag);
 		write_to_drop_dir_thread(transfer);
 	}
 	void testQueueDropDirTransfer(const std::string& data)
@@ -621,6 +811,57 @@ public:
 	void testDrainDropDirTransferQueue() { drainDropDirTransferQueue(); }
 	std::size_t testPendingDropDirTransferCount() const { return m_pendingDropDirTransfers.size(); }
 	bool testCleanupSendFileThread(bool cancel) { return cleanupSendFileThread(cancel); }
+	void testSetFileClipboardSessions(
+		const std::string& remoteSession,
+		const std::string& readySession,
+		const std::vector<std::string>& readyPaths)
+	{
+		m_clipboardRevision.advance();
+		m_remoteFileClipboardSession = remoteSession;
+		m_remoteFileClipboardRevision = m_clipboardRevision;
+		m_readyFileClipboardSession = readySession;
+		m_readyFileClipboardPaths = readyPaths;
+		m_readyFileClipboardRevision = m_clipboardRevision;
+	}
+	void testPublishMaterializedFileClipboard()
+	{
+		publishMaterializedFileClipboard(
+			m_readyFileClipboardPaths, m_readyFileClipboardSession);
+	}
+	void testSupersedeFileClipboard(const char* reason)
+	{
+		supersedeFileClipboard(reason);
+	}
+	std::uint64_t testPendingClipboardPublicationId() const
+	{
+		return m_pendingMaterializedClipboardPublicationId;
+	}
+	bool testMaterializedClipboardCommitted() const
+	{
+		return m_lastCommittedClipboardPublicationId != 0;
+	}
+	const std::string& testRemoteFileClipboardSession() const
+	{
+		return m_remoteFileClipboardSession;
+	}
+	void testHandleClipboardPublished(
+		std::uint64_t publicationId,
+		IScreen::ClipboardPublicationResult result)
+	{
+		IScreen::ClipboardPublicationInfo info;
+		info.m_id = kClipboardClipboard;
+		info.m_publicationId = publicationId;
+		info.m_result = result;
+		info.m_platformSequence = 0;
+		handleClipboardPublished(
+			Event(Event::kUnknown, m_primaryClient, &info,
+				  Event::kDontFreeData), NULL);
+	}
+	bool testHandleTransactionalFileAck(
+		BaseClientProxy* source, const barrier::FileTransferFrame& frame)
+	{
+		return handleTransactionalFileAck(source, frame);
+	}
 #endif
 #if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
 public:
@@ -637,6 +878,9 @@ private:
         std::string m_clipboardOwner;
         UInt32            m_clipboardSeqNum;
         bool              m_pendingClipboardFetch;
+        std::string       m_previousClipboardOwner;
+        UInt32            m_previousClipboardSeqNum;
+        bool              m_hasClipboardRollback;
     };
 
     // the primary screen client
@@ -651,11 +895,16 @@ private:
     struct PendingBulkBinding {
         PendingBulkBinding() : client(NULL), issued() { }
         PendingBulkBinding(const std::string& clientName,
-                           BaseClientProxy* boundClient) :
-            name(clientName), client(boundClient), issued() { }
+                           BaseClientProxy* boundClient,
+                           const std::string& oneTimeToken,
+                           const std::string& controlConnectionBinding) :
+            name(clientName), client(boundClient), token(oneTimeToken),
+            connectionBinding(controlConnectionBinding), issued() { }
 
         std::string name;
         BaseClientProxy* client;
+        std::string token;
+        std::string connectionBinding;
         Stopwatch issued;
     };
     std::map<std::string, PendingBulkBinding> m_pendingBulkBindings;
@@ -675,16 +924,25 @@ private:
     bool                  m_inputHandoffCommitReady;
     bool                  m_inputHandoffCommitted;
     bool                  m_inputHandoffCommitAckPending;
+    bool                  m_inputHandoffSourceRevokePending;
+    bool                  m_inputHandoffSourceRevoked;
     BaseClientProxy*      m_inputHandoffSource;
     BaseClientProxy*      m_inputHandoffTarget;
     UInt32                m_inputHandoffSeqNum;
+    UInt32                m_inputHandoffSourceLeaseSeqNum;
     SInt32                m_inputHandoffX;
     SInt32                m_inputHandoffY;
     SInt32                m_inputHandoffSourceX;
     SInt32                m_inputHandoffSourceY;
     KeyModifierMask       m_inputHandoffMask;
+    bool                  m_inputHandoffForScreensaver;
     EDirection            m_inputHandoffGuardDir;
     EventQueueTimer*      m_inputHandoffTimer;
+    Stopwatch             m_inputHandoffPhaseTimer;
+    BaseClientProxy*      m_activeReplacementSource;
+    BaseClientProxy*      m_activeReplacementTarget;
+    UInt32                m_activeReplacementSeqNum;
+    EventQueueTimer*      m_activeReplacementTimer;
 
     // current mouse position (in absolute screen coordinates) on
     // whichever screen is active
@@ -767,30 +1025,54 @@ private:
 
     // file transfer
     FileReceiveSession     m_fileReceiveSession;
+    BaseClientProxy*       m_fileReceiveSource;
+    barrier::BulkChannel*  m_fileReceiveBulkChannel;
     DragFileList        m_dragFileList;
     DragFileList        m_fakeDragFileList;
     Thread*                m_sendFileThread;
     std::shared_ptr<StreamChunker> m_sendFileChunker;
     std::shared_ptr<barrier::BulkChannel> m_sendFileBulkChannel;
+    std::shared_ptr<barrier::FileTransferSendState> m_sendFileTransactionState;
     BaseClientProxy*       m_sendFileTarget;
     UInt32                 m_sendFileTransferId;
     bool                   m_sendFileCompletionPending;
     bool                   m_sendFileStarted;
+    std::atomic<bool>      m_sendFilePreflightFailed;
     bool                   m_sendFileCleanupPending;
     bool                   m_sendFileIsClipboardPrefetch;
+    bool                   m_sendFileCancelAckPending;
+    EventQueueTimer*       m_sendFileCancelAckTimeoutTimer;
+    UInt32                 m_sendFileCancelAckTimeoutTransferId;
+    EventQueueTimer*       m_sendFileReapTimer;
+    UInt32                 m_sendFileReapTransferId;
+    UInt32                 m_sendFileOutputDrainTransferId;
+    double                 m_sendFileOutputDrainDeadline;
+    BaseClientProxy*       m_pendingManualFileSendTarget;
+    std::string            m_pendingManualFileSendPath;
     BaseClientProxy*       m_pendingFileClipboardPrefetchTarget;
     std::vector<barrier::fs::path> m_pendingFileClipboardPrefetchPaths;
+    std::string            m_pendingFileClipboardPrefetchSession;
+    barrier::ClipboardRevision m_pendingFileClipboardPrefetchRevision;
     ClientSet              m_deferredDeleteClients;
     Thread*                m_writeToDropDirThread;
 	std::deque<std::shared_ptr<CompletedFileTransfer> > m_pendingDropDirTransfers;
+	std::map<BaseClientProxy*, DragFileList> m_transactionalDragFileLists;
 	barrier::ClipboardRevision m_clipboardRevision;
     std::string         m_remoteFileClipboardSession;
 	barrier::ClipboardRevision m_remoteFileClipboardRevision;
+    std::string         m_remoteFileClipboardOriginBinding;
     std::string         m_readyFileClipboardSession;
     std::vector<std::string> m_readyFileClipboardPaths;
 	barrier::ClipboardRevision m_readyFileClipboardRevision;
+	std::uint64_t       m_nextClipboardPublicationId;
+	std::uint64_t       m_pendingMaterializedClipboardPublicationId;
+	std::uint64_t       m_lastCommittedClipboardPublicationId;
+	std::shared_ptr<const String> m_pendingMaterializedClipboardData;
+	std::string         m_pendingMaterializedClipboardSession;
+	barrier::ClipboardRevision m_pendingMaterializedClipboardRevision;
 	std::uint64_t       m_fileReceiveClipboardGeneration;
 	std::string         m_fileReceiveRemoteFileClipboardSession;
+	std::string         m_fileReceiveClipboardOrigin;
 	barrier::ClipboardRevision m_fileReceiveClipboardRevision;
     std::string m_dragFileExt;
     bool                m_ignoreFileTransfer;

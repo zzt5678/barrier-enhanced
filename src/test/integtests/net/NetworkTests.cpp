@@ -29,8 +29,7 @@
 #include "server/ClientListener.h"
 #include "server/ClientProxy.h"
 #include "client/Client.h"
-#include "barrier/FileChunk.h"
-#include "barrier/StreamChunker.h"
+#include "barrier/FileTransferSendState.h"
 #include "net/SocketMultiplexer.h"
 #include "net/NetworkAddress.h"
 #include "net/TCPSocketFactory.h"
@@ -62,10 +61,9 @@ using ::testing::Invoke;
 
 #define TEST_HOST "127.0.0.1"
 
-const size_t kMockDataSize = 1024 * 1024 * 10; // 10MB
-const UInt16 kMockDataChunkIncrement = 1024; // 1KB
 const char* kMockFilename = "NetworkTests.mock";
 const size_t kMockFileSize = 1024 * 1024 * 10; // 10MB
+const char* kRepeatedMockFilename = "NetworkTests.repeated.mock";
 const int kRepeatedMockDataTransfers = 8;
 const size_t kRepeatedMockDataSize = 1024 * 1024; // 1MB per connection-reuse cycle
 
@@ -75,30 +73,51 @@ void getCursorPos(SInt32& x, SInt32& y);
 UInt8* newMockData(size_t size);
 void createFile(fstream& file, const char* filename, size_t size);
 
+class NetworkPrimaryClient : public MockPrimaryClient
+{
+public:
+    void getShape(SInt32& x, SInt32& y,
+                  SInt32& width, SInt32& height) const override
+    {
+        getScreenShape(x, y, width, height);
+    }
+};
+
 class NetworkTests : public ::testing::Test
 {
 public:
+    struct ClientFileSendContext {
+        ClientListener* listener;
+        Client* client;
+    };
+
     NetworkTests() :
-        m_mockData(NULL),
-        m_mockDataSize(0),
-        m_mockFileSize(0),
-        m_repeatedServer(NULL),
-        m_repeatedClient(NULL),
-        m_repeatedTransferId(0),
-        m_repeatedCompleted(0)
+        m_transferPollTimer(NULL),
+        m_transferServerSender(NULL),
+        m_transferClientSender(NULL),
+        m_transferReceiveCompleted(false),
+        m_repeatServerTransfers(false),
+        m_transferPollTicks(0),
+        m_completedTransfers(0)
     {
-        m_mockData = newMockData(kMockDataSize);
         createFile(m_mockFile, kMockFilename, kMockFileSize);
+        createFile(m_repeatedMockFile, kRepeatedMockFilename,
+                   kRepeatedMockDataSize);
     }
 
     ~NetworkTests()
     {
+        cleanupTransferCompletionPoll();
         remove(kMockFilename);
-        delete[] m_mockData;
+        remove(kRepeatedMockFilename);
     }
 
-    void                sendMockData(void* eventTarget, UInt32 transferId = 0,
-                                     size_t dataSize = kMockDataSize);
+    void                startTransferCompletionPoll(Server* serverSender,
+                                                     Client* clientSender,
+                                                     bool repeatServerTransfers);
+    void                cleanupTransferCompletionPoll();
+    void                handleTransferCompletionPoll(const Event&, void*);
+    void                markTransferReceiveCompleted(const Event&, void* receiver);
 
     void                sendToClient_mockData_handleClientConnected(const Event&, void* vlistener);
     void                sendToClient_mockData_fileRecieveCompleted(const Event&, void*);
@@ -117,14 +136,15 @@ public:
 
 public:
     TestEventQueue        m_events;
-    UInt8*                m_mockData;
-    size_t                m_mockDataSize;
     fstream                m_mockFile;
-    size_t                m_mockFileSize;
-    Server*                m_repeatedServer;
-    BaseClientProxy*       m_repeatedClient;
-    UInt32                 m_repeatedTransferId;
-    int                    m_repeatedCompleted;
+    fstream                m_repeatedMockFile;
+    EventQueueTimer*       m_transferPollTimer;
+    Server*                m_transferServerSender;
+    Client*                m_transferClientSender;
+    bool                   m_transferReceiveCompleted;
+    bool                   m_repeatServerTransfers;
+    int                    m_transferPollTicks;
+    int                    m_completedTransfers;
 };
 
 TEST_F(NetworkTests, sendToClient_mockData)
@@ -140,7 +160,7 @@ TEST_F(NetworkTests, sendToClient_mockData)
     ClientListener listener(serverAddress, serverSocketFactory, &m_events,
                             ConnectionSecurityLevel::PLAINTEXT);
     NiceMock<MockScreen> serverScreen;
-    NiceMock<MockPrimaryClient> primaryClient;
+    NiceMock<NetworkPrimaryClient> primaryClient;
     NiceMock<MockConfig> serverConfig;
     NiceMock<MockInputFilter> serverInputFilter;
 
@@ -172,17 +192,22 @@ TEST_F(NetworkTests, sendToClient_mockData)
     Client client(&m_events, "stub", serverAddress, clientSocketFactory, &clientScreen, clientArgs);
 
     m_events.adoptHandler(
-        m_events.forFile().fileRecieveCompleted(), &client,
+        m_events.forFile().dropDirWriteFinished(), &client,
         new TMethodEventJob<NetworkTests>(
-            this, &NetworkTests::sendToClient_mockData_fileRecieveCompleted));
+            this, &NetworkTests::sendToClient_mockData_fileRecieveCompleted,
+            &client));
+
+    startTransferCompletionPoll(&server, NULL, false);
 
     client.connect();
 
-    m_events.initQuitTimeout(10);
+    m_events.initQuitTimeout(30);
     m_events.loop();
+    cleanupTransferCompletionPoll();
+    EXPECT_EQ(1, m_completedTransfers);
     server.setActive(&primaryClient);
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
-    m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &client);
+    m_events.removeHandler(m_events.forFile().dropDirWriteFinished(), &client);
     m_events.cleanupQuitTimeout();
 }
 
@@ -199,7 +224,7 @@ TEST_F(NetworkTests, sendToClient_mockFile)
     ClientListener listener(serverAddress, serverSocketFactory, &m_events,
                             ConnectionSecurityLevel::PLAINTEXT);
     NiceMock<MockScreen> serverScreen;
-    NiceMock<MockPrimaryClient> primaryClient;
+    NiceMock<NetworkPrimaryClient> primaryClient;
     NiceMock<MockConfig> serverConfig;
     NiceMock<MockInputFilter> serverInputFilter;
 
@@ -231,18 +256,23 @@ TEST_F(NetworkTests, sendToClient_mockFile)
     Client client(&m_events, "stub", serverAddress, clientSocketFactory, &clientScreen, clientArgs);
 
     m_events.adoptHandler(
-        m_events.forFile().fileRecieveCompleted(), &client,
+        m_events.forFile().dropDirWriteFinished(), &client,
         new TMethodEventJob<NetworkTests>(
-            this, &NetworkTests::sendToClient_mockFile_fileRecieveCompleted));
+            this, &NetworkTests::sendToClient_mockFile_fileRecieveCompleted,
+            &client));
+
+    startTransferCompletionPoll(&server, NULL, false);
 
     client.connect();
 
     m_events.initQuitTimeout(30);
     m_events.loop();
+    cleanupTransferCompletionPoll();
+    EXPECT_EQ(1, m_completedTransfers);
     server.setActive(&primaryClient);
     EXPECT_TRUE(server.testCleanupSendFileThread(false));
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
-    m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &client);
+    m_events.removeHandler(m_events.forFile().dropDirWriteFinished(), &client);
     m_events.cleanupQuitTimeout();
 }
 
@@ -258,7 +288,7 @@ TEST_F(NetworkTests, sendToServer_mockData)
     ClientListener listener(serverAddress, serverSocketFactory, &m_events,
                             ConnectionSecurityLevel::PLAINTEXT);
     NiceMock<MockScreen> serverScreen;
-    NiceMock<MockPrimaryClient> primaryClient;
+    NiceMock<NetworkPrimaryClient> primaryClient;
     NiceMock<MockConfig> serverConfig;
     NiceMock<MockInputFilter> serverInputFilter;
 
@@ -282,24 +312,31 @@ TEST_F(NetworkTests, sendToServer_mockData)
     clientArgs.m_enableDragDrop = true;
     clientArgs.m_enableCrypto = false;
     Client client(&m_events, "stub", serverAddress, clientSocketFactory, &clientScreen, clientArgs);
+    ClientFileSendContext sendContext = { &listener, &client };
 
     m_events.adoptHandler(
         m_events.forClientListener().connected(), &listener,
         new TMethodEventJob<NetworkTests>(
-            this, &NetworkTests::sendToServer_mockData_handleClientConnected, &client));
+            this, &NetworkTests::sendToServer_mockData_handleClientConnected,
+            &sendContext));
 
     m_events.adoptHandler(
-        m_events.forFile().fileRecieveCompleted(), &server,
+        m_events.forFile().dropDirWriteFinished(), &server,
         new TMethodEventJob<NetworkTests>(
-            this, &NetworkTests::sendToServer_mockData_fileRecieveCompleted));
+            this, &NetworkTests::sendToServer_mockData_fileRecieveCompleted,
+            &server));
+
+    startTransferCompletionPoll(NULL, &client, false);
 
     client.connect();
 
-    m_events.initQuitTimeout(10);
+    m_events.initQuitTimeout(30);
     m_events.loop();
+    cleanupTransferCompletionPoll();
+    EXPECT_EQ(1, m_completedTransfers);
     server.setActive(&primaryClient);
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
-    m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &server);
+    m_events.removeHandler(m_events.forFile().dropDirWriteFinished(), &server);
     m_events.cleanupQuitTimeout();
 }
 
@@ -316,7 +353,7 @@ TEST_F(NetworkTests, sendToServer_mockFile)
     ClientListener listener(serverAddress, serverSocketFactory, &m_events,
                             ConnectionSecurityLevel::PLAINTEXT);
     NiceMock<MockScreen> serverScreen;
-    NiceMock<MockPrimaryClient> primaryClient;
+    NiceMock<NetworkPrimaryClient> primaryClient;
     NiceMock<MockConfig> serverConfig;
     NiceMock<MockInputFilter> serverInputFilter;
 
@@ -340,25 +377,31 @@ TEST_F(NetworkTests, sendToServer_mockFile)
     clientArgs.m_enableDragDrop = true;
     clientArgs.m_enableCrypto = false;
     Client client(&m_events, "stub", serverAddress, clientSocketFactory, &clientScreen, clientArgs);
+    ClientFileSendContext sendContext = { &listener, &client };
 
     m_events.adoptHandler(
         m_events.forClientListener().connected(), &listener,
         new TMethodEventJob<NetworkTests>(
-            this, &NetworkTests::sendToServer_mockFile_handleClientConnected, &client));
+            this, &NetworkTests::sendToServer_mockFile_handleClientConnected, &sendContext));
 
     m_events.adoptHandler(
-        m_events.forFile().fileRecieveCompleted(), &server,
+        m_events.forFile().dropDirWriteFinished(), &server,
         new TMethodEventJob<NetworkTests>(
-            this, &NetworkTests::sendToServer_mockFile_fileRecieveCompleted));
+            this, &NetworkTests::sendToServer_mockFile_fileRecieveCompleted,
+            &server));
+
+    startTransferCompletionPoll(NULL, &client, false);
 
     client.connect();
 
     m_events.initQuitTimeout(30);
     m_events.loop();
+    cleanupTransferCompletionPoll();
+    EXPECT_EQ(1, m_completedTransfers);
     server.setActive(&primaryClient);
     EXPECT_TRUE(client.testCleanupSendFileThread(false));
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
-    m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &server);
+    m_events.removeHandler(m_events.forFile().dropDirWriteFinished(), &server);
     m_events.cleanupQuitTimeout();
 }
 
@@ -373,7 +416,7 @@ TEST_F(NetworkTests, repeatedSendToClient_mockDataReusesConnection)
     ClientListener listener(serverAddress, serverSocketFactory, &m_events,
                             ConnectionSecurityLevel::PLAINTEXT);
     NiceMock<MockScreen> serverScreen;
-    NiceMock<MockPrimaryClient> primaryClient;
+    NiceMock<NetworkPrimaryClient> primaryClient;
     NiceMock<MockConfig> serverConfig;
     NiceMock<MockInputFilter> serverInputFilter;
 
@@ -403,19 +446,116 @@ TEST_F(NetworkTests, repeatedSendToClient_mockDataReusesConnection)
     Client client(&m_events, "stub", serverAddress, clientSocketFactory, &clientScreen, clientArgs);
 
     m_events.adoptHandler(
-        m_events.forFile().fileRecieveCompleted(), &client,
+        m_events.forFile().dropDirWriteFinished(), &client,
         new TMethodEventJob<NetworkTests>(
-            this, &NetworkTests::repeatedSendToClient_mockData_fileRecieveCompleted));
+            this, &NetworkTests::repeatedSendToClient_mockData_fileRecieveCompleted,
+            &client));
+
+    startTransferCompletionPoll(&server, NULL, true);
 
     client.connect();
 
     m_events.initQuitTimeout(30);
     m_events.loop();
-    server.setActive(&primaryClient);
-    EXPECT_EQ(kRepeatedMockDataTransfers, m_repeatedCompleted);
+    cleanupTransferCompletionPoll();
+    EXPECT_EQ(kRepeatedMockDataTransfers, m_completedTransfers);
     m_events.removeHandler(m_events.forClientListener().connected(), &listener);
-    m_events.removeHandler(m_events.forFile().fileRecieveCompleted(), &client);
+    m_events.removeHandler(m_events.forFile().dropDirWriteFinished(), &client);
     m_events.cleanupQuitTimeout();
+}
+
+void
+NetworkTests::startTransferCompletionPoll(Server* serverSender,
+                                          Client* clientSender,
+                                          bool repeatServerTransfers)
+{
+    cleanupTransferCompletionPoll();
+    m_transferServerSender = serverSender;
+    m_transferClientSender = clientSender;
+    m_transferReceiveCompleted = false;
+    m_repeatServerTransfers = repeatServerTransfers;
+    m_transferPollTicks = 0;
+    m_completedTransfers = 0;
+    m_transferPollTimer = m_events.newTimer(0.01, NULL);
+    if (m_transferPollTimer == NULL) {
+        ADD_FAILURE() << "could not create transfer completion timer";
+        return;
+    }
+    m_events.adoptHandler(
+        Event::kTimer, m_transferPollTimer,
+        new TMethodEventJob<NetworkTests>(
+            this, &NetworkTests::handleTransferCompletionPoll));
+}
+
+void
+NetworkTests::cleanupTransferCompletionPoll()
+{
+    if (m_transferPollTimer != NULL) {
+        m_events.removeHandler(Event::kTimer, m_transferPollTimer);
+        m_events.deleteTimer(m_transferPollTimer);
+        m_transferPollTimer = NULL;
+    }
+    m_transferServerSender = NULL;
+    m_transferClientSender = NULL;
+}
+
+void
+NetworkTests::markTransferReceiveCompleted(const Event& event, void* receiver)
+{
+    EXPECT_EQ(receiver, event.getTarget());
+    EXPECT_FALSE(m_transferReceiveCompleted);
+    m_transferReceiveCompleted = true;
+}
+
+void
+NetworkTests::handleTransferCompletionPoll(const Event&, void*)
+{
+    if (!m_transferReceiveCompleted) {
+        return;
+    }
+
+    std::shared_ptr<barrier::FileTransferSendState> state;
+    bool senderRetired = false;
+    if (m_transferServerSender != NULL) {
+        state = m_transferServerSender->m_sendFileTransactionState;
+        senderRetired = state == NULL &&
+            m_transferServerSender->m_sendFileThread == NULL &&
+            m_transferServerSender->m_sendFileTarget == NULL;
+    }
+    else if (m_transferClientSender != NULL) {
+        state = m_transferClientSender->testSendFileTransactionState();
+        senderRetired = state == NULL &&
+            !m_transferClientSender->testHasSendFileThread();
+    }
+    else {
+        ADD_FAILURE() << "transfer completion poll has no sender";
+        m_events.raiseQuitEvent();
+        return;
+    }
+
+    if (state && state->stopped() && !state->committed()) {
+        ADD_FAILURE() << "transactional sender stopped with reason "
+                      << static_cast<int>(state->result());
+        m_events.raiseQuitEvent();
+        return;
+    }
+    if (!senderRetired) {
+        if (++m_transferPollTicks > 2000) {
+            ADD_FAILURE() << "transactional sender was not retired after commit";
+            m_events.raiseQuitEvent();
+        }
+        return;
+    }
+
+    ++m_completedTransfers;
+    m_transferReceiveCompleted = false;
+    m_transferPollTicks = 0;
+    if (m_repeatServerTransfers &&
+        m_completedTransfers < kRepeatedMockDataTransfers) {
+        m_transferServerSender->sendFileToClient(kRepeatedMockFilename);
+        return;
+    }
+    m_events.raiseQuitEvent();
 }
 
 void
@@ -432,18 +572,13 @@ NetworkTests::sendToClient_mockData_handleClientConnected(const Event&, void* vl
     BaseClientProxy* bcp = client;
     server->adoptClient(bcp);
     server->setActive(bcp);
-    server->setFileTransferForTest(bcp, 1);
-
-    sendMockData(server, 1);
+    server->sendFileToClient(kRepeatedMockFilename);
 }
 
 void
-NetworkTests::sendToClient_mockData_fileRecieveCompleted(const Event& event, void*)
+NetworkTests::sendToClient_mockData_fileRecieveCompleted(const Event& event, void* receiver)
 {
-    Client* client = static_cast<Client*>(event.getTarget());
-    EXPECT_TRUE(client->isReceivedFileSizeValid());
-
-    m_events.raiseQuitEvent();
+    markTransferReceiveCompleted(event, receiver);
 }
 
 void
@@ -461,32 +596,14 @@ NetworkTests::repeatedSendToClient_mockData_handleClientConnected(const Event&, 
     server->adoptClient(bcp);
     server->setActive(bcp);
 
-    m_repeatedServer = server;
-    m_repeatedClient = bcp;
-    m_repeatedTransferId = 1;
-    m_repeatedCompleted = 0;
-
-    server->setFileTransferForTest(bcp, m_repeatedTransferId);
-    sendMockData(server, m_repeatedTransferId, kRepeatedMockDataSize);
+    server->sendFileToClient(kRepeatedMockFilename);
 }
 
 void
-NetworkTests::repeatedSendToClient_mockData_fileRecieveCompleted(const Event& event, void*)
+NetworkTests::repeatedSendToClient_mockData_fileRecieveCompleted(
+    const Event& event, void* receiver)
 {
-    Client* client = static_cast<Client*>(event.getTarget());
-    EXPECT_TRUE(client->isReceivedFileSizeValid());
-
-    ++m_repeatedCompleted;
-    if (m_repeatedCompleted >= kRepeatedMockDataTransfers) {
-        m_events.raiseQuitEvent();
-        return;
-    }
-
-    ASSERT_TRUE(m_repeatedServer != NULL);
-    ASSERT_TRUE(m_repeatedClient != NULL);
-    ++m_repeatedTransferId;
-    m_repeatedServer->setFileTransferForTest(m_repeatedClient, m_repeatedTransferId);
-    sendMockData(m_repeatedServer, m_repeatedTransferId, kRepeatedMockDataSize);
+    markTransferReceiveCompleted(event, receiver);
 }
 
 void
@@ -508,91 +625,46 @@ NetworkTests::sendToClient_mockFile_handleClientConnected(const Event&, void* vl
 }
 
 void
-NetworkTests::sendToClient_mockFile_fileRecieveCompleted(const Event& event, void*)
+NetworkTests::sendToClient_mockFile_fileRecieveCompleted(const Event& event, void* receiver)
 {
-    Client* client = static_cast<Client*>(event.getTarget());
-    EXPECT_TRUE(client->isReceivedFileSizeValid());
-
-    m_events.raiseQuitEvent();
+    markTransferReceiveCompleted(event, receiver);
 }
 
 void
 NetworkTests::sendToServer_mockData_handleClientConnected(const Event&, void* vclient)
 {
-    Client* client = static_cast<Client*>(vclient);
-    sendMockData(client);
+    ClientFileSendContext* context = static_cast<ClientFileSendContext*>(vclient);
+    ClientProxy* proxy = context->listener->getNextClient();
+    if (proxy == NULL) {
+        throw runtime_error("client is null");
+    }
+    context->listener->getServer()->adoptClient(proxy);
+    context->client->sendFileToServer(kRepeatedMockFilename);
 }
 
 void
-NetworkTests::sendToServer_mockData_fileRecieveCompleted(const Event& event, void*)
+NetworkTests::sendToServer_mockData_fileRecieveCompleted(
+    const Event& event, void* receiver)
 {
-    Server* server = static_cast<Server*>(event.getTarget());
-    EXPECT_TRUE(server->isReceivedFileSizeValid());
-
-    m_events.raiseQuitEvent();
+    markTransferReceiveCompleted(event, receiver);
 }
 
 void
 NetworkTests::sendToServer_mockFile_handleClientConnected(const Event&, void* vclient)
 {
-    Client* client = static_cast<Client*>(vclient);
-    client->sendFileToServer(kMockFilename);
-}
-
-void
-NetworkTests::sendToServer_mockFile_fileRecieveCompleted(const Event& event, void*)
-{
-    Server* server = static_cast<Server*>(event.getTarget());
-    EXPECT_TRUE(server->isReceivedFileSizeValid());
-
-    m_events.raiseQuitEvent();
-}
-
-void
-NetworkTests::sendMockData(void* eventTarget, UInt32 transferId, size_t mockDataSize)
-{
-    // send first message (file size)
-    String size = barrier::string::sizeTypeToString(mockDataSize);
-    FileChunk* sizeMessage = FileChunk::start(size);
-    sizeMessage->m_transferId = transferId;
-
-    Event sizeEvent(m_events.forFile().fileChunkSending(), eventTarget, sizeMessage);
-    sizeEvent.setDataObject(sizeMessage);
-    m_events.addEvent(sizeEvent);
-
-    // send chunk messages with incrementing chunk size
-    size_t lastSize = 0;
-    size_t sentLength = 0;
-    while (true) {
-        size_t dataSize = lastSize + kMockDataChunkIncrement;
-
-        // make sure we don't read too much from the mock data.
-        if (sentLength + dataSize > mockDataSize) {
-            dataSize = mockDataSize - sentLength;
-        }
-
-        // first byte is the chunk mark, last is \0
-        FileChunk* chunk = FileChunk::data(m_mockData, dataSize);
-        chunk->m_transferId = transferId;
-        Event chunkEvent(m_events.forFile().fileChunkSending(), eventTarget, chunk);
-        chunkEvent.setDataObject(chunk);
-        m_events.addEvent(chunkEvent);
-
-        sentLength += dataSize;
-        lastSize = dataSize;
-
-        if (sentLength == mockDataSize) {
-            break;
-        }
-
+    ClientFileSendContext* context = static_cast<ClientFileSendContext*>(vclient);
+    ClientProxy* proxy = context->listener->getNextClient();
+    if (proxy == NULL) {
+        throw runtime_error("client is null");
     }
+    context->listener->getServer()->adoptClient(proxy);
+    context->client->sendFileToServer(kMockFilename);
+}
 
-    // send last message
-    FileChunk* transferFinished = FileChunk::end();
-    transferFinished->m_transferId = transferId;
-    Event finishEvent(m_events.forFile().fileChunkSending(), eventTarget, transferFinished);
-    finishEvent.setDataObject(transferFinished);
-    m_events.addEvent(finishEvent);
+void
+NetworkTests::sendToServer_mockFile_fileRecieveCompleted(const Event& event, void* receiver)
+{
+    markTransferReceiveCompleted(event, receiver);
 }
 
 UInt8*

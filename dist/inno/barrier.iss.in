@@ -1,24 +1,28 @@
-#define MyAppName "Weave"
+#define MyAppName "@WEAVE_PRODUCT_NAME@"
 #define MyAppVersion "@BARRIER_VERSION_MAJOR@.@BARRIER_VERSION_MINOR@.@BARRIER_VERSION_PATCH@.@BARRIER_BUILD_NUMBER@"
 #define MyAppTextVersion "@BARRIER_VERSION@"
-#define MyAppPublisher "Debauchee Open Source Group"
-#define MyAppURL "https://github.com/debauchee/barrier/wiki"
+#define MyAppPublisher "@WEAVE_PRODUCT_PUBLISHER@"
+#define MyAppURL "@WEAVE_PROJECT_URL@"
+#define MyAppSupportURL "@WEAVE_SUPPORT_URL@"
+#define MyAppUpdatesURL "@WEAVE_UPDATES_URL@"
 #define MyAppCopyright "Copyright (C) 2018 Debauchee Open Source Group"
 #define MyAppExeName "weave.exe"
-#define MyAppServiceName "Barrier"
+#define MyAppServiceName "@WEAVE_SERVICE_NAME@"
+#define MyAppServiceDisplayName "@WEAVE_SERVICE_DISPLAY_NAME@"
 #define MyAppServiceExe "weaved.exe"
-#define MyAppServiceDesc "Manages the Weave background processes."
+#define MyAppServiceDesc "@WEAVE_SERVICE_DESCRIPTION@"
 #define MyAppListenerDesc "Weave Listener"
+#define ReleaseStage "@CMAKE_BINARY_DIR@/windows-release/Release"
 
 [Setup]
-AppId={{41036EA6-3F7A-4803-8AE0-469E5E91EFCC}
+AppId={{@WEAVE_WINDOWS_APP_ID@}
 AppName={#MyAppName}
 AppVersion={#MyAppTextVersion}
 AppVerName={#MyAppName} {#MyAppTextVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
-AppSupportURL={#MyAppURL}
-AppUpdatesURL={#MyAppURL}
+AppSupportURL={#MyAppSupportURL}
+AppUpdatesURL={#MyAppUpdatesURL}
 DefaultDirName={pf}\{#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile=@CMAKE_CURRENT_SOURCE_DIR@/res/License.rtf
@@ -33,7 +37,8 @@ VersionInfoCopyright={#MyAppCopyright}
 
 Compression=lzma
 SolidCompression=yes
-ArchitecturesInstallIn64BitMode=x64 ia64
+ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 #include "scripts\lang\english.iss"
@@ -42,7 +47,8 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "@CMAKE_RUNTIME_OUTPUT_DIRECTORY@/Release/*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+#include "{#ReleaseStage}/payload-files.iss"
+Source: "{#ReleaseStage}/manifest.sha256"; DestDir: "{app}"; DestName: "release-manifest.sha256"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
@@ -54,8 +60,8 @@ Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: 
 ; to avoid duplicate entries remove the existing rule (fails if it doesn't exist) before adding
 Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall delete rule name=""{#MyAppListenerDesc}"""; Flags: runhidden
 Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall add rule name=""{#MyAppListenerDesc}"" protocol=TCP dir=in localport=24800 action=allow"; Flags: runhidden
-Filename: {sys}\sc.exe; Parameters: "create {#MyAppServiceName} start= auto binPath= ""\""{app}\{#MyAppServiceExe}\"""""; Flags: runhidden
-Filename: {sys}\sc.exe; Parameters: "config {#MyAppServiceName} start= auto binPath= ""\""{app}\{#MyAppServiceExe}\"""""; Flags: runhidden
+Filename: {sys}\sc.exe; Parameters: "create {#MyAppServiceName} DisplayName= ""{#MyAppServiceDisplayName}"" start= auto binPath= ""\""{app}\{#MyAppServiceExe}\"""""; Flags: runhidden
+Filename: {sys}\sc.exe; Parameters: "config {#MyAppServiceName} DisplayName= ""{#MyAppServiceDisplayName}"" start= auto binPath= ""\""{app}\{#MyAppServiceExe}\"""""; Flags: runhidden
 Filename: {sys}\sc.exe; Parameters: "description {#MyAppServiceName} ""{#MyAppServiceDesc}"""; Flags: runhidden
 Filename: {sys}\sc.exe; Parameters: "start {#MyAppServiceName}"; Flags: runhidden
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
@@ -71,21 +77,57 @@ Filename: {sys}\netsh.exe; Parameters: "advfirewall firewall delete rule name=""
 
 [CustomMessages]
 DependenciesDir="redist"
+vcredist2015to2022_title=Microsoft Visual C++ 2015-2022 Redistributable (x64)
+vcredist2015to2022_size=25 MB
 
 ; shared code for installing the products
 #include "scripts\products.iss"
 #include "scripts\products\stringversion.iss"
 #include "scripts\products\winversion.iss"
 #include "scripts\products\msiproduct.iss"
-#include "scripts\products\vcredist2017.iss"
 
 [Code]
+const
+	vcredist2015to2022_url = 'https://aka.ms/vs/17/release/vc_redist.x64.exe';
+	vcredist2015to2022_registry_key = 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64';
+	vcredist2015to2022_min_version = '@WEAVE_VC_REDIST_MIN_VERSION@';
+
+function vcredist2015to2022_is_current(): Boolean;
+var
+	Installed: Cardinal;
+	InstalledVersion: String;
+begin
+	Result := RegQueryDWordValue(
+		HKLM64, vcredist2015to2022_registry_key, 'Installed', Installed) and
+		(Installed = 1) and RegQueryStringValue(
+		HKLM64, vcredist2015to2022_registry_key, 'Version', InstalledVersion);
+	if Result then begin
+		if (Length(InstalledVersion) > 0) and
+			((InstalledVersion[1] = 'v') or (InstalledVersion[1] = 'V')) then
+			InstalledVersion := Copy(InstalledVersion, 2, Length(InstalledVersion));
+		Result := compareversion(
+			InstalledVersion, vcredist2015to2022_min_version) >= 0;
+	end;
+end;
+
+procedure vcredist2015to2022();
+begin
+	if not vcredist2015to2022_is_current() then
+		AddProduct(
+			'vc_redist.x64.exe',
+			'/install /passive /norestart',
+			CustomMessage('vcredist2015to2022_title'),
+			CustomMessage('vcredist2015to2022_size'),
+			vcredist2015to2022_url,
+			false, false, false);
+end;
+
 function InitializeSetup(): boolean;
 begin
 	// initialize windows version
 	initwinversion();
 
-	vcredist2017('14'); // min allowed version is 14.0
+	vcredist2015to2022();
 
 	Result := true;
 end;

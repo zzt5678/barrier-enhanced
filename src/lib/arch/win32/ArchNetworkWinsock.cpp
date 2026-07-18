@@ -554,7 +554,7 @@ ArchNetworkWinsock::readSocket(ArchSocket s, void* buf, size_t len)
     if (n == SOCKET_ERROR) {
         int err = getsockerror_winsock();
         if (err == WSAEINTR || err == WSAEWOULDBLOCK) {
-            return 0;
+            throw XArchNetworkInterrupted(new XArchEvalWinsock(err));
         }
         throwError(err);
     }

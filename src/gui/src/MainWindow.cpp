@@ -35,6 +35,7 @@
 #include "ProcessorArch.h"
 #include "SslCertificate.h"
 #include "ShutdownCh.h"
+#include "ServerLaunchProfile.h"
 #include "WorkflowHubDialog.h"
 #include "WindowLifecyclePolicy.h"
 #include "WorkflowStore.h"
@@ -106,6 +107,12 @@ namespace {
 constexpr int kRestartBaseDelayMs = 500;
 constexpr int kRestartMaxDelayMs = 3000;
 constexpr int kRestartStabilityWindowMs = 10000;
+constexpr int kServiceStopAckTimeoutMs = 25000;
+#if defined(Q_OS_WIN)
+// ServerApp's USR_CONFIG_NAME is not exposed without also importing the core
+// IPC types, which conflict with the GUI IPC types.
+constexpr char kWindowsUserConfigName[] = "barrier.sgc";
+#endif
 
 void refreshDashboardScrollArea(QWidget* root)
 {
@@ -164,8 +171,11 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_pActionWorkflowHub(NULL),
     m_pActionCommandPalette(NULL),
     m_RestartTimer(this),
+    m_ServiceStopAckTimer(this),
     m_UnexpectedExitCount(0),
     m_AllowApplicationQuit(false),
+    m_ExplicitServiceQuitPending(false),
+    m_PendingServiceStopRequestId(0),
     m_WindowGeometryInitialized(false),
     m_DashboardSingleColumn(false)
 {
@@ -274,8 +284,14 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     connect(&m_IpcClient, SIGNAL(readLogLine(const QString&)), this, SLOT(appendLogRaw(const QString&)));
     connect(&m_IpcClient, SIGNAL(errorMessage(const QString&)), this, SLOT(appendLogError(const QString&)));
     connect(&m_IpcClient, SIGNAL(infoMessage(const QString&)), this, SLOT(appendLogInfo(const QString&)));
+    connect(&m_IpcClient, &IpcClient::serviceStopAcknowledged,
+            this, &MainWindow::handleServiceStopAcknowledged);
     m_IpcClient.connectToHost();
 #endif
+
+    m_ServiceStopAckTimer.setSingleShot(true);
+    connect(&m_ServiceStopAckTimer, &QTimer::timeout,
+            this, &MainWindow::handleServiceStopTimeout);
 
     // Preserve restored geometry; only apply the compact default on first launch.
     if (!m_WindowGeometryInitialized) {
@@ -331,6 +347,7 @@ MainWindow::~MainWindow()
     delete m_DownloadMessageBox;
     delete m_BonjourInstall;
     delete m_pSslCertificate;
+    delete m_pTempConfigFile;
 
     // LogWindow is created as a sibling of the MainWindow rather than a child
     // so that the main window can be hidden without hiding the log. because of
@@ -830,6 +847,12 @@ void MainWindow::proofreadInfo()
 
 void MainWindow::startBarrier()
 {
+    if (m_ExplicitServiceQuitPending) {
+        appendLogInfo(
+            "start ignored while the background service is stopping");
+        return;
+    }
+
     bool desktopMode = appConfig().processMode() == Desktop;
     bool serviceMode = appConfig().processMode() == Service;
 
@@ -861,6 +884,7 @@ void MainWindow::startBarrier()
 
     QString app;
     QStringList args;
+    QString configForLog;
 
     args << "-f" << "--no-tray" << "--debug" << appConfig().logLevelText();
 
@@ -900,13 +924,36 @@ void MainWindow::startBarrier()
 
 #if defined(Q_OS_WIN)
     // QProcess passes arguments without shell parsing, so do not embed quotes.
-    args << "--profile-dir" << QString::fromStdString(barrier::DataDirectories::profile().u8string());
+    const QString profileDirectory =
+        QString::fromStdString(barrier::DataDirectories::profile().u8string());
+    if (!ServerLaunchProfile::appendProfileDirectoryArgument(
+            args, serviceMode, profileDirectory)) {
+        appendLogError("The Weave profile directory is unavailable.");
+        if (desktopMode) {
+            stopBarrier();
+        }
+        else {
+            m_ExpectedRunningState = kStopped;
+            resetRestartBackoff();
+            setBarrierState(barrierDisconnected);
+        }
+        return;
+    }
 #endif
 
     if ((barrier_type() == BarrierType::Client && !clientArgs(args, app))
-        || (barrier_type() == BarrierType::Server && !serverArgs(args, app)))
+        || (barrier_type() == BarrierType::Server &&
+            !serverArgs(args, app, configForLog)))
     {
-        stopBarrier();
+        if (desktopMode) {
+            stopBarrier();
+        }
+        else {
+            // Do not alter a running service when launch preparation failed.
+            m_ExpectedRunningState = kStopped;
+            resetRestartBackoff();
+            setBarrierState(barrierDisconnected);
+        }
         return;
     }
 
@@ -925,7 +972,9 @@ void MainWindow::startBarrier()
 
     appendLogDebug(QString("command: %1 %2").arg(app, args.join(" ")));
 
-    appendLogInfo("config file: " + configFilename());
+    if (!configForLog.isEmpty()) {
+        appendLogInfo("config file: " + configForLog);
+    }
     appendLogInfo("log level: " + appConfig().logLevelText());
 
     if (appConfig().logToFile())
@@ -1004,18 +1053,26 @@ QString MainWindow::configFilename()
     QString filename;
     if (m_pRadioInternalConfig->isChecked())
     {
-        // TODO: no need to use a temporary file, since we need it to
-        // be permanent (since it'll be used for Windows services, etc).
+        delete m_pTempConfigFile;
         m_pTempConfigFile = new QTemporaryFile();
         if (!m_pTempConfigFile->open())
         {
             QMessageBox::critical(this, tr("Cannot write configuration file"), tr("The temporary configuration file required to start Weave can not be written."));
+            delete m_pTempConfigFile;
+            m_pTempConfigFile = NULL;
             return "";
         }
 
         serverConfig().save(*m_pTempConfigFile);
         filename = m_pTempConfigFile->fileName();
 
+        if (!m_pTempConfigFile->flush()) {
+            QMessageBox::critical(this, tr("Cannot write configuration file"),
+                                  tr("The temporary configuration file required to start Weave can not be written."));
+            delete m_pTempConfigFile;
+            m_pTempConfigFile = NULL;
+            return "";
+        }
         m_pTempConfigFile->close();
     }
     else
@@ -1052,7 +1109,7 @@ QString MainWindow::appPath(const QString& name)
     return appConfig().barrierProgramDir() + name;
 }
 
-bool MainWindow::serverArgs(QStringList& args, QString& app)
+bool MainWindow::serverArgs(QStringList& args, QString& app, QString& configForLog)
 {
     app = appPath(appConfig().barriersName());
 
@@ -1083,11 +1140,78 @@ bool MainWindow::serverArgs(QStringList& args, QString& app)
         args << "--nested-remote-mode";
     }
 
-    QString configFilename = this->configFilename();
-    args << "-c" << configFilename << "--address" << address();
+    bool usesCanonicalServiceConfig = false;
+#if defined(Q_OS_WIN)
+    usesCanonicalServiceConfig = appConfig().processMode() == Service;
+    if (usesCanonicalServiceConfig && !persistServiceServerConfig(configForLog)) {
+        return false;
+    }
+#endif
+
+    if (!usesCanonicalServiceConfig) {
+        configForLog = configFilename();
+    }
+    if (!ServerLaunchProfile::appendServerConfigArgument(
+            args, usesCanonicalServiceConfig, configForLog)) {
+        return false;
+    }
+
+    args << "--address" << address();
 
     return true;
 }
+
+#if defined(Q_OS_WIN)
+bool MainWindow::persistServiceServerConfig(QString& configForLog)
+{
+    const QString profileDirectory =
+        QString::fromStdString(barrier::DataDirectories::profile().u8string());
+    if (profileDirectory.isEmpty()) {
+        QMessageBox::critical(this, tr("Cannot write configuration file"),
+                              tr("The user profile directory required by the Weave service is unavailable."));
+        return false;
+    }
+
+    const QString destination = ServerLaunchProfile::canonicalConfigPath(
+        profileDirectory, QString::fromLatin1(kWindowsUserConfigName));
+    ServerLaunchProfile::PersistResult result;
+
+    if (m_pRadioInternalConfig->isChecked()) {
+        QByteArray contents;
+        QBuffer buffer(&contents);
+        if (!buffer.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::critical(this, tr("Cannot write configuration file"),
+                                  tr("The internal Weave configuration could not be serialized."));
+            return false;
+        }
+
+        QTextStream output(&buffer);
+        output << serverConfig();
+        output.flush();
+        if (output.status() != QTextStream::Ok) {
+            QMessageBox::critical(this, tr("Cannot write configuration file"),
+                                  tr("The internal Weave configuration could not be serialized."));
+            return false;
+        }
+        result = ServerLaunchProfile::persistContents(contents, destination);
+    }
+    else {
+        const QString source = configFilename();
+        if (source.isEmpty()) {
+            return false;
+        }
+        result = ServerLaunchProfile::persistExternal(source, destination);
+    }
+
+    if (!result.ok) {
+        QMessageBox::critical(this, tr("Cannot write configuration file"), result.error);
+        return false;
+    }
+
+    configForLog = destination;
+    return true;
+}
+#endif
 
 void MainWindow::stopBarrier()
 {
@@ -1107,11 +1231,7 @@ void MainWindow::stopBarrier()
         stopDesktop();
     }
 
-    // HACK: deleting the object deletes the physical file, which is
-    // bad, since it could be in use by the Windows service!
-#if !defined(Q_OS_WIN)
     delete m_pTempConfigFile;
-#endif
     m_pTempConfigFile = NULL;
 
     // reset so that new connects cause auto-hide.
@@ -1120,6 +1240,9 @@ void MainWindow::stopBarrier()
 
 void MainWindow::stopService()
 {
+    if (m_ExplicitServiceQuitPending) {
+        return;
+    }
     // send empty command to stop service from launching anything.
     m_IpcClient.sendCommand("", appConfig().elevateMode());
 }
@@ -1218,8 +1341,10 @@ void MainWindow::setBarrierState(qBarrierState state)
     const bool activeOrStarting =
         state == barrierConnected || state == barrierConnecting || state == barrierTransfering;
 
-    m_pActionStartBarrier->setEnabled(!activeOrStarting);
-    m_pActionStopBarrier->setEnabled(activeOrStarting);
+    m_pActionStartBarrier->setEnabled(
+        !m_ExplicitServiceQuitPending && !activeOrStarting);
+    m_pActionStopBarrier->setEnabled(
+        !m_ExplicitServiceQuitPending && activeOrStarting);
 
     switch (state)
     {
@@ -1285,8 +1410,91 @@ void MainWindow::scheduleAutoRestart()
 
 void MainWindow::quitApplication()
 {
+    const bool serviceMode = appConfig().processMode() == Service;
+    if (m_ExplicitServiceQuitPending) {
+        showControlCenter();
+        return;
+    }
+
+    if (!serviceMode) {
+        m_AllowApplicationQuit = true;
+        stopBarrier();
+        qApp->quit();
+        return;
+    }
+
+    m_ExplicitServiceQuitPending = true;
+    m_AllowApplicationQuit = false;
+    // Explicit Quit owns the data-plane lifecycle. Ordinary window close and
+    // minimize continue through closeEvent() and deliberately keep it alive.
+    stopBarrier();
+    m_PendingServiceStopRequestId = m_IpcClient.requestServiceStop();
+    if (m_PendingServiceStopRequestId == 0) {
+        m_ExplicitServiceQuitPending = false;
+        appendLogError(
+            "service stop request was not delivered; keeping the GUI open");
+        QMessageBox::warning(
+            this,
+            tr("Unable to stop Weave"),
+            tr("The Weave background service could not be reached. "
+               "The interface will remain open so the stop command can be retried."));
+        return;
+    }
+
+    m_pActionQuit->setEnabled(false);
+    m_pActionStartBarrier->setEnabled(false);
+    m_pActionStopBarrier->setEnabled(false);
+    setStatus(tr("Stopping the Weave background service..."));
+    m_ServiceStopAckTimer.start(kServiceStopAckTimeoutMs);
+}
+
+void MainWindow::handleServiceStopAcknowledged(
+    quint64 requestId, quint64 commandGeneration)
+{
+    const bool matchesPendingRequest = m_ExplicitServiceQuitPending &&
+        requestId != 0 && requestId == m_PendingServiceStopRequestId;
+    if (!WindowLifecyclePolicy::canCompleteExplicitQuit(
+            true, matchesPendingRequest)) {
+        return;
+    }
+
+    appendLogInfo(QString(
+        "service confirmed stopped request=%1 generation=%2")
+        .arg(requestId).arg(commandGeneration));
+    m_ServiceStopAckTimer.stop();
+    m_ExplicitServiceQuitPending = false;
+    m_PendingServiceStopRequestId = 0;
     m_AllowApplicationQuit = true;
     qApp->quit();
+}
+
+void MainWindow::handleServiceStopTimeout()
+{
+    if (!m_ExplicitServiceQuitPending) {
+        return;
+    }
+
+    const quint64 requestId = m_PendingServiceStopRequestId;
+    m_IpcClient.abandonServiceStopRequest(requestId);
+    m_ExplicitServiceQuitPending = false;
+    m_PendingServiceStopRequestId = 0;
+    m_AllowApplicationQuit = false;
+    m_pActionQuit->setEnabled(true);
+    const bool activeOrStarting =
+        barrierState() == barrierConnected ||
+        barrierState() == barrierConnecting ||
+        barrierState() == barrierTransfering;
+    m_pActionStartBarrier->setEnabled(!activeOrStarting);
+    m_pActionStopBarrier->setEnabled(activeOrStarting);
+    appendLogError(QString(
+        "service did not confirm stopped request=%1 before timeout")
+        .arg(requestId));
+    showControlCenter();
+    QMessageBox::warning(
+        this,
+        tr("Unable to stop Weave"),
+        tr("The Weave background process did not confirm that it stopped. "
+           "The interface will remain open so the stop can be retried."));
 }
 
 void MainWindow::setVisible(bool visible)

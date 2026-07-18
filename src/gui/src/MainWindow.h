@@ -157,7 +157,10 @@ public slots:
         void setIcon(qBarrierState state);
         void setBarrierState(qBarrierState state);
         bool clientArgs(QStringList& args, QString& app);
-        bool serverArgs(QStringList& args, QString& app);
+        bool serverArgs(QStringList& args, QString& app, QString& configForLog);
+#if defined(Q_OS_WIN)
+        bool persistServiceServerConfig(QString& configForLog);
+#endif
         void setStatus(const QString& status);
         void updateFromLogLine(const QString& line);
         void processLogLine(const QString& line);
@@ -234,9 +237,12 @@ public slots:
         QString m_PendingStdOutLog;
         QString m_PendingStdErrLog;
         QTimer m_RestartTimer;
+        QTimer m_ServiceStopAckTimer;
         QElapsedTimer m_ProcessLifetime;
         int m_UnexpectedExitCount;
         bool m_AllowApplicationQuit;
+        bool m_ExplicitServiceQuitPending;
+        quint64 m_PendingServiceStopRequestId;
         bool m_WindowGeometryInitialized;
         bool m_DashboardSingleColumn;
 
@@ -249,6 +255,9 @@ private slots:
     void installBonjour();
     void on_m_pCheckBoxEnableDragDrop_clicked(bool checked);
     void on_m_pCheckBoxGameMode_clicked(bool checked);
+    void handleServiceStopAcknowledged(quint64 requestId,
+                                       quint64 commandGeneration);
+    void handleServiceStopTimeout();
 
 };
 

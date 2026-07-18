@@ -76,6 +76,19 @@ QByteArray buildFrame(const QByteArray& payload)
     return frame;
 }
 
+QByteArray buildStopAckFrame(quint64 requestId, quint64 generation)
+{
+    QByteArray frame;
+    frame.append(kIpcMsgStopAck, 4);
+    const quint64 values[] = {requestId, generation};
+    for (quint64 value : values) {
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            frame.append(static_cast<char>((value >> shift) & 0xff));
+        }
+    }
+    return frame;
+}
+
 void writeFrame(QTcpSocket& socket, const QByteArray& frame)
 {
     ASSERT_EQ(socket.write(frame), frame.size());
@@ -89,6 +102,16 @@ int readBigEndianInt(const QByteArray& data, int offset)
             (static_cast<unsigned char>(data[offset + 1]) << 16) |
             (static_cast<unsigned char>(data[offset + 2]) << 8) |
             static_cast<unsigned char>(data[offset + 3]));
+}
+
+quint64 readBigEndianUInt64(const QByteArray& data, int offset)
+{
+    quint64 value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value = (value << 8) |
+            static_cast<unsigned char>(data[offset + i]);
+    }
+    return value;
 }
 
 bool waitForAvailableBytes(QTcpSocket& socket, int expectedBytes, int timeoutMs = 1000)
@@ -147,7 +170,7 @@ QByteArray sendCommandFrame(ElevateMode elevate)
 
     IpcClient commandClient(rawClient.release());
     commandClient.sendCommand("weaves --example", elevate);
-    EXPECT_TRUE(commandClient.waitForBytesWrittenForTest(1000));
+    EXPECT_TRUE(commandClient.flushPendingWrites(1000));
 
     if (!waitForAvailableBytes(*serverSocket, 8)) {
         ADD_FAILURE() << "timed out waiting for IPC command header";
@@ -245,6 +268,101 @@ TEST(IpcReaderTests, RejectsHighBitPayloadLengthAndResynchronizesNextMessage)
     EXPECT_EQ(lines.front().toStdString(), "after high-bit length");
 }
 
+TEST(IpcReaderTests, EmitsStopAckOnlyAfterTheWholeFrameArrives)
+{
+    ensureCoreApplication();
+
+    IpcSockets sockets;
+    sockets.connect();
+
+    IpcReader reader(sockets.serverSocket.get());
+    QList<QPair<quint64, quint64>> acknowledgements;
+    QObject::connect(
+        &reader, &IpcReader::serviceStopAcknowledged,
+        [&](quint64 requestId, quint64 generation) {
+            acknowledgements.append(qMakePair(requestId, generation));
+        });
+    reader.start();
+
+    const QByteArray frame = buildStopAckFrame(0x0102030405060708ULL, 42);
+    writeFrame(sockets.client, frame.left(11));
+    EXPECT_TRUE(acknowledgements.isEmpty());
+
+    writeFrame(sockets.client, frame.mid(11));
+    ASSERT_TRUE(spinUntil([&]() { return acknowledgements.size() == 1; }));
+    EXPECT_EQ(acknowledgements.front().first, 0x0102030405060708ULL);
+    EXPECT_EQ(acknowledgements.front().second, 42u);
+}
+
+TEST(IpcReaderTests, DropsPartialFrameWhenTheSocketDisconnects)
+{
+    ensureCoreApplication();
+
+    QTcpServer firstServer;
+    ASSERT_TRUE(firstServer.listen(QHostAddress::LocalHost));
+
+    QTcpSocket socket;
+    IpcReader reader(&socket);
+    QList<QPair<quint64, quint64>> acknowledgements;
+    QObject::connect(
+        &reader, &IpcReader::serviceStopAcknowledged,
+        [&](quint64 requestId, quint64 generation) {
+            acknowledgements.append(qMakePair(requestId, generation));
+        });
+    reader.start();
+
+    socket.connectToHost(QHostAddress::LocalHost, firstServer.serverPort());
+    ASSERT_TRUE(socket.waitForConnected(1000));
+    ASSERT_TRUE(firstServer.waitForNewConnection(1000));
+    std::unique_ptr<QTcpSocket> firstPeer(firstServer.nextPendingConnection());
+    ASSERT_NE(firstPeer, nullptr);
+
+    const QByteArray firstFrame = buildStopAckFrame(11, 1);
+    writeFrame(*firstPeer, firstFrame.left(11));
+    EXPECT_TRUE(acknowledgements.isEmpty());
+
+    firstPeer->disconnectFromHost();
+    if (firstPeer->state() != QAbstractSocket::UnconnectedState) {
+        ASSERT_TRUE(firstPeer->waitForDisconnected(1000));
+    }
+    ASSERT_TRUE(spinUntil([&]() {
+        return socket.state() == QAbstractSocket::UnconnectedState;
+    }));
+
+    QTcpServer secondServer;
+    ASSERT_TRUE(secondServer.listen(QHostAddress::LocalHost));
+    socket.connectToHost(QHostAddress::LocalHost, secondServer.serverPort());
+    ASSERT_TRUE(socket.waitForConnected(1000));
+    ASSERT_TRUE(secondServer.waitForNewConnection(1000));
+    std::unique_ptr<QTcpSocket> secondPeer(secondServer.nextPendingConnection());
+    ASSERT_NE(secondPeer, nullptr);
+
+    writeFrame(*secondPeer, buildStopAckFrame(22, 2));
+    ASSERT_TRUE(spinUntil([&]() { return acknowledgements.size() == 1; }));
+    EXPECT_EQ(acknowledgements.front().first, 22u);
+    EXPECT_EQ(acknowledgements.front().second, 2u);
+}
+
+TEST(IpcReaderTests, ResynchronizesFromGarbageToStopAck)
+{
+    ensureCoreApplication();
+
+    IpcSockets sockets;
+    sockets.connect();
+
+    IpcReader reader(sockets.serverSocket.get());
+    quint64 acknowledgedRequest = 0;
+    QObject::connect(
+        &reader, &IpcReader::serviceStopAcknowledged,
+        [&](quint64 requestId, quint64) { acknowledgedRequest = requestId; });
+    reader.start();
+
+    writeFrame(sockets.client,
+               QByteArray("invalid ipc bytes") + buildStopAckFrame(77, 9));
+    ASSERT_TRUE(spinUntil([&]() { return acknowledgedRequest != 0; }));
+    EXPECT_EQ(acknowledgedRequest, 77u);
+}
+
 TEST(IpcClientTests, SendCommandWritesElevateModeByte)
 {
     ensureCoreApplication();
@@ -291,7 +409,7 @@ TEST(IpcClientTests, QueuesOneCommandUntilSocketConnectsAfterHello)
 
     std::unique_ptr<QTcpSocket> serverSocket(server.nextPendingConnection());
     ASSERT_NE(serverSocket, nullptr);
-    EXPECT_TRUE(commandClient.waitForBytesWrittenForTest(1000));
+    EXPECT_TRUE(commandClient.flushPendingWrites(1000));
 
     const QByteArray expectedCommand("second-command");
     const int expectedBytes = 9 + 8 + expectedCommand.size() + 1;
@@ -304,4 +422,160 @@ TEST(IpcClientTests, QueuesOneCommandUntilSocketConnectsAfterHello)
     EXPECT_EQ(readBigEndianInt(bytes, 13), expectedCommand.size());
     EXPECT_EQ(QByteArray(bytes.constData() + 17, expectedCommand.size()), expectedCommand);
     EXPECT_EQ(static_cast<unsigned char>(bytes[17 + expectedCommand.size()]), 2);
+}
+
+TEST(IpcClientTests, FlushPendingWritesFailsClosedWhenDisconnected)
+{
+    ensureCoreApplication();
+
+    IpcClient commandClient(new QTcpSocket());
+    commandClient.sendCommand("stop", ElevateAsNeeded);
+
+    EXPECT_FALSE(commandClient.flushPendingWrites(10));
+}
+
+
+TEST(IpcClientTests, ServiceStopRequestCarriesANonZeroRequestId)
+{
+    ensureCoreApplication();
+
+    IpcSockets sockets;
+    sockets.connect();
+    IpcClient commandClient(sockets.serverSocket.release());
+
+    const quint64 requestId = commandClient.requestServiceStop();
+    ASSERT_NE(requestId, 0u);
+    ASSERT_TRUE(commandClient.flushPendingWrites(1000));
+    ASSERT_TRUE(waitForAvailableBytes(sockets.client, 12));
+
+    const QByteArray frame = sockets.client.read(12);
+    EXPECT_EQ(frame.left(4), QByteArray(kIpcMsgStopRequest, 4));
+    EXPECT_EQ(readBigEndianUInt64(frame, 4), requestId);
+}
+
+TEST(IpcClientTests, ServiceStopRequestQueuesWhileDisconnectedAndReplaysAfterHello)
+{
+    ensureCoreApplication();
+
+    QTcpServer server;
+    ASSERT_TRUE(server.listen(QHostAddress::LocalHost));
+
+    QTcpSocket* rawClient = new QTcpSocket();
+    IpcClient commandClient(rawClient);
+    const quint64 requestId = commandClient.requestServiceStop();
+    ASSERT_NE(requestId, 0u);
+
+    rawClient->connectToHost(QHostAddress::LocalHost, server.serverPort());
+    ASSERT_TRUE(rawClient->waitForConnected(1000));
+    ASSERT_TRUE(server.waitForNewConnection(1000));
+    std::unique_ptr<QTcpSocket> serverSocket(server.nextPendingConnection());
+    ASSERT_NE(serverSocket, nullptr);
+    ASSERT_TRUE(commandClient.flushPendingWrites(1000));
+    ASSERT_TRUE(waitForAvailableBytes(*serverSocket, 21));
+
+    const QByteArray frames = serverSocket->read(21);
+    EXPECT_EQ(frames.left(4), QByteArray(kIpcMsgHello, 4));
+    EXPECT_EQ(frames.mid(9, 4), QByteArray(kIpcMsgStopRequest, 4));
+    EXPECT_EQ(readBigEndianUInt64(frames, 13), requestId);
+}
+
+TEST(IpcClientTests, MatchingStopAckClearsRequestBeforeTheNextConnectionHello)
+{
+    ensureCoreApplication();
+
+    IpcSockets sockets;
+    sockets.connect();
+    IpcClient commandClient(sockets.serverSocket.release());
+    const quint64 requestId = commandClient.requestServiceStop();
+    ASSERT_NE(requestId, 0u);
+    ASSERT_TRUE(commandClient.flushPendingWrites(1000));
+    ASSERT_TRUE(waitForAvailableBytes(sockets.client, 12));
+    sockets.client.read(12);
+
+    ASSERT_TRUE(QMetaObject::invokeMethod(
+        &commandClient, "handleServiceStopAcknowledged",
+        Qt::DirectConnection,
+        Q_ARG(quint64, requestId), Q_ARG(quint64, 7)));
+    ASSERT_TRUE(QMetaObject::invokeMethod(
+        &commandClient, "connected", Qt::DirectConnection));
+    ASSERT_TRUE(commandClient.flushPendingWrites(1000));
+    ASSERT_TRUE(waitForAvailableBytes(sockets.client, 9));
+
+    const QByteArray replay = sockets.client.readAll();
+    EXPECT_EQ(replay.size(), 9);
+    EXPECT_EQ(replay.left(4), QByteArray(kIpcMsgHello, 4));
+}
+
+TEST(IpcClientTests, StaleStopAckDoesNotClearPendingRequest)
+{
+    ensureCoreApplication();
+
+    IpcSockets sockets;
+    sockets.connect();
+    IpcClient commandClient(sockets.serverSocket.release());
+    const quint64 requestId = commandClient.requestServiceStop();
+    ASSERT_NE(requestId, 0u);
+    ASSERT_TRUE(commandClient.flushPendingWrites(1000));
+    ASSERT_TRUE(waitForAvailableBytes(sockets.client, 12));
+    sockets.client.read(12);
+
+    ASSERT_TRUE(QMetaObject::invokeMethod(
+        &commandClient, "handleServiceStopAcknowledged",
+        Qt::DirectConnection,
+        Q_ARG(quint64, requestId + 1), Q_ARG(quint64, 7)));
+    ASSERT_TRUE(QMetaObject::invokeMethod(
+        &commandClient, "connected", Qt::DirectConnection));
+    ASSERT_TRUE(commandClient.flushPendingWrites(1000));
+    ASSERT_TRUE(waitForAvailableBytes(sockets.client, 21));
+
+    const QByteArray replay = sockets.client.read(21);
+    EXPECT_EQ(replay.left(4), QByteArray(kIpcMsgHello, 4));
+    EXPECT_EQ(replay.mid(9, 4), QByteArray(kIpcMsgStopRequest, 4));
+    EXPECT_EQ(readBigEndianUInt64(replay, 13), requestId);
+}
+
+TEST(IpcClientTests, RetryingPendingStopRequestResendsTheSameRequestId)
+{
+    ensureCoreApplication();
+
+    IpcSockets sockets;
+    sockets.connect();
+    IpcClient commandClient(sockets.serverSocket.release());
+    const quint64 requestId = commandClient.requestServiceStop();
+    ASSERT_NE(requestId, 0u);
+    ASSERT_TRUE(commandClient.flushPendingWrites(1000));
+    ASSERT_TRUE(waitForAvailableBytes(sockets.client, 12));
+    sockets.client.read(12);
+
+    EXPECT_EQ(commandClient.requestServiceStop(), requestId);
+    ASSERT_TRUE(commandClient.flushPendingWrites(1000));
+    ASSERT_TRUE(waitForAvailableBytes(sockets.client, 12));
+
+    const QByteArray retry = sockets.client.read(12);
+    EXPECT_EQ(retry.left(4), QByteArray(kIpcMsgStopRequest, 4));
+    EXPECT_EQ(readBigEndianUInt64(retry, 4), requestId);
+}
+
+TEST(IpcClientTests, AbandoningPendingStopPreventsReconnectReplay)
+{
+    ensureCoreApplication();
+
+    IpcSockets sockets;
+    sockets.connect();
+    IpcClient commandClient(sockets.serverSocket.release());
+    const quint64 requestId = commandClient.requestServiceStop();
+    ASSERT_NE(requestId, 0u);
+    ASSERT_TRUE(commandClient.flushPendingWrites(1000));
+    ASSERT_TRUE(waitForAvailableBytes(sockets.client, 12));
+    sockets.client.read(12);
+
+    EXPECT_TRUE(commandClient.abandonServiceStopRequest(requestId));
+    ASSERT_TRUE(QMetaObject::invokeMethod(
+        &commandClient, "connected", Qt::DirectConnection));
+    ASSERT_TRUE(commandClient.flushPendingWrites(1000));
+    ASSERT_TRUE(waitForAvailableBytes(sockets.client, 9));
+
+    const QByteArray replay = sockets.client.readAll();
+    EXPECT_EQ(replay.size(), 9);
+    EXPECT_EQ(replay.left(4), QByteArray(kIpcMsgHello, 4));
 }

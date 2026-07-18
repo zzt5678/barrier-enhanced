@@ -152,7 +152,9 @@ PrimaryClient::disable()
 void
 PrimaryClient::refreshKeyState()
 {
-    m_screen->refreshKeyState();
+    if (m_screen != NULL) {
+        m_screen->refreshKeyState();
+    }
 }
 
 void

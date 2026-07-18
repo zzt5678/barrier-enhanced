@@ -30,6 +30,8 @@
 #include "server/ClientProxy1_8.h"
 #include "server/ClientProxy1_9.h"
 #include "server/ClientProxy1_10.h"
+#include "server/ClientProxy1_11.h"
+#include "server/ClientProxy1_12.h"
 #include "barrier/protocol_types.h"
 #include "barrier/ProtocolUtil.h"
 #include "barrier/XBarrier.h"
@@ -50,6 +52,7 @@ ClientProxyUnknown::ClientProxyUnknown(barrier::IStream* stream, double timeout,
     m_handshakeKind(kHandshakeNone),
     m_bulkName(),
     m_bulkToken(),
+    m_bulkConnectionBinding(),
     m_server(server),
     m_events(events)
 {
@@ -91,7 +94,8 @@ ClientProxyUnknown::orphanClientProxy()
 }
 
 barrier::IStream*
-ClientProxyUnknown::orphanBulkStream(std::string& name, std::string& token)
+ClientProxyUnknown::orphanBulkStream(std::string& name, std::string& token,
+                                    std::string& connectionBinding)
 {
     if (!m_ready || m_handshakeKind != kHandshakeBulk) {
         return NULL;
@@ -99,6 +103,7 @@ ClientProxyUnknown::orphanBulkStream(std::string& name, std::string& token)
     removeHandlers();
     name = m_bulkName;
     token = m_bulkToken;
+    connectionBinding = m_bulkConnectionBinding;
     barrier::IStream* stream = m_stream;
     m_stream = NULL;
     return stream;
@@ -221,18 +226,42 @@ ClientProxyUnknown::handleData(const Event&, void*)
         // Parse either a normal control hello or a typed bulk hello. Reading
         // the discriminator first prevents WBUL from ever creating a screen.
         SInt16 major, minor;
-        if (memcmp(code, kMsgHelloBulkBack, 4) == 0) {
+        if (memcmp(code, kMsgHelloBulkBack1_12, 4) == 0) {
             std::string token;
-            if (!ProtocolUtil::readf(m_stream, kMsgHelloBulkBack + 4,
-                                     &major, &minor, &name, &token) ||
+            std::string connectionBinding;
+            if (!ProtocolUtil::readf(m_stream, kMsgHelloBulkBack1_12 + 4,
+                                     &major, &minor, &name, &token,
+                                     &connectionBinding) ||
                 name.empty() || token.empty() || token.size() > 256 ||
-                major != kProtocolMajorVersion || minor < 9) {
+                major != kProtocolMajorVersion || minor < 12 ||
+                !isValidConnectionBinding(connectionBinding)) {
                 throw XBadClient();
             }
             removeHandlers();
             m_handshakeKind = kHandshakeBulk;
             m_bulkName = name;
             m_bulkToken = token;
+            m_bulkConnectionBinding = connectionBinding;
+            LOG((CLOG_DEBUG1
+                "received connection-bound bulk hello for client \"%s\"",
+                name.c_str()));
+            sendSuccess();
+            return;
+        }
+
+        if (memcmp(code, kMsgHelloBulkBack, 4) == 0) {
+            std::string token;
+            if (!ProtocolUtil::readf(m_stream, kMsgHelloBulkBack + 4,
+                                     &major, &minor, &name, &token) ||
+                name.empty() || token.empty() || token.size() > 256 ||
+                major != kProtocolMajorVersion || minor < 9 || minor >= 12) {
+                throw XBadClient();
+            }
+            removeHandlers();
+            m_handshakeKind = kHandshakeBulk;
+            m_bulkName = name;
+            m_bulkToken = token;
+            m_bulkConnectionBinding.clear();
             LOG((CLOG_DEBUG1 "received bulk connection hello for client \"%s\"",
                  name.c_str()));
             sendSuccess();
@@ -303,6 +332,14 @@ ClientProxyUnknown::handleData(const Event&, void*)
             case 10:
                 m_proxy = new ClientProxy1_10(name, m_stream, m_server, m_events);
                 break;
+
+            case 11:
+                m_proxy = new ClientProxy1_11(name, m_stream, m_server, m_events);
+                break;
+
+            case 12:
+                m_proxy = new ClientProxy1_12(name, m_stream, m_server, m_events);
+                break;
             }
         }
 
@@ -353,9 +390,10 @@ ClientProxyUnknown::handleTimeout(const Event&, void*)
 }
 
 void
-ClientProxyUnknown::handleDisconnect(const Event&, void*)
+ClientProxyUnknown::handleDisconnect(const Event& event, void*)
 {
-    LOG((CLOG_NOTE "new client disconnected"));
+    LOG((CLOG_NOTE "new client handshake failed: %s",
+         m_events->getTypeName(event.getType())));
     sendFailure();
 }
 

@@ -41,25 +41,39 @@ constexpr int kMessageCodeSize = 4;
 constexpr int kMessageLengthSize = 4;
 constexpr int kMaxLogLineBytes = 1024 * 1024;
 
-QByteArray logMessageHeader()
+QByteArray messageHeader(const char* code)
 {
-    return QByteArray(kIpcMsgLogLine, kMessageCodeSize);
+    return QByteArray(code, kMessageCodeSize);
 }
 
 void discardUntilNextHeader(QByteArray& buffer, int searchStart)
 {
-    const QByteArray header = logMessageHeader();
-    const int nextHeader = buffer.indexOf(header, searchStart);
+    const QByteArray headers[] = {
+        messageHeader(kIpcMsgLogLine),
+        messageHeader(kIpcMsgStopAck),
+    };
+    int nextHeader = -1;
+    for (const QByteArray& header : headers) {
+        const int candidate = buffer.indexOf(header, searchStart);
+        if (candidate >= 0 && (nextHeader < 0 || candidate < nextHeader)) {
+            nextHeader = candidate;
+        }
+    }
     if (nextHeader >= 0) {
         buffer.remove(0, nextHeader);
         return;
     }
 
     int keepBytes = 0;
-    const int maxSuffix = std::min(buffer.size(), header.size() - 1);
+    const int maxSuffix = std::min(buffer.size(), kMessageCodeSize - 1);
     for (int size = maxSuffix; size > 0; --size) {
-        if (buffer.right(size) == header.left(size)) {
-            keepBytes = size;
+        for (const QByteArray& header : headers) {
+            if (buffer.right(size) == header.left(size)) {
+                keepBytes = size;
+                break;
+            }
+        }
+        if (keepBytes != 0) {
             break;
         }
     }
@@ -76,6 +90,8 @@ void discardUntilNextHeader(QByteArray& buffer, int searchStart)
 IpcReader::IpcReader(QTcpSocket* socket) :
 m_Socket(socket)
 {
+    connect(m_Socket, &QTcpSocket::disconnected,
+            this, &IpcReader::resetBuffer);
 }
 
 IpcReader::~IpcReader()
@@ -90,6 +106,11 @@ void IpcReader::start()
 void IpcReader::stop()
 {
     disconnect(m_Socket, SIGNAL(readyRead()), this, SLOT(read()));
+    resetBuffer();
+}
+
+void IpcReader::resetBuffer()
+{
     QMutexLocker locker(&m_Mutex);
     m_Buffer.clear();
 }
@@ -116,9 +137,27 @@ void IpcReader::read()
                           << QByteArray(bufferData, kMessageCodeSize).constData()
                           << std::endl);
 
-        if (memcmp(bufferData, kIpcMsgLogLine, kMessageCodeSize) != 0) {
+        const bool isLog =
+            memcmp(bufferData, kIpcMsgLogLine, kMessageCodeSize) == 0;
+        const bool isStopAck =
+            memcmp(bufferData, kIpcMsgStopAck, kMessageCodeSize) == 0;
+        if (!isLog && !isStopAck) {
             qWarning() << "Invalid IPC message header, resynchronizing buffered data";
             discardUntilNextHeader(m_Buffer, 1);
+            continue;
+        }
+
+        if (isStopAck) {
+            constexpr int kStopAckSize = kMessageCodeSize + 16;
+            if (m_Buffer.size() < kStopAckSize) {
+                return;
+            }
+            const quint64 requestId = bytesToUInt64(
+                bufferData + kMessageCodeSize);
+            const quint64 generation = bytesToUInt64(
+                bufferData + kMessageCodeSize + 8);
+            m_Buffer.remove(0, kStopAckSize);
+            serviceStopAcknowledged(requestId, generation);
             continue;
         }
 
@@ -169,4 +208,14 @@ int IpcReader::bytesToInt(const char *buffer, int size)
     else {
         return 0;
     }
+}
+
+quint64 IpcReader::bytesToUInt64(const char* buffer)
+{
+    quint64 value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value = (value << 8) |
+            static_cast<unsigned char>(buffer[i]);
+    }
+    return value;
 }

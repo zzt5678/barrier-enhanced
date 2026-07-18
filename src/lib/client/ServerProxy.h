@@ -20,6 +20,8 @@
 
 #include "barrier/clipboard_types.h"
 #include "barrier/ClipboardChunk.h"
+#include "barrier/FileTransferProtocol.h"
+#include "barrier/FileTransferReceiver.h"
 #include "barrier/key_types.h"
 #include "barrier/mouse_types.h"
 #include "barrier/option_types.h"
@@ -27,6 +29,7 @@
 #include "base/Event.h"
 #include "base/Stopwatch.h"
 
+#include <atomic>
 #include <memory>
 #include <cstdint>
 #include <map>
@@ -70,7 +73,13 @@ public:
     void                onInfoChanged();
     bool                onGrabClipboard(ClipboardID);
     virtual ClipboardSendResult onClipboardChanged(ClipboardID, const IClipboard*);
+    virtual ClipboardSendResult onClipboardDataChanged(
+                            ClipboardID,
+                            const std::shared_ptr<const std::string>& data,
+                            bool needsOrderedBulkRoute);
     barrier::IStream*   getStream() const { return m_stream; }
+    const std::string&  getConnectionBinding() const
+                            { return m_connectionBinding; }
     void                keepAlive();
     virtual bool        cleanupClipboardSendThread(bool cancel);
     virtual bool        reapClipboardSendResult(ClipboardID id, bool& succeeded);
@@ -78,6 +87,62 @@ public:
     void                revokeInputLease();
     bool                handleBulkMessage(const UInt8* code,
                                           barrier::IStream* stream);
+    void                handleBulkDisconnected(barrier::BulkChannel* channel);
+    bool                sendTransactionalFileTransferFrame(
+                            const barrier::FileTransferFrame& frame);
+
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+    void                testHandleClipboardSendingChunk(ClipboardChunk* chunk)
+                            { handleClipboardSendingChunk(chunk); }
+    void                testBindTransactionalFileTransfer(
+                            const std::string& connectionBinding)
+                            { initializeTransactionalFileTransfer(connectionBinding); }
+    void                testPollTransactionalFileReceive()
+                            { pollTransactionalFileReceive(); }
+    void                testFireTransactionalFileReceiveTimer()
+    {
+        if (m_fileTransferReceiveTimer != NULL) {
+            handleTransactionalFileReceivePoll(Event(), NULL);
+        }
+    }
+    bool                testHasTransactionalFileReceiveTimer() const
+                            { return m_fileTransferReceiveTimer != NULL; }
+    bool                testHasTransactionalReceive() const
+    {
+        return m_fileTransferReceiver &&
+            m_fileTransferReceiver->hasActiveTransfer();
+    }
+    bool                testTransactionalReceiveCleanupPending() const
+    {
+        return m_fileTransferReceiver &&
+            m_fileTransferReceiver->workerCleanupPending();
+    }
+    bool                testTransactionalCancelAckPending() const
+                            { return m_fileTransferCancelAckPending; }
+    UInt32              testTransactionalReceiveId() const
+    {
+        return m_fileTransferReceiver ?
+            m_fileTransferReceiver->activeTransferId() : 0;
+    }
+    bool                testTransactionalRetiredWorkerPending() const
+    {
+        return m_fileTransferReceiver &&
+            m_fileTransferReceiver->session().retiredWorkerPending();
+    }
+    std::uint64_t       testTransactionalReceiveGeneration() const
+    {
+        return m_fileTransferReceiver ?
+            m_fileTransferReceiver->sessionGeneration() : 0;
+    }
+    void                testSetTransactionalReceiveWorkerExitGate(
+                            const std::shared_ptr<std::atomic<bool> >& gate)
+    {
+        if (m_fileTransferReceiver) {
+            const_cast<FileReceiveSession&>(
+                m_fileTransferReceiver->session()).testSetWorkerExitGate(gate);
+        }
+    }
+#endif
 
     //@}
 
@@ -91,6 +156,8 @@ public:
 
 #ifdef BARRIER_TEST_ENV
     void                handleDataForTest() { handleData(Event(), NULL); }
+    void                testUseMessageParser()
+                            { m_parser = &ServerProxy::parseMessage; }
 #endif
 
 #if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
@@ -141,11 +208,14 @@ private:
     void                handleData(const Event&, void*);
     void                handleKeepAliveAlarm(const Event&, void*);
     void                handleKeepAliveEvent(const Event&, void*);
+    void                handleTransactionalFileReceivePoll(
+                            const Event&, void*);
 
     // message handlers
     bool                enter();
     void                prepareEnter();
     void                abortEnter();
+    void                revokeInputLeaseRequest();
     void                leave();
     void                setClipboard();
     void                setClipboard(barrier::IStream* stream);
@@ -171,11 +241,32 @@ private:
     void                setOptions();
     void                queryInfo();
     void                infoAcknowledgment();
-    void                fileChunkReceived();
-    void                fileChunkReceived(barrier::IStream* stream);
+    int                 fileChunkReceived();
+    int                 fileChunkReceived(barrier::IStream* stream);
+    bool                discardLegacyFileChunk(barrier::IStream* stream);
+    bool                discardLegacyDragInfo(barrier::IStream* stream);
     void                bulkOffer();
+    bool                bulkOffer1_12();
+    void                initializeTransactionalFileTransfer(
+                            const std::string& connectionBinding);
+    EResult             transactionalControlFrame(const UInt8* code);
+    bool                transactionalBulkFrame(
+                            const UInt8* code, barrier::IStream* stream);
+    bool                handleTransactionalFileCancel(
+                            const barrier::FileTransferFrame& frame);
+    bool                writeTransactionalFileTransferFrame(
+                            const barrier::FileTransferFrame& frame,
+                            barrier::FileTransferRole initiatorRole);
+    void                pollTransactionalFileReceive();
+    bool                scheduleTransactionalFileReceivePoll(UInt32 transferId);
+    void                cleanupTransactionalFileReceivePoll();
+    void                resetTransactionalFileReceivePollBudget();
+    bool                quarantineTransactionalFileReceive(
+                            UInt32 transferId, bool cancelled);
+    void                resetTransactionalFileReceive(bool notifyClient);
     void                dragInfoReceived();
     void                handleClipboardSendingEvent(const Event&, void*);
+    void                handleClipboardSendingChunk(ClipboardChunk* chunk);
 
 #if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
 public:
@@ -191,6 +282,7 @@ private:
     bool                  m_hasEnterSequence;
     bool                  m_inputActive;
     SInt16                m_protocolMinorVersion;
+    std::string           m_connectionBinding;
     UInt32                m_preparedEnterSequence;
     bool                  m_hasPreparedEnter;
     bool                  m_preparedEnterReady;
@@ -243,4 +335,15 @@ private:
     ClipboardID         m_clipboardSendId;
     bool                m_clipboardSendSucceeded;
     bool                m_clipboardSendResultAvailable;
+    std::shared_ptr<barrier::ClipboardSendAttempt> m_clipboardSendAttempt;
+    std::uint64_t       m_nextClipboardSendAttempt;
+    std::uint64_t       m_latestClipboardSendAttempt[kClipboardEnd];
+    std::unique_ptr<barrier::FileTransferReceiver> m_fileTransferReceiver;
+    std::shared_ptr<barrier::BulkChannel> m_fileTransferReceiveBulkChannel;
+    EventQueueTimer*    m_fileTransferReceiveTimer;
+    UInt32              m_fileTransferReceiveId;
+    bool                m_fileTransferCancelAckPending;
+    UInt32              m_fileTransferReceivePollBudgetId;
+    double              m_fileTransferReceivePollElapsed;
+    double              m_fileTransferReceiveNextPollDelay;
 };

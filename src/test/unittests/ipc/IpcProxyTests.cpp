@@ -10,8 +10,11 @@
 #include "test/mock/barrier/MockEventQueue.h"
 #include "test/mock/io/MockStream.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 using ::testing::_;
@@ -106,6 +109,15 @@ void appendReadyV2Frame(std::vector<UInt8>& bytes,
     appendUInt64(bytes, queryNonce);
 }
 
+void appendActivatedFrame(std::vector<UInt8>& bytes,
+                          UInt32 processId,
+                          std::uint64_t activationNonce)
+{
+    appendBytes(bytes, "IACK", 4);
+    appendUInt32(bytes, processId);
+    appendUInt64(bytes, activationNonce);
+}
+
 std::vector<UInt8> nodeReadyV2Frames(UInt32 helloProcessId,
                                      UInt32 readyProcessId,
                                      UInt32 sessionId,
@@ -139,6 +151,18 @@ std::vector<UInt8> clientCommandFrames(EIpcClientType clientType,
     return bytes;
 }
 
+std::vector<UInt8> clientStopRequestFrames(EIpcClientType clientType,
+                                           std::uint64_t requestId)
+{
+    std::vector<UInt8> bytes;
+    appendBytes(bytes, "IHEL", 4);
+    bytes.push_back(static_cast<UInt8>(clientType));
+    appendUInt32(bytes, 12345);
+    appendBytes(bytes, "ISRP", 4);
+    appendUInt64(bytes, requestId);
+    return bytes;
+}
+
 UInt32 readFromBuffer(const std::vector<UInt8>& bytes, size_t& offset,
                       void* buffer, UInt32 size)
 {
@@ -152,6 +176,169 @@ UInt32 readFromBuffer(const std::vector<UInt8>& bytes, size_t& offset,
     return size;
 }
 
+UInt32 readOneAvailableByte(const std::vector<UInt8>& bytes, size_t& offset,
+                            bool& byteAvailable, void* buffer, UInt32 size)
+{
+    if (!byteAvailable || offset >= bytes.size()) {
+        return 0;
+    }
+
+    EXPECT_GT(size, 0u);
+    static_cast<UInt8*>(buffer)[0] = bytes[offset++];
+    byteAvailable = false;
+    return 1;
+}
+
+IpcPeerAuthContext authenticatedTestPeer(
+    std::uint32_t processId, EIpcClientType clientType,
+    std::uint32_t sessionId = 7,
+    const std::string& userSid = "S-1-5-21-1000")
+{
+    return IpcPeerAuthContext::accepted(
+        processId, clientType, sessionId, IpcPeerIntegrityLevel::Medium,
+        userSid);
+}
+
+}
+
+TEST(IpcProxyTests, peerAuthenticationContextFailsClosedByDefault)
+{
+    const IpcPeerAuthContext context;
+
+    EXPECT_FALSE(context.permitsConnection());
+    EXPECT_FALSE(context.hasKernelIdentity());
+    EXPECT_EQ(0u, context.authenticatedSessionId());
+    EXPECT_EQ(IpcPeerIntegrityLevel::Unknown, context.integrityLevel());
+}
+
+TEST(IpcProxyTests, secureDesktopSystemIdentityIsLimitedToNodeRole)
+{
+    using IpcPeerAuthenticationPolicy::tokenOwnerAllowed;
+
+    EXPECT_TRUE(tokenOwnerAllowed(kIpcClientGui, true, false));
+    EXPECT_FALSE(tokenOwnerAllowed(kIpcClientGui, false, true));
+    EXPECT_FALSE(tokenOwnerAllowed(kIpcClientGui, false, false));
+
+    EXPECT_TRUE(tokenOwnerAllowed(kIpcClientNode, true, false));
+    EXPECT_TRUE(tokenOwnerAllowed(kIpcClientNode, false, true));
+    EXPECT_FALSE(tokenOwnerAllowed(kIpcClientNode, false, false));
+    EXPECT_FALSE(tokenOwnerAllowed(kIpcClientUnknown, true, true));
+}
+
+TEST(IpcProxyTests, peerAuthenticationRejectsIncompleteOrLowIntegrityIdentity)
+{
+    EXPECT_FALSE(IpcPeerAuthContext::accepted(
+        0, kIpcClientNode, 7,
+        IpcPeerIntegrityLevel::Medium,
+        "S-1-5-21-1000").permitsConnection());
+    EXPECT_FALSE(IpcPeerAuthContext::accepted(
+        12345, kIpcClientNode, 0,
+        IpcPeerIntegrityLevel::Medium,
+        "S-1-5-21-1000").permitsConnection());
+    EXPECT_FALSE(IpcPeerAuthContext::accepted(
+        12345, kIpcClientNode, 7,
+        IpcPeerIntegrityLevel::Low,
+        "S-1-5-21-1000").permitsConnection());
+    EXPECT_FALSE(IpcPeerAuthContext::accepted(
+        12345, kIpcClientNode, 7,
+        IpcPeerIntegrityLevel::Medium,
+        "").permitsConnection());
+}
+
+TEST(IpcProxyTests, peerAuthenticationPreservesVerifiedSessionAndIntegrity)
+{
+    const IpcPeerAuthContext context = authenticatedTestPeer(
+        12345, kIpcClientNode, 9);
+    std::string reason;
+
+    EXPECT_TRUE(context.permitsConnection());
+    EXPECT_TRUE(context.hasKernelIdentity());
+    EXPECT_EQ(9u, context.authenticatedSessionId());
+    EXPECT_EQ(IpcPeerIntegrityLevel::Medium, context.integrityLevel());
+    EXPECT_TRUE(context.authorizesSession(9, &reason));
+    EXPECT_FALSE(context.authorizesSession(10, &reason));
+    EXPECT_FALSE(reason.empty());
+}
+
+TEST(IpcProxyTests, commandConstructedFromWireFieldsHasNoTrustedOrigin)
+{
+    IpcCommandMessage command(
+        "weaves --origin-pid 999 --origin-session 42 --origin-sid S-1-5-18",
+        IpcCommandMessage::kElevateAlways);
+
+    EXPECT_FALSE(command.origin().kernelVerified());
+    EXPECT_EQ(0u, command.origin().processId());
+    EXPECT_EQ(0u, command.origin().sessionId());
+    EXPECT_TRUE(command.origin().userSid().empty());
+}
+
+TEST(IpcProxyTests, onlyKernelVerifiedGuiPeerProvidesCommandOrigin)
+{
+    const IpcPeerAuthContext gui = authenticatedTestPeer(
+        12345, kIpcClientGui, 9, "S-1-5-21-2000");
+    const IpcPeerAuthContext node = authenticatedTestPeer(
+        54321, kIpcClientNode, 10, "S-1-5-21-3000");
+
+    EXPECT_TRUE(gui.commandOrigin().kernelVerified());
+    EXPECT_EQ(12345u, gui.commandOrigin().processId());
+    EXPECT_EQ(9u, gui.commandOrigin().sessionId());
+    EXPECT_EQ("S-1-5-21-2000", gui.commandOrigin().userSid());
+
+    EXPECT_FALSE(node.commandOrigin().kernelVerified());
+    EXPECT_EQ(0u, node.commandOrigin().processId());
+    EXPECT_EQ(0u, node.commandOrigin().sessionId());
+    EXPECT_TRUE(node.commandOrigin().userSid().empty());
+}
+
+TEST(IpcProxyTests, authenticatedCommandOriginIsNotSerializedOnWire)
+{
+    NiceMock<MockEventQueue> sourceEvents;
+    IStreamEvents sourceStreamEvents;
+    IpcClientProxyEvents sourceIpcEvents;
+    setupClientProxyEvents(
+        sourceEvents, sourceStreamEvents, sourceIpcEvents);
+
+    NiceMock<MockStream>* sourceStream = new NiceMock<MockStream>();
+    ON_CALL(*sourceStream, getEventTarget()).WillByDefault(
+        Invoke([sourceStream]() { return sourceStream; }));
+
+    const std::string command =
+        "weaves --origin-pid 999 --origin-sid S-1-5-18";
+    IpcClientProxy sourceProxy(
+        *sourceStream, &sourceEvents,
+        authenticatedTestPeer(
+            12345, kIpcClientGui, 9, "S-1-5-21-2000"));
+    sourceProxy.m_processId = 999;
+    IpcCommandMessage* parsed = sourceProxy.parseCommand(
+        command, IpcCommandMessage::kElevateNever);
+    ASSERT_NE(nullptr, parsed);
+    ASSERT_TRUE(parsed->origin().kernelVerified());
+    EXPECT_EQ(12345u, parsed->origin().processId());
+
+    NiceMock<MockEventQueue> destinationEvents;
+    IStreamEvents destinationStreamEvents;
+    IpcServerProxyEvents destinationIpcEvents;
+    setupServerProxyEvents(
+        destinationEvents, destinationStreamEvents, destinationIpcEvents);
+    NiceMock<MockStream> destinationStream;
+    ON_CALL(destinationStream, getEventTarget()).WillByDefault(
+        Invoke([&destinationStream]() { return &destinationStream; }));
+
+    std::vector<UInt8> expected;
+    appendBytes(expected, "ICMD", 4);
+    appendUInt32(expected, static_cast<UInt32>(command.size()));
+    appendBytes(expected, command.data(), command.size());
+    expected.push_back(IpcCommandMessage::kElevateNever);
+    EXPECT_CALL(destinationStream,
+                write(_, static_cast<UInt32>(expected.size())))
+        .WillOnce(Invoke([&](const void* data, UInt32 size) {
+            const UInt8* begin = static_cast<const UInt8*>(data);
+            EXPECT_EQ(expected, std::vector<UInt8>(begin, begin + size));
+        }));
+
+    IpcServerProxy destinationProxy(destinationStream, &destinationEvents);
+    destinationProxy.send(*parsed);
+    delete parsed;
 }
 
 TEST(IpcProxyTests, clientProxyInvalidHeaderDisconnectsWithoutNullMessageEvent)
@@ -202,6 +389,31 @@ TEST(IpcProxyTests, clientProxyDisconnectIsIdempotent)
     proxy.handleWriteError(Event(Event::kUnknown), NULL);
 }
 
+TEST(IpcProxyTests, clientProxySendRefWaitTimeoutTerminates)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            NiceMock<MockEventQueue> events;
+            IStreamEvents streamEvents;
+            IpcClientProxyEvents ipcEvents;
+            setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+            NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+            ON_CALL(*stream, getEventTarget()).WillByDefault(
+                Invoke([stream]() { return stream; }));
+
+            IpcClientProxy* proxy = new IpcClientProxy(*stream, &events);
+            if (!proxy->tryAddSendRef()) {
+                std::_Exit(72);
+            }
+            proxy->waitForSendRefs(0.0, []() { std::_Exit(73); });
+            std::_Exit(74);
+        },
+        ::testing::ExitedWithCode(73),
+        "");
+}
+
 TEST(IpcProxyTests, clientProxyRejectsNodeCommand)
 {
     NiceMock<MockEventQueue> events;
@@ -212,7 +424,8 @@ TEST(IpcProxyTests, clientProxyRejectsNodeCommand)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     const Event::Type messageType = ipcEvents.messageReceived();
     const Event::Type disconnectedType = ipcEvents.disconnected();
     const std::vector<UInt8> bytes = clientCommandFrames(
@@ -250,7 +463,8 @@ TEST(IpcProxyTests, clientProxyAllowsGuiCommand)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientGui));
     const Event::Type messageType = ipcEvents.messageReceived();
     const std::string command = "weaves --example";
     const std::vector<UInt8> bytes = clientCommandFrames(
@@ -272,6 +486,10 @@ TEST(IpcProxyTests, clientProxyAllowsGuiCommand)
             IpcCommandMessage* commandMessage = static_cast<IpcCommandMessage*>(message);
             EXPECT_EQ(command, commandMessage->command());
             EXPECT_EQ(IpcCommandMessage::kElevateNever, commandMessage->elevateMode());
+            EXPECT_TRUE(commandMessage->origin().kernelVerified());
+            EXPECT_EQ(12345u, commandMessage->origin().processId());
+            EXPECT_EQ(7u, commandMessage->origin().sessionId());
+            EXPECT_EQ("S-1-5-21-1000", commandMessage->origin().userSid());
             sawCommand = true;
         }
         delete message;
@@ -280,6 +498,346 @@ TEST(IpcProxyTests, clientProxyAllowsGuiCommand)
     proxy.handleData(Event(Event::kUnknown), NULL);
     EXPECT_EQ(2, messageEvents);
     EXPECT_TRUE(sawCommand);
+}
+
+TEST(IpcProxyTests, clientProxyAllowsAuthenticatedGuiStopRequest)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientGui));
+    const std::vector<UInt8> bytes = clientStopRequestFrames(
+        kIpcClientGui, 0x1020304050607080ull);
+    size_t offset = 0;
+    bool sawStopRequest = false;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke([&](const Event& event) {
+        IpcMessage* message = static_cast<IpcMessage*>(event.getDataObject());
+        if (message->type() == kIpcStopRequest) {
+            IpcStopRequestMessage* stop =
+                static_cast<IpcStopRequestMessage*>(message);
+            EXPECT_EQ(0x1020304050607080ull, stop->requestId());
+            EXPECT_TRUE(stop->origin().kernelVerified());
+            EXPECT_EQ(12345u, stop->origin().processId());
+            sawStopRequest = true;
+        }
+        delete message;
+    }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_TRUE(sawStopRequest);
+}
+
+TEST(IpcProxyTests, clientProxyRejectsNodeStopRequest)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
+    const Event::Type messageType = ipcEvents.messageReceived();
+    const Event::Type disconnectedType = ipcEvents.disconnected();
+    const std::vector<UInt8> bytes = clientStopRequestFrames(
+        kIpcClientNode, 99);
+    size_t offset = 0;
+    int messageEvents = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [&](const Event& event) {
+            if (event.getType() == messageType) {
+                ++messageEvents;
+                IpcHelloMessage* hello =
+                    static_cast<IpcHelloMessage*>(event.getDataObject());
+                EXPECT_EQ(kIpcClientNode, hello->clientType());
+                EXPECT_EQ(12345u, hello->processId());
+                delete hello;
+            }
+            else {
+                EXPECT_EQ(disconnectedType, event.getType());
+                EXPECT_EQ(&proxy, event.getTarget());
+            }
+        }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_EQ(1, messageEvents);
+    EXPECT_TRUE(proxy.m_disconnecting.load());
+}
+
+TEST(IpcProxyTests, clientProxySerializesStopAckWithRequestAndGeneration)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+    IpcClientProxy proxy(*stream, &events);
+    std::vector<UInt8> expected;
+    appendBytes(expected, "ISAK", 4);
+    appendUInt64(expected, 0x1020304050607080ull);
+    appendUInt64(expected, 42);
+    EXPECT_CALL(*stream, write(_, static_cast<UInt32>(expected.size())))
+        .WillOnce(Invoke([&](const void* data, UInt32 size) {
+            const UInt8* begin = static_cast<const UInt8*>(data);
+            EXPECT_EQ(expected, std::vector<UInt8>(begin, begin + size));
+        }));
+
+    IpcStopAckMessage ack(0x1020304050607080ull, 42);
+    proxy.send(ack);
+}
+
+TEST(IpcProxyTests, clientProxyParsesNodeFramesDeliveredOneByteAtATime)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+    IpcClientProxy proxy(
+        *stream, &events,
+        authenticatedTestPeer(12345, kIpcClientNode));
+
+    const std::uint64_t activationNonce = 0x1020304050607080ull;
+    proxy.m_activationChallengeNonce = activationNonce;
+    std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build", 91);
+    appendActivatedFrame(bytes, 12345, activationNonce);
+    size_t offset = 0;
+    bool byteAvailable = false;
+    std::vector<UInt8> messageTypes;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readOneAvailableByte(
+                bytes, offset, byteAvailable, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [&](const Event& event) {
+            ASSERT_EQ(ipcEvents.messageReceived(), event.getType());
+            IpcMessage* message =
+                static_cast<IpcMessage*>(event.getDataObject());
+            messageTypes.push_back(message->type());
+            delete message;
+        }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    while (offset < bytes.size()) {
+        byteAvailable = true;
+        proxy.handleData(Event(Event::kUnknown), NULL);
+    }
+
+    const std::vector<UInt8> expectedTypes = {
+        kIpcHello, kIpcReadyV2, kIpcActivated
+    };
+    EXPECT_EQ(expectedTypes, messageTypes);
+    EXPECT_TRUE(proxy.m_ready.load());
+    EXPECT_TRUE(proxy.matchesActivation(12345, activationNonce));
+}
+
+TEST(IpcProxyTests, clientProxyParsesGuiCommandDeliveredOneByteAtATime)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+    IpcClientProxy proxy(
+        *stream, &events,
+        authenticatedTestPeer(12345, kIpcClientGui));
+    const std::string command = "weaves --example";
+    const std::vector<UInt8> bytes = clientCommandFrames(
+        kIpcClientGui, command, IpcCommandMessage::kElevateAlways);
+    size_t offset = 0;
+    bool byteAvailable = false;
+    std::vector<UInt8> messageTypes;
+    std::string parsedCommand;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readOneAvailableByte(
+                bytes, offset, byteAvailable, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [&](const Event& event) {
+            ASSERT_EQ(ipcEvents.messageReceived(), event.getType());
+            IpcMessage* message =
+                static_cast<IpcMessage*>(event.getDataObject());
+            messageTypes.push_back(message->type());
+            if (message->type() == kIpcCommand) {
+                parsedCommand =
+                    static_cast<IpcCommandMessage*>(message)->command();
+            }
+            delete message;
+        }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    while (offset < bytes.size()) {
+        byteAvailable = true;
+        proxy.handleData(Event(Event::kUnknown), NULL);
+    }
+
+    const std::vector<UInt8> expectedTypes = { kIpcHello, kIpcCommand };
+    EXPECT_EQ(expectedTypes, messageTypes);
+    EXPECT_EQ(command, parsedCommand);
+}
+
+TEST(IpcProxyTests, authenticatedNodeCannotSpoofGuiAndSendCommand)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(
+        *stream, &events,
+        authenticatedTestPeer(12345, kIpcClientNode));
+    const std::vector<UInt8> bytes = clientCommandFrames(
+        kIpcClientGui, "weaves --example", IpcCommandMessage::kElevateAlways);
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke([&](const Event& event) {
+        EXPECT_EQ(ipcEvents.disconnected(), event.getType());
+        EXPECT_EQ(&proxy, event.getTarget());
+    }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_EQ(kIpcClientUnknown, proxy.m_clientType.load());
+    EXPECT_EQ(0u, proxy.m_processId.load());
+}
+
+TEST(IpcProxyTests, authenticatedGuiCannotSpoofNodeReadiness)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(
+        *stream, &events,
+        authenticatedTestPeer(12345, kIpcClientGui));
+    const std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build");
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke([&](const Event& event) {
+        EXPECT_EQ(ipcEvents.disconnected(), event.getType());
+        EXPECT_EQ(&proxy, event.getTarget());
+    }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_FALSE(proxy.m_ready.load());
+}
+
+TEST(IpcProxyTests, authenticatedPeerCannotClaimAnotherProcessId)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(
+        *stream, &events,
+        authenticatedTestPeer(54321, kIpcClientGui));
+    const std::vector<UInt8> bytes = clientCommandFrames(
+        kIpcClientGui, "weaves --example", IpcCommandMessage::kElevateAlways);
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke([&](const Event& event) {
+        EXPECT_EQ(ipcEvents.disconnected(), event.getType());
+        EXPECT_EQ(&proxy, event.getTarget());
+    }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_EQ(kIpcClientUnknown, proxy.m_clientType.load());
+    EXPECT_EQ(0u, proxy.m_processId.load());
+}
+
+TEST(IpcProxyTests, failedPeerAuthenticationCannotFallBackToClaimedHello)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
+
+    const IpcPeerAuthContext peerAuth = IpcPeerAuthContext::rejected(
+        "kernel TCP owner lookup failed");
+    EXPECT_FALSE(peerAuth.permitsConnection());
+    IpcClientProxy proxy(*stream, &events, peerAuth);
+    const std::vector<UInt8> bytes = clientCommandFrames(
+        kIpcClientGui, "weaves --example", IpcCommandMessage::kElevateAlways);
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke([&](const Event& event) {
+        EXPECT_EQ(ipcEvents.disconnected(), event.getType());
+        EXPECT_EQ(&proxy, event.getTarget());
+    }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_EQ(kIpcClientUnknown, proxy.m_clientType.load());
+    EXPECT_EQ(0u, proxy.m_processId.load());
 }
 
 TEST(IpcProxyTests, serverSendDoesNotHoldClientListLockWhileWriting)
@@ -306,6 +864,120 @@ TEST(IpcProxyTests, serverSendDoesNotHoldClientListLockWhileWriting)
 
 	IpcLogLineMessage message("test");
 	server.send(message, kIpcClientNode);
+}
+
+TEST(IpcProxyTests, serverSendReleasesEveryRecipientWhenFirstWriteThrows)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* firstStream = new NiceMock<MockStream>();
+    NiceMock<MockStream>* secondStream = new NiceMock<MockStream>();
+    NiceMock<MockStream>* thirdStream = new NiceMock<MockStream>();
+    ON_CALL(*firstStream, getEventTarget()).WillByDefault(
+        Invoke([firstStream]() { return firstStream; }));
+    ON_CALL(*secondStream, getEventTarget()).WillByDefault(
+        Invoke([secondStream]() { return secondStream; }));
+    ON_CALL(*thirdStream, getEventTarget()).WillByDefault(
+        Invoke([thirdStream]() { return thirdStream; }));
+
+    IpcClientProxy first(*firstStream, &events);
+    IpcClientProxy second(*secondStream, &events);
+    IpcClientProxy third(*thirdStream, &events);
+    first.m_clientType = kIpcClientNode;
+    second.m_clientType = kIpcClientNode;
+    third.m_clientType = kIpcClientNode;
+
+    IpcServer server;
+    server.m_clients.push_back(&first);
+    server.m_clients.push_back(&second);
+    server.m_clients.push_back(&third);
+
+    EXPECT_CALL(*firstStream, write(_, _)).WillOnce(Invoke(
+        [](const void*, UInt32) { throw std::runtime_error("write failed"); }));
+    EXPECT_CALL(*secondStream, write(_, _)).Times(0);
+    EXPECT_CALL(*thirdStream, write(_, _)).Times(0);
+
+    IpcShutdownMessage message;
+    EXPECT_THROW(server.send(message, kIpcClientNode), std::runtime_error);
+
+    const UInt32 firstRefs = first.m_sendRefCount;
+    const UInt32 secondRefs = second.m_sendRefCount;
+    const UInt32 thirdRefs = third.m_sendRefCount;
+    while (first.m_sendRefCount != 0) {
+        first.releaseSendRef();
+    }
+    while (second.m_sendRefCount != 0) {
+        second.releaseSendRef();
+    }
+    while (third.m_sendRefCount != 0) {
+        third.releaseSendRef();
+    }
+
+    EXPECT_EQ(0u, firstRefs);
+    EXPECT_EQ(0u, secondRefs);
+    EXPECT_EQ(0u, thirdRefs);
+}
+
+TEST(IpcProxyTests, serverSendToProcessReleasesEveryRecipientWhenFirstWriteThrows)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* firstStream = new NiceMock<MockStream>();
+    NiceMock<MockStream>* secondStream = new NiceMock<MockStream>();
+    NiceMock<MockStream>* thirdStream = new NiceMock<MockStream>();
+    ON_CALL(*firstStream, getEventTarget()).WillByDefault(
+        Invoke([firstStream]() { return firstStream; }));
+    ON_CALL(*secondStream, getEventTarget()).WillByDefault(
+        Invoke([secondStream]() { return secondStream; }));
+    ON_CALL(*thirdStream, getEventTarget()).WillByDefault(
+        Invoke([thirdStream]() { return thirdStream; }));
+
+    IpcClientProxy first(*firstStream, &events);
+    IpcClientProxy second(*secondStream, &events);
+    IpcClientProxy third(*thirdStream, &events);
+    first.m_clientType = kIpcClientNode;
+    second.m_clientType = kIpcClientNode;
+    third.m_clientType = kIpcClientNode;
+    first.m_processId = 1001;
+    second.m_processId = 1001;
+    third.m_processId = 1001;
+
+    IpcServer server;
+    server.m_clients.push_back(&first);
+    server.m_clients.push_back(&second);
+    server.m_clients.push_back(&third);
+
+    EXPECT_CALL(*firstStream, write(_, _)).WillOnce(Invoke(
+        [](const void*, UInt32) { throw std::runtime_error("write failed"); }));
+    EXPECT_CALL(*secondStream, write(_, _)).Times(0);
+    EXPECT_CALL(*thirdStream, write(_, _)).Times(0);
+
+    IpcShutdownMessage message;
+    EXPECT_THROW(server.sendToProcess(message, kIpcClientNode, 1001),
+                 std::runtime_error);
+
+    const UInt32 firstRefs = first.m_sendRefCount;
+    const UInt32 secondRefs = second.m_sendRefCount;
+    const UInt32 thirdRefs = third.m_sendRefCount;
+    while (first.m_sendRefCount != 0) {
+        first.releaseSendRef();
+    }
+    while (second.m_sendRefCount != 0) {
+        second.releaseSendRef();
+    }
+    while (third.m_sendRefCount != 0) {
+        third.releaseSendRef();
+    }
+
+    EXPECT_EQ(0u, firstRefs);
+    EXPECT_EQ(0u, secondRefs);
+    EXPECT_EQ(0u, thirdRefs);
 }
 
 TEST(IpcProxyTests, serverSendToProcessOnlyWritesMatchingNodePid)
@@ -336,6 +1008,94 @@ TEST(IpcProxyTests, serverSendToProcessOnlyWritesMatchingNodePid)
 
 	IpcShutdownMessage message;
 	EXPECT_TRUE(server.sendToProcess(message, kIpcClientNode, 1001));
+}
+
+TEST(IpcProxyTests, activationAckRequiresExactTargetedChallenge)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(
+        *stream, &events,
+        authenticatedTestPeer(12345, kIpcClientNode));
+    proxy.m_clientType = kIpcClientNode;
+    proxy.m_processId = 12345;
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+
+    const std::uint64_t activationNonce = 0x1122334455667788ull;
+    std::vector<UInt8> expectedChallenge;
+    appendBytes(expectedChallenge, "IACT", 4);
+    appendUInt64(expectedChallenge, activationNonce);
+    EXPECT_CALL(*stream, write(_, static_cast<UInt32>(expectedChallenge.size())))
+        .WillOnce(Invoke([&](const void* data, UInt32 size) {
+            const UInt8* begin = static_cast<const UInt8*>(data);
+            EXPECT_EQ(expectedChallenge,
+                      std::vector<UInt8>(begin, begin + size));
+        }));
+    ASSERT_TRUE(server.sendActivateToProcess(12345, activationNonce));
+
+    std::vector<UInt8> frames;
+    appendActivatedFrame(frames, 12345, activationNonce);
+    size_t offset = 0;
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(frames, offset, buffer, size);
+        }));
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [&](const Event& event) {
+            IpcMessage* message =
+                static_cast<IpcMessage*>(event.getDataObject());
+            delete message;
+        }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_TRUE(server.hasActivatedClientProcess(12345, activationNonce));
+    EXPECT_FALSE(server.hasActivatedClientProcess(12345,
+                                                   activationNonce + 1));
+    EXPECT_FALSE(server.hasActivatedClientProcess(54321, activationNonce));
+}
+
+TEST(IpcProxyTests, unchallengedActivationAckDisconnects)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+    IpcClientProxy proxy(
+        *stream, &events,
+        authenticatedTestPeer(12345, kIpcClientNode));
+
+    std::vector<UInt8> frames;
+    appendBytes(frames, "IHEL", 4);
+    frames.push_back(static_cast<UInt8>(kIpcClientNode));
+    appendUInt32(frames, 12345);
+    appendActivatedFrame(frames, 12345, 99);
+    size_t offset = 0;
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(frames, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [&](const Event& event) {
+            if (event.getType() == ipcEvents.messageReceived()) {
+                delete static_cast<IpcMessage*>(event.getDataObject());
+            }
+        }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_TRUE(proxy.m_disconnecting.load());
 }
 
 TEST(IpcProxyTests, serverFindsOnlyReadyMatchingProcess)
@@ -383,7 +1143,8 @@ TEST(IpcProxyTests, clientProxyRequiresNodeReadyAfterHello)
 	NiceMock<MockStream>* stream = new NiceMock<MockStream>();
 	ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-	IpcClientProxy proxy(*stream, &events);
+	IpcClientProxy proxy(
+		*stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
 	const Event::Type messageType = ipcEvents.messageReceived();
 	std::vector<UInt8> bytes;
 	appendBytes(bytes, "IHEL", 4);
@@ -422,7 +1183,8 @@ TEST(IpcProxyTests, capabilityReadyMustMatchProcessSessionAndDesktop)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     IpcServer server;
     server.m_clients.push_back(&proxy);
     const std::vector<UInt8> bytes = nodeReadyV2Frames(
@@ -472,6 +1234,49 @@ TEST(IpcProxyTests, capabilityReadyMustMatchProcessSessionAndDesktop)
     EXPECT_EQ("Default", reportedDesktop);
 }
 
+TEST(IpcProxyTests, capabilityReadyMustMatchAuthenticatedTokenSession)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(
+        *stream, &events,
+        authenticatedTestPeer(12345, kIpcClientNode, 7));
+    const std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 8, 42, true, "Default", "test-build");
+    const Event::Type messageType = ipcEvents.messageReceived();
+    const Event::Type disconnectedType = ipcEvents.disconnected();
+    size_t offset = 0;
+    int messageEvents = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [&](const Event& event) {
+            if (event.getType() == messageType) {
+                ++messageEvents;
+                delete event.getDataObject();
+            }
+            else {
+                EXPECT_EQ(disconnectedType, event.getType());
+            }
+        }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_EQ(1, messageEvents);
+    EXPECT_FALSE(proxy.m_ready.load());
+    EXPECT_TRUE(proxy.m_disconnecting.load());
+}
+
 TEST(IpcProxyTests, capabilityProofMustMatchWatchdogQueryNonce)
 {
     NiceMock<MockEventQueue> events;
@@ -482,7 +1287,8 @@ TEST(IpcProxyTests, capabilityProofMustMatchWatchdogQueryNonce)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     IpcServer server;
     server.m_clients.push_back(&proxy);
     const std::vector<UInt8> bytes = nodeReadyV2Frames(
@@ -514,7 +1320,8 @@ TEST(IpcProxyTests, periodicInvalidationRetiresWatchdogQueryProof)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     IpcServer server;
     server.m_clients.push_back(&proxy);
     std::vector<UInt8> bytes = nodeReadyV2Frames(
@@ -548,7 +1355,8 @@ TEST(IpcProxyTests, matchingPeriodicLeasePreservesWatchdogQueryProof)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     IpcServer server;
     server.m_clients.push_back(&proxy);
     std::vector<UInt8> bytes = nodeReadyV2Frames(
@@ -582,7 +1390,8 @@ TEST(IpcProxyTests, capabilityReadyFalseCannotBeAdopted)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     IpcServer server;
     server.m_clients.push_back(&proxy);
     const std::vector<UInt8> bytes = nodeReadyV2Frames(
@@ -613,7 +1422,8 @@ TEST(IpcProxyTests, capabilityReadinessUsesLatestRecoveryUpdate)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     IpcServer server;
     server.m_clients.push_back(&proxy);
     std::vector<UInt8> bytes = nodeReadyV2Frames(
@@ -655,7 +1465,8 @@ TEST(IpcProxyTests, capabilityReadinessUsesLatestInvalidationUpdate)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     IpcServer server;
     server.m_clients.push_back(&proxy);
     std::vector<UInt8> bytes = nodeReadyV2Frames(
@@ -687,7 +1498,8 @@ TEST(IpcProxyTests, expiredCapabilityReadinessCannotBeAdopted)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     IpcServer server;
     server.m_clients.push_back(&proxy);
     const std::vector<UInt8> bytes = nodeReadyV2Frames(
@@ -719,7 +1531,8 @@ TEST(IpcProxyTests, expiredCapabilityProofCannotBeAdopted)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     IpcServer server;
     server.m_clients.push_back(&proxy);
     const std::vector<UInt8> bytes = nodeReadyV2Frames(
@@ -751,7 +1564,8 @@ TEST(IpcProxyTests, oversizedCapabilityStringDisconnectsWithoutThrowing)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     const Event::Type messageType = ipcEvents.messageReceived();
     const Event::Type disconnectedType = ipcEvents.disconnected();
     std::vector<UInt8> bytes;
@@ -787,6 +1601,46 @@ TEST(IpcProxyTests, oversizedCapabilityStringDisconnectsWithoutThrowing)
     EXPECT_TRUE(proxy.m_disconnecting.load());
 }
 
+TEST(IpcProxyTests, oversizedCommandStringDisconnectsBeforePayloadAllocation)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+    IpcClientProxy proxy(
+        *stream, &events,
+        authenticatedTestPeer(12345, kIpcClientGui));
+    std::vector<UInt8> bytes;
+    appendBytes(bytes, "IHEL", 4);
+    bytes.push_back(static_cast<UInt8>(kIpcClientGui));
+    appendUInt32(bytes, 12345);
+    appendBytes(bytes, "ICMD", 4);
+    appendUInt32(bytes, PROTOCOL_MAX_STRING_LENGTH + 1);
+    size_t offset = 0;
+    int messageEvents = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [&](const Event& event) {
+            if (event.getType() == ipcEvents.messageReceived()) {
+                ++messageEvents;
+                delete event.getDataObject();
+            }
+        }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_EQ(1, messageEvents);
+    EXPECT_TRUE(proxy.m_disconnecting.load());
+}
+
 TEST(IpcProxyTests, capabilityReadyWithDifferentProcessIdIsRejected)
 {
     NiceMock<MockEventQueue> events;
@@ -797,7 +1651,8 @@ TEST(IpcProxyTests, capabilityReadyWithDifferentProcessIdIsRejected)
     NiceMock<MockStream>* stream = new NiceMock<MockStream>();
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
-    IpcClientProxy proxy(*stream, &events);
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
     const Event::Type messageType = ipcEvents.messageReceived();
     const Event::Type disconnectedType = ipcEvents.disconnected();
     const std::vector<UInt8> bytes = nodeReadyV2Frames(
@@ -883,6 +1738,33 @@ TEST(IpcProxyTests, serverProxyInvalidHeaderDisconnectsWithoutNullMessageEvent)
     EXPECT_NE(Event::kUnknown, messageType);
 }
 
+TEST(IpcProxyTests, oversizedLogStringDisconnectsBeforePayloadAllocation)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcServerProxyEvents ipcEvents;
+    setupServerProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(
+        Invoke([&stream]() { return &stream; }));
+    IpcServerProxy proxy(stream, &events);
+    std::vector<UInt8> bytes;
+    appendBytes(bytes, "ILOG", 4);
+    appendUInt32(bytes, PROTOCOL_MAX_STRING_LENGTH + 1);
+    size_t offset = 0;
+
+    EXPECT_CALL(stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(stream, close()).Times(1);
+    EXPECT_CALL(events, addEvent(_)).Times(0);
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_TRUE(proxy.m_disconnected);
+}
+
 TEST(IpcProxyTests, serverProxySerializesCapabilityReadyAsOneMessage)
 {
     NiceMock<MockEventQueue> events;
@@ -950,7 +1832,115 @@ TEST(IpcProxyTests, serverProxyParsesInputReadinessQuery)
     EXPECT_TRUE(sawQuery);
 }
 
-TEST(IpcProxyTests, truncatedInputReadinessQueryDisconnectsWithoutEvent)
+TEST(IpcProxyTests, serverProxyParsesTargetedActivation)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcServerProxyEvents ipcEvents;
+    setupServerProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(
+        Invoke([&stream]() { return &stream; }));
+    IpcServerProxy proxy(stream, &events);
+    const Event::Type messageType = ipcEvents.messageReceived();
+    std::vector<UInt8> bytes;
+    appendBytes(bytes, "IACT", 4);
+    appendUInt64(bytes, 0x1020304050607080ull);
+    size_t offset = 0;
+    EXPECT_CALL(stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke([&](const Event& event) {
+        EXPECT_EQ(messageType, event.getType());
+        IpcActivateNodeMessage* activate =
+            static_cast<IpcActivateNodeMessage*>(event.getDataObject());
+        EXPECT_EQ(kIpcActivate, activate->type());
+        EXPECT_EQ(0x1020304050607080ull, activate->activationNonce());
+        delete activate;
+    }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+}
+
+TEST(IpcProxyTests, serverProxyParsesFramesDeliveredOneByteAtATime)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcServerProxyEvents ipcEvents;
+    setupServerProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(
+        Invoke([&stream]() { return &stream; }));
+    IpcServerProxy proxy(stream, &events);
+    std::vector<UInt8> bytes;
+    appendBytes(bytes, "ILOG", 4);
+    appendString(bytes, "one-byte log");
+    appendBytes(bytes, "ISDN", 4);
+    appendBytes(bytes, "IRQP", 4);
+    appendUInt64(bytes, 91);
+    appendBytes(bytes, "IACT", 4);
+    appendUInt64(bytes, 0x1020304050607080ull);
+    size_t offset = 0;
+    bool byteAvailable = false;
+    std::vector<UInt8> messageTypes;
+
+    EXPECT_CALL(stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readOneAvailableByte(
+                bytes, offset, byteAvailable, buffer, size);
+        }));
+    EXPECT_CALL(stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [&](const Event& event) {
+            ASSERT_EQ(ipcEvents.messageReceived(), event.getType());
+            IpcMessage* message =
+                static_cast<IpcMessage*>(event.getDataObject());
+            messageTypes.push_back(message->type());
+            delete message;
+        }));
+
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    while (offset < bytes.size()) {
+        byteAvailable = true;
+        proxy.handleData(Event(Event::kUnknown), NULL);
+    }
+
+    const std::vector<UInt8> expectedTypes = {
+        kIpcLogLine, kIpcShutdown, kIpcReadyQuery, kIpcActivate
+    };
+    EXPECT_EQ(expectedTypes, messageTypes);
+}
+
+TEST(IpcProxyTests, serverProxySerializesActivationAck)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcServerProxyEvents ipcEvents;
+    setupServerProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(
+        Invoke([&stream]() { return &stream; }));
+    std::vector<UInt8> expected;
+    appendBytes(expected, "IACK", 4);
+    appendUInt32(expected, 12345);
+    appendUInt64(expected, 0x1020304050607080ull);
+    EXPECT_CALL(stream, write(_, static_cast<UInt32>(expected.size())))
+        .WillOnce(Invoke([&](const void* data, UInt32 size) {
+            const UInt8* begin = static_cast<const UInt8*>(data);
+            EXPECT_EQ(expected, std::vector<UInt8>(begin, begin + size));
+        }));
+
+    IpcServerProxy proxy(stream, &events);
+    IpcNodeActivatedMessage activated(
+        12345, 0x1020304050607080ull);
+    proxy.send(activated);
+}
+
+TEST(IpcProxyTests, partialInputReadinessQueryWaitsForRemainingBytes)
 {
     NiceMock<MockEventQueue> events;
     IStreamEvents streamEvents;
@@ -962,17 +1952,37 @@ TEST(IpcProxyTests, truncatedInputReadinessQueryDisconnectsWithoutEvent)
     IpcServerProxy proxy(stream, &events);
     std::vector<UInt8> bytes;
     appendBytes(bytes, "IRQP", 4);
-    appendUInt32(bytes, 0);
+    appendUInt64(bytes, 91);
     size_t offset = 0;
+    size_t availableBytes = 8;
+    bool sawQuery = false;
 
     EXPECT_CALL(stream, read(_, _)).WillRepeatedly(Invoke(
         [&](void* buffer, UInt32 size) {
-            return readFromBuffer(bytes, offset, buffer, size);
+            const size_t available = availableBytes - offset;
+            const UInt32 count = static_cast<UInt32>(
+                std::min<std::size_t>(size, available));
+            if (count != 0) {
+                std::memcpy(buffer, bytes.data() + offset, count);
+                offset += count;
+            }
+            return count;
         }));
-    EXPECT_CALL(stream, close()).Times(1);
-    EXPECT_CALL(events, addEvent(_)).Times(0);
+    EXPECT_CALL(stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke([&](const Event& event) {
+        IpcInputReadyQueryMessage* query =
+            static_cast<IpcInputReadyQueryMessage*>(event.getDataObject());
+        EXPECT_EQ(91u, query->queryNonce());
+        sawQuery = true;
+        delete query;
+    }));
 
     proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_FALSE(sawQuery);
+
+    availableBytes = bytes.size();
+    proxy.handleData(Event(Event::kUnknown), NULL);
+    EXPECT_TRUE(sawQuery);
 }
 
 TEST(IpcProxyTests, clientProxySerializesInputReadinessQuery)

@@ -23,6 +23,7 @@
 #include "arch/XArch.h"
 #include "barrier/win32/AppUtilWindows.h"
 
+#include <cstdlib>
 #include <string.h>
 #include <shellapi.h>
 
@@ -31,6 +32,8 @@ static const UINT        kRemoveReceiver  = WM_USER + 11;
 static const UINT        kUpdateReceiver  = WM_USER + 12;
 static const UINT        kNotifyReceiver  = WM_USER + 13;
 static const UINT        kFirstReceiverID = WM_USER + 14;
+static const UINT        kShutdown        = WM_USER + 15;
+static const double      kShutdownDeadlineSeconds = 2.0;
 
 //
 // ArchTaskBarWindows
@@ -55,9 +58,23 @@ ArchTaskBarWindows::ArchTaskBarWindows() :
 ArchTaskBarWindows::~ArchTaskBarWindows()
 {
     if (m_thread != NULL) {
-        PostMessage(m_hwnd, WM_QUIT, 0, 0);
-        ARCH->wait(m_thread, -1.0);
+        if (!ARCH->wait(m_thread, 0.0)) {
+            const DWORD threadID = static_cast<DWORD>(
+                ARCH->getIDOfThread(m_thread));
+            const bool stopPosted = threadID != 0 &&
+                PostThreadMessage(threadID, WM_QUIT, 0, 0) != 0;
+            if (!stopPosted && m_hwnd != NULL) {
+                PostMessage(m_hwnd, kShutdown, 0, 0);
+            }
+            if (!ARCH->wait(m_thread, kShutdownDeadlineSeconds)) {
+                // The worker still references this object. Continuing
+                // teardown would create a use-after-free, so let the process
+                // supervisor restart this instance instead.
+                std::_Exit(EXIT_FAILURE);
+            }
+        }
         ARCH->closeThread(m_thread);
+        m_thread = NULL;
     }
     if (m_condVar != NULL) {
         ARCH->closeCondVar(m_condVar);
@@ -398,6 +415,10 @@ ArchTaskBarWindows::wndProc(HWND hwnd,
         updateIcon((UINT)wParam);
         break;
 
+    case kShutdown:
+        PostQuitMessage(0);
+        return 0;
+
     default:
         if (msg == m_taskBarRestart) {
             // task bar was recreated so re-add our icons
@@ -498,6 +519,7 @@ ArchTaskBarWindows::threadMainLoop()
     // clean up
     removeAllIcons();
     DestroyWindow(m_hwnd);
+    m_hwnd = NULL;
     UnregisterClass(className, instanceWin32());
 }
 

@@ -7,6 +7,7 @@
 
 class TransferArchive {
 public:
+    static bool isSafePortablePathComponent(const std::string& component);
     static bool isPackageData(const std::string& data);
     static bool isPackageFile(const barrier::fs::path& packagePath);
     static bool createSelectionPackageFile(const std::vector<barrier::fs::path>& sourcePaths,

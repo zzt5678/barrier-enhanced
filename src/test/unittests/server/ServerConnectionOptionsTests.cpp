@@ -53,3 +53,30 @@ TEST(ServerConnectionOptionsTests, addDefaultConnectionOptions_existingHeartbeat
     EXPECT_EQ(1u, optionCount(optionsList, kOptionHeartbeat));
     EXPECT_EQ(5000u, optionValue(optionsList, kOptionHeartbeat));
 }
+
+TEST(ServerFileReceiveRouteTests, staleSourceCannotAbortCurrentReceive)
+{
+    Server server;
+    BaseClientProxy* source = reinterpret_cast<BaseClientProxy*>(1);
+    BaseClientProxy* staleSource = reinterpret_cast<BaseClientProxy*>(2);
+    barrier::BulkChannel* route =
+        reinterpret_cast<barrier::BulkChannel*>(3);
+    barrier::BulkChannel* staleRoute =
+        reinterpret_cast<barrier::BulkChannel*>(4);
+
+    ASSERT_TRUE(server.getFileReceiveSession().begin(8, 8, 8));
+    server.bindFileReceiveClipboardRevision(source, route);
+
+    EXPECT_TRUE(server.canReceiveFileChunk(source, route));
+    EXPECT_FALSE(server.canReceiveFileChunk(source, staleRoute));
+    EXPECT_FALSE(server.canReceiveFileChunk(staleSource, route));
+
+    server.abortFileReceiveRoute(staleSource, staleRoute);
+    EXPECT_EQ(FileReceiveSession::kReceiving,
+              server.getFileReceiveSession().state());
+
+    server.abortFileReceiveRoute(source, route);
+    EXPECT_EQ(FileReceiveSession::kIdle,
+              server.getFileReceiveSession().state());
+    EXPECT_TRUE(server.canReceiveFileChunk(staleSource, staleRoute));
+}

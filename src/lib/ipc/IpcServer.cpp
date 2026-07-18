@@ -21,7 +21,9 @@
 #include "ipc/Ipc.h"
 #include "ipc/IpcClientProxy.h"
 #include "ipc/IpcMessage.h"
+#include "ipc/IpcPeerAuthentication.h"
 #include "net/IDataSocket.h"
+#include "net/TCPSocket.h"
 #include "io/IStream.h"
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
@@ -35,6 +37,7 @@
 //
 
 IpcServer::IpcServer(IEventQueue* events, SocketMultiplexer* socketMultiplexer) :
+    m_peerAuthenticator(&IpcPeerAuthenticator::authenticate),
     m_mock(false),
     m_events(events),
     m_socketMultiplexer(socketMultiplexer),
@@ -45,12 +48,27 @@ IpcServer::IpcServer(IEventQueue* events, SocketMultiplexer* socketMultiplexer) 
 }
 
 IpcServer::IpcServer(IEventQueue* events, SocketMultiplexer* socketMultiplexer, int port) :
+    m_peerAuthenticator(&IpcPeerAuthenticator::authenticate),
     m_mock(false),
     m_events(events),
     m_socketMultiplexer(socketMultiplexer),
     m_address(NetworkAddress(IPC_HOST, port))
 {
     init();
+}
+
+IpcServer::IpcServer(IEventQueue* events,
+                     SocketMultiplexer* socketMultiplexer, int port,
+                     PeerAuthenticator peerAuthenticator) :
+    IpcServer(events, socketMultiplexer, port)
+{
+    m_peerAuthenticator = peerAuthenticator;
+}
+
+IpcServer::PeerAuthenticator
+IpcServer::testPeerAuthenticator() const
+{
+    return m_peerAuthenticator;
 }
 
 void
@@ -106,10 +124,25 @@ IpcServer::handleClientConnecting(const Event&, void*)
 
     LOG((CLOG_DEBUG "accepted ipc client connection"));
 
+    TCPSocket* tcpSocket = dynamic_cast<TCPSocket*>(stream);
+    const IpcPeerAuthContext peerAuth =
+        tcpSocket != nullptr && m_peerAuthenticator != nullptr
+        ? m_peerAuthenticator(*tcpSocket)
+        : IpcPeerAuthContext::rejected(
+            tcpSocket == nullptr
+                ? "accepted IPC transport is not a TCP socket"
+                : "IPC peer authenticator is unavailable");
+    if (!peerAuth.permitsConnection()) {
+        LOG((CLOG_WARN "rejecting local ipc connection: %s",
+             peerAuth.rejectionReason().c_str()));
+        delete stream;
+        return;
+    }
+
     IpcClientProxy* proxy = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_clientsMutex);
-        proxy = new IpcClientProxy(*stream, m_events);
+        proxy = new IpcClientProxy(*stream, m_events, peerAuth);
         m_clients.push_back(proxy);
     }
 
@@ -247,6 +280,50 @@ IpcServer::hasInputReadyClientProcess(EIpcClientType clientType,
     return false;
 }
 
+bool
+IpcServer::hasActivatedClientProcess(UInt32 processId,
+                                     std::uint64_t activationNonce) const
+{
+    if (processId == 0 || activationNonce == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (ClientList::const_iterator it = m_clients.begin();
+         it != m_clients.end(); ++it) {
+        if ((*it)->matchesActivation(processId, activationNonce)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void
+IpcServer::sendWithAcquiredRefs(
+    const IpcMessage& message,
+    const std::vector<IpcClientProxy*>& recipients)
+{
+    try {
+        for (std::vector<IpcClientProxy*>::const_iterator it = recipients.begin();
+             it != recipients.end(); ++it) {
+            (*it)->send(message);
+        }
+    }
+    catch (...) {
+        for (std::vector<IpcClientProxy*>::const_iterator it = recipients.begin();
+             it != recipients.end(); ++it) {
+            (*it)->releaseSendRef();
+        }
+        throw;
+    }
+
+    for (std::vector<IpcClientProxy*>::const_iterator it = recipients.begin();
+         it != recipients.end(); ++it) {
+        (*it)->releaseSendRef();
+    }
+}
+
 void
 IpcServer::send(const IpcMessage& message, EIpcClientType filterType)
 {
@@ -265,18 +342,7 @@ IpcServer::send(const IpcMessage& message, EIpcClientType filterType)
         }
     }
 
-    std::vector<IpcClientProxy*>::iterator it;
-    for (it = recipients.begin(); it != recipients.end(); it++) {
-        IpcClientProxy* proxy = *it;
-        try {
-            proxy->send(message);
-        }
-        catch (...) {
-            proxy->releaseSendRef();
-            throw;
-        }
-        proxy->releaseSendRef();
-    }
+    sendWithAcquiredRefs(message, recipients);
 }
 
 bool
@@ -303,18 +369,19 @@ IpcServer::sendToProcess(const IpcMessage& message, EIpcClientType filterType,
         }
     }
 
-    std::vector<IpcClientProxy*>::iterator it;
-    for (it = recipients.begin(); it != recipients.end(); it++) {
-        IpcClientProxy* proxy = *it;
-        try {
-            proxy->send(message);
-        }
-        catch (...) {
-            proxy->releaseSendRef();
-            throw;
-        }
-        proxy->releaseSendRef();
-    }
+    sendWithAcquiredRefs(message, recipients);
 
     return !recipients.empty();
+}
+
+bool
+IpcServer::sendActivateToProcess(UInt32 processId,
+                                 std::uint64_t activationNonce)
+{
+    if (processId == 0 || activationNonce == 0) {
+        return false;
+    }
+
+    IpcActivateNodeMessage activate(activationNonce);
+    return sendToProcess(activate, kIpcClientNode, processId);
 }

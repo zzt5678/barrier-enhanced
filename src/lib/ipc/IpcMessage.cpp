@@ -78,12 +78,57 @@ IpcInputReadyQueryMessage::~IpcInputReadyQueryMessage()
 {
 }
 
+IpcActivateNodeMessage::IpcActivateNodeMessage(
+    std::uint64_t activationNonce) :
+    IpcMessage(kIpcActivate),
+    m_activationNonce(activationNonce)
+{
+}
+
+IpcActivateNodeMessage::~IpcActivateNodeMessage()
+{
+}
+
+IpcNodeActivatedMessage::IpcNodeActivatedMessage(
+    UInt32 processId, std::uint64_t activationNonce) :
+    IpcMessage(kIpcActivated),
+    m_processId(processId),
+    m_activationNonce(activationNonce)
+{
+}
+
+IpcNodeActivatedMessage::~IpcNodeActivatedMessage()
+{
+}
+
 IpcShutdownMessage::IpcShutdownMessage() :
 IpcMessage(kIpcShutdown)
 {
 }
 
 IpcShutdownMessage::~IpcShutdownMessage()
+{
+}
+
+IpcStopRequestMessage::IpcStopRequestMessage(std::uint64_t requestId) :
+    IpcMessage(kIpcStopRequest),
+    m_requestId(requestId)
+{
+}
+
+IpcStopRequestMessage::~IpcStopRequestMessage()
+{
+}
+
+IpcStopAckMessage::IpcStopAckMessage(
+    std::uint64_t requestId, std::uint64_t commandGeneration) :
+    IpcMessage(kIpcStopAck),
+    m_requestId(requestId),
+    m_commandGeneration(commandGeneration)
+{
+}
+
+IpcStopAckMessage::~IpcStopAckMessage()
 {
 }
 

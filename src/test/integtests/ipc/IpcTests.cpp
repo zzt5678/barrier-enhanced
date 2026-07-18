@@ -19,8 +19,6 @@
 // TODO: fix, tests failing intermittently on mac.
 #ifndef WINAPI_CARBON
 
-#define BARRIER_TEST_ENV
-
 #include "test/global/TestEventQueue.h"
 #include "ipc/IpcServer.h"
 #include "ipc/IpcClient.h"
@@ -28,6 +26,7 @@
 #include "ipc/IpcMessage.h"
 #include "ipc/IpcClientProxy.h"
 #include "ipc/Ipc.h"
+#include "ipc/IpcPeerAuthentication.h"
 #include "net/SocketMultiplexer.h"
 #include "mt/Thread.h"
 #include "arch/Arch.h"
@@ -38,7 +37,71 @@
 
 #include "test/global/gtest.h"
 
+#include <atomic>
+
+#if SYSAPI_WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #define TEST_IPC_PORT 24802
+
+class IpcServerTestAccess final : public IpcServer
+{
+public:
+    IpcServerTestAccess(IEventQueue* events,
+                        SocketMultiplexer* socketMultiplexer, int port,
+                        PeerAuthenticator peerAuthenticator) :
+        IpcServer(events, socketMultiplexer, port, peerAuthenticator)
+    {
+    }
+
+    static PeerAuthenticator peerAuthenticator(const IpcServer& server)
+    {
+        return server.testPeerAuthenticator();
+    }
+};
+
+namespace {
+
+std::atomic<UInt32> g_rejectingAuthenticatorCalls(0);
+
+UInt32
+currentTestProcessId()
+{
+#if SYSAPI_WIN32
+    return static_cast<UInt32>(GetCurrentProcessId());
+#else
+    return static_cast<UInt32>(getpid());
+#endif
+}
+
+IpcPeerAuthContext
+authenticateCurrentNodeForTest(const TCPSocket&)
+{
+    return IpcPeerAuthContext::accepted(
+        currentTestProcessId(), kIpcClientNode, 1,
+        IpcPeerIntegrityLevel::Medium, "test-user-sid");
+}
+
+IpcPeerAuthContext
+authenticateCurrentGuiForTest(const TCPSocket&)
+{
+    return IpcPeerAuthContext::accepted(
+        currentTestProcessId(), kIpcClientGui, 1,
+        IpcPeerIntegrityLevel::Medium, "test-user-sid");
+}
+
+IpcPeerAuthContext
+rejectCurrentPeerForTest(const TCPSocket&)
+{
+    g_rejectingAuthenticatorCalls.fetch_add(1, std::memory_order_relaxed);
+    return IpcPeerAuthContext::rejected("rejected by the IPC integration test");
+}
+
+}
 
 class IpcTests : public ::testing::Test
 {
@@ -71,7 +134,13 @@ public:
 TEST_F(IpcTests, connectToServer)
 {
     SocketMultiplexer socketMultiplexer;
+#if SYSAPI_WIN32
+    IpcServerTestAccess server(
+        &m_events, &socketMultiplexer, TEST_IPC_PORT,
+        &authenticateCurrentNodeForTest);
+#else
     IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+#endif
     server.listen();
     m_connectToServer_server = &server;
 
@@ -104,7 +173,9 @@ TEST_F(IpcTests, disconnectWithoutConnectingIsIdempotent)
 TEST_F(IpcTests, disconnectAfterConnectingIsIdempotent)
 {
     SocketMultiplexer socketMultiplexer;
-    IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+    IpcServerTestAccess server(
+        &m_events, &socketMultiplexer, TEST_IPC_PORT,
+        &authenticateCurrentNodeForTest);
     server.listen();
     m_connectToServer_server = &server;
 
@@ -131,7 +202,9 @@ TEST_F(IpcTests, disconnectAfterConnectingIsIdempotent)
 TEST_F(IpcTests, repeatedConnectIsNoOp)
 {
     SocketMultiplexer socketMultiplexer;
-    IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+    IpcServerTestAccess server(
+        &m_events, &socketMultiplexer, TEST_IPC_PORT,
+        &authenticateCurrentNodeForTest);
     server.listen();
     m_connectToServer_server = &server;
 
@@ -188,7 +261,9 @@ TEST_F(IpcTests, commandMessagePreservesElevateModeAcrossIpcEncoding)
 TEST_F(IpcTests, sendMessageToClient)
 {
     SocketMultiplexer socketMultiplexer;
-    IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+    IpcServerTestAccess server(
+        &m_events, &socketMultiplexer, TEST_IPC_PORT,
+        &authenticateCurrentNodeForTest);
     server.listen();
     m_sendMessageToClient_server = &server;
 
@@ -231,6 +306,135 @@ IpcTests::~IpcTests()
 {
 }
 
+class IpcServerAuthenticationTests : public ::testing::Test
+{
+public:
+    IpcServerAuthenticationTests() :
+        m_clientConnected(false),
+        m_serverAcceptedClient(false),
+        m_observationTimer(nullptr)
+    {
+    }
+
+    void handleClientConnected(const Event&, void*)
+    {
+        m_clientConnected = true;
+        if (m_observationTimer == nullptr) {
+            m_observationTimer = m_events.newOneShotTimer(0.5, nullptr);
+            m_events.adoptHandler(
+                Event::kTimer, m_observationTimer,
+                new TMethodEventJob<IpcServerAuthenticationTests>(
+                    this,
+                    &IpcServerAuthenticationTests::handleObservationElapsed));
+        }
+    }
+
+    void handleServerAcceptedClient(const Event&, void*)
+    {
+        m_serverAcceptedClient = true;
+    }
+
+    void handleObservationElapsed(const Event&, void*)
+    {
+        m_events.raiseQuitEvent();
+    }
+
+    void runRejectedConnectionAttempt(IpcServer& server,
+                                      SocketMultiplexer& socketMultiplexer,
+                                      int port)
+    {
+        server.listen();
+        IpcClient client(&m_events, &socketMultiplexer, port);
+        m_events.adoptHandler(
+            m_events.forIpcClient().connected(), &client,
+            new TMethodEventJob<IpcServerAuthenticationTests>(
+                this, &IpcServerAuthenticationTests::handleClientConnected));
+        m_events.adoptHandler(
+            m_events.forIpcServer().clientConnected(), &server,
+            new TMethodEventJob<IpcServerAuthenticationTests>(
+                this, &IpcServerAuthenticationTests::handleServerAcceptedClient));
+
+        client.connect();
+        m_events.initQuitTimeout(5);
+        m_events.loop();
+
+        m_events.removeHandler(m_events.forIpcClient().connected(), &client);
+        m_events.removeHandler(m_events.forIpcServer().clientConnected(), &server);
+        m_events.cleanupQuitTimeout();
+        if (m_observationTimer != nullptr) {
+            m_events.removeHandler(Event::kTimer, m_observationTimer);
+            m_events.deleteTimer(m_observationTimer);
+            m_observationTimer = nullptr;
+        }
+
+        EXPECT_TRUE(m_clientConnected);
+        EXPECT_FALSE(m_serverAcceptedClient);
+        EXPECT_FALSE(server.hasClients(kIpcClientNode));
+    }
+
+protected:
+    TestEventQueue m_events;
+    bool m_clientConnected;
+    bool m_serverAcceptedClient;
+    EventQueueTimer* m_observationTimer;
+};
+
+TEST_F(IpcServerAuthenticationTests, defaultServerUsesKernelPeerAuthenticator)
+{
+    SocketMultiplexer socketMultiplexer;
+    IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT + 1);
+
+    EXPECT_EQ(&IpcPeerAuthenticator::authenticate,
+              IpcServerTestAccess::peerAuthenticator(server));
+}
+
+TEST_F(IpcServerAuthenticationTests, overrideIsLimitedToOneTestInstance)
+{
+    SocketMultiplexer socketMultiplexer;
+    IpcServerTestAccess overridden(
+        &m_events, &socketMultiplexer, TEST_IPC_PORT + 1,
+        &authenticateCurrentNodeForTest);
+    IpcServer productionDefault(
+        &m_events, &socketMultiplexer, TEST_IPC_PORT + 2);
+
+    EXPECT_EQ(&authenticateCurrentNodeForTest,
+              IpcServerTestAccess::peerAuthenticator(overridden));
+    EXPECT_EQ(&IpcPeerAuthenticator::authenticate,
+              IpcServerTestAccess::peerAuthenticator(productionDefault));
+}
+
+TEST_F(IpcServerAuthenticationTests, rejectedAuthenticatorFailsClosed)
+{
+    g_rejectingAuthenticatorCalls.store(0, std::memory_order_relaxed);
+    SocketMultiplexer socketMultiplexer;
+    IpcServerTestAccess server(
+        &m_events, &socketMultiplexer, TEST_IPC_PORT + 3,
+        &rejectCurrentPeerForTest);
+
+    runRejectedConnectionAttempt(server, socketMultiplexer, TEST_IPC_PORT + 3);
+    EXPECT_EQ(1u, g_rejectingAuthenticatorCalls.load(std::memory_order_relaxed));
+}
+
+TEST_F(IpcServerAuthenticationTests, nullAuthenticatorFailsClosed)
+{
+    SocketMultiplexer socketMultiplexer;
+    IpcServerTestAccess server(
+        &m_events, &socketMultiplexer, TEST_IPC_PORT + 4, nullptr);
+
+    EXPECT_EQ(nullptr, IpcServerTestAccess::peerAuthenticator(server));
+    runRejectedConnectionAttempt(server, socketMultiplexer, TEST_IPC_PORT + 4);
+}
+
+#if SYSAPI_WIN32
+TEST_F(IpcServerAuthenticationTests, defaultServerRejectsSameProcessClient)
+{
+    SocketMultiplexer socketMultiplexer;
+    IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT + 5);
+
+    runRejectedConnectionAttempt(server, socketMultiplexer, TEST_IPC_PORT + 5);
+}
+#endif
+
 void
 IpcTests::runCommandRoundTrip(UInt8 elevateMode)
 {
@@ -240,7 +444,9 @@ IpcTests::runCommandRoundTrip(UInt8 elevateMode)
     m_sendMessageToServer_receivedElevate = false;
 
     SocketMultiplexer socketMultiplexer;
-    IpcServer server(&m_events, &socketMultiplexer, TEST_IPC_PORT);
+    IpcServerTestAccess server(
+        &m_events, &socketMultiplexer, TEST_IPC_PORT,
+        &authenticateCurrentGuiForTest);
     server.listen();
 
     // event handler sends "test" command to server.

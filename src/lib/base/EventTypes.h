@@ -87,7 +87,8 @@ public:
         m_outputFlushed(Event::kUnknown),
         m_outputError(Event::kUnknown),
         m_inputShutdown(Event::kUnknown),
-        m_outputShutdown(Event::kUnknown) { }
+        m_outputShutdown(Event::kUnknown),
+        m_inputFormatError(Event::kUnknown) { }
 
     //! @name accessors
     //@{
@@ -710,6 +711,7 @@ public:
     ClipboardEvents() :
         m_clipboardGrabbed(Event::kUnknown),
         m_clipboardChanged(Event::kUnknown),
+        m_clipboardPublished(Event::kUnknown),
         m_clipboardSending(Event::kUnknown) { }
 
     //! @name accessors
@@ -731,6 +733,9 @@ public:
     */
     Event::Type        clipboardChanged();
 
+    //! Asynchronous platform clipboard publication reached a terminal state.
+    Event::Type        clipboardPublished();
+
     //! Clipboard sending event type
     /*!
     Returns the clipboard sending event type. This is used to send
@@ -743,6 +748,7 @@ public:
 private:
     Event::Type        m_clipboardGrabbed;
     Event::Type        m_clipboardChanged;
+    Event::Type        m_clipboardPublished;
     Event::Type        m_clipboardSending;
 };
 

@@ -5,6 +5,7 @@
 
 #include "io/filesystem.h"
 
+#include <array>
 #include <fstream>
 
 namespace {
@@ -32,11 +33,14 @@ std::string readFile(const barrier::fs::path& path)
                        std::istreambuf_iterator<char>());
 }
 
-bool hasBarrierUnpackDirs(const barrier::fs::path& root)
+bool hasUnpackStagingDirs(const barrier::fs::path& root)
 {
     for (barrier::fs::directory_iterator it(root), end; it != end; ++it) {
         const std::string name = it->path().filename().u8string();
-        if (name.compare(0, std::string(".barrier-unpack-").size(), ".barrier-unpack-") == 0) {
+        if (name.compare(0, std::string(".barrier-unpack-").size(),
+                         ".barrier-unpack-") == 0 ||
+            name.compare(0, std::string(".weave-unpack-").size(),
+                         ".weave-unpack-") == 0) {
             return true;
         }
     }
@@ -74,6 +78,63 @@ TEST(DropHelperTests, writeToDir_writesFileAndClearsTransferState)
     EXPECT_EQ("payload", readFile(tempRoot / "example.txt"));
     EXPECT_TRUE(files.empty());
     EXPECT_TRUE(data.empty());
+
+    barrier::fs::remove_all(tempRoot);
+}
+
+TEST(DropHelperTests, writeToDir_rejectsUnsafePortableLeafNames)
+{
+    const barrier::fs::path tempRoot =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-drop-helper-unsafe-name-test");
+    barrier::fs::remove_all(tempRoot);
+    barrier::fs::create_directories(tempRoot);
+
+    const std::array<const char*, 10> unsafeNames{{
+        "file.txt:stream", "CON.txt", "report.", "report ",
+        "bad<name.txt", "../escape.txt", "folder/name.txt", "LPT1.log",
+        "CON .txt", "CONOUT$"
+    }};
+    for (const char* unsafeName : unsafeNames) {
+        String data("payload");
+        DragFileList files = makeSingleFileList(unsafeName, data.size());
+
+        const std::vector<String> dropped =
+            DropHelper::writeToDir(tempRoot.u8string(), files, data);
+
+        EXPECT_TRUE(dropped.empty()) << unsafeName;
+        EXPECT_TRUE(files.empty()) << unsafeName;
+        EXPECT_TRUE(data.empty()) << unsafeName;
+    }
+    EXPECT_TRUE(barrier::fs::is_empty(tempRoot));
+
+    barrier::fs::remove_all(tempRoot);
+}
+
+TEST(DropHelperTests, writeToDir_doesNotOverwriteExistingFinalTarget)
+{
+    const barrier::fs::path tempRoot =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-drop-helper-final-target-test");
+    barrier::fs::remove_all(tempRoot);
+    barrier::fs::create_directories(tempRoot);
+    {
+        std::ofstream existing(
+            (tempRoot / "example.txt").u8string().c_str(),
+            std::ios::out | std::ios::binary | std::ios::trunc);
+        existing << "user data";
+    }
+
+    String data("payload");
+    DragFileList files = makeSingleFileList("example.txt", data.size());
+
+    const std::vector<String> dropped =
+        DropHelper::writeToDir(tempRoot.u8string(), files, data);
+
+    ASSERT_EQ(1u, dropped.size());
+    EXPECT_EQ("user data", readFile(tempRoot / "example.txt"));
+    EXPECT_EQ("payload", readFile(tempRoot / "example (1).txt"));
+    EXPECT_EQ((tempRoot / "example (1).txt").u8string(), dropped.front());
 
     barrier::fs::remove_all(tempRoot);
 }
@@ -127,6 +188,33 @@ TEST(DropHelperTests, writeToDirFromFile_writesFileAndClearsTransferState)
     EXPECT_EQ("payload", readFile(tempRoot / "example.txt"));
     EXPECT_TRUE(files.empty());
     EXPECT_TRUE(barrier::fs::exists(sourcePath));
+
+    barrier::fs::remove_all(tempRoot);
+}
+
+TEST(DropHelperTests, writeToDirFromFile_rejectsUnsafePortableLeafName)
+{
+    const barrier::fs::path tempRoot =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-drop-helper-spool-unsafe-name-test");
+    barrier::fs::remove_all(tempRoot);
+    barrier::fs::create_directories(tempRoot);
+    const barrier::fs::path sourcePath = tempRoot / "received.part";
+    {
+        std::ofstream source(sourcePath.u8string().c_str(),
+                             std::ios::out | std::ios::binary |
+                                 std::ios::trunc);
+        source << "payload";
+    }
+    DragFileList files = makeSingleFileList("NUL.txt", 7);
+
+    const std::vector<String> dropped = DropHelper::writeToDirFromFile(
+        tempRoot.u8string(), files, sourcePath);
+
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_TRUE(files.empty());
+    EXPECT_EQ("payload", readFile(sourcePath));
+    EXPECT_FALSE(barrier::fs::exists(tempRoot / "NUL.txt"));
 
     barrier::fs::remove_all(tempRoot);
 }
@@ -195,6 +283,67 @@ TEST(DropHelperTests, writeToDirFromFile_extractsPackageForDirectoryDrop)
     EXPECT_EQ("hello", readFile(tempRoot / "drop" / "source" / "folder" / "hello.txt"));
     EXPECT_TRUE(files.empty());
     EXPECT_TRUE(barrier::fs::exists(packagePath));
+    EXPECT_FALSE(hasUnpackStagingDirs(tempRoot / "drop"));
+
+    barrier::fs::remove(packagePath);
+    barrier::fs::remove_all(tempRoot);
+}
+
+TEST(DropHelperTests, writeToDirFromFile_keepsPublishedRootsWhenLaterRootFails)
+{
+    const barrier::fs::path tempRoot =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-drop-helper-partial-bundle-test");
+    barrier::fs::remove_all(tempRoot);
+    barrier::fs::create_directories(tempRoot / "source");
+    barrier::fs::create_directories(tempRoot / "drop");
+
+    const std::string longName(255, 'z');
+    {
+        std::ofstream first(
+            (tempRoot / "source" / "a-success.txt").u8string().c_str(),
+            std::ios::out | std::ios::binary | std::ios::trunc);
+        first << "published";
+        std::ofstream blocked(
+            (tempRoot / "source" / barrier::fs::u8path(longName)).u8string().c_str(),
+            std::ios::out | std::ios::binary | std::ios::trunc);
+        blocked << "incoming";
+        std::ofstream existing(
+            (tempRoot / "drop" / barrier::fs::u8path(longName)).u8string().c_str(),
+            std::ios::out | std::ios::binary | std::ios::trunc);
+        existing << "existing";
+    }
+
+    barrier::fs::path packagePath;
+    std::string error;
+    ASSERT_TRUE(TransferArchive::createSelectionPackageFile(
+        {tempRoot / "source" / "a-success.txt",
+         tempRoot / "source" / barrier::fs::u8path(longName)},
+        packagePath, error)) << error;
+
+    DragFileList files;
+    DragInformation firstInfo;
+    String firstName("a-success.txt");
+    firstInfo.setFilename(firstName);
+    firstInfo.setEntryType(DragInformation::File);
+    files.push_back(firstInfo);
+    DragInformation blockedInfo;
+    String blockedName(longName);
+    blockedInfo.setFilename(blockedName);
+    blockedInfo.setEntryType(DragInformation::File);
+    files.push_back(blockedInfo);
+
+    const std::vector<String> dropped = DropHelper::writeToDirFromFile(
+        (tempRoot / "drop").u8string(), files, packagePath);
+
+    ASSERT_EQ(1u, dropped.size());
+    EXPECT_EQ((tempRoot / "drop" / "a-success.txt").u8string(),
+              dropped.front());
+    EXPECT_EQ("published", readFile(tempRoot / "drop" / "a-success.txt"));
+    EXPECT_EQ("existing", readFile(
+        tempRoot / "drop" / barrier::fs::u8path(longName)));
+    EXPECT_FALSE(hasUnpackStagingDirs(tempRoot / "drop"));
+    EXPECT_TRUE(files.empty());
 
     barrier::fs::remove(packagePath);
     barrier::fs::remove_all(tempRoot);
@@ -220,7 +369,7 @@ TEST(DropHelperTests, writeToDir_removesStagingAndClearsTransferStateWhenPackage
     EXPECT_TRUE(dropped.empty());
     EXPECT_TRUE(files.empty());
     EXPECT_TRUE(data.empty());
-    EXPECT_FALSE(hasBarrierUnpackDirs(tempRoot));
+    EXPECT_FALSE(hasUnpackStagingDirs(tempRoot));
 
     barrier::fs::remove_all(tempRoot);
 }
@@ -251,7 +400,7 @@ TEST(DropHelperTests, writeToDirFromFile_removesStagingAndClearsTransferStateWhe
     EXPECT_TRUE(dropped.empty());
     EXPECT_TRUE(files.empty());
     EXPECT_TRUE(barrier::fs::exists(sourcePath));
-    EXPECT_FALSE(hasBarrierUnpackDirs(tempRoot / "drop"));
+    EXPECT_FALSE(hasUnpackStagingDirs(tempRoot / "drop"));
 
     barrier::fs::remove_all(tempRoot);
 }

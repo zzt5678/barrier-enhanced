@@ -22,6 +22,7 @@
 #include "SetupWizard.h"
 #include "DisplayIsValid.h"
 #include "GuiInstanceCoordinator.h"
+#include "common/Version.h"
 
 #include <QtCore>
 #include <QtGui>
@@ -31,10 +32,12 @@
 #include <QFileInfo>
 #include <QSocketNotifier>
 
+#include <cstdio>
+#include <cstring>
+
 #if defined(Q_OS_UNIX)
 #include <cerrno>
 #include <csignal>
-#include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -123,6 +126,13 @@ void cleanupStartupArtifacts()
 
 int main(int argc, char* argv[])
 {
+    for (int index = 1; index < argc; ++index) {
+        if (std::strcmp(argv[index], "--version") == 0) {
+            std::printf("Weave %s\n", kBuildId);
+            return 0;
+        }
+    }
+
 #ifdef WINAPI_XWINDOWS
     // QApplication's constructor will call a fscking abort() if
     // DISPLAY is bad. Let's check it first and handle it gracefully
@@ -139,6 +149,7 @@ int main(int argc, char* argv[])
 	QCoreApplication::setOrganizationName("Weave");
 	QCoreApplication::setOrganizationDomain("github.com");
 	QCoreApplication::setApplicationName("Weave");
+	QCoreApplication::setApplicationVersion(QString::fromLatin1(kBuildId));
 
 	// Enable High DPI scaling for modern displays
 	QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);

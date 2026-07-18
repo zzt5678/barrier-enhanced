@@ -524,10 +524,18 @@ ArchNetworkBSD::readSocket(ArchSocket s, void* buf, size_t len)
 
     ssize_t n = read(s->m_fd, buf, len);
     if (n == -1) {
-        if (errno == EINTR || errno == EAGAIN) {
-            return 0;
+        const int error = errno;
+        if (error == EINTR) {
+            throwError(error);
         }
-        throwError(errno);
+        if (error == EAGAIN
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+            || error == EWOULDBLOCK
+#endif
+        ) {
+            throw XArchNetworkInterrupted(new XArchEvalUnix(error));
+        }
+        throwError(error);
     }
     return n;
 }

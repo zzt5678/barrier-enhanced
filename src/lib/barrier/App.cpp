@@ -25,6 +25,7 @@
 #include "base/log_outputters.h"
 #include "barrier/XBarrier.h"
 #include "barrier/ArgsBase.h"
+#include "barrier/ServiceLaunchState.h"
 #include "ipc/IpcServerProxy.h"
 #include "base/TMethodEventJob.h"
 #include "ipc/IpcMessage.h"
@@ -35,6 +36,8 @@
 
 #if SYSAPI_WIN32
 #include "base/IEventQueue.h"
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
 #endif
 
 #include <iostream>
@@ -43,6 +46,32 @@
 namespace {
 
 const double kIpcInputReadinessIntervalSeconds = 0.25;
+
+struct PlatformInputCapability {
+    bool uiAccessRequired = false;
+    bool querySucceeded = false;
+    bool uiAccessEnabled = false;
+};
+
+PlatformInputCapability platformInputCapability()
+{
+    PlatformInputCapability capability;
+#if SYSAPI_WIN32
+    capability.uiAccessRequired = true;
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return capability;
+    }
+
+    DWORD uiAccess = 0;
+    DWORD returned = 0;
+    capability.querySucceeded = GetTokenInformation(
+        token, TokenUIAccess, &uiAccess, sizeof(uiAccess), &returned) != FALSE;
+    capability.uiAccessEnabled = capability.querySucceeded && uiAccess != 0;
+    CloseHandle(token);
+#endif
+    return capability;
+}
 
 }
 
@@ -74,6 +103,10 @@ App::App(IEventQueue* events, CreateTaskBarReceiverFunc createTaskBarReceiver, A
     m_hasReportedIpcReadiness(false),
     m_lastIpcInputReady(false),
     m_lastIpcInputGeneration(0),
+    m_serviceActivationRequested(false),
+    m_serviceActivated(false),
+    m_ipcShutdownRequested(false),
+    m_serviceActivationNonce(0),
     m_socketMultiplexer(nullptr)
 {
     assert(s_instance == nullptr);
@@ -285,17 +318,36 @@ App::sendIpcInputReadiness(std::uint64_t queryNonce)
         return false;
     }
 
-    const std::uint64_t generationBefore = ipcInputGeneration();
-    std::string desktopName = ipcInputDesktopName();
-    bool inputReady = ipcInputReady();
-    const std::uint64_t generationAfter = ipcInputGeneration();
-    const std::uint64_t inputGeneration = generationAfter;
-    if (generationBefore != generationAfter) {
-        // A desktop transition happened while taking the snapshot. A later
-        // lease tick will report the stable state; never advertise a mixed one.
-        inputReady = false;
-        desktopName = ipcInputDesktopName();
+    const bool passiveProbe = serviceStandbyUsesPassiveInputProbe(
+        argsBase().m_serviceStandby, m_serviceActivated);
+    std::uint64_t inputGeneration = 0;
+    std::string desktopName;
+    bool inputReady = false;
+    if (passiveProbe) {
+        inputReady = ipcStandbyInputProbe(inputGeneration, desktopName);
+        if (!inputReady) {
+            inputGeneration = 0;
+        }
     }
+    else {
+        const std::uint64_t generationBefore = ipcInputGeneration();
+        desktopName = ipcInputDesktopName();
+        inputReady = ipcInputReady();
+        const std::uint64_t generationAfter = ipcInputGeneration();
+        inputGeneration = generationAfter;
+        if (generationBefore != generationAfter) {
+            // A desktop transition happened while taking the snapshot. A later
+            // lease tick will report the stable state; never advertise a mixed one.
+            inputReady = false;
+            desktopName = ipcInputDesktopName();
+        }
+    }
+
+    const bool backendReady = inputReady;
+    const PlatformInputCapability capability = platformInputCapability();
+    inputReady = serviceNodeInputReadinessReady(
+        capability.uiAccessRequired, backendReady,
+        capability.querySucceeded, capability.uiAccessEnabled);
 
     IpcNodeReadyV2Message ready(
         m_ipcClient->processId(), m_ipcClient->sessionId(),
@@ -305,8 +357,15 @@ App::sendIpcInputReadiness(std::uint64_t queryNonce)
         ready.inputGeneration() != m_lastIpcInputGeneration ||
         ready.desktopName() != m_lastIpcInputDesktopName;
     if (changed) {
+        if (backendReady && !inputReady && capability.uiAccessRequired) {
+            LOG((CLOG_WARN
+                "withholding Windows input readiness: UIAccess token query=%s enabled=%s",
+                capability.querySucceeded ? "ok" : "failed",
+                capability.uiAccessEnabled ? "yes" : "no"));
+        }
         LOG((CLOG_INFO
-            "reporting local input readiness: pid=%u session=%u desktop=%s generation=%llu ready=%s build=%s",
+            "reporting local %s readiness: pid=%u session=%u desktop=%s generation=%llu ready=%s build=%s",
+            passiveProbe ? "standby input probe" : "active input",
             ready.processId(), ready.sessionId(),
             ready.desktopName().empty() ? "<none>" : ready.desktopName().c_str(),
             static_cast<unsigned long long>(ready.inputGeneration()),
@@ -357,6 +416,7 @@ App::handleIpcMessage(const Event& e, void*)
 
     if (m->type() == kIpcShutdown) {
         LOG((CLOG_INFO "got ipc shutdown message"));
+        m_ipcShutdownRequested = true;
         m_events->addEvent(Event(Event::kQuit));
     }
     else if (m->type() == kIpcReadyQuery) {
@@ -367,6 +427,84 @@ App::handleIpcMessage(const Event& e, void*)
             return;
         }
         sendIpcInputReadiness(query->queryNonce());
+    }
+    else if (m->type() == kIpcActivate) {
+        const IpcActivateNodeMessage* activate =
+            static_cast<const IpcActivateNodeMessage*>(m);
+        const std::uint64_t nonce = activate->activationNonce();
+        if (!argsBase().m_serviceStandby || nonce == 0) {
+            LOG((CLOG_WARN
+                "ignoring ipc activation outside a valid service standby"));
+            return;
+        }
+        if (m_serviceActivated) {
+            if (nonce == m_serviceActivationNonce) {
+                sendIpcServiceActivated(nonce);
+            }
+            else {
+                LOG((CLOG_WARN
+                    "ignoring replacement activation nonce after service activation"));
+            }
+            return;
+        }
+        if (m_serviceActivationRequested) {
+            if (nonce != m_serviceActivationNonce) {
+                LOG((CLOG_WARN
+                    "ignoring conflicting activation nonce while handoff is pending"));
+            }
+            return;
+        }
+
+        m_serviceActivationRequested = true;
+        m_serviceActivationNonce = nonce;
+        LOG((CLOG_INFO
+            "accepted service activation nonce=%llu; leaving standby event loop",
+            static_cast<unsigned long long>(nonce)));
+        m_events->addEvent(Event(Event::kQuit));
+    }
+}
+
+bool
+App::waitForServiceActivation(std::uint64_t& activationNonce)
+{
+    activationNonce = 0;
+    if (!argsBase().m_serviceStandby || m_ipcClient == NULL) {
+        return false;
+    }
+
+    m_events->loop();
+    if (m_ipcShutdownRequested || !m_serviceActivationRequested ||
+        m_serviceActivationNonce == 0) {
+        return false;
+    }
+
+    activationNonce = m_serviceActivationNonce;
+    return true;
+}
+
+bool
+App::sendIpcServiceActivated(std::uint64_t activationNonce)
+{
+    if (m_ipcClient == NULL || !argsBase().m_serviceStandby ||
+        !m_serviceActivationRequested || activationNonce == 0 ||
+        activationNonce != m_serviceActivationNonce) {
+        return false;
+    }
+
+    IpcNodeActivatedMessage activated(m_ipcClient->processId(),
+                                      activationNonce);
+    try {
+        m_ipcClient->send(activated);
+        m_serviceActivated = true;
+        LOG((CLOG_INFO
+            "reported service data-plane activation pid=%u nonce=%llu",
+            activated.processId(),
+            static_cast<unsigned long long>(activationNonce)));
+        return true;
+    }
+    catch (const XBase& e) {
+        LOG((CLOG_WARN "failed to report service activation: %s", e.what()));
+        return false;
     }
 }
 

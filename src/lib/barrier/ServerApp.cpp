@@ -767,8 +767,18 @@ ServerApp::mainLoop()
         return kExitFailed;
     }
 
-    // start server, etc
-    appUtil().startNode();
+    if (argsBase().m_serviceStandby) {
+        LOG((CLOG_INFO
+            "preparing server in service standby without opening a listener"));
+        if (!initServer() || m_serverState != kInitialized ||
+            m_serverScreen == NULL || m_primaryClient == NULL) {
+            cleanupServer();
+            return kExitFailed;
+        }
+    }
+    else {
+        appUtil().startNode();
+    }
 
     // init ipc client after node start, since create a new screen wipes out
     // the event queue (the screen ctors call adoptBuffer).
@@ -810,7 +820,28 @@ ServerApp::mainLoop()
 
     runCocoaApp();
 #else
-    m_events->loop();
+    int result = kExitSuccess;
+    bool runActiveLoop = true;
+    if (argsBase().m_serviceStandby) {
+        std::uint64_t activationNonce = 0;
+        if (!waitForServiceActivation(activationNonce)) {
+            runActiveLoop = false;
+        }
+        else {
+            if (!m_serverScreen->prepareInputBackend()) {
+                LOG((CLOG_INFO
+                    "Windows input helper activation is pending; active readiness will wait for it"));
+            }
+            if (!startServer() || m_serverState != kStarted ||
+                !sendIpcServiceActivated(activationNonce)) {
+                result = kExitFailed;
+                runActiveLoop = false;
+            }
+        }
+    }
+    if (runActiveLoop) {
+        m_events->loop();
+    }
 #endif
 
     DAEMON_RUNNING(false);
@@ -829,7 +860,11 @@ ServerApp::mainLoop()
         cleanupIpcClient();
     }
 
+#if defined(MAC_OS_X_VERSION_10_7)
     return kExitSuccess;
+#else
+    return result;
+#endif
 }
 
 void ServerApp::resetServer(const Event&, void*)
@@ -942,4 +977,21 @@ ServerApp::ipcInputDesktopName() const
 {
     return m_serverScreen == NULL ? std::string() :
         m_serverScreen->inputDesktopName();
+}
+
+bool
+ServerApp::ipcStandbyInputProbe(std::uint64_t& inputGeneration,
+                                std::string& desktopName) const
+{
+    inputGeneration = 0;
+    desktopName.clear();
+    if (m_serverScreen == NULL ||
+        !m_serverScreen->probeInputBackend(desktopName)) {
+        return false;
+    }
+
+    // Active readiness is challenged again after IACK and reports the real
+    // desktop-helper generation, so this phase-local token cannot be adopted.
+    inputGeneration = 1;
+    return true;
 }

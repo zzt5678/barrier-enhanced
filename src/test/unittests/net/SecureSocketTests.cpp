@@ -12,9 +12,11 @@
 #include "test/mock/barrier/MockEventQueue.h"
 
 #include <atomic>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 using ::testing::_;
 using ::testing::Invoke;
@@ -179,6 +181,18 @@ public:
         m_writable = true;
     }
 
+    void markSecureConnected()
+    {
+        markConnected();
+        testSetSecureReadyNoLock();
+    }
+
+    bool readStopsJobWithLock()
+    {
+        Lock lock(&getMutex());
+        return doRead() == kBreak;
+    }
+
     void failTLSWithLock()
     {
         Lock lock(&getMutex());
@@ -213,6 +227,52 @@ public:
     bool readable() const { return m_readable; }
     bool writable() const { return m_writable; }
     ArchSocket rawSocket() { return getSocket(); }
+};
+
+class PayloadThenFatalSecureSocket : public TestableSecureSocket {
+public:
+    PayloadThenFatalSecureSocket(IEventQueue* events,
+                                 SocketMultiplexer* multiplexer) :
+        TestableSecureSocket(events, multiplexer)
+    {
+    }
+
+    int secureReadForInput(void* buffer, int size, int& bytesRead) override
+    {
+        if (m_readCount++ == 0) {
+            const int payloadSize = static_cast<int>(sizeof(kPayload) - 1);
+            if (size < payloadSize) {
+                throw std::runtime_error("scripted secure read buffer is too small");
+            }
+            std::memcpy(buffer, kPayload, payloadSize);
+            bytesRead = payloadSize;
+            return payloadSize;
+        }
+
+        isFatal(true);
+        bytesRead = -1;
+        return -1;
+    }
+
+    static constexpr char kPayload[] = "tail";
+
+private:
+    int m_readCount = 0;
+};
+
+class FatalSecureSocket : public TestableSecureSocket {
+public:
+    FatalSecureSocket(IEventQueue* events, SocketMultiplexer* multiplexer) :
+        TestableSecureSocket(events, multiplexer)
+    {
+    }
+
+    int secureReadForInput(void*, int, int& bytesRead) override
+    {
+        isFatal(true);
+        bytesRead = -1;
+        return -1;
+    }
 };
 
 struct EventCounts {
@@ -267,6 +327,89 @@ void countEvent(EventCounts& counts,
     }
 }
 
+}
+
+TEST(SecureSocketTests, payloadBeforeTlsCloseIsReadyBeforeShutdownAndRemainsReadable)
+{
+    NiceMock<MockEventQueue> events;
+    ISocketEvents socketEvents;
+    IStreamEvents streamEvents;
+    IDataSocketEvents dataSocketEvents;
+    SocketMultiplexer multiplexer;
+    std::vector<Event::Type> eventOrder;
+
+    setEventDefaults(events, socketEvents, streamEvents, dataSocketEvents);
+
+    PayloadThenFatalSecureSocket socket(&events, &multiplexer);
+    const Event::Type inputReadyType = streamEvents.inputReady();
+    const Event::Type inputShutdownType = streamEvents.inputShutdown();
+    const Event::Type disconnectedType = socketEvents.disconnected();
+
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&](const Event& event) {
+            if (event.getTarget() == socket.getEventTarget()) {
+                eventOrder.push_back(event.getType());
+            }
+        }));
+
+    socket.markSecureConnected();
+    ASSERT_TRUE(socket.readStopsJobWithLock());
+
+    ASSERT_GE(eventOrder.size(), 2u);
+    EXPECT_EQ(inputReadyType, eventOrder[0]);
+    EXPECT_EQ(inputShutdownType, eventOrder[1]);
+    EXPECT_EQ(4u, socket.getSize());
+    EXPECT_EQ(4u, socket.getInputBytesReceived());
+
+    char payload[5] = {};
+    EXPECT_EQ(2u, socket.read(payload, 2));
+    EXPECT_EQ(2u, socket.getSize());
+    EXPECT_TRUE(socket.connected());
+    EXPECT_NE(nullptr, socket.rawSocket());
+    EXPECT_EQ(2u, eventOrder.size());
+
+    EXPECT_EQ(2u, socket.read(payload + 2, 2));
+    EXPECT_STREQ(PayloadThenFatalSecureSocket::kPayload, payload);
+    EXPECT_EQ(0u, socket.getSize());
+    EXPECT_EQ(4u, socket.getInputBytesReceived());
+
+    ASSERT_GE(eventOrder.size(), 3u);
+    EXPECT_EQ(disconnectedType, eventOrder[2]);
+    EXPECT_FALSE(socket.connected());
+    EXPECT_EQ(nullptr, socket.rawSocket());
+}
+
+TEST(SecureSocketTests, tlsFailureWithoutPayloadStillDisconnectsImmediately)
+{
+    NiceMock<MockEventQueue> events;
+    ISocketEvents socketEvents;
+    IStreamEvents streamEvents;
+    IDataSocketEvents dataSocketEvents;
+    SocketMultiplexer multiplexer;
+    std::vector<Event::Type> eventOrder;
+
+    setEventDefaults(events, socketEvents, streamEvents, dataSocketEvents);
+
+    FatalSecureSocket socket(&events, &multiplexer);
+    const Event::Type inputShutdownType = streamEvents.inputShutdown();
+    const Event::Type disconnectedType = socketEvents.disconnected();
+
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&](const Event& event) {
+            if (event.getTarget() == socket.getEventTarget()) {
+                eventOrder.push_back(event.getType());
+            }
+        }));
+
+    socket.markSecureConnected();
+    ASSERT_TRUE(socket.readStopsJobWithLock());
+
+    ASSERT_EQ(2u, eventOrder.size());
+    EXPECT_EQ(inputShutdownType, eventOrder[0]);
+    EXPECT_EQ(disconnectedType, eventOrder[1]);
+    EXPECT_EQ(0u, socket.getSize());
+    EXPECT_FALSE(socket.connected());
+    EXPECT_EQ(nullptr, socket.rawSocket());
 }
 
 TEST(SecureSocketTests, transientTlsFailureClosesTransportAndAllowsRetry)

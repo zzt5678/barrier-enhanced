@@ -10,6 +10,7 @@
 #include "barrier/FileReceiveSession.h"
 
 #include "barrier/TransferDigest.h"
+#include "mt/ThreadShutdown.h"
 
 #include <atomic>
 #include <chrono>
@@ -22,17 +23,25 @@
 #include <utility>
 #include <vector>
 
+const size_t FileReceiveSession::kDefaultAsyncQueueLimit;
+const size_t FileReceiveSession::kMaxAsyncChunkSize;
+
 namespace {
+
+const std::chrono::milliseconds kSpoolWorkerReaperInitialPoll(10);
+const std::chrono::milliseconds kSpoolWorkerReaperMaxPoll(250);
 
 struct RetiredSpoolWorker {
     std::thread* thread;
     std::shared_ptr<std::atomic<bool> > done;
+    std::shared_ptr<std::atomic<bool> > reaped;
 };
 
 class SpoolWorkerReaper {
 public:
     SpoolWorkerReaper() :
         m_stopping(false),
+        m_shutdownDeadline(),
         m_reaper(&SpoolWorkerReaper::run, this)
     {
     }
@@ -42,20 +51,25 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_stopping = true;
+            m_shutdownDeadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(static_cast<int>(
+                    barrier::kFinalThreadShutdownDeadlineSeconds * 1000.0));
         }
         m_wake.notify_one();
         m_reaper.join();
     }
 
     void retire(std::thread* thread,
-                const std::shared_ptr<std::atomic<bool> >& done)
+                const std::shared_ptr<std::atomic<bool> >& done,
+                const std::shared_ptr<std::atomic<bool> >& reaped)
     {
         if (thread == NULL) {
+            reaped->store(true, std::memory_order_release);
             return;
         }
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            RetiredSpoolWorker worker = { thread, done };
+            RetiredSpoolWorker worker = { thread, done, reaped };
             m_workers.push_back(worker);
         }
         m_wake.notify_one();
@@ -64,20 +78,35 @@ public:
 private:
     void run()
     {
+        std::chrono::milliseconds pollDelay =
+            kSpoolWorkerReaperInitialPoll;
         for (;;) {
             std::vector<RetiredSpoolWorker> ready;
-            std::vector<RetiredSpoolWorker> abandoned;
+            bool pollExpired = false;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 if (!m_stopping && m_workers.empty()) {
                     m_wake.wait(lock, [this]() {
                         return m_stopping || !m_workers.empty();
                     });
+                    pollDelay = kSpoolWorkerReaperInitialPoll;
                 }
-                else if (!m_stopping) {
-                    m_wake.wait_for(lock, std::chrono::milliseconds(10), [this]() {
-                        return m_stopping;
-                    });
+                else if (!m_workers.empty()) {
+                    const std::chrono::steady_clock::time_point now =
+                        std::chrono::steady_clock::now();
+                    if (m_stopping && now >= m_shutdownDeadline) {
+                        barrier::terminateProcessForFinalThreadShutdown();
+                    }
+                    std::chrono::steady_clock::time_point wakeAt =
+                        now + pollDelay;
+                    if (m_stopping && m_shutdownDeadline < wakeAt) {
+                        wakeAt = m_shutdownDeadline;
+                    }
+                    pollExpired = m_wake.wait_until(lock, wakeAt) ==
+                        std::cv_status::timeout;
+                    if (!pollExpired) {
+                        pollDelay = kSpoolWorkerReaperInitialPoll;
+                    }
                 }
 
                 std::deque<RetiredSpoolWorker>::iterator worker = m_workers.begin();
@@ -86,38 +115,39 @@ private:
                         ready.push_back(*worker);
                         worker = m_workers.erase(worker);
                     }
-                    else if (m_stopping) {
-                        abandoned.push_back(*worker);
-                        worker = m_workers.erase(worker);
-                    }
                     else {
                         ++worker;
                     }
                 }
+                if (!ready.empty() || m_workers.empty()) {
+                    pollDelay = kSpoolWorkerReaperInitialPoll;
+                }
+                else if (pollExpired &&
+                         pollDelay < kSpoolWorkerReaperMaxPoll) {
+                    pollDelay *= 2;
+                    if (pollDelay > kSpoolWorkerReaperMaxPoll) {
+                        pollDelay = kSpoolWorkerReaperMaxPoll;
+                    }
+                }
                 if (m_stopping && m_workers.empty()) {
                     lock.unlock();
-                    release(ready, true);
-                    release(abandoned, false);
+                    release(ready);
                     return;
                 }
             }
-            release(ready, true);
+            release(ready);
         }
     }
 
-    static void release(std::vector<RetiredSpoolWorker>& workers, bool join)
+    static void release(std::vector<RetiredSpoolWorker>& workers)
     {
         for (std::vector<RetiredSpoolWorker>::iterator worker = workers.begin();
              worker != workers.end(); ++worker) {
             if (worker->thread->joinable()) {
-                if (join) {
-                    worker->thread->join();
-                }
-                else {
-                    worker->thread->detach();
-                }
+                worker->thread->join();
             }
             delete worker->thread;
+            worker->reaped->store(true, std::memory_order_release);
         }
     }
 
@@ -126,30 +156,25 @@ private:
     std::condition_variable m_wake;
     std::deque<RetiredSpoolWorker> m_workers;
     bool m_stopping;
+    std::chrono::steady_clock::time_point m_shutdownDeadline;
     std::thread m_reaper;
 };
 
 void
 retireSpoolWorker(std::thread* worker,
-                  const std::shared_ptr<std::atomic<bool> >& done) noexcept
+                  const std::shared_ptr<std::atomic<bool> >& done,
+                  const std::shared_ptr<std::atomic<bool> >& reaped) noexcept
 {
     if (worker == NULL) {
+        reaped->store(true, std::memory_order_release);
         return;
     }
     try {
         static SpoolWorkerReaper reaper;
-        reaper.retire(worker, done);
+        reaper.retire(worker, done, reaped);
     }
     catch (...) {
-        if (worker->joinable()) {
-            try {
-                worker->detach();
-            }
-            catch (...) {
-                return;
-            }
-        }
-        delete worker;
+        barrier::terminateProcessForFinalThreadShutdown();
     }
 }
 
@@ -163,10 +188,27 @@ removeSpoolFile(const barrier::fs::path& path)
     barrier::fs::remove(path, error);
 }
 
+void
+invokeNoexcept(std::function<void()> callback) noexcept
+{
+    if (!callback) {
+        return;
+    }
+    try {
+        callback();
+    }
+    catch (...) {
+        // Flow-control release must never escape a worker or teardown path.
+    }
+}
+
 }
 
 struct FileReceiveSession::AsyncState {
-    AsyncState(size_t expected, size_t queueLimit) :
+    AsyncState(
+        size_t expected,
+        size_t queueLimit,
+        const std::shared_ptr<std::atomic<bool> >& workerExitGateForTest) :
         expectedSize(expected),
         queueLimit(queueLimit),
         queuedBytes(0),
@@ -178,7 +220,11 @@ struct FileReceiveSession::AsyncState {
         complete(false),
         failed(false),
         pathTransferred(false),
-        workerDone(new std::atomic<bool>(false))
+        backpressureResume(),
+        pauseProgress(),
+        workerDone(new std::atomic<bool>(false)),
+        workerReaped(new std::atomic<bool>(false)),
+        workerExitGateForTest(workerExitGateForTest)
     {
     }
 
@@ -197,7 +243,11 @@ struct FileReceiveSession::AsyncState {
     bool complete;
     bool failed;
     bool pathTransferred;
+    std::function<void()> backpressureResume;
+    std::function<void()> pauseProgress;
     std::shared_ptr<std::atomic<bool> > workerDone;
+    std::shared_ptr<std::atomic<bool> > workerReaped;
+    std::shared_ptr<std::atomic<bool> > workerExitGateForTest;
 };
 
 FileReceiveSession::FileReceiveSession() :
@@ -205,7 +255,10 @@ FileReceiveSession::FileReceiveSession() :
     m_expectedSize(0),
     m_receivedSize(0),
     m_spoolWorker(NULL),
-    m_generation(0)
+    m_retiredWorkerReaped(),
+    m_retiredWorkerBlocksBegin(false),
+    m_generation(0),
+    m_commitBarrier()
 {
 }
 
@@ -220,7 +273,18 @@ FileReceiveSession::begin(size_t expectedSize,
                           size_t reserveLimit,
                           size_t asyncQueueLimit)
 {
+    if (!releaseCompletedWorkerCleanup()) {
+        return false;
+    }
+    const State currentState = state();
+    if (currentState != kIdle && currentState != kFailed) {
+        return false;
+    }
+
     reset();
+    if (!releaseCompletedWorkerCleanup()) {
+        return false;
+    }
     m_expectedSize = expectedSize;
     m_state = kReceiving;
 
@@ -242,7 +306,8 @@ FileReceiveSession::begin(size_t expectedSize,
             return false;
         }
         try {
-            m_asyncState.reset(new AsyncState(expectedSize, asyncQueueLimit));
+            m_asyncState.reset(new AsyncState(
+                expectedSize, asyncQueueLimit, m_workerExitGateForTest));
             const std::shared_ptr<AsyncState> state = m_asyncState;
             m_spoolWorker = new std::thread([state]() {
                 FileReceiveSession::runSpoolWorker(state);
@@ -266,33 +331,43 @@ FileReceiveSession::begin(size_t expectedSize,
     return true;
 }
 
-bool
+FileReceiveSession::AppendResult
 FileReceiveSession::append(std::string content)
 {
     const size_t contentSize = content.size();
     if (state() != kReceiving ||
         m_receivedSize > m_expectedSize ||
         contentSize > m_expectedSize - m_receivedSize) {
-        return false;
-    }
-    if (!m_digest || !m_digest->update(content.data(), contentSize)) {
-        return false;
+        return kAppendFailed;
     }
 
+    bool applyBackpressure = false;
     if (m_asyncState) {
-        std::lock_guard<std::mutex> lock(m_asyncState->mutex);
-        if (m_asyncState->failed || m_asyncState->cancelRequested ||
-            m_asyncState->finishRequested ||
-            contentSize > m_asyncState->queueLimit - m_asyncState->queuedBytes) {
-            return false;
+        {
+            std::lock_guard<std::mutex> lock(m_asyncState->mutex);
+            if (m_asyncState->failed || m_asyncState->cancelRequested ||
+                m_asyncState->finishRequested ||
+                contentSize > kMaxAsyncChunkSize ||
+                contentSize > m_asyncState->queueLimit - m_asyncState->queuedBytes) {
+                return kAppendFailed;
+            }
+            try {
+                m_asyncState->chunks.push_back(std::string());
+            }
+            catch (const std::exception&) {
+                return kAppendFailed;
+            }
+            if (!m_digest || !m_digest->update(content.data(), contentSize)) {
+                m_asyncState->chunks.pop_back();
+                return kAppendFailed;
+            }
+            m_asyncState->chunks.back().swap(content);
+            m_asyncState->queuedBytes += contentSize;
+            const size_t reserve = (std::min)(
+                m_asyncState->queueLimit, kMaxAsyncChunkSize);
+            applyBackpressure =
+                m_asyncState->queuedBytes >= m_asyncState->queueLimit - reserve;
         }
-        try {
-            m_asyncState->chunks.push_back(std::move(content));
-        }
-        catch (const std::exception&) {
-            return false;
-        }
-        m_asyncState->queuedBytes += contentSize;
         m_asyncState->wake.notify_one();
     }
     else {
@@ -300,12 +375,14 @@ FileReceiveSession::append(std::string content)
             m_data.append(content);
         }
         catch (const std::exception&) {
-            return false;
+            return kAppendFailed;
+        }
+        if (!m_digest || !m_digest->update(content.data(), contentSize)) {
+            return kAppendFailed;
         }
     }
-
     m_receivedSize += contentSize;
-    return true;
+    return applyBackpressure ? kAppendBackpressure : kAppendQueued;
 }
 
 bool
@@ -374,6 +451,27 @@ FileReceiveSession::spoolOpenCount() const
     return m_asyncState->spoolOpenCount;
 }
 
+bool
+FileReceiveSession::workerCleanupPending() const
+{
+    return m_retiredWorkerBlocksBegin && retiredWorkerPending();
+}
+
+bool
+FileReceiveSession::retiredWorkerPending() const
+{
+    return m_retiredWorkerReaped &&
+        !m_retiredWorkerReaped->load(std::memory_order_acquire);
+}
+
+void
+FileReceiveSession::quarantineRetiredWorkerCleanup()
+{
+    // The retired worker owns only its detached AsyncState. Once it has been
+    // handed to SpoolWorkerReaper it cannot mutate a subsequent session.
+    m_retiredWorkerBlocksBegin = false;
+}
+
 barrier::fs::path
 FileReceiveSession::spoolPath() const
 {
@@ -385,24 +483,34 @@ FileReceiveSession::spoolPath() const
 }
 
 void
-FileReceiveSession::runSpoolWorker(const std::shared_ptr<AsyncState>& state)
+FileReceiveSession::runSpoolWorker(
+    const std::shared_ptr<AsyncState>& state) noexcept
 {
     struct CompletionGuard {
-        explicit CompletionGuard(const std::shared_ptr<std::atomic<bool> >& done) :
-            m_done(done)
+        CompletionGuard(
+            const std::shared_ptr<std::atomic<bool> >& done,
+            const std::shared_ptr<std::atomic<bool> >& exitGate) :
+            m_done(done),
+            m_exitGate(exitGate)
         {
         }
         ~CompletionGuard()
         {
+            while (m_exitGate &&
+                   !m_exitGate->load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             m_done->store(true, std::memory_order_release);
         }
         std::shared_ptr<std::atomic<bool> > m_done;
-    } completion(state->workerDone);
+        std::shared_ptr<std::atomic<bool> > m_exitGate;
+    } completion(state->workerDone, state->workerExitGateForTest);
 
     barrier::fs::path spoolPath;
     std::ofstream spool;
     bool keepSpool = false;
 
+    try {
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (state->cancelRequested) {
@@ -412,9 +520,15 @@ FileReceiveSession::runSpoolWorker(const std::shared_ptr<AsyncState>& state)
 
     if (!barrier::create_secure_temp_file(
             "weave-receive-", ".part", spoolPath)) {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->failed = true;
-        state->wake.notify_all();
+        std::function<void()> resume;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->failed = true;
+            resume.swap(state->backpressureResume);
+            state->pauseProgress = std::function<void()>();
+            state->wake.notify_all();
+        }
+        invokeNoexcept(resume);
         return;
     }
 
@@ -436,12 +550,16 @@ FileReceiveSession::runSpoolWorker(const std::shared_ptr<AsyncState>& state)
     barrier::open_utf8_path(
         spool, spoolPath, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!spool.is_open()) {
+        std::function<void()> resume;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->failed = true;
             state->spoolPath.clear();
+            resume.swap(state->backpressureResume);
+            state->pauseProgress = std::function<void()>();
             state->wake.notify_all();
         }
+        invokeNoexcept(resume);
         removeSpoolFile(spoolPath);
         return;
     }
@@ -454,6 +572,7 @@ FileReceiveSession::runSpoolWorker(const std::shared_ptr<AsyncState>& state)
 
     for (;;) {
         std::string chunk;
+        std::function<void()> resume;
         bool finish = false;
         bool cancel = false;
         {
@@ -467,11 +586,18 @@ FileReceiveSession::runSpoolWorker(const std::shared_ptr<AsyncState>& state)
                 chunk.swap(state->chunks.front());
                 state->chunks.pop_front();
                 state->queuedBytes -= chunk.size();
+                if (state->backpressureResume &&
+                    state->queuedBytes <= state->queueLimit / 2) {
+                    resume.swap(state->backpressureResume);
+                    state->pauseProgress = std::function<void()>();
+                }
             }
             else if (!cancel && state->finishRequested) {
                 finish = true;
             }
         }
+
+        invokeNoexcept(resume);
 
         if (cancel) {
             break;
@@ -479,13 +605,29 @@ FileReceiveSession::runSpoolWorker(const std::shared_ptr<AsyncState>& state)
         if (!chunk.empty()) {
             spool.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
             if (spool.fail()) {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->failed = true;
-                state->wake.notify_all();
+                std::function<void()> failedResume;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->failed = true;
+                    failedResume.swap(state->backpressureResume);
+                    state->pauseProgress = std::function<void()>();
+                    state->wake.notify_all();
+                }
+                invokeNoexcept(failedResume);
                 break;
             }
-            std::lock_guard<std::mutex> lock(state->mutex);
-            state->writtenBytes += chunk.size();
+            std::function<void()> progress;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->writtenBytes += chunk.size();
+                try {
+                    progress = state->pauseProgress;
+                }
+                catch (...) {
+                    progress = std::function<void()>();
+                }
+            }
+            invokeNoexcept(progress);
             continue;
         }
         if (!finish) {
@@ -525,6 +667,25 @@ FileReceiveSession::runSpoolWorker(const std::shared_ptr<AsyncState>& state)
     if (!keepSpool) {
         removeSpoolFile(spoolPath);
     }
+    }
+    catch (...) {
+        if (spool.is_open()) {
+            spool.close();
+        }
+        std::function<void()> resume;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->failed = true;
+            state->complete = false;
+            state->spoolOpen = false;
+            state->spoolPath.clear();
+            resume.swap(state->backpressureResume);
+            state->pauseProgress = std::function<void()>();
+            state->wake.notify_all();
+        }
+        invokeNoexcept(resume);
+        removeSpoolFile(spoolPath);
+    }
 }
 
 void
@@ -533,6 +694,16 @@ FileReceiveSession::fail()
     clearPayload();
     advanceGeneration();
     m_state = kFailed;
+    resolveCommitBarrier();
+}
+
+void
+FileReceiveSession::discardRemaining()
+{
+    clearPayload();
+    advanceGeneration();
+    m_state = kDiscarding;
+    resolveCommitBarrier();
 }
 
 void
@@ -541,6 +712,59 @@ FileReceiveSession::reset()
     clearPayload();
     advanceGeneration();
     m_state = kIdle;
+    resolveCommitBarrier();
+}
+
+bool
+FileReceiveSession::installCommitBarrier(
+    std::uint64_t generation, const std::function<void()>& commit,
+    const std::function<void()>& progress)
+{
+    const State currentState = state();
+    if (!commit || generation == 0 || generation != m_generation ||
+        (currentState != kFinalizing && currentState != kComplete) ||
+        m_commitBarrier) {
+        return false;
+    }
+    m_commitBarrier = commit;
+    if (m_asyncState) {
+        std::lock_guard<std::mutex> lock(m_asyncState->mutex);
+        m_asyncState->pauseProgress = progress;
+    }
+    return true;
+}
+
+bool
+FileReceiveSession::installBackpressureBarrier(
+    std::uint64_t generation, const std::function<void()>& resume,
+    const std::function<void()>& progress)
+{
+    if (!resume || generation == 0 || generation != m_generation ||
+        m_state != kReceiving || !m_asyncState) {
+        return false;
+    }
+
+    bool resumeImmediately = false;
+    {
+        std::lock_guard<std::mutex> lock(m_asyncState->mutex);
+        if (m_asyncState->failed || m_asyncState->cancelRequested ||
+            m_asyncState->finishRequested ||
+            m_asyncState->backpressureResume) {
+            return false;
+        }
+        if (m_asyncState->queuedBytes <= m_asyncState->queueLimit / 2) {
+            resumeImmediately = true;
+        }
+        else {
+            m_asyncState->backpressureResume = resume;
+            m_asyncState->pauseProgress = progress;
+        }
+    }
+
+    if (resumeImmediately) {
+        invokeNoexcept(resume);
+    }
+    return true;
 }
 
 void
@@ -564,7 +788,13 @@ FileReceiveSession::takeCompleted(std::string& data,
             m_asyncState->pathTransferred = true;
         }
         m_asyncState->wake.notify_one();
-        retireSpoolWorker(m_spoolWorker, m_asyncState->workerDone);
+        if (workerCleanupPending()) {
+            barrier::terminateProcessForFinalThreadShutdown();
+        }
+        m_retiredWorkerReaped = m_asyncState->workerReaped;
+        m_retiredWorkerBlocksBegin = false;
+        retireSpoolWorker(m_spoolWorker, m_asyncState->workerDone,
+                          m_asyncState->workerReaped);
         m_asyncState.reset();
         m_spoolWorker = NULL;
     }
@@ -575,6 +805,26 @@ FileReceiveSession::takeCompleted(std::string& data,
     m_receivedSize = 0;
     advanceGeneration();
     m_state = kIdle;
+    resolveCommitBarrier();
+}
+
+void
+FileReceiveSession::resolveCommitBarrier() noexcept
+{
+    std::function<void()> commit;
+    commit.swap(m_commitBarrier);
+    if (m_asyncState) {
+        std::lock_guard<std::mutex> lock(m_asyncState->mutex);
+        m_asyncState->pauseProgress = std::function<void()>();
+    }
+    if (commit) {
+        try {
+            commit();
+        }
+        catch (...) {
+            // The payload is already committed; session teardown must not throw.
+        }
+    }
 }
 
 void
@@ -592,19 +842,48 @@ FileReceiveSession::cancelSpoolWorker()
     if (m_asyncState) {
         const std::shared_ptr<std::atomic<bool> > workerDone =
             m_asyncState->workerDone;
+        std::function<void()> resume;
         {
             std::lock_guard<std::mutex> lock(m_asyncState->mutex);
             m_asyncState->cancelRequested = true;
+            resume.swap(m_asyncState->backpressureResume);
+            m_asyncState->pauseProgress = std::function<void()>();
         }
         m_asyncState->wake.notify_one();
-        retireSpoolWorker(m_spoolWorker, workerDone);
+        invokeNoexcept(resume);
+        if (workerCleanupPending()) {
+            barrier::terminateProcessForFinalThreadShutdown();
+        }
+        m_retiredWorkerReaped = m_asyncState->workerReaped;
+        m_retiredWorkerBlocksBegin = true;
+        retireSpoolWorker(m_spoolWorker, workerDone,
+                          m_asyncState->workerReaped);
         m_asyncState.reset();
     }
     else if (m_spoolWorker != NULL) {
-        m_spoolWorker->detach();
-        delete m_spoolWorker;
+        barrier::terminateProcessForFinalThreadShutdown();
     }
     m_spoolWorker = NULL;
+}
+
+bool
+FileReceiveSession::releaseCompletedWorkerCleanup()
+{
+    if (!m_retiredWorkerReaped) {
+        return true;
+    }
+    if (!m_retiredWorkerBlocksBegin) {
+        if (m_retiredWorkerReaped->load(std::memory_order_acquire)) {
+            m_retiredWorkerReaped.reset();
+        }
+        return true;
+    }
+    if (!m_retiredWorkerReaped->load(std::memory_order_acquire)) {
+        return false;
+    }
+    m_retiredWorkerReaped.reset();
+    m_retiredWorkerBlocksBegin = false;
+    return true;
 }
 
 void

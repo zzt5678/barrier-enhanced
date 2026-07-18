@@ -1,10 +1,10 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
-<Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProductVersion>3.10</ProductVersion>
-        <ProjectGuid>{d4ba9f39-6a35-4c8f-9cb2-67fcbe5cab17}</ProjectGuid>
+        <ProjectGuid>{FFA33E8C-6E81-49D6-A118-A46CAC8E1DA0}</ProjectGuid>
         <SchemaVersion>2.0</SchemaVersion>
-        <OutputName>Barrier</OutputName>
+        <OutputName>Weave</OutputName>
         <OutputType>Package</OutputType>
         <WixTargetsPath Condition=" '$(WixTargetsPath)' == '' AND '$(MSBuildExtensionsPath32)' != '' ">$(MSBuildExtensionsPath32)\Microsoft\WiX\v3.x\Wix.targets</WixTargetsPath>
         <WixTargetsPath Condition=" '$(WixTargetsPath)' == '' ">$(MSBuildExtensionsPath)\Microsoft\WiX\v3.x\Wix.targets</WixTargetsPath>

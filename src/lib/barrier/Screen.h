@@ -27,6 +27,7 @@
 #include "base/String.h"
 
 #include <cstdint>
+#include <memory>
 
 class IClipboard;
 class IPlatformScreen;
@@ -45,7 +46,18 @@ public:
     virtual ~Screen();
 
 #ifdef BARRIER_TEST_ENV
-    Screen() : m_mock(true) { }
+    Screen() :
+        m_screen(nullptr),
+        m_isPrimary(false),
+        m_enabled(false),
+        m_entered(false),
+        m_screenSaverSync(false),
+        m_halfDuplex(0),
+        m_fakeInput(false),
+        m_events(nullptr),
+        m_mock(true),
+        m_enableDragDrop(false)
+    { }
 #endif
 
     //! @name manipulators
@@ -61,6 +73,9 @@ public:
 
     //! Prepare the platform input backend without enabling clipboard/network state.
     bool                prepareInputBackend();
+
+    //! Probe platform input access without activating hooks or cursor capture.
+    bool                probeInputBackend(std::string& desktopName) const;
 
     //! Deactivate screen
     /*!
@@ -104,6 +119,16 @@ public:
     soon after an enter().
     */
     void                setClipboard(ClipboardID, const IClipboard*);
+    virtual bool        setClipboardChecked(
+                            ClipboardID, const IClipboard*);
+    virtual bool        setClipboardSnapshot(
+                            ClipboardID,
+                            const std::shared_ptr<const String>& data);
+    virtual bool        setClipboardSnapshot(
+                            ClipboardID,
+                            const std::shared_ptr<const String>& data,
+                            std::uint64_t publicationId);
+    virtual bool        hasAsyncClipboardPublications() const;
 
     //! Grab clipboard
     /*!
@@ -315,6 +340,10 @@ public:
     // IScreen overrides
     virtual void*        getEventTarget() const;
     virtual bool        getClipboard(ClipboardID id, IClipboard*) const;
+    virtual bool        getClipboardSnapshot(
+                            ClipboardID id,
+                            std::shared_ptr<const String>* data,
+                            UInt32* snapshotTime) const;
     virtual void        getShape(SInt32& x, SInt32& y,
                             SInt32& width, SInt32& height) const;
     virtual void        getCursorPos(SInt32& x, SInt32& y) const;

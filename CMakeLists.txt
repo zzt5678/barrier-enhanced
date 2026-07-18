@@ -36,6 +36,13 @@ endif()
 
 include (cmake/Version.cmake)
 include (cmake/Package.cmake)
+include (cmake/ProductIdentity.cmake.in)
+
+file (MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/src/lib/common")
+configure_file (
+    "${CMAKE_CURRENT_SOURCE_DIR}/res/ProductIdentity.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/src/lib/common/ProductIdentity.h"
+    @ONLY)
 
 # TODO: Find out why we need these, and remove them
 if (COMMAND cmake_policy)
@@ -461,6 +468,15 @@ endif()
 #
 if (${CMAKE_SYSTEM_NAME} MATCHES "Windows")
         set (BARRIER_WIX_VERSION "${BARRIER_VERSION_MAJOR}.${BARRIER_VERSION_MINOR}.${BARRIER_VERSION_PATCH}")
+        set (WEAVE_VC_REDIST_MAJOR_VERSION 14)
+        if (MSVC AND MSVC_VERSION GREATER_EQUAL 1900)
+            math (EXPR WEAVE_VC_REDIST_MINOR_VERSION "${MSVC_VERSION} - 1900")
+            set (WEAVE_VC_REDIST_MIN_VERSION
+                 "14.${WEAVE_VC_REDIST_MINOR_VERSION}.0.0")
+        else()
+            set (WEAVE_VC_REDIST_MINOR_VERSION 40)
+            set (WEAVE_VC_REDIST_MIN_VERSION "14.40.0.0")
+        endif()
         message (STATUS "Configuring the wix installer")
         configure_files (${CMAKE_CURRENT_SOURCE_DIR}/dist/wix ${CMAKE_BINARY_DIR}/installer-wix)
         message (STATUS "Configuring the inno installer")
@@ -482,6 +498,27 @@ endif()
 
 if (BARRIER_BUILD_TESTS)
     enable_testing()
+
+    set (WEAVE_PRODUCT_IDENTITY_TEST_DIR
+         "${CMAKE_CURRENT_BINARY_DIR}/product-identity-golden")
+    file (MAKE_DIRECTORY "${WEAVE_PRODUCT_IDENTITY_TEST_DIR}")
+    configure_file (
+        "${CMAKE_CURRENT_SOURCE_DIR}/dist/inno/barrier.iss.in"
+        "${WEAVE_PRODUCT_IDENTITY_TEST_DIR}/weave.iss"
+        @ONLY)
+    add_test (
+        NAME product_identity_golden
+        COMMAND ${CMAKE_COMMAND}
+            -DPRODUCT_IDENTITY_HEADER=${CMAKE_CURRENT_BINARY_DIR}/src/lib/common/ProductIdentity.h
+            -DINNO_SCRIPT=${WEAVE_PRODUCT_IDENTITY_TEST_DIR}/weave.iss
+            -DBINARY_ROOT=${CMAKE_CURRENT_BINARY_DIR}
+            -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/src/test/ProductIdentityGoldenTest.cmake.in)
+    add_test (
+        NAME windows_release_policy
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsReleasePolicyTest.cmake.in)
 endif()
 
 add_subdirectory (src)

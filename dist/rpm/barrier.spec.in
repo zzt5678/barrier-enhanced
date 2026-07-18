@@ -1,12 +1,13 @@
+# Internal barrier/synergy build identifiers are retained for source compatibility.
 %global barrier_revision @BARRIER_REVISION@
-Summary: Keyboard and mouse sharing solution
+Summary: @WEAVE_PRODUCT_NAME@ keyboard, mouse, and clipboard sharing
 Name: weave
 Version: @BARRIER_VERSION@
 Release: @BARRIER_BUILD_NUMBER@%{?dist}
 License: GPLv2
 Group: System Environment/Daemons
-URL: https://github.com/debauchee/barrier
-Source0: https://github.com/debauchee/barrier/archive/v%{version}.tar.gz
+URL: @WEAVE_PROJECT_URL@
+Source0: @WEAVE_PROJECT_URL@/archive/v%{version}.tar.gz
 
 BuildRequires: cmake3
 BuildRequires: avahi-compat-libdns_sd-devel
@@ -18,11 +19,13 @@ BuildRequires: desktop-file-utils
 BuildRequires: openssl-devel
 
 %description
-Barrier allows you to share one mouse and keyboard between multiple computers.
-Work seamlessly across Windows, macOS and Linux.
+@WEAVE_PRODUCT_NAME@ shares one keyboard, mouse, and clipboard across trusted computers.
+Move the pointer across a configured screen edge to control another computer
+while each computer continues using its own display.
 
 %prep
-%setup -q -n %{name}-%{version}
+# GitHub archives retain the barrier-enhanced repository directory name.
+%setup -q -n barrier-enhanced-%{version}
 
 
 %build
@@ -34,6 +37,7 @@ make %{?_smp_mflags}
 install -D -p -m 0755 bin/weave %{buildroot}%{_bindir}/weave
 install -D -p -m 0755 bin/weavec %{buildroot}%{_bindir}/weavec
 install -D -p -m 0755 bin/weaves %{buildroot}%{_bindir}/weaves
+# Source assets retain legacy barrier filenames; installed files use Weave names.
 install -D -p -m 0644 doc/barrierc.1 %{buildroot}%{_mandir}/man1/weavec.1
 install -D -p -m 0644 doc/barriers.1 %{buildroot}%{_mandir}/man1/weaves.1
 install -D -p -m 0644 res/barrier.desktop %{buildroot}%{_datadir}/applications/weave.desktop
@@ -50,19 +54,20 @@ cat <<END> %{buildroot}%{_datadir}/metainfo/%{name}.appdata.xml
   <id>%{name}</id>
   <metadata_license>FSFAP</metadata_license>
   <project_license>GPLv2</project_license>
-  <name>weave</name>
-  <summary>Share mouse and keyboard between multiple computers over the network</summary>
+  <name>@WEAVE_PRODUCT_NAME@</name>
+  <summary>Share one keyboard, mouse, and clipboard across trusted computers</summary>
 
   <description>
     <p>
-      Barrier allows you to share one mouse and keyboard between multiple computers.
-      Work seamlessly across Windows, macOS and Linux.
+      @WEAVE_PRODUCT_NAME@ shares one keyboard, mouse, and clipboard across trusted computers.
+      Move the pointer across a configured screen edge to control another computer
+      while each computer continues using its own display.
     </p>
   </description>
 
   <launchable type="desktop-id">%{name}.desktop</launchable>
 
-  <url type="homepage">https://github.com/debauchee/barrier</url>
+  <url type="homepage">@WEAVE_PROJECT_URL@</url>
 
   <provides>
     <binary>weave</binary>
@@ -70,9 +75,6 @@ cat <<END> %{buildroot}%{_datadir}/metainfo/%{name}.appdata.xml
     <binary>weaves</binary>
   </provides>
 
-  <releases>
-    <release version="%{version}" date="2019-03-21" />
-  </releases>
 </component>
 END
 
@@ -86,6 +88,7 @@ desktop-file-validate %{buildroot}/%{_datadir}/applications/weave.desktop
 %files
 # None of the documentation files are actually useful here, they all point to
 # the online website, so include just one, the README
+# The example config retains its legacy source filename for compatibility.
 %doc LICENSE ChangeLog res/Readme.txt doc/barrier.conf.example*
 %{_bindir}/weave
 %{_bindir}/weavec

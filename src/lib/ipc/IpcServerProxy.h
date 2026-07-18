@@ -21,10 +21,15 @@
 #include "base/Event.h"
 #include "base/EventTypes.h"
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
 namespace barrier { class IStream; }
 class IpcMessage;
 class IpcLogLineMessage;
 class IpcInputReadyQueryMessage;
+class IpcActivateNodeMessage;
 class IEventQueue;
 
 class IpcServerProxy {
@@ -42,8 +47,12 @@ private:
     void                send(const IpcMessage& message);
 
     void                handleData(const Event&, void*);
-    IpcLogLineMessage*    parseLogLine();
-    IpcInputReadyQueryMessage* parseInputReadyQuery();
+    IpcMessage*         parseBufferedMessage();
+    IpcLogLineMessage*    parseLogLine(const std::string& logLine);
+    IpcInputReadyQueryMessage* parseInputReadyQuery(
+                            std::uint64_t queryNonce);
+    IpcActivateNodeMessage* parseActivateNode(
+                            std::uint64_t activationNonce);
     void                disconnect();
 
 #if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
@@ -53,4 +62,6 @@ private:
 #endif
     barrier::IStream&    m_stream;
     IEventQueue*        m_events;
+    std::vector<UInt8>  m_receiveBuffer;
+    bool                m_disconnected;
 };

@@ -302,16 +302,19 @@ std::string archivePathKey(const barrier::fs::path& relativePath)
     return key;
 }
 
-#if defined(WINAPI_MSWINDOWS)
 bool isReservedWindowsName(const std::string& component)
 {
     const std::size_t extension = component.find('.');
     std::string base = component.substr(0, extension);
+    while (!base.empty() && (base.back() == '.' || base.back() == ' ')) {
+        base.pop_back();
+    }
     std::transform(base.begin(), base.end(), base.begin(), [](unsigned char value) {
         return static_cast<char>(std::toupper(value));
     });
 
-    if (base == "CON" || base == "PRN" || base == "AUX" || base == "NUL") {
+    if (base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" ||
+        base == "CONIN$" || base == "CONOUT$" || base == "CLOCK$") {
         return true;
     }
     if (base.size() == 4 && base[3] >= '1' && base[3] <= '9') {
@@ -324,21 +327,12 @@ bool isSafeWindowsPath(const barrier::fs::path& relativePath)
 {
     for (const auto& part : relativePath) {
         const std::string component = part.u8string();
-        if (component.empty() || component.back() == '.' || component.back() == ' ' ||
-            isReservedWindowsName(component)) {
+        if (!TransferArchive::isSafePortablePathComponent(component)) {
             return false;
-        }
-
-        for (unsigned char value : component) {
-            if (value < 32 || value == '<' || value == '>' || value == ':' ||
-                value == '"' || value == '|' || value == '?' || value == '*') {
-                return false;
-            }
         }
     }
     return true;
 }
-#endif
 
 bool validateEntryPath(const std::string& relativeUtf8,
                        char type,
@@ -748,6 +742,28 @@ bool appendFile(std::ofstream& output,
 }
 
 } // namespace
+
+bool
+TransferArchive::isSafePortablePathComponent(const std::string& component)
+{
+    if (component.empty() || component == "." || component == ".." ||
+        component.size() > 255 || !Unicode::isUTF8(component) ||
+        component.find('\0') != std::string::npos ||
+        component.find('/') != std::string::npos ||
+        component.find('\\') != std::string::npos ||
+        component.back() == '.' || component.back() == ' ' ||
+        isReservedWindowsName(component)) {
+        return false;
+    }
+
+    for (unsigned char value : component) {
+        if (value < 32 || value == '<' || value == '>' || value == ':' ||
+            value == '"' || value == '|' || value == '?' || value == '*') {
+            return false;
+        }
+    }
+    return true;
+}
 
 bool
 TransferArchive::isPackageData(const std::string& data)

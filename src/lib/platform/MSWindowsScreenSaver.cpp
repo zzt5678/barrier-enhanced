@@ -20,7 +20,9 @@
 
 #include "platform/MSWindowsScreen.h"
 #include "mt/Thread.h"
+#include "mt/ThreadShutdown.h"
 #include "arch/Arch.h"
+#include "arch/XArch.h"
 #include "arch/win32/ArchMiscWindows.h"
 #include "base/Log.h"
 
@@ -38,6 +40,28 @@ static const TCHAR* const g_pathScreenSaverIsSecure[] = {
     "Desktop",
     NULL
 };
+
+namespace {
+
+class ScopedRegistryKey {
+public:
+    explicit ScopedRegistryKey(HKEY key) : m_key(key) { }
+    ~ScopedRegistryKey()
+    {
+        if (m_key != NULL) {
+            ArchMiscWindows::closeKey(m_key);
+        }
+    }
+
+    HKEY get() const { return m_key; }
+
+private:
+    ScopedRegistryKey(const ScopedRegistryKey&);
+    ScopedRegistryKey& operator=(const ScopedRegistryKey&);
+    HKEY m_key;
+};
+
+} // namespace
 
 //
 // MSWindowsScreenSaver
@@ -245,8 +269,16 @@ MSWindowsScreenSaver::unwatchProcess()
 {
     if (m_watch != NULL) {
         LOG((CLOG_DEBUG "stopped watching screen saver process/desktop"));
-        m_watch->cancel();
-        m_watch->wait();
+        if (!m_watch->wait(0.0)) {
+            m_watch->cancel();
+            m_watch->unblockPollSocket();
+            barrier::waitForFinalThreadShutdown(
+                "Windows screen saver watcher",
+                barrier::kFinalThreadShutdownDeadlineSeconds,
+                [this](double timeout) {
+                    return m_watch->wait(timeout);
+                });
+        }
         delete m_watch;
         m_watch  = NULL;
         m_active = false;
@@ -303,15 +335,22 @@ MSWindowsScreenSaver::setSecure(bool secure, bool saveSecureAsInt)
     if (hkey == NULL) {
         return;
     }
+    ScopedRegistryKey registryKey(hkey);
 
-    if (saveSecureAsInt) {
-        ArchMiscWindows::setValue(hkey, g_isSecureNT, secure ? 1 : 0);
+    try {
+        if (saveSecureAsInt) {
+            ArchMiscWindows::setValue(
+                registryKey.get(), g_isSecureNT, secure ? 1 : 0);
+        }
+        else {
+            ArchMiscWindows::setValue(
+                registryKey.get(), g_isSecureNT, secure ? "1" : "0");
+        }
     }
-    else {
-        ArchMiscWindows::setValue(hkey, g_isSecureNT, secure ? "1" : "0");
+    catch (const XArch& error) {
+        LOG((CLOG_WARN "unable to update screen saver security setting: %s",
+             error.what()));
     }
-
-    ArchMiscWindows::closeKey(hkey);
 }
 
 bool

@@ -7,7 +7,9 @@
 #include "test/global/TestEventQueue.h"
 #include "test/global/gtest.h"
 
+#include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -114,10 +116,115 @@ public:
         return getOutputWriteSizeNoLock(m_lowPriorityOutputBuffer);
     }
 
+    void completeHighPriorityWrite(UInt32 bytes)
+    {
+        Lock lock(&getMutex());
+        discardWrittenData(m_outputBuffer, static_cast<int>(bytes));
+    }
+
     bool connected() const
     {
         return m_connected;
     }
+};
+
+class RecordingEventQueue : public TestEventQueue {
+public:
+    void addEvent(const Event& event) override
+    {
+        m_types.push_back(event.getType());
+        TestEventQueue::addEvent(event);
+    }
+
+    size_t count(Event::Type type) const
+    {
+        size_t result = 0;
+        for (std::vector<Event::Type>::const_iterator i = m_types.begin();
+             i != m_types.end(); ++i) {
+            if (*i == type) {
+                ++result;
+            }
+        }
+        return result;
+    }
+
+    size_t firstIndex(Event::Type type) const
+    {
+        for (size_t i = 0; i < m_types.size(); ++i) {
+            if (m_types[i] == type) {
+                return i;
+            }
+        }
+        return m_types.size();
+    }
+
+private:
+    std::vector<Event::Type> m_types;
+};
+
+class ScriptedReadTCPSocket : public TCPSocket {
+public:
+    enum Script {
+        kImmediateTransient,
+        kPayloadThenTransient,
+        kPayloadThenEof,
+        kImmediateEof,
+    };
+
+    ScriptedReadTCPSocket(IEventQueue* events,
+                          SocketMultiplexer* multiplexer,
+                          Script script) :
+        TCPSocket(events, multiplexer, IArchNetwork::kINET),
+        m_script(script),
+        m_readCount(0)
+    {
+        m_connected = true;
+        m_readable = true;
+        m_writable = true;
+    }
+
+    bool readWantsRetry()
+    {
+        return doRead() == kRetry;
+    }
+
+    bool connected() const
+    {
+        return m_connected;
+    }
+
+    bool readable() const
+    {
+        return m_readable;
+    }
+
+protected:
+    size_t readSocketNoLock(void* buffer, size_t size) override
+    {
+        const int readCount = m_readCount++;
+        if (m_script == kImmediateTransient ||
+            (m_script == kPayloadThenTransient && readCount > 0)) {
+            throw XArchNetworkInterrupted("socket read would block");
+        }
+        if (m_script == kImmediateEof ||
+            (m_script == kPayloadThenEof && readCount > 0)) {
+            return 0;
+        }
+        if (readCount == 0) {
+            const char payload[] = "abc";
+            const size_t payloadSize = sizeof(payload) - 1;
+            EXPECT_GE(size, payloadSize);
+            std::memcpy(buffer, payload, payloadSize);
+            return payloadSize;
+        }
+
+        ADD_FAILURE() << "unexpected scripted socket read";
+        return 0;
+    }
+
+private:
+    Script m_script;
+    int m_readCount;
 };
 
 }
@@ -207,6 +314,41 @@ TEST(TCPSocketTests, lowPriorityOutputUsesPrimaryFifo)
     EXPECT_TRUE(socket.connected());
 }
 
+TEST(TCPSocketTests, completedWritesAdvanceMonotonicOutputCounter)
+{
+    TestEventQueue events;
+    SocketMultiplexer multiplexer;
+    OutputWindowTCPSocket socket(&events, &multiplexer);
+    const std::string payload("abcdefgh");
+
+    EXPECT_EQ(0u, socket.getOutputBytesWritten());
+
+    socket.write(payload.data(), static_cast<UInt32>(payload.size()));
+    socket.completeHighPriorityWrite(3u);
+    EXPECT_EQ(3u, socket.getOutputBytesWritten());
+
+    socket.completeHighPriorityWrite(5u);
+    EXPECT_EQ(8u, socket.getOutputBytesWritten());
+}
+
+TEST(TCPSocketTests, queuedInputAdvancesMonotonicReceiveCounter)
+{
+    TestEventQueue events;
+    SocketMultiplexer multiplexer;
+    InputBackpressureTCPSocket socket(&events, &multiplexer);
+
+    EXPECT_EQ(0u, socket.getInputBytesReceived());
+
+    ASSERT_TRUE(socket.queueInputBytes(3));
+    EXPECT_EQ(3u, socket.getInputBytesReceived());
+
+    EXPECT_EQ(2u, socket.read(nullptr, 2));
+    EXPECT_EQ(3u, socket.getInputBytesReceived());
+
+    ASSERT_TRUE(socket.queueInputBytes(5));
+    EXPECT_EQ(8u, socket.getInputBytesReceived());
+}
+
 TEST(TCPSocketTests, highPriorityOutputWriteSizeIsNotCappedByLowPriorityWindow)
 {
     TestEventQueue events;
@@ -293,4 +435,81 @@ TEST(TCPSocketTests, inputBackpressureResumesReadRegistrationAfterDrainingToLowW
 
     EXPECT_NE(nullptr, socket.newJob().get());
     EXPECT_TRUE(socket.connected());
+}
+
+TEST(TCPSocketTests, transientReadAfterPayloadKeepsConnectionAndBufferedInput)
+{
+    RecordingEventQueue events;
+    SocketMultiplexer multiplexer;
+    ScriptedReadTCPSocket socket(
+        &events, &multiplexer,
+        ScriptedReadTCPSocket::kPayloadThenTransient);
+    const Event::Type inputReady = events.forIStream().inputReady();
+    const Event::Type inputShutdown = events.forIStream().inputShutdown();
+
+    EXPECT_TRUE(socket.readWantsRetry());
+    EXPECT_TRUE(socket.connected());
+    EXPECT_TRUE(socket.readable());
+    EXPECT_EQ(1u, events.count(inputReady));
+    EXPECT_EQ(0u, events.count(inputShutdown));
+    ASSERT_EQ(3u, socket.getSize());
+
+    char payload[3] = {};
+    EXPECT_EQ(3u, socket.read(payload, sizeof(payload)));
+    EXPECT_EQ("abc", std::string(payload, sizeof(payload)));
+}
+
+TEST(TCPSocketTests, transientReadBeforePayloadKeepsConnectionOpen)
+{
+    RecordingEventQueue events;
+    SocketMultiplexer multiplexer;
+    ScriptedReadTCPSocket socket(
+        &events, &multiplexer,
+        ScriptedReadTCPSocket::kImmediateTransient);
+    const Event::Type inputReady = events.forIStream().inputReady();
+    const Event::Type inputShutdown = events.forIStream().inputShutdown();
+
+    EXPECT_TRUE(socket.readWantsRetry());
+    EXPECT_TRUE(socket.connected());
+    EXPECT_TRUE(socket.readable());
+    EXPECT_EQ(0u, socket.getSize());
+    EXPECT_EQ(0u, events.count(inputReady));
+    EXPECT_EQ(0u, events.count(inputShutdown));
+}
+
+TEST(TCPSocketTests, eofAfterPayloadQueuesDataBeforeInputShutdown)
+{
+    RecordingEventQueue events;
+    SocketMultiplexer multiplexer;
+    ScriptedReadTCPSocket socket(
+        &events, &multiplexer,
+        ScriptedReadTCPSocket::kPayloadThenEof);
+    const Event::Type inputReady = events.forIStream().inputReady();
+    const Event::Type inputShutdown = events.forIStream().inputShutdown();
+
+    EXPECT_FALSE(socket.readWantsRetry());
+    EXPECT_TRUE(socket.connected());
+    EXPECT_FALSE(socket.readable());
+    EXPECT_EQ(3u, socket.getSize());
+    ASSERT_EQ(1u, events.count(inputReady));
+    ASSERT_EQ(1u, events.count(inputShutdown));
+    EXPECT_LT(events.firstIndex(inputReady), events.firstIndex(inputShutdown));
+}
+
+TEST(TCPSocketTests, eofWithoutPayloadSignalsInputShutdown)
+{
+    RecordingEventQueue events;
+    SocketMultiplexer multiplexer;
+    ScriptedReadTCPSocket socket(
+        &events, &multiplexer,
+        ScriptedReadTCPSocket::kImmediateEof);
+    const Event::Type inputReady = events.forIStream().inputReady();
+    const Event::Type inputShutdown = events.forIStream().inputShutdown();
+
+    EXPECT_FALSE(socket.readWantsRetry());
+    EXPECT_TRUE(socket.connected());
+    EXPECT_FALSE(socket.readable());
+    EXPECT_EQ(0u, socket.getSize());
+    EXPECT_EQ(0u, events.count(inputReady));
+    EXPECT_EQ(1u, events.count(inputShutdown));
 }

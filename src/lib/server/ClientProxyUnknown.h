@@ -47,7 +47,8 @@ public:
 
     //! Orphan a successfully authenticated bulk stream.
     barrier::IStream*   orphanBulkStream(std::string& name,
-                                         std::string& token);
+                                         std::string& token,
+                                         std::string& connectionBinding);
 
     //! Get the stream
     barrier::IStream*    getStream() { return m_stream; }
@@ -80,6 +81,7 @@ private:
     HandshakeKind       m_handshakeKind;
     std::string         m_bulkName;
     std::string         m_bulkToken;
+    std::string         m_bulkConnectionBinding;
     Server*                m_server;
     IEventQueue*        m_events;
 };

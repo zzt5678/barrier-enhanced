@@ -201,8 +201,9 @@ public:
     /*!
     Read up to \c len bytes from socket \c s in \c buf and return the
     number of bytes read.  The number of bytes can be less than \c len
-    if not enough data is available.  Returns 0 if the remote end has
-    disconnected and/or there is no more queued received data.
+    if not enough data is available.  Returns 0 only when the remote end
+    has closed its write side.  Throws XArchNetworkInterrupted when a
+    non-blocking read is temporarily unavailable or interrupted.
     */
     virtual size_t        readSocket(ArchSocket s, void* buf, size_t len) = 0;
 

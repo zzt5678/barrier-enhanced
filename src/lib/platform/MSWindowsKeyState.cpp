@@ -20,6 +20,7 @@
 
 #include "platform/MSWindowsDesks.h"
 #include "mt/Thread.h"
+#include "mt/ThreadShutdown.h"
 #include "arch/win32/ArchMiscWindows.h"
 #include "base/Log.h"
 #include "base/String.h"
@@ -803,8 +804,13 @@ MSWindowsKeyState::fakeCtrlAltDel()
 		CloseHandle(hEvtSendSas);
 	}
 	else {
-        Thread cad([this](){ ctrl_alt_del_thread(); });
-		cad.wait();
+        Thread cad([](){ ctrl_alt_del_thread(); });
+        barrier::waitForFinalThreadShutdown(
+            "Windows Ctrl+Alt+Del helper",
+            barrier::kFinalThreadShutdownDeadlineSeconds,
+            [&cad](double timeout) {
+                return cad.wait(timeout);
+            });
 	}
 
 	return true;

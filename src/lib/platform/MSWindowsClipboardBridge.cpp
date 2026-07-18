@@ -14,14 +14,17 @@
 #include "common/win32/SessionUserImpersonation.h"
 #include "platform/MSWindowsClipboard.h"
 
+#include <openssl/rand.h>
+
 #include <Wtsapi32.h>
 #include <UserEnv.h>
 #include <sddl.h>
-#include <wincrypt.h>
 
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #ifndef PIPE_REJECT_REMOTE_CLIENTS
@@ -288,25 +291,33 @@ bool connectOverlapped(HANDLE pipe, std::string* error)
     return true;
 }
 
-std::string randomPipeSuffix()
+bool openSslRandomBytes(unsigned char* bytes, std::size_t size)
 {
+    if (bytes == nullptr ||
+        size > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        return false;
+    }
+    return RAND_bytes(bytes, static_cast<int>(size)) == 1;
+}
+
+bool generatePipeSuffixImpl(
+    std::string& suffix,
+    const MSWindowsClipboardBridgeProtocol::RandomBytesProvider& provider)
+{
+    suffix.clear();
     unsigned char bytes[16];
     ZeroMemory(bytes, sizeof(bytes));
-    HCRYPTPROV provider = 0;
     bool generated = false;
-    if (CryptAcquireContextA(&provider, NULL, NULL, PROV_RSA_FULL,
-                             CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
-        generated = CryptGenRandom(provider, sizeof(bytes), bytes) != FALSE;
-        CryptReleaseContext(provider, 0);
+    try {
+        generated = provider && provider(bytes, sizeof(bytes));
     }
+    catch (...) {
+        generated = false;
+    }
+
     if (!generated) {
-        LARGE_INTEGER counter;
-        QueryPerformanceCounter(&counter);
-        const ULONGLONG fallback =
-            static_cast<ULONGLONG>(counter.QuadPart) ^
-            (static_cast<ULONGLONG>(GetCurrentProcessId()) << 32) ^
-            GetTickCount64();
-        std::memcpy(bytes, &fallback, sizeof(fallback));
+        SecureZeroMemory(bytes, sizeof(bytes));
+        return false;
     }
 
     std::ostringstream stream;
@@ -314,7 +325,8 @@ std::string randomPipeSuffix()
     for (size_t i = 0; i < sizeof(bytes); ++i) {
         stream << std::setw(2) << static_cast<unsigned int>(bytes[i]);
     }
-    return stream.str();
+    suffix = stream.str();
+    return true;
 }
 
 bool getUserSidString(HANDLE token, std::string* sid, std::string* error)
@@ -350,9 +362,20 @@ bool isExpectedPipeName(const std::string& pipeName)
            pipeName.compare(0, sizeof(kPipePrefix) - 1, kPipePrefix) == 0;
 }
 
+std::wstring widenAscii(const std::string& value)
+{
+    return std::wstring(value.begin(), value.end());
+}
+
 } // namespace
 
 namespace MSWindowsClipboardBridgeProtocol {
+
+bool generatePipeSuffix(
+    std::string& suffix, const RandomBytesProvider& provider)
+{
+    return generatePipeSuffixImpl(suffix, provider);
+}
 
 bool validateResponseHeader(const ResponseHeader& header, std::string* error)
 {
@@ -362,7 +385,7 @@ bool validateResponseHeader(const ResponseHeader& header, std::string* error)
         }
         return false;
     }
-    if (header.status > kInvalidRequest) {
+    if (header.status > kRevisionChanged) {
         if (error != NULL) {
             *error = "clipboard helper response has an invalid status";
         }
@@ -374,8 +397,7 @@ bool validateResponseHeader(const ResponseHeader& header, std::string* error)
         }
         return false;
     }
-    if (header.status == kSuccess &&
-        (header.size < 4 || header.size > kMaxSnapshotBytes)) {
+    if (header.status == kSuccess && header.size > kMaxSnapshotBytes) {
         if (error != NULL) {
             *error = "clipboard helper response size is outside the allowed range";
         }
@@ -430,18 +452,110 @@ bool validateSnapshot(const std::string& snapshot, std::string* error)
     return true;
 }
 
+bool isCurrentHelperSession(UInt32 helperSession, UInt32 owningSession)
+{
+    return helperSession != 0xffffffff &&
+        owningSession != 0xffffffff && helperSession == owningSession;
+}
+
+bool isCurrentHelperIdentity(UInt32 helperSession,
+                             const std::string& helperOwnerSid,
+                             UInt32 owningSession,
+                             const std::string& currentOwnerSid,
+                             bool currentSessionActive)
+{
+    return currentSessionActive &&
+        isCurrentHelperSession(helperSession, owningSession) &&
+        !helperOwnerSid.empty() && helperOwnerSid == currentOwnerSid;
+}
+
+UInt32 selectOwningSession(UInt32 nodeSession, UInt32 activeConsoleSession)
+{
+    // The helper is owned by the authenticated node process. Following the
+    // global console session can cross user boundaries before the watchdog
+    // has replaced that node.
+    (void)activeConsoleSession;
+    return nodeSession;
+}
+
 } // namespace MSWindowsClipboardBridgeProtocol
+
+namespace {
+
+bool queryOwningNodeIdentity(DWORD* sessionId, std::string* userSid,
+                             std::string* error)
+{
+    DWORD nodeSession = 0xffffffff;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &nodeSession)) {
+        if (error != NULL) {
+            *error = windowsError("ProcessIdToSessionId", GetLastError());
+        }
+        return false;
+    }
+    nodeSession = MSWindowsClipboardBridgeProtocol::selectOwningSession(
+        nodeSession, WTSGetActiveConsoleSessionId());
+    if (nodeSession == 0xffffffff) {
+        if (error != NULL) {
+            *error = "the Weave node session could not be determined";
+        }
+        return false;
+    }
+
+    LPWSTR rawState = NULL;
+    DWORD stateBytes = 0;
+    if (!WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE, nodeSession, WTSConnectState,
+            &rawState, &stateBytes) || rawState == NULL ||
+        stateBytes < sizeof(WTS_CONNECTSTATE_CLASS)) {
+        if (rawState != NULL) {
+            WTSFreeMemory(rawState);
+        }
+        if (error != NULL) {
+            *error = windowsError("WTSQuerySessionInformation", GetLastError());
+        }
+        return false;
+    }
+    const WTS_CONNECTSTATE_CLASS state =
+        *reinterpret_cast<const WTS_CONNECTSTATE_CLASS*>(rawState);
+    WTSFreeMemory(rawState);
+    if (state != WTSActive) {
+        if (error != NULL) {
+            *error = "the Weave node session is not active";
+        }
+        return false;
+    }
+
+    HANDLE rawSessionToken = NULL;
+    if (!WTSQueryUserToken(nodeSession, &rawSessionToken)) {
+        if (error != NULL) {
+            *error = windowsError("WTSQueryUserToken", GetLastError());
+        }
+        return false;
+    }
+    ScopedHandle sessionToken(rawSessionToken);
+    std::string ownerSid;
+    if (!getUserSidString(sessionToken.get(), &ownerSid, error)) {
+        return false;
+    }
+
+    *sessionId = nodeSession;
+    *userSid = ownerSid;
+    return true;
+}
+
+} // namespace
 
 MSWindowsClipboardBridge::MSWindowsClipboardBridge() :
     m_pipe(INVALID_HANDLE_VALUE),
     m_process(NULL),
     m_processId(0),
     m_sessionId(0xffffffff),
+    m_userSid(),
     m_nextStartAttemptAt(0)
 {
-    static_assert(sizeof(MSWindowsClipboardBridgeProtocol::RequestHeader) == 8,
+    static_assert(sizeof(MSWindowsClipboardBridgeProtocol::RequestHeader) == 12,
                   "clipboard request header layout changed");
-    static_assert(sizeof(MSWindowsClipboardBridgeProtocol::ReadyHeader) == 8,
+    static_assert(sizeof(MSWindowsClipboardBridgeProtocol::ReadyHeader) == 12,
                   "clipboard ready header layout changed");
     static_assert(sizeof(MSWindowsClipboardBridgeProtocol::ResponseHeader) == 12,
                   "clipboard response header layout changed");
@@ -477,9 +591,36 @@ MSWindowsClipboardBridge::readSnapshot(IClipboard* destination,
                                        IClipboard::Time time,
                                        std::string* error)
 {
+    if (destination == NULL) {
+        if (error != NULL) {
+            *error = "clipboard snapshot destination is null";
+        }
+        return ReadResult::Failed;
+    }
+
+    std::string snapshot;
+    const ReadResult result = readSnapshot(&snapshot, error);
+    if (result == ReadResult::Succeeded) {
+        IClipboard::unmarshall(destination, snapshot, time);
+    }
+    return result;
+}
+
+MSWindowsClipboardBridge::ReadResult
+MSWindowsClipboardBridge::readSnapshot(std::string* destination,
+                                       std::string* error)
+{
     if (error != NULL) {
         error->clear();
     }
+    if (destination == NULL) {
+        if (error != NULL) {
+            *error = "clipboard snapshot destination is null";
+        }
+        return ReadResult::Failed;
+    }
+    destination->clear();
+
     bool required = false;
     DWORD identityError = ERROR_SUCCESS;
     if (!SessionUserImpersonation::queryRequired(required, identityError)) {
@@ -498,8 +639,56 @@ MSWindowsClipboardBridge::readSnapshot(IClipboard* destination,
         }
 
         bool connectionFailed = false;
-        if (requestSnapshot(destination, time, &connectionFailed, error)) {
+        if (requestSnapshot(destination, &connectionFailed, error)) {
             return ReadResult::Succeeded;
+        }
+        if (!connectionFailed) {
+            return ReadResult::Failed;
+        }
+        stop();
+    }
+    return ReadResult::Failed;
+}
+
+MSWindowsClipboardBridge::ReadResult
+MSWindowsClipboardBridge::publishSnapshot(const std::string& snapshot,
+                                          UInt32 expectedWindowsSequence,
+                                          UInt32* committedWindowsSequence,
+                                          std::string* error)
+{
+    if (committedWindowsSequence != NULL) {
+        *committedWindowsSequence = 0;
+    }
+    if (!MSWindowsClipboardBridgeProtocol::validateSnapshot(snapshot, error)) {
+        return ReadResult::Failed;
+    }
+
+    bool required = false;
+    DWORD identityError = ERROR_SUCCESS;
+    if (!SessionUserImpersonation::queryRequired(required, identityError)) {
+        if (error != NULL) {
+            *error = windowsError("process identity inspection", identityError);
+        }
+        return ReadResult::Failed;
+    }
+    if (!required) {
+        return ReadResult::NotRequired;
+    }
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!ensureStarted(error)) {
+            return ReadResult::Failed;
+        }
+
+        bool superseded = false;
+        bool connectionFailed = false;
+        if (requestPublish(snapshot, expectedWindowsSequence,
+                           committedWindowsSequence, &superseded,
+                           &connectionFailed, error)) {
+            return ReadResult::Succeeded;
+        }
+        if (superseded) {
+            return ReadResult::Superseded;
         }
         if (!connectionFailed) {
             return ReadResult::Failed;
@@ -514,9 +703,23 @@ bool MSWindowsClipboardBridge::ensureStarted(std::string* error)
     if (error != NULL) {
         error->clear();
     }
+    DWORD owningSessionId = 0xffffffff;
+    std::string owningUserSid;
+    if (!queryOwningNodeIdentity(
+            &owningSessionId, &owningUserSid, error)) {
+        if (isValidHandle(m_pipe) || isValidHandle(m_process)) {
+            stop();
+        }
+        m_nextStartAttemptAt = GetTickCount64() + kStartRetryDelayMs;
+        return false;
+    }
+
     if (isValidHandle(m_pipe) && isValidHandle(m_process)) {
         DWORD exitCode = 0;
-        if (GetExitCodeProcess(m_process, &exitCode) && exitCode == STILL_ACTIVE) {
+        if (GetExitCodeProcess(m_process, &exitCode) &&
+            exitCode == STILL_ACTIVE &&
+            MSWindowsClipboardBridgeProtocol::isCurrentHelperIdentity(
+                m_sessionId, m_userSid, owningSessionId, owningUserSid, true)) {
             return true;
         }
         stop();
@@ -530,14 +733,8 @@ bool MSWindowsClipboardBridge::ensureStarted(std::string* error)
         return false;
     }
 
-    m_sessionId = WTSGetActiveConsoleSessionId();
-    if (m_sessionId == 0xffffffff) {
-        if (error != NULL) {
-            *error = "there is no active console session";
-        }
-        m_nextStartAttemptAt = now + kStartRetryDelayMs;
-        return false;
-    }
+    m_sessionId = owningSessionId;
+    m_userSid = owningUserSid;
 
     HANDLE rawSessionToken = NULL;
     if (!WTSQueryUserToken(m_sessionId, &rawSessionToken)) {
@@ -562,7 +759,11 @@ bool MSWindowsClipboardBridge::ensureStarted(std::string* error)
     ScopedHandle primaryToken(rawPrimaryToken);
 
     std::string userSid;
-    if (!getUserSidString(primaryToken.get(), &userSid, error)) {
+    if (!getUserSidString(primaryToken.get(), &userSid, error) ||
+        userSid != m_userSid) {
+        if (error != NULL && error->empty()) {
+            *error = "the clipboard helper token owner changed during launch";
+        }
         m_nextStartAttemptAt = now + kStartRetryDelayMs;
         return false;
     }
@@ -587,11 +788,21 @@ bool MSWindowsClipboardBridge::ensureStarted(std::string* error)
     security.bInheritHandle = FALSE;
 
     std::ostringstream pipeNameBuilder;
+    std::string pipeSuffix;
+    if (!MSWindowsClipboardBridgeProtocol::generatePipeSuffix(
+            pipeSuffix, openSslRandomBytes)) {
+        if (error != NULL) {
+            *error = "could not generate a secure clipboard helper pipe name";
+        }
+        m_nextStartAttemptAt = now + kStartRetryDelayMs;
+        return false;
+    }
     pipeNameBuilder << kPipePrefix << m_sessionId << "-" << GetCurrentProcessId()
-                    << "-" << randomPipeSuffix();
+                    << "-" << pipeSuffix;
     const std::string pipeName = pipeNameBuilder.str();
-    ScopedHandle pipe(CreateNamedPipeA(
-        pipeName.c_str(),
+    const std::wstring widePipeName = widenAscii(pipeName);
+    ScopedHandle pipe(CreateNamedPipeW(
+        widePipeName.c_str(),
         PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
         1, 64 * 1024, 64 * 1024, 0, &security));
@@ -603,8 +814,8 @@ bool MSWindowsClipboardBridge::ensureStarted(std::string* error)
         return false;
     }
 
-    std::vector<char> modulePath(32768, '\0');
-    const DWORD moduleLength = GetModuleFileNameA(
+    std::vector<wchar_t> modulePath(32768, L'\0');
+    const DWORD moduleLength = GetModuleFileNameW(
         NULL, modulePath.data(), static_cast<DWORD>(modulePath.size()));
     if (moduleLength == 0 || moduleLength >= modulePath.size()) {
         if (error != NULL) {
@@ -614,12 +825,12 @@ bool MSWindowsClipboardBridge::ensureStarted(std::string* error)
         return false;
     }
 
-    std::ostringstream commandBuilder;
-    commandBuilder << '"' << modulePath.data() << '"'
-                   << " --clipboard-helper \"" << pipeName << '"';
-    std::string command = commandBuilder.str();
-    std::vector<char> commandLine(command.begin(), command.end());
-    commandLine.push_back('\0');
+    std::wostringstream commandBuilder;
+    commandBuilder << L'"' << modulePath.data() << L'"'
+                   << L" --clipboard-helper \"" << widePipeName << L'"';
+    const std::wstring command = commandBuilder.str();
+    std::vector<wchar_t> commandLine(command.begin(), command.end());
+    commandLine.push_back(L'\0');
 
     ScopedEnvironmentBlock environment;
     if (!CreateEnvironmentBlock(environment.out(), primaryToken.get(), FALSE)) {
@@ -630,17 +841,17 @@ bool MSWindowsClipboardBridge::ensureStarted(std::string* error)
         return false;
     }
 
-    STARTUPINFOA startup;
+    STARTUPINFOW startup;
     ZeroMemory(&startup, sizeof(startup));
     startup.cb = sizeof(startup);
-    char desktop[] = "winsta0\\Default";
+    wchar_t desktop[] = L"winsta0\\Default";
     startup.lpDesktop = desktop;
 
     PROCESS_INFORMATION processInfo;
     ZeroMemory(&processInfo, sizeof(processInfo));
     const DWORD creationFlags =
         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | NORMAL_PRIORITY_CLASS;
-    if (!CreateProcessAsUserA(
+    if (!CreateProcessAsUserW(
             primaryToken.get(), NULL, commandLine.data(), NULL, NULL, FALSE,
             creationFlags, environment.get(), NULL, &startup, &processInfo)) {
         if (error != NULL) {
@@ -676,7 +887,8 @@ bool MSWindowsClipboardBridge::ensureStarted(std::string* error)
     if (!transferOverlapped(pipe.get(), false, &ready, sizeof(ready),
                             kIoTimeoutMs, error) ||
         ready.magic != MSWindowsClipboardBridgeProtocol::kMagic ||
-        ready.processId != processInfo.dwProcessId) {
+        ready.processId != processInfo.dwProcessId ||
+        ready.sessionId != m_sessionId) {
         if (error != NULL && error->empty()) {
             *error = "clipboard helper readiness handshake was invalid";
         }
@@ -696,17 +908,34 @@ bool MSWindowsClipboardBridge::ensureStarted(std::string* error)
     return true;
 }
 
+bool MSWindowsClipboardBridge::helperMatchesCurrentNode(std::string* error) const
+{
+    DWORD owningSessionId = 0xffffffff;
+    std::string owningUserSid;
+    return queryOwningNodeIdentity(
+               &owningSessionId, &owningUserSid, error) &&
+        MSWindowsClipboardBridgeProtocol::isCurrentHelperIdentity(
+            m_sessionId, m_userSid, owningSessionId, owningUserSid, true);
+}
+
 bool MSWindowsClipboardBridge::requestSnapshot(
-    IClipboard* destination, IClipboard::Time time, bool* connectionFailed,
-    std::string* error)
+    std::string* destination, bool* connectionFailed, std::string* error)
 {
     if (error != NULL) {
         error->clear();
     }
     *connectionFailed = false;
+    if (!helperMatchesCurrentNode(error)) {
+        *connectionFailed = true;
+        if (error != NULL && error->empty()) {
+            *error = "clipboard helper belongs to a stale Windows session";
+        }
+        return false;
+    }
     MSWindowsClipboardBridgeProtocol::RequestHeader request;
     request.magic = MSWindowsClipboardBridgeProtocol::kMagic;
     request.command = MSWindowsClipboardBridgeProtocol::kSnapshot;
+    request.size = 0;
     if (!transferOverlapped(m_pipe, true, &request, sizeof(request),
                             kIoTimeoutMs, error)) {
         *connectionFailed = true;
@@ -740,6 +969,13 @@ bool MSWindowsClipboardBridge::requestSnapshot(
         }
         return false;
     }
+    if (response.size < 4) {
+        *connectionFailed = true;
+        if (error != NULL) {
+            *error = "clipboard helper returned an empty snapshot";
+        }
+        return false;
+    }
 
     std::string snapshot(response.size, '\0');
     if (!transferOverlapped(m_pipe, false, &snapshot[0], snapshot.size(),
@@ -751,10 +987,114 @@ bool MSWindowsClipboardBridge::requestSnapshot(
         *connectionFailed = true;
         return false;
     }
+    if (!helperMatchesCurrentNode(error)) {
+        *connectionFailed = true;
+        if (error != NULL && error->empty()) {
+            *error = "Windows session changed while reading the clipboard";
+        }
+        return false;
+    }
 
-    IClipboard::unmarshall(destination, snapshot, time);
+    *destination = std::move(snapshot);
     LOG((CLOG_DEBUG "read %lu clipboard byte(s) from active-session helper: session=%lu pid=%lu",
-         static_cast<unsigned long>(snapshot.size()), m_sessionId, m_processId));
+         static_cast<unsigned long>(destination->size()), m_sessionId, m_processId));
+    return true;
+}
+
+bool MSWindowsClipboardBridge::requestPublish(
+    const std::string& snapshot, UInt32 expectedWindowsSequence,
+    UInt32* committedWindowsSequence, bool* superseded,
+    bool* connectionFailed, std::string* error)
+{
+    if (error != NULL) {
+        error->clear();
+    }
+    if (committedWindowsSequence != NULL) {
+        *committedWindowsSequence = 0;
+    }
+    *superseded = false;
+    *connectionFailed = false;
+    if (!helperMatchesCurrentNode(error)) {
+        *connectionFailed = true;
+        if (error != NULL && error->empty()) {
+            *error = "clipboard helper belongs to a stale Windows session";
+        }
+        return false;
+    }
+
+    MSWindowsClipboardBridgeProtocol::RequestHeader request;
+    request.magic = MSWindowsClipboardBridgeProtocol::kMagic;
+    request.command = MSWindowsClipboardBridgeProtocol::kPublish;
+    request.size = static_cast<UInt32>(
+        sizeof(MSWindowsClipboardBridgeProtocol::PublishRequestHeader) +
+        snapshot.size());
+    MSWindowsClipboardBridgeProtocol::PublishRequestHeader publishRequest;
+    publishRequest.expectedWindowsSequence = expectedWindowsSequence;
+    publishRequest.snapshotSize = static_cast<UInt32>(snapshot.size());
+    if (!transferOverlapped(m_pipe, true, &request, sizeof(request),
+                            kIoTimeoutMs, error) ||
+        !transferOverlapped(m_pipe, true, &publishRequest,
+                            sizeof(publishRequest), kIoTimeoutMs, error) ||
+        !transferOverlapped(m_pipe, true,
+                            const_cast<char*>(snapshot.data()), snapshot.size(),
+                            kIoTimeoutMs, error)) {
+        *connectionFailed = true;
+        return false;
+    }
+
+    MSWindowsClipboardBridgeProtocol::ResponseHeader response;
+    if (!transferOverlapped(m_pipe, false, &response, sizeof(response),
+                            kIoTimeoutMs, error)) {
+        *connectionFailed = true;
+        return false;
+    }
+    if (!MSWindowsClipboardBridgeProtocol::validateResponseHeader(response,
+                                                                   error)) {
+        *connectionFailed = true;
+        return false;
+    }
+    if (response.status != MSWindowsClipboardBridgeProtocol::kSuccess) {
+        *superseded = response.status ==
+            MSWindowsClipboardBridgeProtocol::kRevisionChanged;
+        if (error != NULL) {
+            if (*superseded) {
+                *error = "the Windows clipboard revision was superseded";
+            }
+            else if (response.status ==
+                     MSWindowsClipboardBridgeProtocol::kClipboardUnavailable) {
+                *error = "the active-session clipboard is temporarily unavailable";
+            }
+            else {
+                *error = "the clipboard helper could not publish the snapshot";
+            }
+        }
+        return false;
+    }
+    if (response.size !=
+        sizeof(MSWindowsClipboardBridgeProtocol::PublishResponse)) {
+        *connectionFailed = true;
+        if (error != NULL) {
+            *error = "the clipboard helper returned an invalid publish response";
+        }
+        return false;
+    }
+    MSWindowsClipboardBridgeProtocol::PublishResponse publishResponse;
+    if (!transferOverlapped(m_pipe, false, &publishResponse,
+                            sizeof(publishResponse), kIoTimeoutMs, error)) {
+        *connectionFailed = true;
+        return false;
+    }
+    if (committedWindowsSequence != NULL) {
+        *committedWindowsSequence =
+            publishResponse.committedWindowsSequence;
+    }
+    if (!helperMatchesCurrentNode(error)) {
+        *connectionFailed = true;
+        if (error != NULL && error->empty()) {
+            *error = "Windows session changed while publishing the clipboard";
+        }
+        return false;
+    }
     return true;
 }
 
@@ -764,6 +1104,7 @@ void MSWindowsClipboardBridge::stop()
         MSWindowsClipboardBridgeProtocol::RequestHeader request;
         request.magic = MSWindowsClipboardBridgeProtocol::kMagic;
         request.command = MSWindowsClipboardBridgeProtocol::kShutdown;
+        request.size = 0;
         std::string ignored;
         transferOverlapped(m_pipe, true, &request, sizeof(request), 100,
                            &ignored);
@@ -782,6 +1123,7 @@ void MSWindowsClipboardBridge::stop()
     }
     m_processId = 0;
     m_sessionId = 0xffffffff;
+    m_userSid.clear();
 }
 
 int MSWindowsClipboardBridge::runHelper(const std::string& pipeName)
@@ -789,11 +1131,12 @@ int MSWindowsClipboardBridge::runHelper(const std::string& pipeName)
     if (!isExpectedPipeName(pipeName)) {
         return 2;
     }
-    if (!WaitNamedPipeA(pipeName.c_str(), kConnectTimeoutMs)) {
+    const std::wstring widePipeName = widenAscii(pipeName);
+    if (!WaitNamedPipeW(widePipeName.c_str(), kConnectTimeoutMs)) {
         return 3;
     }
 
-    ScopedHandle pipe(CreateFileA(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE,
+    ScopedHandle pipe(CreateFileW(widePipeName.c_str(), GENERIC_READ | GENERIC_WRITE,
                                   0, NULL, OPEN_EXISTING, 0, NULL));
     if (!isValidHandle(pipe.get())) {
         return 4;
@@ -802,8 +1145,13 @@ int MSWindowsClipboardBridge::runHelper(const std::string& pipeName)
     MSWindowsClipboardBridgeProtocol::ReadyHeader ready;
     ready.magic = MSWindowsClipboardBridgeProtocol::kMagic;
     ready.processId = GetCurrentProcessId();
-    if (!transferBlocking(pipe.get(), true, &ready, sizeof(ready))) {
+    DWORD helperSessionId = 0xffffffff;
+    if (!ProcessIdToSessionId(ready.processId, &helperSessionId)) {
         return 5;
+    }
+    ready.sessionId = helperSessionId;
+    if (!transferBlocking(pipe.get(), true, &ready, sizeof(ready))) {
+        return 7;
     }
 
     for (;;) {
@@ -815,7 +1163,7 @@ int MSWindowsClipboardBridge::runHelper(const std::string& pipeName)
             return 6;
         }
         if (request.command == MSWindowsClipboardBridgeProtocol::kShutdown) {
-            return 0;
+            return request.size == 0 ? 0 : 6;
         }
 
         MSWindowsClipboardBridgeProtocol::ResponseHeader response;
@@ -824,6 +1172,9 @@ int MSWindowsClipboardBridge::runHelper(const std::string& pipeName)
         response.size = 0;
         std::string snapshot;
         if (request.command == MSWindowsClipboardBridgeProtocol::kSnapshot) {
+            if (request.size != 0) {
+                return 6;
+            }
             Clipboard clipboard;
             MSWindowsClipboard source(NULL);
             bool copied = false;
@@ -851,6 +1202,62 @@ int MSWindowsClipboardBridge::runHelper(const std::string& pipeName)
                     response.size = static_cast<UInt32>(snapshot.size());
                 }
             }
+        }
+        else if (request.command == MSWindowsClipboardBridgeProtocol::kPublish) {
+            if (request.size <
+                    sizeof(MSWindowsClipboardBridgeProtocol::PublishRequestHeader) + 4 ||
+                request.size >
+                    sizeof(MSWindowsClipboardBridgeProtocol::PublishRequestHeader) +
+                    MSWindowsClipboardBridgeProtocol::kMaxSnapshotBytes) {
+                return 6;
+            }
+            MSWindowsClipboardBridgeProtocol::PublishRequestHeader publishRequest;
+            if (!transferBlocking(pipe.get(), false, &publishRequest,
+                                  sizeof(publishRequest)) ||
+                publishRequest.snapshotSize !=
+                    request.size - sizeof(publishRequest)) {
+                return 6;
+            }
+            snapshot.assign(publishRequest.snapshotSize, '\0');
+            if (!transferBlocking(pipe.get(), false, &snapshot[0], snapshot.size()) ||
+                !MSWindowsClipboardBridgeProtocol::validateSnapshot(
+                    snapshot, NULL)) {
+                return 6;
+            }
+
+            Clipboard clipboard;
+            clipboard.unmarshall(snapshot, 0);
+            MSWindowsClipboard destination(NULL);
+            UInt32 committedWindowsSequence = 0;
+            const MSWindowsClipboard::ConditionalCopyResult copyResult =
+                destination.copyFromIfSequence(
+                    &clipboard, 0, publishRequest.expectedWindowsSequence,
+                    &committedWindowsSequence);
+            response.status = copyResult ==
+                    MSWindowsClipboard::ConditionalCopyResult::Succeeded
+                ? MSWindowsClipboardBridgeProtocol::kSuccess
+                : copyResult ==
+                    MSWindowsClipboard::ConditionalCopyResult::SequenceChanged
+                    ? MSWindowsClipboardBridgeProtocol::kRevisionChanged
+                    : MSWindowsClipboardBridgeProtocol::kPublishFailed;
+            MSWindowsClipboardBridgeProtocol::PublishResponse publishResponse;
+            publishResponse.committedWindowsSequence =
+                committedWindowsSequence;
+            if (response.status == MSWindowsClipboardBridgeProtocol::kSuccess) {
+                response.size = sizeof(publishResponse);
+            }
+            snapshot.clear();
+
+            if (!transferBlocking(pipe.get(), true, &response,
+                                  sizeof(response))) {
+                return 0;
+            }
+            if (response.status == MSWindowsClipboardBridgeProtocol::kSuccess &&
+                !transferBlocking(pipe.get(), true, &publishResponse,
+                                  sizeof(publishResponse))) {
+                return 0;
+            }
+            continue;
         }
 
         if (!transferBlocking(pipe.get(), true, &response, sizeof(response))) {

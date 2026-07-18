@@ -28,7 +28,9 @@ public:
 
     bool handleBulkMessage(const UInt8* code,
                            barrier::IStream* stream) override;
-    void handleBulkDisconnected(barrier::BulkChannel* channel) override;
+    void handleBulkDisconnected(
+        barrier::BulkChannel* channel,
+        std::uint64_t pausedGeneration = 0) override;
 
 private:
     Server* m_bulkServer;

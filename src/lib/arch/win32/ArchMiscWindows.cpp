@@ -18,6 +18,7 @@
 
 #include "arch/win32/ArchMiscWindows.h"
 #include "arch/win32/ArchDaemonWindows.h"
+#include "arch/win32/XArchWindows.h"
 #include "base/Log.h"
 #include "common/Version.h"
 
@@ -228,42 +229,46 @@ void
 ArchMiscWindows::setValue(HKEY key,
                 const TCHAR* name, const std::string& value)
 {
-    assert(key != NULL);
-    if (key == NULL) {
-        // TODO: throw exception
-        return;
+    if (key == NULL || name == NULL) {
+        throw XArch("invalid registry key or value name");
     }
-    RegSetValueEx(key, name, 0, REG_SZ,
-                                reinterpret_cast<const BYTE*>(value.c_str()),
-                                (DWORD)value.size() + 1);
+    const LONG result = RegSetValueEx(
+        key, name, 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(value.c_str()),
+        static_cast<DWORD>(value.size() + 1u));
+    if (result != ERROR_SUCCESS) {
+        throw XArch(new XArchEvalWindows(static_cast<DWORD>(result)));
+    }
 }
 
 void
 ArchMiscWindows::setValue(HKEY key, const TCHAR* name, DWORD value)
 {
-    assert(key != NULL);
-    if (key == NULL) {
-        // TODO: throw exception
-        return;
+    if (key == NULL || name == NULL) {
+        throw XArch("invalid registry key or value name");
     }
-    RegSetValueEx(key, name, 0, REG_DWORD,
-                                reinterpret_cast<CONST BYTE*>(&value),
-                                sizeof(DWORD));
+    const LONG result = RegSetValueEx(
+        key, name, 0, REG_DWORD,
+        reinterpret_cast<CONST BYTE*>(&value), sizeof(DWORD));
+    if (result != ERROR_SUCCESS) {
+        throw XArch(new XArchEvalWindows(static_cast<DWORD>(result)));
+    }
 }
 
 void
 ArchMiscWindows::setValueBinary(HKEY key,
                 const TCHAR* name, const std::string& value)
 {
-    assert(key  != NULL);
-    assert(name != NULL);
     if (key == NULL || name == NULL) {
-        // TODO: throw exception
-        return;
+        throw XArch("invalid registry key or value name");
     }
-    RegSetValueEx(key, name, 0, REG_BINARY,
-                                reinterpret_cast<const BYTE*>(value.data()),
-                                (DWORD)value.size());
+    const LONG result = RegSetValueEx(
+        key, name, 0, REG_BINARY,
+        reinterpret_cast<const BYTE*>(value.data()),
+        static_cast<DWORD>(value.size()));
+    if (result != ERROR_SUCCESS) {
+        throw XArch(new XArchEvalWindows(static_cast<DWORD>(result)));
+    }
 }
 
 std::string

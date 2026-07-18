@@ -32,6 +32,9 @@
 
 #include <shellapi.h>
 #include <objidl.h>
+#include <limits>
+#include <mutex>
+#include <vector>
 
 static std::string convertBMPToPNG(const std::string& dibData);
 static std::string convertPNGToDIB(const std::string& pngData);
@@ -42,6 +45,126 @@ namespace {
 const UINT kMaxHDropTextPaths = 1024;
 const size_t kMaxHDropTextBytes = 1024 * 1024;
 const unsigned long long kMaxClipboardImagePixels = 32ull * 1024ull * 1024ull;
+
+struct PreparedClipboardFormat {
+    PreparedClipboardFormat(UINT format_, HANDLE data_) :
+        format(format_),
+        data(data_)
+    {
+    }
+
+    UINT format;
+    HANDLE data;
+};
+
+class PreparedClipboardFormats {
+public:
+    ~PreparedClipboardFormats()
+    {
+        for (std::vector<PreparedClipboardFormat>::iterator index =
+                 m_formats.begin(); index != m_formats.end(); ++index) {
+            if (index->data != NULL) {
+                GlobalFree(index->data);
+            }
+        }
+    }
+
+    bool append(UINT format, HANDLE data)
+    {
+        if (format == 0 || data == NULL) {
+            if (data != NULL) {
+                GlobalFree(data);
+            }
+            return false;
+        }
+
+        try {
+            m_formats.push_back(PreparedClipboardFormat(format, data));
+        }
+        catch (...) {
+            GlobalFree(data);
+            return false;
+        }
+        return true;
+    }
+
+    size_t size() const
+    {
+        return m_formats.size();
+    }
+
+    bool commit(IMSWindowsClipboardFacade* facade)
+    {
+        if (facade == NULL) {
+            return false;
+        }
+
+        for (std::vector<PreparedClipboardFormat>::iterator index =
+                 m_formats.begin(); index != m_formats.end(); ++index) {
+            HANDLE data = index->data;
+            index->data = NULL;
+
+            // The facade transfers successful writes to the OS and frees a
+            // handle when SetClipboardData fails. Either result consumes it.
+            if (!facade->write(data, index->format)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    std::vector<PreparedClipboardFormat> m_formats;
+};
+
+class ClipboardCloseGuard {
+public:
+    explicit ClipboardCloseGuard(const IClipboard* clipboard) :
+        m_clipboard(clipboard)
+    {
+    }
+
+    ~ClipboardCloseGuard()
+    {
+        m_clipboard->close();
+    }
+
+private:
+    ClipboardCloseGuard(const ClipboardCloseGuard&);
+    ClipboardCloseGuard& operator=(const ClipboardCloseGuard&);
+
+    const IClipboard* m_clipboard;
+};
+
+LRESULT CALLBACK clipboardOwnerWindowProc(HWND window, UINT message,
+                                          WPARAM wParam, LPARAM lParam)
+{
+    return DefWindowProc(window, message, wParam, lParam);
+}
+
+HWND createClipboardOwnerWindow()
+{
+    static const char kClassName[] = "WeaveClipboardOwnerWindow";
+    static std::once_flag registerOnce;
+    static bool registered = false;
+    std::call_once(registerOnce, []() {
+        WNDCLASSEXA windowClass;
+        ZeroMemory(&windowClass, sizeof(windowClass));
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.lpfnWndProc = clipboardOwnerWindowProc;
+        windowClass.hInstance = GetModuleHandleA(NULL);
+        windowClass.lpszClassName = kClassName;
+        const ATOM atom = RegisterClassExA(&windowClass);
+        registered = atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    });
+    if (!registered) {
+        return NULL;
+    }
+
+    return CreateWindowExA(
+        0, kClassName, "", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL,
+        GetModuleHandleA(NULL), NULL);
+}
 
 UINT preferredDropEffectFormat()
 {
@@ -92,14 +215,26 @@ std::string utf8FromWide(const std::wstring& value)
     if (value.empty()) {
         return {};
     }
-
-    const int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, NULL, 0, NULL, NULL);
-    if (size <= 1) {
+    if (value.size() > static_cast<size_t>(
+            (std::numeric_limits<int>::max)())) {
         return {};
     }
 
-    std::string result(static_cast<size_t>(size - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, &result[0], size, NULL, NULL);
+    const int inputSize = static_cast<int>(value.size());
+    const int size = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), inputSize,
+        NULL, 0, NULL, NULL);
+    if (size <= 0) {
+        return {};
+    }
+
+    std::string result(static_cast<size_t>(size), '\0');
+    const int written = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), inputSize,
+        &result[0], size, NULL, NULL);
+    if (written != size) {
+        return {};
+    }
     return result;
 }
 
@@ -144,7 +279,8 @@ unsigned char channelFromMask(UInt32 pixel, UInt32 mask)
 UINT                    MSWindowsClipboard::s_ownershipFormat = 0;
 
 MSWindowsClipboard::MSWindowsClipboard(HWND window) :
-    m_window(window),
+    m_window(window != NULL ? window : createClipboardOwnerWindow()),
+    m_ownsWindow(window == NULL && m_window != NULL),
     m_time(0),
     m_facade(new MSWindowsClipboardFacade()),
     m_deleteFacade(true)
@@ -160,6 +296,11 @@ MSWindowsClipboard::MSWindowsClipboard(HWND window) :
 MSWindowsClipboard::~MSWindowsClipboard()
 {
     clearConverters();
+
+    if (m_ownsWindow) {
+        DestroyWindow(m_window);
+        m_window = NULL;
+    }
 
     // dependency injection causes confusion over ownership, so we need
     // logic to decide whether or not we delete the facade. there must
@@ -192,6 +333,141 @@ MSWindowsClipboard::emptyUnowned()
     return true;
 }
 
+MSWindowsClipboard::ConditionalCopyResult
+MSWindowsClipboard::copyFromIfSequence(
+    const IClipboard* source, Time time, UInt32 expectedWindowsSequence,
+    UInt32* committedWindowsSequence)
+{
+    if (committedWindowsSequence != NULL) {
+        *committedWindowsSequence = 0;
+    }
+    if (source == NULL) {
+        return ConditionalCopyResult::Failed;
+    }
+    if (GetClipboardSequenceNumber() != expectedWindowsSequence) {
+        return ConditionalCopyResult::SequenceChanged;
+    }
+    if (!source->open(time)) {
+        return ConditionalCopyResult::Failed;
+    }
+    ClipboardCloseGuard closeSource(source);
+
+    PreparedClipboardFormats prepared;
+    bool preparedAllFormats = true;
+    try {
+        for (SInt32 format = 0;
+             format != IClipboard::kNumFormats && preparedAllFormats;
+             ++format) {
+            const IClipboard::EFormat clipboardFormat =
+                static_cast<IClipboard::EFormat>(format);
+            if (!source->has(clipboardFormat)) {
+                continue;
+            }
+
+            const std::string data = source->get(clipboardFormat);
+            RemoteFileClipboard::Data filePayload;
+            if (clipboardFormat == IClipboard::kFileList &&
+                (!RemoteFileClipboard::parse(data, filePayload) ||
+                 filePayload.mode !=
+                     RemoteFileClipboard::Mode::MaterializedPaths)) {
+                preparedAllFormats = false;
+                break;
+            }
+
+            const size_t formatStart = prepared.size();
+            for (ConverterList::const_iterator index = m_converters.begin();
+                 index != m_converters.end(); ++index) {
+                IMSWindowsClipboardConverter* converter = *index;
+                if (converter->getFormat() != clipboardFormat) {
+                    continue;
+                }
+
+                HANDLE win32Data = converter->fromIClipboard(data);
+                if (win32Data != NULL &&
+                    !prepared.append(
+                        converter->getWin32Format(), win32Data)) {
+                    preparedAllFormats = false;
+                    break;
+                }
+            }
+            if (!preparedAllFormats || prepared.size() == formatStart) {
+                preparedAllFormats = false;
+                break;
+            }
+
+            if (clipboardFormat == IClipboard::kFileList) {
+                HANDLE effect = createDropEffectHandle(
+                    filePayload.cut ? DROPEFFECT_MOVE : DROPEFFECT_COPY);
+                preparedAllFormats = prepared.append(
+                    preferredDropEffectFormat(), effect);
+            }
+            else if (clipboardFormat == IClipboard::kPNG) {
+                const std::string dibData = convertPNGToDIB(data);
+                if (dibData.empty()) {
+                    preparedAllFormats = false;
+                    break;
+                }
+
+                MSWindowsClipboardBitmapConverter bitmapConverter;
+                preparedAllFormats = prepared.append(
+                    CF_DIB, bitmapConverter.fromIClipboard(dibData));
+            }
+        }
+
+        if (preparedAllFormats) {
+            HGLOBAL ownership =
+                GlobalAlloc(GMEM_MOVEABLE | GMEM_DDESHARE, 1);
+            preparedAllFormats = prepared.append(
+                getOwnershipFormat(), ownership);
+        }
+    }
+    catch (...) {
+        LOG((CLOG_WARN
+            "failed while preparing remote Windows clipboard formats"));
+        preparedAllFormats = false;
+    }
+
+    if (!preparedAllFormats) {
+        LOG((CLOG_WARN
+            "refusing to replace the Windows clipboard because a remote format could not be prepared"));
+        return ConditionalCopyResult::Failed;
+    }
+
+    if (m_window == NULL || !open(time)) {
+        return ConditionalCopyResult::Failed;
+    }
+    ClipboardCloseGuard closeDestination(this);
+
+    if (GetClipboardSequenceNumber() != expectedWindowsSequence) {
+        return ConditionalCopyResult::SequenceChanged;
+    }
+    if (!emptyUnowned()) {
+        return ConditionalCopyResult::Failed;
+    }
+
+    if (!prepared.commit(m_facade)) {
+        // EmptyClipboard and SetClipboardData do not provide a rollback API.
+        // Preparation failures are side-effect free, but an OS-level failure
+        // during this commit can leave the clipboard empty or partially set.
+        LOG((CLOG_WARN
+            "Windows clipboard commit failed after EmptyClipboard; partial clipboard data may remain"));
+        return ConditionalCopyResult::Failed;
+    }
+
+    if (!isOwnedByBarrier()) {
+        return ConditionalCopyResult::Failed;
+    }
+
+    const UInt32 committedSequence = GetClipboardSequenceNumber();
+    if (committedSequence == 0) {
+        return ConditionalCopyResult::Failed;
+    }
+    if (committedWindowsSequence != NULL) {
+        *committedWindowsSequence = committedSequence;
+    }
+    return ConditionalCopyResult::Succeeded;
+}
+
 bool
 MSWindowsClipboard::empty()
 {
@@ -213,9 +489,16 @@ MSWindowsClipboard::empty()
 void
 MSWindowsClipboard::add(EFormat format, const std::string& data)
 {
+    addWithStatus(format, data);
+}
+
+bool
+MSWindowsClipboard::addWithStatus(EFormat format, const std::string& data)
+{
     LOG((CLOG_DEBUG "add %d bytes to clipboard format: %d", data.size(), format));
 
     if (format == IClipboard::kFileList) {
+        bool payloadWritten = false;
         RemoteFileClipboard::Data payload;
         if (RemoteFileClipboard::parse(data, payload) &&
             payload.mode == RemoteFileClipboard::Mode::MaterializedPaths) {
@@ -225,7 +508,9 @@ MSWindowsClipboard::add(EFormat format, const std::string& data)
                 if (converter->getFormat() == format) {
                     HANDLE win32Data = converter->fromIClipboard(data);
                     if (win32Data != NULL) {
-                        m_facade->write(win32Data, converter->getWin32Format());
+                        payloadWritten = m_facade->write(
+                            win32Data, converter->getWin32Format()) ||
+                            payloadWritten;
                     }
                 }
             }
@@ -235,10 +520,11 @@ MSWindowsClipboard::add(EFormat format, const std::string& data)
                 m_facade->write(effect, preferredDropEffectFormat());
             }
         }
-        return;
+        return payloadWritten;
     }
 
     // convert data to win32 form
+    bool payloadWritten = false;
     for (ConverterList::const_iterator index = m_converters.begin();
                                 index != m_converters.end(); ++index) {
         IMSWindowsClipboardConverter* converter = *index;
@@ -248,7 +534,8 @@ MSWindowsClipboard::add(EFormat format, const std::string& data)
             HANDLE win32Data = converter->fromIClipboard(data);
             if (win32Data != NULL) {
                 UINT win32Format = converter->getWin32Format();
-                m_facade->write(win32Data, win32Format);
+                payloadWritten = m_facade->write(
+                    win32Data, win32Format) || payloadWritten;
             }
         }
     }
@@ -264,7 +551,7 @@ MSWindowsClipboard::add(EFormat format, const std::string& data)
             }
         }
     }
-
+    return payloadWritten;
 }
 
 bool
@@ -368,7 +655,7 @@ std::string MSWindowsClipboard::get(EFormat format) const
         }
 
         RemoteFileClipboard::Data parsed;
-        if (!RemoteFileClipboard::parse(payload, parsed)) {
+        if (!RemoteFileClipboard::parseLocalClipboard(payload, parsed)) {
             return {};
         }
 
@@ -476,7 +763,8 @@ MSWindowsClipboard::isOwnedByBarrier()
 {
     // create ownership format if we haven't yet
     if (s_ownershipFormat == 0) {
-        s_ownershipFormat = RegisterClipboardFormat(TEXT("BarrierOwnership"));
+        s_ownershipFormat = RegisterClipboardFormat(
+            TEXT("WeaveClipboardOwnership.v1"));
     }
     return (IsClipboardFormatAvailable(getOwnershipFormat()) != 0);
 }
@@ -486,7 +774,8 @@ MSWindowsClipboard::getOwnershipFormat()
 {
     // create ownership format if we haven't yet
     if (s_ownershipFormat == 0) {
-        s_ownershipFormat = RegisterClipboardFormat(TEXT("BarrierOwnership"));
+        s_ownershipFormat = RegisterClipboardFormat(
+            TEXT("WeaveClipboardOwnership.v1"));
     }
 
     // return the format
@@ -497,6 +786,12 @@ std::string
 MSWindowsClipboard::convertDIBToPNGForTest(const std::string& dibData)
 {
     return convertBMPToPNG(dibData);
+}
+
+std::string
+MSWindowsClipboard::utf8FromWideForTest(const std::wstring& value)
+{
+    return utf8FromWide(value);
 }
 
 //
@@ -529,6 +824,10 @@ static std::string convertBMPToPNG(const std::string& dibData)
     // Height can be negative for top-down DIB
     bool topDown = (height < 0);
     if (height < 0) {
+        if (height == (std::numeric_limits<SInt32>::min)()) {
+            LOG((CLOG_WARN "DIB has an unrepresentable top-down height"));
+            return {};
+        }
         height = -height;
     }
     if (width <= 0 || height <= 0) {

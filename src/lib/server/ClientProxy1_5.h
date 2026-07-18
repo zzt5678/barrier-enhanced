@@ -23,6 +23,7 @@
 
 class Server;
 class IEventQueue;
+namespace barrier { class BulkChannel; }
 
 //! Proxy for client implementing protocol version 1.5
 class ClientProxy1_5 : public ClientProxy1_4 {
@@ -34,9 +35,15 @@ public:
     virtual void        sendDragInfo(UInt32 fileCount, const char* info, size_t size);
     virtual void        fileChunkSending(UInt8 mark, char* data, size_t dataSize);
     virtual bool        parseMessage(const UInt8* code);
-    void                fileChunkReceived();
-    void                fileChunkReceived(barrier::IStream* stream);
+    int                 fileChunkReceived();
+    int                 fileChunkReceived(
+                            barrier::IStream* stream,
+                            barrier::BulkChannel* channel = NULL);
     void                dragInfoReceived();
+
+protected:
+    bool                discardLegacyFileChunk(barrier::IStream* stream);
+    bool                discardLegacyDragInfo(barrier::IStream* stream);
 
 private:
     IEventQueue*        m_events;

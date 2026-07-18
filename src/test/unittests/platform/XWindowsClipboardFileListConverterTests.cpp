@@ -16,7 +16,7 @@ TEST(XWindowsClipboardFileListConverterTests, fromIClipboard_withMaterializedPat
 
     RemoteFileClipboard::Data payload;
     payload.mode = RemoteFileClipboard::Mode::MaterializedPaths;
-    payload.sessionId = "ready-session";
+    payload.sessionId = "00000000000000000000000000000041";
     payload.paths.push_back(barrier::fs::u8path("/tmp/weave-cache/example file.txt"));
 
     XWindowsClipboardFileListConverter converter(display, "text/uri-list", false);
@@ -40,7 +40,7 @@ TEST(XWindowsClipboardFileListConverterTests, fromIClipboard_withSourcePaths_ret
 
     RemoteFileClipboard::Data payload;
     payload.mode = RemoteFileClipboard::Mode::SourcePaths;
-    payload.sessionId = "source-session";
+    payload.sessionId = "00000000000000000000000000000042";
     payload.paths.push_back(barrier::fs::u8path("/tmp/source-only.txt"));
 
     XWindowsClipboardFileListConverter converter(display, "text/uri-list", false);

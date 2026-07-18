@@ -19,6 +19,7 @@
 #pragma once
 
 #include "ipc/Ipc.h"
+#include "ipc/IpcPeerAuthentication.h"
 #include "net/TCPListenSocket.h"
 #include "net/NetworkAddress.h"
 #include "arch/Arch.h"
@@ -28,22 +29,28 @@
 #include <list>
 #include <mutex>
 #include <string>
+#include <vector>
 
 class Event;
 class IpcClientProxy;
 class IpcMessage;
 class IEventQueue;
 class SocketMultiplexer;
+class TCPSocket;
+class IpcServerTestAccess;
 
 //! IPC server for communication between daemon and GUI.
 /*!
-The IPC server listens on localhost. The IPC client runs on both the
-client/server process or the GUI. The IPC server runs on the daemon process.
-This allows the GUI to send config changes to the daemon and client/server,
-and allows the daemon and client/server to send log data to the GUI.
+The IPC server listens on localhost. On Windows, localhost is only the
+transport boundary: accepted sockets must also prove their kernel owner PID,
+trusted component image, role, and token identity before protocol data is
+accepted. The IPC client runs in both the client/server process and the GUI.
+The IPC server runs on the daemon process.
 */
 class IpcServer {
 public:
+    typedef IpcPeerAuthContext (*PeerAuthenticator)(const TCPSocket&);
+
     IpcServer(IEventQueue* events, SocketMultiplexer* socketMultiplexer);
     IpcServer(IEventQueue* events, SocketMultiplexer* socketMultiplexer, int port);
     virtual ~IpcServer();
@@ -58,6 +65,8 @@ public:
     virtual void        send(const IpcMessage& message, EIpcClientType filterType);
     virtual bool        sendToProcess(const IpcMessage& message, EIpcClientType filterType,
                                       UInt32 processId);
+    virtual bool        sendActivateToProcess(UInt32 processId,
+                                              std::uint64_t activationNonce);
 
     //@}
     //! @name accessors
@@ -75,8 +84,20 @@ public:
                                                    std::uint64_t queryNonce = 0,
                                                    bool requireDesktopMatch = true,
                                                    std::string* reportedDesktopName = nullptr) const;
+    virtual bool        hasActivatedClientProcess(UInt32 processId,
+                                                  std::uint64_t activationNonce) const;
 
     //@}
+
+private:
+    friend class IpcServerTestAccess;
+
+    IpcServer(IEventQueue* events, SocketMultiplexer* socketMultiplexer,
+              int port, PeerAuthenticator peerAuthenticator);
+    PeerAuthenticator testPeerAuthenticator() const;
+    void                sendWithAcquiredRefs(
+                            const IpcMessage& message,
+                            const std::vector<IpcClientProxy*>& recipients);
 
 #if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
 public:
@@ -96,6 +117,7 @@ private:
 #endif
     typedef std::list<IpcClientProxy*> ClientList;
 
+    PeerAuthenticator   m_peerAuthenticator;
     bool                m_mock;
     IEventQueue*        m_events;
     SocketMultiplexer*    m_socketMultiplexer;
@@ -107,6 +129,7 @@ private:
 #ifdef BARRIER_TEST_ENV
 public:
     IpcServer() :
+        m_peerAuthenticator(nullptr),
         m_mock(true),
         m_events(nullptr),
         m_socketMultiplexer(nullptr),

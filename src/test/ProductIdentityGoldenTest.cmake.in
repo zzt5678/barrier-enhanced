@@ -1,0 +1,253 @@
+cmake_policy(VERSION 3.16)
+
+function(assert_file_contains path expected)
+    if (NOT EXISTS "${path}")
+        message(FATAL_ERROR "required identity file does not exist: ${path}")
+    endif()
+
+    file(READ "${path}" contents)
+    string(FIND "${contents}" "${expected}" position)
+    if (position EQUAL -1)
+        message(FATAL_ERROR "${path} does not contain: ${expected}")
+    endif()
+endfunction()
+
+function(assert_file_excludes path unexpected)
+    if (NOT EXISTS "${path}")
+        message(FATAL_ERROR "required identity file does not exist: ${path}")
+    endif()
+
+    file(READ "${path}" contents)
+    string(FIND "${contents}" "${unexpected}" position)
+    if (NOT position EQUAL -1)
+        message(FATAL_ERROR "${path} unexpectedly contains: ${unexpected}")
+    endif()
+endfunction()
+
+function(assert_legacy_branding_whitelisted path)
+    if (NOT EXISTS "${path}")
+        message(FATAL_ERROR "required branding file does not exist: ${path}")
+    endif()
+
+    file(STRINGS "${path}" lines)
+    foreach(line IN LISTS lines)
+        if (line MATCHES "(^|[^A-Za-z0-9_])Barrier([^A-Za-z0-9_]|$)|github\\.com/debauchee/barrier|Debauchee")
+            set(is_whitelisted FALSE)
+            foreach(allowed_pattern IN LISTS ARGN)
+                if (line MATCHES "${allowed_pattern}")
+                    set(is_whitelisted TRUE)
+                    break()
+                endif()
+            endforeach()
+            if (NOT is_whitelisted)
+                message(FATAL_ERROR
+                        "${path} contains non-whitelisted legacy branding: ${line}")
+            endif()
+        endif()
+    endforeach()
+endfunction()
+
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_PRODUCT_NAME \"Weave\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_PRODUCT_PUBLISHER \"Weave Project\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_SERVICE_NAME \"WeaveService\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_SERVICE_DISPLAY_NAME \"Weave Background Service\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_SERVICE_QUIT_MESSAGE \"WeaveService.DaemonExit.v1\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_SETTINGS_REGISTRY_PATH \"SOFTWARE\\\\Weave\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_PROJECT_URL \"https://github.com/zzt5678/barrier-enhanced\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_SUPPORT_URL \"https://github.com/zzt5678/barrier-enhanced/issues\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_UPDATES_URL \"https://github.com/zzt5678/barrier-enhanced/releases\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_GUI_INTERNAL_NAME \"weave\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_GUI_ORIGINAL_FILENAME \"weave.exe\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_DAEMON_INTERNAL_NAME \"weaved\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_DAEMON_ORIGINAL_FILENAME \"weaved.exe\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_CLIENT_INTERNAL_NAME \"weavec\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_CLIENT_ORIGINAL_FILENAME \"weavec.exe\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_SERVER_INTERNAL_NAME \"weaves\"")
+assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_SERVER_ORIGINAL_FILENAME \"weaves.exe\"")
+
+set(VERSION_SOURCE "${SOURCE_ROOT}/src/lib/common/Version.cpp")
+assert_file_contains("${VERSION_SOURCE}" "#include \"common/ProductIdentity.h\"")
+assert_file_contains("${VERSION_SOURCE}" "const char* kApplication = WEAVE_PRODUCT_NAME")
+assert_file_contains("${VERSION_SOURCE}" "const char* kContact     = \"Issues: \" WEAVE_SUPPORT_URL")
+assert_file_contains("${VERSION_SOURCE}" "const char* kWebsite     = WEAVE_PROJECT_URL")
+assert_file_contains("${VERSION_SOURCE}" "const char* kAppVersion  = WEAVE_PRODUCT_NAME \" \" BARRIER_VERSION")
+assert_file_excludes("${VERSION_SOURCE}" "https://github.com/debauchee/barrier/")
+assert_file_excludes("${VERSION_SOURCE}" "todo@mail.com")
+
+set(ROOT_README "${SOURCE_ROOT}/README.md")
+assert_file_contains("${ROOT_README}" "# Weave")
+assert_file_contains("${ROOT_README}" "https://github.com/zzt5678/barrier-enhanced")
+assert_file_excludes("${ROOT_README}" "https://github.com/debauchee/barrier")
+assert_file_excludes("${ROOT_README}" "# Barrier")
+assert_legacy_branding_whitelisted(
+    "${ROOT_README}"
+    "stability-focused fork of Barrier"
+    "older Barrier protocol peers"
+    "derived from Barrier")
+
+set(SHIPPED_README "${SOURCE_ROOT}/res/Readme.txt")
+assert_file_contains("${SHIPPED_README}" "Thank you for choosing Weave!")
+assert_file_contains("${SHIPPED_README}"
+                     "https://github.com/zzt5678/barrier-enhanced")
+assert_file_excludes("${SHIPPED_README}" "https://github.com/debauchee/barrier")
+assert_legacy_branding_whitelisted("${SHIPPED_README}")
+
+set(DOXYGEN_CONFIG "${SOURCE_ROOT}/res/doxygen.cfg.in")
+assert_file_contains("${DOXYGEN_CONFIG}" "PROJECT_NAME           = \"Weave\"")
+assert_legacy_branding_whitelisted("${DOXYGEN_CONFIG}")
+
+set(WINDOWS_CLIPBOARD "${SOURCE_ROOT}/src/lib/platform/MSWindowsClipboard.cpp")
+assert_file_contains("${WINDOWS_CLIPBOARD}" "WeaveClipboardOwnership.v1")
+assert_file_excludes("${WINDOWS_CLIPBOARD}" "BarrierOwnership")
+
+set(RPM_SPEC "${SOURCE_ROOT}/dist/rpm/barrier.spec.in")
+assert_file_contains("${RPM_SPEC}"
+                     "Summary: @WEAVE_PRODUCT_NAME@ keyboard, mouse, and clipboard sharing")
+assert_file_contains("${RPM_SPEC}" "Name: weave")
+assert_file_contains("${RPM_SPEC}" "URL: @WEAVE_PROJECT_URL@")
+assert_file_contains("${RPM_SPEC}"
+                     "Source0: @WEAVE_PROJECT_URL@/archive/v%{version}.tar.gz")
+assert_file_contains("${RPM_SPEC}" "<name>@WEAVE_PRODUCT_NAME@</name>")
+assert_file_contains("${RPM_SPEC}"
+                     "<summary>Share one keyboard, mouse, and clipboard across trusted computers</summary>")
+assert_file_contains("${RPM_SPEC}"
+                     "@WEAVE_PRODUCT_NAME@ shares one keyboard, mouse, and clipboard across trusted computers.")
+assert_file_contains("${RPM_SPEC}"
+                     "<url type=\"homepage\">@WEAVE_PROJECT_URL@</url>")
+assert_file_contains("${RPM_SPEC}"
+                     "Internal barrier/synergy build identifiers are retained for source compatibility.")
+assert_file_contains("${RPM_SPEC}"
+                     "Source assets retain legacy barrier filenames; installed files use Weave names.")
+assert_file_excludes("${RPM_SPEC}" "https://github.com/debauchee/barrier")
+assert_file_excludes("${RPM_SPEC}" "Barrier allows you")
+assert_file_excludes("${RPM_SPEC}"
+                     "Work seamlessly across Windows, macOS and Linux.")
+assert_file_excludes("${RPM_SPEC}"
+                     "<release version=\"%{version}\" date=\"2019-03-21\" />")
+assert_legacy_branding_whitelisted(
+    "${RPM_SPEC}"
+    "^\\* Sat Jan 27 2018 Debauchee")
+
+assert_file_contains("${INNO_SCRIPT}" "AppId={{6563BA05-7A36-49B4-8684-2820ACDA171C}")
+assert_file_contains("${INNO_SCRIPT}" "#define MyAppServiceName \"WeaveService\"")
+assert_file_contains("${INNO_SCRIPT}" "#define MyAppServiceDisplayName \"Weave Background Service\"")
+assert_file_contains("${INNO_SCRIPT}" "#define MyAppURL \"https://github.com/zzt5678/barrier-enhanced\"")
+assert_file_contains("${INNO_SCRIPT}" "#define MyAppSupportURL \"https://github.com/zzt5678/barrier-enhanced/issues\"")
+assert_file_contains("${INNO_SCRIPT}" "#define MyAppUpdatesURL \"https://github.com/zzt5678/barrier-enhanced/releases\"")
+assert_file_contains("${INNO_SCRIPT}"
+                     "#define ReleaseStage \"${BINARY_ROOT}/windows-release/Release\"")
+assert_file_contains("${INNO_SCRIPT}" "#include \"{#ReleaseStage}/payload-files.iss\"")
+assert_file_contains("${INNO_SCRIPT}" "Source: \"{#ReleaseStage}/manifest.sha256\"")
+assert_file_excludes("${INNO_SCRIPT}" "recursesubdirs")
+assert_file_excludes("${INNO_SCRIPT}" "SYSTEM\\CurrentControlSet\\Services\\Barrier")
+assert_file_excludes("${INNO_SCRIPT}" "LegacyBarrierServiceDetected")
+assert_file_excludes("${INNO_SCRIPT}" "Weave installation cannot continue while that service exists")
+assert_file_excludes("${INNO_SCRIPT}" "AppId={{41036EA6-3F7A-4803-8AE0-469E5E91EFCC}")
+assert_file_excludes("${INNO_SCRIPT}" "Parameters: \"create Barrier")
+assert_file_excludes("${INNO_SCRIPT}" "Parameters: \"delete Barrier")
+assert_file_excludes("${INNO_SCRIPT}" "Parameters: \"stop Barrier")
+
+assert_file_excludes("${SOURCE_ROOT}/dist/wix/Product.wxs"
+                     "Id=\"LegacyBarrierServiceSearch\"")
+assert_file_excludes("${SOURCE_ROOT}/dist/wix/Product.wxs"
+                     "LEGACY_BARRIER_SERVICE")
+assert_file_excludes("${SOURCE_ROOT}/dist/wix/Product.wxs"
+                     "SYSTEM\\CurrentControlSet\\Services\\Barrier")
+assert_file_contains("${SOURCE_ROOT}/dist/wix/Include.wxi.in"
+                     "<?define UpgradeGuid=\"8B5E12D6-57C0-4B70-BE15-FFFE47230272\"")
+assert_file_contains("${SOURCE_ROOT}/dist/wix/Include.wxi.in"
+                     "<?define UpgradeGuid=\"F0D33EF8-15CE-4A26-BEA3-8E281655A2C1\"")
+assert_file_excludes("${SOURCE_ROOT}/dist/wix/Include.wxi.in"
+                     "E8A4FA54-14B9-4FD1-8E00-7BC46555FDA0")
+assert_file_excludes("${SOURCE_ROOT}/dist/wix/Include.wxi.in"
+                     "BE0B9FD8-45E2-4A8E-A0D8-1F774D074A78")
+
+set(WIX_PRODUCT "${SOURCE_ROOT}/dist/wix/Product.wxs")
+assert_file_contains("${WIX_PRODUCT}" "<Product Id=\"*\"")
+assert_file_contains("${WIX_PRODUCT}"
+                     "Component Guid=\"49069D9B-CD31-4482-9470-49DCD76C0EB5\" Id=\"RegistryEntries\"")
+assert_file_contains("${WIX_PRODUCT}"
+                     "Component Guid=\"C5B05265-C9FF-4076-8767-50DB840E049A\" Id=\"Core\"")
+assert_file_contains("${WIX_PRODUCT}"
+                     "Component Guid=\"65E1ED70-2BA3-420B-A4BB-1264D62DDC83\" Id=\"Gui\"")
+assert_file_contains("${WIX_PRODUCT}"
+                     "Component Guid=\"D46D7B3D-C698-43BC-9669-1CB763E409A8\" Id=\"QtPlatformPlugin\"")
+foreach(legacy_component_guid IN ITEMS
+        "7CF3564D-1F8E-4D3D-9781-E1EE22D5BD67"
+        "EC9AD3B0-277C-4157-B5C8-5FD5B6A5F4AD"
+        "BAC8149B-6287-45BF-9C27-43D71ED40214"
+        "684EFA14-856B-440E-A5E6-E90E04E36B41")
+    assert_file_excludes("${WIX_PRODUCT}" "${legacy_component_guid}")
+endforeach()
+
+set(WIX_PROJECT "${SOURCE_ROOT}/dist/wix/Barrier.wixproj")
+assert_file_contains("${WIX_PROJECT}"
+                     "<ProjectGuid>{FFA33E8C-6E81-49D6-A118-A46CAC8E1DA0}</ProjectGuid>")
+assert_file_contains("${WIX_PROJECT}" "<OutputName>Weave</OutputName>")
+assert_file_excludes("${WIX_PROJECT}" "d4ba9f39-6a35-4c8f-9cb2-67fcbe5cab17")
+
+set(WIX_SOLUTION "${SOURCE_ROOT}/dist/wix/Barrier.sln")
+assert_file_contains("${WIX_SOLUTION}"
+                     "= \"Weave\", \"Barrier.wixproj\", \"{FFA33E8C-6E81-49D6-A118-A46CAC8E1DA0}\"")
+assert_file_excludes("${WIX_SOLUTION}" "D4BA9F39-6A35-4C8F-9CB2-67FCBE5CAB17")
+
+assert_file_contains("${SOURCE_ROOT}/src/lib/arch/win32/ArchDaemonWindows.cpp"
+                     "WEAVE_SERVICE_DISPLAY_NAME")
+assert_file_contains("${SOURCE_ROOT}/src/lib/arch/win32/ArchSystemWindows.cpp"
+                     "WEAVE_SETTINGS_REGISTRY_SUBKEY")
+assert_file_contains("${SOURCE_ROOT}/src/lib/barrier/win32/DaemonApp.cpp"
+                     "daemonize(WEAVE_SERVICE_NAME")
+
+set(WINDOWS_RESOURCE_FILES
+    "${SOURCE_ROOT}/src/gui/res/win/Barrier.rc"
+    "${SOURCE_ROOT}/src/cmd/barrierd/barrierd.rc"
+    "${SOURCE_ROOT}/src/cmd/barrierc/barrierc.rc"
+    "${SOURCE_ROOT}/src/cmd/barriers/barriers.rc")
+
+foreach(resource_file IN LISTS WINDOWS_RESOURCE_FILES)
+    assert_file_contains("${resource_file}" "#include \"common/ProductIdentity.h\"")
+    assert_file_contains("${resource_file}" "VALUE \"CompanyName\", WEAVE_PRODUCT_PUBLISHER")
+    assert_file_contains("${resource_file}" "VALUE \"CompanyWeb\", WEAVE_PROJECT_URL")
+    assert_file_contains("${resource_file}" "VALUE \"ProductName\", WEAVE_PRODUCT_NAME")
+    assert_file_contains("${resource_file}"
+                         "VALUE \"LegalCopyright\", \"Copyright (C) 2018 Debauchee Open Source Group")
+    assert_file_contains("${resource_file}" "Copyright (C) 2002-2014 Chris Schoeneman\"")
+    assert_file_excludes("${resource_file}" "VALUE \"CompanyName\", \"Debauchee Open Source Group\"")
+    assert_file_excludes("${resource_file}" "VALUE \"CompanyWeb\", \"https://github.com/debauchee/barrier/\"")
+endforeach()
+
+assert_file_contains("${SOURCE_ROOT}/src/gui/res/win/Barrier.rc"
+                     "VALUE \"OriginalFilename\", WEAVE_GUI_ORIGINAL_FILENAME")
+assert_file_contains("${SOURCE_ROOT}/src/gui/res/win/Barrier.rc"
+                     "VALUE \"InternalName\", WEAVE_GUI_INTERNAL_NAME")
+assert_file_contains("${SOURCE_ROOT}/src/cmd/barrierd/barrierd.rc"
+                     "VALUE \"OriginalFilename\", WEAVE_DAEMON_ORIGINAL_FILENAME")
+assert_file_contains("${SOURCE_ROOT}/src/cmd/barrierd/barrierd.rc"
+                     "VALUE \"InternalName\", WEAVE_DAEMON_INTERNAL_NAME")
+assert_file_contains("${SOURCE_ROOT}/src/cmd/barrierc/barrierc.rc"
+                     "VALUE \"OriginalFilename\", WEAVE_CLIENT_ORIGINAL_FILENAME")
+assert_file_contains("${SOURCE_ROOT}/src/cmd/barrierc/barrierc.rc"
+                     "VALUE \"InternalName\", WEAVE_CLIENT_INTERNAL_NAME")
+assert_file_contains("${SOURCE_ROOT}/src/cmd/barriers/barriers.rc"
+                     "VALUE \"OriginalFilename\", WEAVE_SERVER_ORIGINAL_FILENAME")
+assert_file_contains("${SOURCE_ROOT}/src/cmd/barriers/barriers.rc"
+                     "VALUE \"InternalName\", WEAVE_SERVER_INTERNAL_NAME")
+
+set(WIX_INCLUDE "${SOURCE_ROOT}/dist/wix/Include.wxi.in")
+assert_file_contains("${WIX_INCLUDE}" "<?define Name=\"@WEAVE_PRODUCT_NAME@\" ?>")
+assert_file_contains("${WIX_INCLUDE}" "<?define Author=\"@WEAVE_PRODUCT_PUBLISHER@\" ?>")
+assert_file_contains("${WIX_INCLUDE}" "<?define Web=\"@WEAVE_PROJECT_URL@\" ?>")
+assert_file_contains("${WIX_INCLUDE}" "<?define ServiceName=\"@WEAVE_SERVICE_NAME@\" ?>")
+assert_file_contains("${WIX_INCLUDE}" "<?define ServiceDisplayName=\"@WEAVE_SERVICE_DISPLAY_NAME@\" ?>")
+assert_file_contains("${WIX_INCLUDE}" "<?define ServiceDescription=\"@WEAVE_SERVICE_DESCRIPTION@\" ?>")
+assert_file_contains("${WIX_INCLUDE}"
+                     "@CMAKE_BINARY_DIR@/windows-release/$(var.Configuration)/payload")
+assert_file_contains("${WIX_INCLUDE}" "@WEAVE_VC_REDIST_MIN_VERSION@")
+
+assert_file_contains("${WIX_PRODUCT}" "Id=\"ARPURLINFOABOUT\" Value=\"$(var.Web)\"")
+assert_file_contains("${WIX_PRODUCT}" "Description=\"$(var.ServiceDescription)\"")
+assert_file_contains("${WIX_PRODUCT}" "DisplayName=\"$(var.ServiceDisplayName)\"")
+assert_file_contains("${WIX_PRODUCT}" "Name=\"$(var.ServiceName)\"")
+assert_file_contains("${WIX_PRODUCT}" "ServiceControl Id=\"ServiceControl\" Name=\"$(var.ServiceName)\"")
+assert_file_excludes("${WIX_PRODUCT}" "ServiceInstall Description=\"Controls the $(var.Name) foreground processes.\"")
+assert_file_excludes("${WIX_PRODUCT}" "ServiceControl Id=\"ServiceControl\" Name=\"Weave\"")

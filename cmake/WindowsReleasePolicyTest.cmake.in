@@ -1,0 +1,374 @@
+cmake_policy(VERSION 3.16)
+
+function(assert_file_contains path expected)
+    if (NOT EXISTS "${path}")
+        message(FATAL_ERROR "required Windows release file does not exist: ${path}")
+    endif()
+
+    file(READ "${path}" contents)
+    string(FIND "${contents}" "${expected}" position)
+    if (position EQUAL -1)
+        message(FATAL_ERROR "${path} does not contain: ${expected}")
+    endif()
+endfunction()
+
+function(assert_file_excludes path unexpected)
+    if (NOT EXISTS "${path}")
+        message(FATAL_ERROR "required Windows release file does not exist: ${path}")
+    endif()
+
+    file(READ "${path}" contents)
+    string(FIND "${contents}" "${unexpected}" position)
+    if (NOT position EQUAL -1)
+        message(FATAL_ERROR "${path} unexpectedly contains: ${unexpected}")
+    endif()
+endfunction()
+
+function(assert_path_exists path)
+    if (NOT EXISTS "${path}")
+        message(FATAL_ERROR "expected Windows release artifact is missing: ${path}")
+    endif()
+endfunction()
+
+function(assert_path_absent path)
+    if (EXISTS "${path}")
+        message(FATAL_ERROR "unexpected Windows release artifact exists: ${path}")
+    endif()
+endfunction()
+
+function(assert_lists_equal description actual_var expected_var)
+    set(actual ${${actual_var}})
+    set(expected ${${expected_var}})
+    list(SORT actual)
+    list(SORT expected)
+    if (NOT "${actual}" STREQUAL "${expected}")
+        message(FATAL_ERROR
+                "${description} differs\nexpected: ${expected}\nactual: ${actual}")
+    endif()
+endfunction()
+
+function(read_release_manifest path payload_dir output_var)
+    if (NOT EXISTS "${path}")
+        message(FATAL_ERROR "Windows release manifest is missing: ${path}")
+    endif()
+
+    file(STRINGS "${path}" manifest_lines)
+    set(entries)
+    foreach(line IN LISTS manifest_lines)
+        if (NOT line MATCHES "^([0-9a-f]+)  ([^/].+)$")
+            message(FATAL_ERROR "invalid Windows release manifest line: ${line}")
+        endif()
+        string(LENGTH "${CMAKE_MATCH_1}" hash_length)
+        if (NOT hash_length EQUAL 64)
+            message(FATAL_ERROR "invalid Windows release manifest hash: ${line}")
+        endif()
+        set(relative_path "${CMAKE_MATCH_2}")
+        if (NOT EXISTS "${payload_dir}/${relative_path}")
+            message(FATAL_ERROR
+                    "manifest entry is absent from staging: ${relative_path}")
+        endif()
+        file(SHA256 "${payload_dir}/${relative_path}" actual_hash)
+        string(TOLOWER "${actual_hash}" actual_hash)
+        if (NOT actual_hash STREQUAL CMAKE_MATCH_1)
+            message(FATAL_ERROR
+                    "manifest hash does not match staging: ${relative_path}")
+        endif()
+        list(APPEND entries "${relative_path}")
+    endforeach()
+    set(${output_var} "${entries}" PARENT_SCOPE)
+endfunction()
+
+function(read_wix_payload_entries path output_var)
+    file(STRINGS "${path}" source_lines)
+    set(entries)
+    set(bin_path_marker [=[$(var.BinPath)\]=])
+    string(LENGTH "${bin_path_marker}" marker_length)
+    foreach(line IN LISTS source_lines)
+        string(FIND "${line}" "${bin_path_marker}" marker_position)
+        if (marker_position EQUAL -1)
+            continue()
+        endif()
+        math(EXPR relative_start "${marker_position} + ${marker_length}")
+        string(SUBSTRING "${line}" ${relative_start} -1 relative_tail)
+        string(FIND "${relative_tail}" "\"" quote_position)
+        if (quote_position EQUAL -1)
+            message(FATAL_ERROR "invalid WiX staged Source: ${line}")
+        endif()
+        string(SUBSTRING "${relative_tail}" 0 ${quote_position} relative_path)
+        string(REPLACE "\\" "/" relative_path "${relative_path}")
+        list(APPEND entries "${relative_path}")
+    endforeach()
+    set(${output_var} "${entries}" PARENT_SCOPE)
+endfunction()
+
+function(read_inno_payload_entries path output_var)
+    if (NOT EXISTS "${path}")
+        message(FATAL_ERROR "Inno Release file list is missing: ${path}")
+    endif()
+    file(STRINGS "${path}" source_lines)
+    set(entries)
+    set(stage_marker "{#ReleaseStage}/payload/")
+    string(LENGTH "${stage_marker}" marker_length)
+    foreach(line IN LISTS source_lines)
+        string(FIND "${line}" "${stage_marker}" marker_position)
+        if (marker_position EQUAL -1)
+            message(FATAL_ERROR "invalid staged Inno Source: ${line}")
+        endif()
+        math(EXPR relative_start "${marker_position} + ${marker_length}")
+        string(SUBSTRING "${line}" ${relative_start} -1 relative_tail)
+        string(FIND "${relative_tail}" "\"" quote_position)
+        if (quote_position EQUAL -1)
+            message(FATAL_ERROR "invalid staged Inno Source: ${line}")
+        endif()
+        string(SUBSTRING "${relative_tail}" 0 ${quote_position} relative_path)
+        list(APPEND entries "${relative_path}")
+    endforeach()
+    set(${output_var} "${entries}" PARENT_SCOPE)
+endfunction()
+
+set(expected_release_files
+    Qt5Core.dll
+    Qt5Gui.dll
+    Qt5Network.dll
+    Qt5Svg.dll
+    Qt5Widgets.dll
+    Qt5WinExtras.dll
+    bearer/qgenericbearer.dll
+    iconengines/qsvgicon.dll
+    imageformats/qgif.dll
+    imageformats/qicns.dll
+    imageformats/qico.dll
+    imageformats/qjpeg.dll
+    imageformats/qsvg.dll
+    imageformats/qtga.dll
+    imageformats/qtiff.dll
+    imageformats/qwbmp.dll
+    imageformats/qwebp.dll
+    libEGL.dll
+    libGLESv2.dll
+    libcrypto-3-x64.dll
+    libssl-3-x64.dll
+    platforms/qwindows.dll
+    styles/qwindowsvistastyle.dll
+    weave.exe
+    weavec.exe
+    weaved.exe
+    weaves.exe
+    zlib1.dll)
+
+set(clean_build "${SOURCE_ROOT}/clean_build.bat")
+assert_file_contains("${clean_build}" "Visual Studio 17 2022")
+assert_file_contains("${clean_build}" "set cmake_gen=Visual Studio 17 2022")
+
+set(gui_cmake "${SOURCE_ROOT}/src/gui/CMakeLists.txt")
+assert_file_contains("${gui_cmake}"
+                     "-DBUILD_CONFIGURATION=$<CONFIG>")
+assert_file_contains("${gui_cmake}"
+                     "add_custom_target(weave_windows_release_stage ALL")
+assert_file_contains("${gui_cmake}"
+                     "DEPENDS barrier barriers barrierc barrierd")
+assert_file_contains("${gui_cmake}" "-DSTAGING_REQUIRED=TRUE")
+
+set(gui_deploy "${SOURCE_ROOT}/src/gui/DeployWindowsGui.cmake")
+assert_file_contains("${gui_deploy}" "--debug")
+assert_file_contains("${gui_deploy}" "--release")
+assert_file_contains("${gui_deploy}" "libssl-3-x64.dll")
+assert_file_contains("${gui_deploy}" "libcrypto-3-x64.dll")
+assert_file_contains("${gui_deploy}"
+                     [=[if (EXISTS "${QT_BIN_DIR}/zlib1.dll")]=])
+assert_file_excludes("${gui_deploy}" "$env:ProgramFiles")
+assert_file_excludes("${gui_deploy}" "ProgramFiles(x86)")
+assert_file_excludes("${gui_deploy}" "Get-ChildItem -Path $root")
+assert_file_excludes("${gui_deploy}" "COMMAND powershell")
+
+set(wix_solution "${SOURCE_ROOT}/dist/wix/Barrier.sln")
+assert_file_contains("${wix_solution}" "# Visual Studio Version 17")
+assert_file_contains("${wix_solution}" "VisualStudioVersion = 17.0.")
+
+set(wix_product "${SOURCE_ROOT}/dist/wix/Product.wxs")
+assert_file_contains("${wix_product}"
+                     "$(var.BinPath)\\libssl-3-x64.dll")
+assert_file_contains("${wix_product}"
+                     "$(var.BinPath)\\libcrypto-3-x64.dll")
+assert_file_excludes("${wix_product}" "libeay32.dll")
+assert_file_excludes("${wix_product}" "ssleay32.dll")
+assert_file_excludes("${wix_product}" "$(var.OpenSSLBinPath)")
+assert_file_excludes("${wix_product}" "$(var.QtBinPath)")
+assert_file_excludes("${wix_product}" "LEGACY_BARRIER_SERVICE")
+assert_file_excludes("${wix_product}" "LegacyBarrierServiceSearch")
+assert_file_excludes("${wix_product}"
+                     "SYSTEM\\CurrentControlSet\\Services\\Barrier")
+assert_file_contains("${wix_product}" "VCRUNTIME_X64_INSTALLED")
+assert_file_contains("${wix_product}" "$(var.VcRedistMinimumVersion)")
+assert_file_contains("${wix_product}" "VCRUNTIME_X64_MAJOR")
+assert_file_contains("${wix_product}" "VCRUNTIME_X64_MINOR")
+foreach(relative_path IN LISTS expected_release_files)
+    string(REPLACE "/" "\\" wix_relative_path "${relative_path}")
+    assert_file_contains("${wix_product}"
+                         "$(var.BinPath)\\${wix_relative_path}")
+endforeach()
+read_wix_payload_entries("${wix_product}" wix_payload_entries)
+assert_lists_equal("WiX Release payload"
+                   wix_payload_entries expected_release_files)
+foreach(component_group IN ITEMS
+        "INSTALLFOLDER|ProductComponents"
+        "BearerDir|ProductQtBearerComponents"
+        "IconEnginesDir|ProductQtIconEngineComponents"
+        "ImageFormatsDir|ProductQtImageFormatComponents"
+        "PlatformsDir|ProductQtPluginComponents"
+        "StylesDir|ProductQtStyleComponents")
+    string(REPLACE "|" ";" component_group_parts "${component_group}")
+    list(GET component_group_parts 0 component_directory)
+    list(GET component_group_parts 1 component_group_id)
+    assert_file_contains("${wix_product}"
+                         "ComponentGroupRef Id=\"${component_group_id}\"")
+    assert_file_contains("${wix_product}"
+                         "ComponentGroup Directory=\"${component_directory}\" Id=\"${component_group_id}\"")
+endforeach()
+assert_file_excludes("${wix_product}" "unittests.exe")
+assert_file_excludes("${wix_product}" ".pdb")
+assert_file_excludes("${wix_product}" "Windows Kits\\10\\bin")
+
+set(inno_script "${SOURCE_ROOT}/dist/inno/barrier.iss.in")
+assert_file_contains("${inno_script}" "vcredist2015to2022")
+assert_file_contains("${inno_script}"
+                     "https://aka.ms/vs/17/release/vc_redist.x64.exe")
+assert_file_excludes("${inno_script}" "vcredist2017")
+assert_file_excludes("${inno_script}" "LegacyBarrierServiceDetected")
+assert_file_excludes("${inno_script}"
+                     "SYSTEM\\CurrentControlSet\\Services\\Barrier")
+assert_file_excludes("${inno_script}"
+                     "Weave installation cannot continue while that service exists")
+assert_file_contains("${inno_script}"
+                     "{#ReleaseStage}/payload-files.iss")
+assert_file_contains("${inno_script}"
+                     "{#ReleaseStage}/manifest.sha256")
+assert_file_contains("${inno_script}"
+                     "#define ReleaseStage \"@CMAKE_BINARY_DIR@/windows-release/Release\"")
+assert_file_excludes("${inno_script}"
+                     "@CMAKE_RUNTIME_OUTPUT_DIRECTORY@/Release/*")
+assert_file_excludes("${inno_script}" "payload/*")
+assert_file_excludes("${inno_script}" "recursesubdirs")
+
+set(wix_include "${SOURCE_ROOT}/dist/wix/Include.wxi.in")
+assert_file_contains("${wix_include}"
+                     "@CMAKE_BINARY_DIR@/windows-release/$(var.Configuration)/payload")
+assert_file_contains("${wix_include}"
+                     "@WEAVE_VC_REDIST_MIN_VERSION@")
+assert_file_contains("${wix_include}"
+                     "@WEAVE_VC_REDIST_MAJOR_VERSION@")
+assert_file_contains("${wix_include}"
+                     "@WEAVE_VC_REDIST_MINOR_VERSION@")
+assert_file_contains("${wix_product}" "$(var.ReleaseManifestPath)")
+
+set(fixture_root "${CMAKE_CURRENT_BINARY_DIR}/windows-release-policy-fixture")
+set(fixture_qt "${fixture_root}/qt")
+set(fixture_openssl "${fixture_root}/openssl")
+file(REMOVE_RECURSE "${fixture_root}")
+file(MAKE_DIRECTORY "${fixture_qt}/bin" "${fixture_openssl}/bin")
+
+foreach(suffix IN ITEMS "" d)
+    foreach(qt_base IN ITEMS
+            Qt5Core Qt5Gui Qt5Network Qt5Svg Qt5Widgets Qt5WinExtras
+            libEGL libGLESv2)
+        file(WRITE "${fixture_qt}/bin/${qt_base}${suffix}.dll" "fixture")
+    endforeach()
+    foreach(plugin_entry IN ITEMS
+            "bearer/qgenericbearer${suffix}.dll"
+            "platforms/qwindows${suffix}.dll"
+            "styles/qwindowsvistastyle${suffix}.dll"
+            "iconengines/qsvgicon${suffix}.dll"
+            "imageformats/qgif${suffix}.dll"
+            "imageformats/qicns${suffix}.dll"
+            "imageformats/qico${suffix}.dll"
+            "imageformats/qjpeg${suffix}.dll"
+            "imageformats/qsvg${suffix}.dll"
+            "imageformats/qtga${suffix}.dll"
+            "imageformats/qtiff${suffix}.dll"
+            "imageformats/qwbmp${suffix}.dll"
+            "imageformats/qwebp${suffix}.dll")
+        get_filename_component(plugin_dir "${plugin_entry}" DIRECTORY)
+        file(MAKE_DIRECTORY "${fixture_qt}/plugins/${plugin_dir}")
+        file(WRITE "${fixture_qt}/plugins/${plugin_entry}" "fixture")
+    endforeach()
+endforeach()
+file(WRITE "${fixture_qt}/bin/zlib1.dll" "controlled fixture")
+file(WRITE "${fixture_openssl}/bin/libssl-3-x64.dll" "fixture")
+file(WRITE "${fixture_openssl}/bin/libcrypto-3-x64.dll" "fixture")
+
+foreach(configuration IN ITEMS Debug Release)
+    string(TOLOWER "${configuration}" configuration_lower)
+    set(output_dir "${fixture_root}/${configuration_lower}")
+    file(MAKE_DIRECTORY "${output_dir}")
+    foreach(product_exe IN ITEMS weave.exe weavec.exe weaved.exe weaves.exe)
+        file(WRITE "${output_dir}/${product_exe}" "fixture")
+    endforeach()
+    file(WRITE "${output_dir}/unittests.exe" "must not ship")
+    file(WRITE "${output_dir}/guiunittests.exe" "must not ship")
+    file(WRITE "${output_dir}/integtests.exe" "must not ship")
+    file(WRITE "${output_dir}/weave.pdb" "must not ship")
+    file(MAKE_DIRECTORY "${output_dir}/test-fixtures")
+    file(WRITE "${output_dir}/test-fixtures/test-helper.dll" "must not ship")
+
+    set(staging_dir "${fixture_root}/stage/${configuration}")
+    if (configuration STREQUAL "Release")
+        file(MAKE_DIRECTORY "${staging_dir}/payload")
+        file(WRITE "${staging_dir}/payload/stale-test.exe"
+             "must be removed before staging")
+    endif()
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+            -DWIN32=TRUE
+            -DBUILD_CONFIGURATION=${configuration}
+            -DQT_BIN_DIR=${fixture_qt}/bin
+            -DOPENSSL_ROOT_HINT=${fixture_openssl}
+            -DOUTPUT_DIR=${output_dir}
+            -DSTAGING_DIR=${staging_dir}
+            -DTARGET_FILE=${output_dir}/weave.exe
+            -P ${gui_deploy}
+        RESULT_VARIABLE deploy_result)
+    if (NOT deploy_result EQUAL 0)
+        message(FATAL_ERROR
+                "${configuration} GUI deployment fixture failed: ${deploy_result}")
+    endif()
+
+    if (configuration STREQUAL "Debug")
+        assert_path_exists("${output_dir}/Qt5Cored.dll")
+        assert_path_exists("${output_dir}/platforms/qwindowsd.dll")
+        assert_path_absent("${output_dir}/Qt5Core.dll")
+    else()
+        assert_path_exists("${output_dir}/Qt5Core.dll")
+        assert_path_exists("${output_dir}/platforms/qwindows.dll")
+        assert_path_absent("${output_dir}/Qt5Cored.dll")
+    endif()
+    assert_path_exists("${output_dir}/libssl-3-x64.dll")
+    assert_path_exists("${output_dir}/libcrypto-3-x64.dll")
+    assert_path_exists("${output_dir}/zlib1.dll")
+    assert_path_absent("${output_dir}/zlib.dll")
+
+    if (configuration STREQUAL "Release")
+        read_release_manifest("${staging_dir}/manifest.sha256"
+                              "${staging_dir}/payload"
+                              staged_manifest_entries)
+        assert_lists_equal("release manifest"
+                           staged_manifest_entries expected_release_files)
+
+        file(GLOB_RECURSE staged_payload_entries
+             LIST_DIRECTORIES FALSE
+             RELATIVE "${staging_dir}/payload"
+             "${staging_dir}/payload/*")
+        assert_lists_equal("release staging payload"
+                           staged_payload_entries expected_release_files)
+        read_inno_payload_entries("${staging_dir}/payload-files.iss"
+                                  staged_inno_entries)
+        assert_lists_equal("Inno Release payload"
+                           staged_inno_entries expected_release_files)
+        assert_path_absent("${staging_dir}/payload/unittests.exe")
+        assert_path_absent("${staging_dir}/payload/guiunittests.exe")
+        assert_path_absent("${staging_dir}/payload/integtests.exe")
+        assert_path_absent("${staging_dir}/payload/weave.pdb")
+        assert_path_absent("${staging_dir}/payload/stale-test.exe")
+        assert_path_absent(
+            "${staging_dir}/payload/test-fixtures/test-helper.dll")
+    endif()
+endforeach()

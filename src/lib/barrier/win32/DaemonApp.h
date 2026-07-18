@@ -19,11 +19,15 @@
 #pragma once
 
 #include "arch/Arch.h"
+#include "barrier/ServiceLaunchState.h"
+#include "base/Event.h"
 #include "ipc/IpcServer.h"
 
+#include <cstdint>
+#include <atomic>
 #include <string>
+#include <vector>
 
-class Event;
 class IpcLogOutputter;
 class FileLogOutputter;
 
@@ -43,8 +47,20 @@ private:
     std::string            logFilename();
     void                initializeTrustedExecutables();
     bool                prepareWatchdogCommand(std::string& command,
+                                               UInt8 requestedElevateMode,
+                                               UInt8& sanitizedElevateMode,
                                                std::string& reason) const;
     void                handleIpcMessage(const Event&, void*);
+    ServiceLaunchCommitResult commitWatchdogLaunchReady(
+                            const ServiceLaunchCandidate& candidate);
+    void                handleWatchdogLaunchReady(const Event&, void*);
+    void                notifyWatchdogStopConfirmed(
+                            unsigned long long commandGeneration);
+    void                handleWatchdogStopConfirmed(const Event&, void*);
+    void                acknowledgeConfirmedStops(
+                            unsigned long long commandGeneration);
+    ServiceLaunchCommitResult promoteWatchdogLaunchReady(
+                            const ServiceLaunchCandidate& candidate);
 
 public:
     static DaemonApp* s_instance;
@@ -57,8 +73,19 @@ private:
     IEventQueue*        m_events;
     FileLogOutputter*    m_fileLogOutputter;
     bool                m_daemonized;
+    Event::Type         m_launchReadyEvent;
+    Event::Type         m_stopConfirmedEvent;
+    std::uint64_t       m_launchRevision;
+    std::atomic<bool>   m_acceptLaunchCommits;
+    std::atomic<bool>   m_acceptStopConfirmations;
+    struct PendingStopAck {
+        std::uint64_t requestId;
+        UInt32 processId;
+        unsigned long long commandGeneration;
+    };
+    std::vector<PendingStopAck> m_pendingStopAcks;
     std::string         m_trustedServerExecutable;
     std::string         m_trustedClientExecutable;
 };
 
-#define LOG_FILENAME "barrierd.log"
+#define LOG_FILENAME "weaved.log"

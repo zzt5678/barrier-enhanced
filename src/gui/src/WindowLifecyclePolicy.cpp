@@ -26,4 +26,9 @@ bool shouldHideOnMinimize(Qt::WindowStates state, bool minimizeToTray,
         state.testFlag(Qt::WindowMinimized);
 }
 
+bool canCompleteExplicitQuit(bool serviceMode, bool stopAcknowledged)
+{
+    return !serviceMode || stopAcknowledged;
+}
+
 } // namespace WindowLifecyclePolicy

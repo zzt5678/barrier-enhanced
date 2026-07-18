@@ -1,4 +1,5 @@
 #include "barrier/FileChunk.h"
+#include "barrier/FileTransferProtocol.h"
 #include "barrier/protocol_types.h"
 #include "arch/Arch.h"
 #include "base/Event.h"
@@ -8,6 +9,7 @@
 #include "test/global/gtest.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -49,6 +51,18 @@ waitForPathRemoval(const barrier::fs::path& path, int attempts = 500)
         ARCH->sleep(0.001);
     }
     return !barrier::fs::exists(path);
+}
+
+static bool
+waitForWorkerCleanup(FileReceiveSession& session, int attempts = 500)
+{
+    for (int i = 0; i < attempts; ++i) {
+        if (!session.workerCleanupPending()) {
+            return true;
+        }
+        ARCH->sleep(0.001);
+    }
+    return !session.workerCleanupPending();
 }
 
 static std::string
@@ -168,7 +182,7 @@ TEST(FileChunkTests, assemble_cancelReleasesPartialReceiveBuffer)
     EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
     EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
     EXPECT_EQ(1024u, received.size());
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kCancelled, FileChunk::assemble(&stream, session));
     EXPECT_TRUE(received.empty());
     EXPECT_EQ(0u, session.expectedSize());
 }
@@ -182,6 +196,35 @@ TEST(FileChunkTests, eventDeleteDataDeletesChunkObject)
     EXPECT_EQ(chunk, event.getData());
 
     Event::deleteData(event);
+}
+
+TEST(FileChunkTests, transactionalChunkFactoriesRecordOffsetsAndCancelReason)
+{
+    FileChunk* start = FileChunk::start("20", true);
+    FileChunk* data = FileChunk::data(
+        reinterpret_cast<const UInt8*>("abc"), 3, 17);
+    FileChunk* end = FileChunk::end("sha256:digest", 20);
+    FileChunk* cancel = FileChunk::cancel(
+        barrier::FileTransferReason::kTimeout);
+    FileChunk* legacy = FileChunk::data(
+        reinterpret_cast<const UInt8*>("abc"), 3);
+
+    EXPECT_TRUE(start->m_transactional);
+    EXPECT_EQ(17u, data->m_offset);
+    EXPECT_TRUE(data->m_transactional);
+    EXPECT_EQ(20u, end->m_offset);
+    EXPECT_TRUE(end->m_transactional);
+    EXPECT_EQ(barrier::FileTransferReason::kTimeout,
+              cancel->m_transferReason);
+    EXPECT_TRUE(cancel->m_transactional);
+    EXPECT_FALSE(legacy->m_transactional);
+    EXPECT_EQ(0u, legacy->m_offset);
+
+    delete start;
+    delete data;
+    delete end;
+    delete cancel;
+    delete legacy;
 }
 
 TEST(FileChunkTests, releaseReceiveBufferClearsDataCapacityAndExpectedSize)
@@ -217,25 +260,32 @@ TEST(FileChunkTests, assemble_readFailureReleasesReceiveBuffer)
     EXPECT_EQ(0u, session.expectedSize());
 }
 
-TEST(FileChunkTests, assemble_newStartDoesNotRetainPreviousPeakCapacity)
+TEST(FileChunkTests, assemble_duplicateStartPreservesMemoryReceiveSession)
 {
     std::vector<UInt8> data;
-    appendFileChunkMessage(data, kDataStart, "1048576");
-    appendFileChunkMessage(data, kDataChunk, String(1024 * 1024, 'x'));
+    appendFileChunkMessage(data, kDataStart, "6");
+    appendFileChunkMessage(data, kDataChunk, "abc");
     appendFileChunkMessage(data, kDataStart, "16");
+    appendFileChunkMessage(data, kDataChunk, "def");
+    appendFileChunkMessage(data, kDataEnd, "");
     FileChunkTestStream stream(data);
 
     FileReceiveSession session;
-    const String& received = session.data();
 
     EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
     EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
-    EXPECT_GE(received.capacity(), 1024u * 1024u);
-    const size_t largeCapacity = received.capacity();
+    const std::uint64_t generation = session.generation();
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
-    EXPECT_EQ(16u, session.expectedSize());
-    EXPECT_LT(received.capacity(), largeCapacity / 2);
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(FileReceiveSession::kReceiving, session.state());
+    EXPECT_EQ(generation, session.generation());
+    EXPECT_EQ(6u, session.expectedSize());
+    EXPECT_EQ(3u, session.receivedSize());
+    EXPECT_EQ("abc", session.data());
+
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ("abcdef", session.data());
 }
 
 TEST(FileChunkTests, assemble_chunkLargerThanExpectedReleasesReceiveBuffer)
@@ -392,6 +442,18 @@ TEST(FileChunkTests, assemble_startLargerThanReceiveLimitIsRejected)
     EXPECT_EQ(0u, session.expectedSize());
 }
 
+TEST(FileChunkTests, assemble_startSizeWithTrailingBytesIsRejected)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "6trailing");
+    FileChunkTestStream stream(data);
+    FileReceiveSession session;
+
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(FileReceiveSession::kFailed, session.state());
+    EXPECT_EQ(0u, session.expectedSize());
+}
+
 TEST(FileChunkTests, assemble_largeTransferUsesSpoolFileAndKeepsMemoryEmpty)
 {
     std::vector<UInt8> data;
@@ -504,6 +566,37 @@ TEST(FileChunkTests, receiveSessionKeepsOneSpoolHandleOpenUntilTransferEnds)
     EXPECT_EQ(6u, barrier::fs::file_size(session.spoolPath()));
 }
 
+TEST(FileChunkTests, assemble_duplicateStartPreservesFinalizingSpoolSession)
+{
+    FileReceiveSession session;
+    ASSERT_TRUE(session.begin(6, 0, 0));
+    ASSERT_TRUE(session.append("abc"));
+    ASSERT_TRUE(session.append("def"));
+    const std::uint64_t generation = session.generation();
+    ASSERT_TRUE(session.finish());
+    ASSERT_TRUE(session.isFinalizing() || session.isComplete());
+
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "3");
+    FileChunkTestStream stream(data);
+
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(generation, session.generation());
+    EXPECT_EQ(6u, session.expectedSize());
+    EXPECT_EQ(6u, session.receivedSize());
+    EXPECT_TRUE(session.isFinalizing() || session.isComplete());
+
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+    std::string completedData;
+    size_t expectedSize = 0;
+    barrier::fs::path spoolPath;
+    session.takeCompleted(completedData, expectedSize, spoolPath);
+    ASSERT_EQ(6u, expectedSize);
+    ASSERT_FALSE(spoolPath.empty());
+    EXPECT_EQ("abcdef", readFileBytes(spoolPath));
+    FileChunk::releaseReceiveBuffer(completedData, expectedSize, &spoolPath);
+}
+
 TEST(FileChunkTests, receiveSessionVerifiesSha256BeforeCompletingSpool)
 {
     FileReceiveSession session;
@@ -549,6 +642,96 @@ TEST(FileChunkTests, receiveSessionRejectsChunkLargerThanAsyncQueueBudget)
     EXPECT_EQ(FileReceiveSession::kFailed, session.state());
 }
 
+TEST(FileChunkTests, receiveSessionBackpressureResumesAtQueueLowWater)
+{
+    const size_t chunkSize = FileReceiveSession::kMaxAsyncChunkSize;
+    FileReceiveSession session;
+    ASSERT_TRUE(session.begin(chunkSize * 2, 0, 0, chunkSize * 2));
+    const std::uint64_t generation = session.generation();
+
+    EXPECT_EQ(FileReceiveSession::kAppendBackpressure,
+              session.append(std::string(chunkSize, 'a')));
+    std::atomic<bool> firstResume(false);
+    ASSERT_TRUE(session.installBackpressureBarrier(
+        generation, [&firstResume]() { firstResume.store(true); }));
+    for (int attempt = 0; attempt < 500 && !firstResume.load(); ++attempt) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(firstResume.load());
+
+    EXPECT_EQ(FileReceiveSession::kAppendBackpressure,
+              session.append(std::string(chunkSize, 'b')));
+    std::atomic<bool> secondResume(false);
+    ASSERT_TRUE(session.installBackpressureBarrier(
+        generation, [&secondResume]() { secondResume.store(true); }));
+    for (int attempt = 0; attempt < 500 && !secondResume.load(); ++attempt) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(secondResume.load());
+
+    ASSERT_TRUE(session.finish());
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+    EXPECT_EQ(chunkSize * 2, barrier::fs::file_size(session.spoolPath()));
+}
+
+TEST(FileChunkTests, receiveSessionAcceptsProtocolSizedAsyncChunk)
+{
+    const size_t chunkSize = FileReceiveSession::kMaxAsyncChunkSize;
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(chunkSize, 0, 0, chunkSize * 2));
+    EXPECT_NE(FileReceiveSession::kAppendFailed,
+              session.append(std::string(chunkSize, 'a')));
+    ASSERT_TRUE(session.finish());
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+    EXPECT_EQ(chunkSize, barrier::fs::file_size(session.spoolPath()));
+}
+
+TEST(FileChunkTests, receiveSessionDoesNotOverlapRetiredSpoolWorkers)
+{
+    const size_t chunkSize = FileReceiveSession::kMaxAsyncChunkSize;
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(chunkSize, 0, 0, chunkSize * 2));
+    ASSERT_NE(FileReceiveSession::kAppendFailed,
+              session.append(std::string(chunkSize, 'a')));
+    session.reset();
+
+    if (session.workerCleanupPending()) {
+        EXPECT_FALSE(session.begin(1, 0, 0, 1));
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(2);
+    while (session.workerCleanupPending() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_FALSE(session.workerCleanupPending());
+    EXPECT_TRUE(session.begin(1, 0, 0, 1));
+}
+
+TEST(FileChunkTests, discardedControlTransferConsumesFramesUntilEnd)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "6");
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    appendFileChunkMessage(data, kDataChunk, "def");
+    appendFileChunkMessage(data, kDataEnd, "");
+    FileChunkTestStream stream(data);
+    FileReceiveSession session;
+
+    ASSERT_EQ(kStart, FileChunk::assemble(&stream, session));
+    ASSERT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    session.discardRemaining();
+
+    EXPECT_EQ(FileReceiveSession::kDiscarding, session.state());
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kCancelled, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(FileReceiveSession::kIdle, session.state());
+    EXPECT_EQ(0u, session.expectedSize());
+}
+
 TEST(FileChunkTests, receiveSessionGenerationRejectsStaleCompletion)
 {
     FileReceiveSession session;
@@ -559,6 +742,7 @@ TEST(FileChunkTests, receiveSessionGenerationRejectsStaleCompletion)
     session.reset();
     EXPECT_FALSE(session.matchesGeneration(firstGeneration));
 
+    ASSERT_TRUE(waitForWorkerCleanup(session));
     ASSERT_TRUE(session.begin(3, 0, 0));
     const std::uint64_t secondGeneration = session.generation();
     EXPECT_GT(secondGeneration, firstGeneration);
@@ -600,6 +784,7 @@ TEST(FileChunkTests, receiveSessionCanStartAgainAfterFailure)
     session.fail();
 
     EXPECT_TRUE(waitForPathRemoval(abandonedPath));
+    ASSERT_TRUE(waitForWorkerCleanup(session));
     ASSERT_TRUE(session.begin(3, 0, 0));
     ASSERT_TRUE(session.append("xyz"));
     ASSERT_TRUE(session.finish());

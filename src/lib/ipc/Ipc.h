@@ -29,6 +29,10 @@ enum EIpcMessage {
     kIpcReady,
     kIpcReadyV2,
     kIpcReadyQuery,
+    kIpcActivate,
+    kIpcActivated,
+    kIpcStopRequest,
+    kIpcStopAck,
 };
 
 enum EIpcClientType {
@@ -57,6 +61,16 @@ extern const char*        kIpcMsgReadyV2;
 // the same nonce so process adoption uses a post-query backend snapshot.
 extern const char*        kIpcMsgReadyQuery;
 
+// activate: daemon -> standby node
+// $1/$2 = activation nonce high/low. Only the authenticated target process
+// receives this after durable ownership commit and old-process fencing.
+extern const char*        kIpcMsgActivate;
+
+// activated: node -> daemon
+// $1 = process id; $2/$3 = activation nonce high/low. The node sends this
+// only after its data plane has started.
+extern const char*        kIpcMsgActivated;
+
 // log line: daemon -> gui
 // $1 = aggregate log lines collected from barriers/c or the daemon itself.
 extern const char*        kIpcMsgLogLine;
@@ -70,3 +84,11 @@ extern const char*        kIpcMsgCommand;
 // shutdown: daemon -> node
 // the daemon tells barriers/c to shut down gracefully.
 extern const char*        kIpcMsgShutdown;
+
+// stop request: authenticated gui -> daemon
+// $1/$2 = non-zero request id high/low.
+extern const char*        kIpcMsgStopRequest;
+
+// stop acknowledgement: daemon -> requesting gui
+// $1/$2 = request id high/low; $3/$4 = confirmed command generation high/low.
+extern const char*        kIpcMsgStopAck;

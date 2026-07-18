@@ -56,6 +56,24 @@ TEST(AppConfigTests, LoadsPlatformDefaultProcessAndElevateModeFromEmptySettings)
     EXPECT_EQ(ElevateAsNeeded, config.elevateMode());
     EXPECT_FALSE(config.autoConfig());
 #endif
+    EXPECT_TRUE(config.getRequireClientCertificate());
+}
+
+TEST(AppConfigTests, PreservesExplicitClientCertificateOptOut)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+
+    const QString settingsPath = dir.filePath("weave.ini");
+    {
+        QSettings settings(settingsPath, QSettings::IniFormat);
+        settings.setValue("requireClientCertificate", false);
+        settings.sync();
+    }
+
+    QSettings settings(settingsPath, QSettings::IniFormat);
+    AppConfig config(&settings);
+    EXPECT_FALSE(config.getRequireClientCertificate());
 }
 
 TEST(AppConfigTests, InvalidPersistedProcessModeFallsBackToPlatformDefault)

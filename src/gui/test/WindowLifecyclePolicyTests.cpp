@@ -41,3 +41,11 @@ TEST(WindowLifecyclePolicyTests, combinedWindowStateStillCountsAsMinimized)
     EXPECT_FALSE(WindowLifecyclePolicy::shouldHideOnMinimize(
         Qt::WindowActive, true, true));
 }
+
+TEST(WindowLifecyclePolicyTests, serviceQuitRequiresMatchingStopAcknowledgement)
+{
+    EXPECT_TRUE(WindowLifecyclePolicy::canCompleteExplicitQuit(false, false));
+    EXPECT_TRUE(WindowLifecyclePolicy::canCompleteExplicitQuit(false, true));
+    EXPECT_FALSE(WindowLifecyclePolicy::canCompleteExplicitQuit(true, false));
+    EXPECT_TRUE(WindowLifecyclePolicy::canCompleteExplicitQuit(true, true));
+}

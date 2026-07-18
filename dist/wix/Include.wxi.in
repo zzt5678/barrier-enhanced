@@ -1,25 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Include>
-    <?define Name="Weave" ?>
+    <?define Name="@WEAVE_PRODUCT_NAME@" ?>
     <?define Version="@BARRIER_WIX_VERSION@" ?>
     <?define QtVersion="@QT_VERSION@" ?>
-    <?define Author="Debauchee Open Source Group" ?>
-    <?define BinPath="@CMAKE_RUNTIME_OUTPUT_DIRECTORY@/$(var.Configuration)" ?>
+    <?define Author="@WEAVE_PRODUCT_PUBLISHER@" ?>
+    <?define Web="@WEAVE_PROJECT_URL@" ?>
+    <?define ServiceName="@WEAVE_SERVICE_NAME@" ?>
+    <?define ServiceDisplayName="@WEAVE_SERVICE_DISPLAY_NAME@" ?>
+    <?define ServiceDescription="@WEAVE_SERVICE_DESCRIPTION@" ?>
+    <?define BinPath="@CMAKE_BINARY_DIR@/windows-release/$(var.Configuration)/payload" ?>
+    <?define ReleaseManifestPath="@CMAKE_BINARY_DIR@/windows-release/$(var.Configuration)/manifest.sha256" ?>
+    <?define VcRedistMinimumVersion="@WEAVE_VC_REDIST_MIN_VERSION@" ?>
+    <?define VcRedistMajorVersion="@WEAVE_VC_REDIST_MAJOR_VERSION@" ?>
+    <?define VcRedistMinorVersion="@WEAVE_VC_REDIST_MINOR_VERSION@" ?>
     <?define ResPath="@CMAKE_CURRENT_SOURCE_DIR@/res" ?>
-    <?define ExtPath="@CMAKE_CURRENT_SOURCE_DIR@/ext" ?>
     <?if $(var.Platform) = "x64" ?>
         <?define ProgramFilesFolder="ProgramFiles64Folder" ?>
         <?define PlatformSimpleName="64-bit" ?>
-        <?define UpgradeGuid="E8A4FA54-14B9-4FD1-8E00-7BC46555FDA0" ?>
-        <?define QtPath="@CMAKE_PREFIX_PATH@" ?>
+        <?define UpgradeGuid="8B5E12D6-57C0-4B70-BE15-FFFE47230272" ?>
     <?else ?>
         <?define ProgramFilesFolder="ProgramFilesFolder" ?>
         <?define PlatformSimpleName="32-bit" ?>
-        <?define UpgradeGuid="BE0B9FD8-45E2-4A8E-A0D8-1F774D074A78" ?>
-        <?define QtPath="@CMAKE_PREFIX_PATH@" ?>
+        <?define UpgradeGuid="F0D33EF8-15CE-4A26-BEA3-8E281655A2C1" ?>
     <?endif ?>
-    <?define QtBinPath="$(var.QtPath)\bin" ?>
-    <?define QtPlatformPath="$(var.QtPath)\plugins\platforms" ?>
-    <?define OpenSSLPath="$(var.ExtPath)\openssl\windows\$(var.Platform)" ?>
-    <?define OpenSSLBinPath="$(var.OpenSSLPath)\bin" ?>
 </Include>

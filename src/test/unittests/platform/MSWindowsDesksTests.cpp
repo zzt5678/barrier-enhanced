@@ -187,6 +187,16 @@ TEST(MSWindowsDesksTests, nestedRemoteModeUsesLowLatencyDeskCommandBudget)
         MSWindowsDesks::deskCommandExecutionGraceForTest(false, true));
 }
 
+TEST(MSWindowsDesksTests, negativeCommandWaitTimeoutCannotBecomeInfinite)
+{
+    EXPECT_DOUBLE_EQ(0.0,
+        MSWindowsDesks::boundedDeskCommandWaitTimeoutForTest(-1.0));
+    EXPECT_DOUBLE_EQ(0.0,
+        MSWindowsDesks::boundedDeskCommandWaitTimeoutForTest(0.0));
+    EXPECT_DOUBLE_EQ(0.25,
+        MSWindowsDesks::boundedDeskCommandWaitTimeoutForTest(0.25));
+}
+
 TEST(MSWindowsDesksTests, desktopActivationWaitsForAllStartupCapabilities)
 {
     EXPECT_FALSE(MSWindowsDesks::canActivateDesktopForTest(
@@ -227,24 +237,30 @@ TEST(MSWindowsDesksTests, shutdownNeverPostsQuitToUnstartedDeskThread)
     EXPECT_TRUE(MSWindowsDesks::shouldPostDeskQuitForTest(true, 42));
 }
 
-TEST(MSWindowsDesksTests, highRateAbsoluteMotionKeepsOneLatestQueueEntry)
+TEST(MSWindowsDesksTests, highRateAbsoluteMotionPreservesTrajectorySamples)
 {
-    SInt32 x = 0;
-    SInt32 y = 0;
+    SInt32 pendingX = 100;
+    SInt32 pendingY = 200;
     int postedCommands = 1;
-    for (SInt32 i = 1; i <= 10000; ++i) {
+
+    // Model a half-second desktop-thread pause at the 240 Hz server rate.
+    // Every absolute point must remain a separate queue entry; replacing the
+    // pending point here is the visible jump regression this test locks down.
+    for (SInt32 sample = 1; sample <= 120; ++sample) {
         if (!MSWindowsDesks::coalesceMouseMotionForTest(
                 MSWindowsDesks::kDeskInputAbsoluteMove,
-                x, y,
+                pendingX, pendingY,
                 MSWindowsDesks::kDeskInputAbsoluteMove,
-                i, 10000 - i)) {
+                100 + sample, 200 + sample)) {
             ++postedCommands;
         }
+        EXPECT_EQ(100, pendingX);
+        EXPECT_EQ(200, pendingY);
     }
 
-    EXPECT_EQ(1, postedCommands);
-    EXPECT_EQ(10000, x);
-    EXPECT_EQ(0, y);
+    EXPECT_EQ(121, postedCommands);
+    EXPECT_LE(postedCommands,
+        static_cast<int>(MSWindowsDesks::maxPendingDeskCommandsForTest()));
 }
 
 TEST(MSWindowsDesksTests, highRateRelativeMotionPreservesAccumulatedDistance)

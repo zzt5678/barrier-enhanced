@@ -5,6 +5,7 @@
 #include <QApplication>
 #include <QBuffer>
 #include <QClipboard>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -29,6 +30,9 @@ const int kDefaultPreviewBudgetBytes = 12 * 1024 * 1024;
 const int kReceiptLimit = 60;
 const int kSuggestionLimit = 40;
 const int kBurstSeconds = 15;
+const int kSensitivePayloadTtlSeconds = 15 * 60;
+const int kSensitivePayloadItemLimitBytes = 256 * 1024;
+const int kSensitivePayloadBudgetBytes = 1024 * 1024;
 
 QString normalizePathLikeText(const QString& text)
 {
@@ -92,7 +96,9 @@ WorkflowStore::WorkflowStore(AppConfig& appConfig, QObject* parent) :
     m_runtimeMode(WorkflowRuntimeMode::Dormant),
     m_lastActivity(QDateTime::currentDateTimeUtc()),
     m_storageRoot(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)),
-    m_ignoreClipboardChanges(false)
+    m_ignoreClipboardChanges(false),
+    m_sensitivePayloadBytes(0),
+    m_nextSensitivePayloadSequence(0)
 {
     if (m_storageRoot.isEmpty()) {
         m_storageRoot = appConfig.barrierProgramDir() + QStringLiteral("workflow");
@@ -115,6 +121,14 @@ WorkflowStore::WorkflowStore(AppConfig& appConfig, QObject* parent) :
     timer->setInterval(5000);
     connect(timer, &QTimer::timeout, this, &WorkflowStore::evaluateRuntimeMode);
     timer->start();
+}
+
+WorkflowStore::~WorkflowStore()
+{
+    const QStringList contextIds = m_sensitivePayloads.keys();
+    for (const QString& contextId : contextIds) {
+        eraseSensitivePayload(contextId);
+    }
 }
 
 void WorkflowStore::attachClipboard(QClipboard* clipboard)
@@ -201,7 +215,30 @@ QVariantMap WorkflowStore::getContextSummary(const QString& contextId) const
 QByteArray WorkflowStore::fetchContextPayload(const QString& contextId) const
 {
     const ContextItem* item = contextById(contextId);
-    if (item == nullptr || item->payloadRef.isEmpty()) {
+    if (item == nullptr) {
+        eraseSensitivePayload(contextId);
+        return QByteArray();
+    }
+
+    if (item->sensitivity == SensitivityLevel::Sensitive) {
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        if (item->expiresAt <= now) {
+            eraseSensitivePayload(contextId);
+            return QByteArray();
+        }
+
+        const auto payload = m_sensitivePayloads.constFind(contextId);
+        if (payload == m_sensitivePayloads.constEnd()) {
+            return QByteArray();
+        }
+        if (payload->expiresAt <= now) {
+            eraseSensitivePayload(contextId);
+            return QByteArray();
+        }
+        return payload->data;
+    }
+
+    if (item->payloadRef.isEmpty()) {
         return QByteArray();
     }
 
@@ -436,6 +473,17 @@ void WorkflowStore::evaluateRuntimeMode()
     assertWorkflowThread(this);
 
     const QDateTime now = QDateTime::currentDateTimeUtc();
+    const int previousHistorySize = m_history.size();
+    const int previousSuggestionSize = m_suggestions.size();
+    pruneHistory();
+    pruneSuggestions();
+    if (m_history.size() != previousHistorySize) {
+        emit historyChanged();
+    }
+    if (m_suggestions.size() != previousSuggestionSize) {
+        emit suggestionsChanged();
+    }
+
     const qint64 idleSeconds = m_lastActivity.secsTo(now);
 
     if (now < m_burstUntil) {
@@ -459,20 +507,28 @@ ContextItem WorkflowStore::buildTextContext(const QString& text)
     item.id = newContextId();
     item.sourceDevice = currentSourceDevice();
     item.kind = looksLikeUrl(text) ? ContextKind::Link : ContextKind::Text;
-    item.summary = summarizeText(text);
     item.byteSize = text.toUtf8().size();
     item.mimeType = item.kind == ContextKind::Link
         ? QStringLiteral("text/uri-list")
         : QStringLiteral("text/plain");
     item.sensitivity = detectSensitivity(text);
+    item.summary = item.sensitivity == SensitivityLevel::Sensitive
+        ? QStringLiteral("Sensitive text (%1 bytes)").arg(item.byteSize)
+        : summarizeText(text);
     item.createdAt = QDateTime::currentDateTimeUtc();
-    item.expiresAt = item.createdAt.addDays(7);
-    item.payloadRef = writeTextPayload(
-        item.id,
-        text,
-        item.kind == ContextKind::Link ? QStringLiteral(".url.txt") : QStringLiteral(".txt"));
-    item.payloadAvailable = !item.payloadRef.isEmpty();
-    item.managedPayload = item.payloadAvailable;
+    if (item.sensitivity == SensitivityLevel::Sensitive) {
+        item.expiresAt = item.createdAt.addSecs(kSensitivePayloadTtlSeconds);
+        item.payloadAvailable = storeSensitivePayload(item.id, text.toUtf8(), item.expiresAt);
+    }
+    else {
+        item.expiresAt = item.createdAt.addDays(7);
+        item.payloadRef = writeTextPayload(
+            item.id,
+            text,
+            item.kind == ContextKind::Link ? QStringLiteral(".url.txt") : QStringLiteral(".txt"));
+        item.payloadAvailable = !item.payloadRef.isEmpty();
+        item.managedPayload = item.payloadAvailable;
+    }
     return item;
 }
 
@@ -621,11 +677,27 @@ void WorkflowStore::consumeClipboardMime(const QMimeData* mimeData)
         }
         else {
             item = buildTextContext(text);
-            signature = QStringLiteral("text:%1:%2").arg(contextKindText(item.kind), text.left(512));
+            if (item.sensitivity == SensitivityLevel::Sensitive) {
+                const QByteArray fingerprint = QCryptographicHash::hash(
+                    text.toUtf8(), QCryptographicHash::Sha256).toHex();
+                signature = QStringLiteral("sensitive:%1:%2")
+                    .arg(contextKindText(item.kind), QString::fromLatin1(fingerprint));
+            }
+            else {
+                signature = QStringLiteral("text:%1:%2").arg(contextKindText(item.kind), text.left(512));
+            }
         }
     }
     else {
         return;
+    }
+
+    if (item.sensitivity == SensitivityLevel::Sensitive &&
+        !signature.startsWith(QStringLiteral("sensitive:"))) {
+        const QByteArray fingerprint = QCryptographicHash::hash(
+            signature.toUtf8(), QCryptographicHash::Sha256).toHex();
+        signature = QStringLiteral("sensitive:%1:%2")
+            .arg(contextKindText(item.kind), QString::fromLatin1(fingerprint));
     }
 
     addContextItem(item, signature);
@@ -634,6 +706,7 @@ void WorkflowStore::consumeClipboardMime(const QMimeData* mimeData)
 void WorkflowStore::addContextItem(ContextItem item, const QString& signature)
 {
     if (signature == m_lastSignature) {
+        removeManagedAssets(item);
         return;
     }
 
@@ -650,7 +723,8 @@ void WorkflowStore::addContextItem(ContextItem item, const QString& signature)
 
 void WorkflowStore::addSuggestionsForItem(const ContextItem& item)
 {
-    if (!m_appConfig->getSuggestionsEnabled()) {
+    if (!m_appConfig->getSuggestionsEnabled() ||
+        item.sensitivity == SensitivityLevel::Sensitive) {
         return;
     }
 
@@ -711,11 +785,25 @@ void WorkflowStore::addSuggestionsForItem(const ContextItem& item)
 
 void WorkflowStore::pruneHistory()
 {
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    bool removedLatest = false;
+    for (int i = m_history.size() - 1; i >= 0; --i) {
+        if (m_history.at(i).expiresAt <= now) {
+            removedLatest = removedLatest || i == 0;
+            removeManagedAssets(m_history.at(i));
+            m_history.removeAt(i);
+        }
+    }
+
     const int historyLimit = qMax(10, m_appConfig->getWorkflowHistoryLimit());
 
     while (m_history.size() > historyLimit || totalHistoryBytes() > kDefaultMetadataBudgetBytes) {
         removeManagedAssets(m_history.back());
         m_history.removeLast();
+    }
+
+    if (removedLatest) {
+        m_lastSignature.clear();
     }
 }
 
@@ -778,6 +866,8 @@ void WorkflowStore::prunePreviewAssets()
 
 void WorkflowStore::removeManagedAssets(const ContextItem& item)
 {
+    eraseSensitivePayload(item.id);
+
     if (item.managedPayload && !item.payloadRef.isEmpty()) {
         QFile::remove(item.payloadRef);
     }
@@ -967,3 +1057,102 @@ bool WorkflowStore::looksLikeExistingPath(const QString& text) const
 
     return QFileInfo(candidate).exists();
 }
+
+bool WorkflowStore::storeSensitivePayload(const QString& contextId,
+                                          const QByteArray& payload,
+                                          const QDateTime& expiresAt)
+{
+    pruneSensitivePayloads(QDateTime::currentDateTimeUtc());
+    eraseSensitivePayload(contextId);
+
+    if (payload.isEmpty() || payload.size() > kSensitivePayloadItemLimitBytes) {
+        return false;
+    }
+
+    while (!m_sensitivePayloads.isEmpty() &&
+           m_sensitivePayloadBytes + payload.size() > kSensitivePayloadBudgetBytes) {
+        auto oldest = m_sensitivePayloads.constBegin();
+        for (auto it = m_sensitivePayloads.constBegin(); it != m_sensitivePayloads.constEnd(); ++it) {
+            if (it->sequence < oldest->sequence) {
+                oldest = it;
+            }
+        }
+        const QString evictedId = oldest.key();
+        for (ContextItem& item : m_history) {
+            if (item.id == evictedId) {
+                item.payloadAvailable = false;
+                break;
+            }
+        }
+        eraseSensitivePayload(evictedId);
+    }
+
+    SensitivePayload entry;
+    entry.data = payload;
+    entry.expiresAt = expiresAt;
+    entry.sequence = ++m_nextSensitivePayloadSequence;
+    m_sensitivePayloads.insert(contextId, entry);
+    m_sensitivePayloadBytes += payload.size();
+    return true;
+}
+
+void WorkflowStore::eraseSensitivePayload(const QString& contextId) const
+{
+    auto entry = m_sensitivePayloads.find(contextId);
+    if (entry == m_sensitivePayloads.end()) {
+        return;
+    }
+
+    m_sensitivePayloadBytes -= entry->data.size();
+    entry->data.fill('\0');
+    m_sensitivePayloads.erase(entry);
+}
+
+void WorkflowStore::pruneSensitivePayloads(const QDateTime& now) const
+{
+    QStringList expired;
+    for (auto it = m_sensitivePayloads.constBegin(); it != m_sensitivePayloads.constEnd(); ++it) {
+        if (it->expiresAt <= now) {
+            expired.append(it.key());
+        }
+    }
+
+    for (const QString& contextId : expired) {
+        eraseSensitivePayload(contextId);
+    }
+}
+
+#if defined(BARRIER_TEST_ENV)
+QString WorkflowStore::testAddTextContext(const QString& text)
+{
+    const QString previousId = m_history.isEmpty() ? QString() : m_history.front().id;
+    QMimeData mimeData;
+    mimeData.setText(text);
+    consumeClipboardMime(&mimeData);
+    if (m_history.isEmpty() || m_history.front().id == previousId) {
+        return QString();
+    }
+    return m_history.front().id;
+}
+
+void WorkflowStore::testExpireContext(const QString& contextId)
+{
+    for (ContextItem& item : m_history) {
+        if (item.id == contextId) {
+            item.expiresAt = QDateTime::currentDateTimeUtc().addSecs(-1);
+            return;
+        }
+    }
+}
+
+void WorkflowStore::testRemoveContext(const QString& contextId)
+{
+    for (int i = 0; i < m_history.size(); ++i) {
+        if (m_history.at(i).id == contextId) {
+            removeManagedAssets(m_history.at(i));
+            m_history.removeAt(i);
+            return;
+        }
+    }
+}
+#endif

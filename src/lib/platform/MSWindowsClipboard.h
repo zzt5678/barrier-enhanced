@@ -22,6 +22,8 @@
 #include "barrier/IClipboard.h"
 #include "common/stdvector.h"
 
+#include <string>
+
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
@@ -31,6 +33,12 @@ class IMSWindowsClipboardFacade;
 //! Microsoft windows clipboard implementation
 class MSWindowsClipboard : public IClipboard {
 public:
+    enum class ConditionalCopyResult {
+        Succeeded,
+        SequenceChanged,
+        Failed
+    };
+
     MSWindowsClipboard(HWND window);
     MSWindowsClipboard(HWND window, IMSWindowsClipboardFacade &facade);
     virtual ~MSWindowsClipboard();
@@ -50,6 +58,13 @@ public:
     */
     bool                emptyUnowned();
 
+    //! Copy only if no other application changed the clipboard revision.
+    ConditionalCopyResult copyFromIfSequence(
+                            const IClipboard* source,
+                            Time time,
+                            UInt32 expectedWindowsSequence,
+                            UInt32* committedWindowsSequence = NULL);
+
     //! Test if clipboard is owned by barrier
     static bool            isOwnedByBarrier();
 
@@ -65,9 +80,11 @@ public:
     void setFacade(IMSWindowsClipboardFacade& facade);
 
     static std::string convertDIBToPNGForTest(const std::string& dibData);
+    static std::string utf8FromWideForTest(const std::wstring& value);
 
 private:
     void                clearConverters();
+    bool                addWithStatus(EFormat, const std::string& data);
 
     UINT convertFormatToWin32(EFormat) const;
     HANDLE convertTextToWin32(const std::string& data) const;
@@ -79,6 +96,7 @@ private:
     typedef std::vector<IMSWindowsClipboardConverter*> ConverterList;
 
     HWND                m_window;
+    bool                m_ownsWindow;
     mutable Time        m_time;
     ConverterList        m_converters;
     static UINT            s_ownershipFormat;

@@ -22,6 +22,8 @@
 #include "base/String.h"
 #include "common/basic_types.h"
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 
 #define CLIPBOARD_CHUNK_META_SIZE 7
@@ -29,6 +31,26 @@
 namespace barrier {
 class BulkChannel;
 class IStream;
+
+class ClipboardSendAttempt {
+public:
+    ClipboardSendAttempt(ClipboardID id, std::uint64_t attemptId) :
+        m_id(id),
+        m_attemptId(attemptId),
+        m_failed(false)
+    {
+    }
+
+    ClipboardID id() const { return m_id; }
+    std::uint64_t attemptId() const { return m_attemptId; }
+    void fail() { m_failed.store(true); }
+    bool failed() const { return m_failed.load(); }
+
+private:
+    ClipboardID m_id;
+    std::uint64_t m_attemptId;
+    std::atomic<bool> m_failed;
+};
 };
 
 class ClipboardChunk : public Chunk {
@@ -72,11 +94,18 @@ public:
 
     void                   setSendRoute(
                             barrier::IStream* stream,
-                            const std::shared_ptr<barrier::BulkChannel>& bulkChannel);
+                            const std::shared_ptr<barrier::BulkChannel>& bulkChannel,
+                            const std::shared_ptr<barrier::ClipboardSendAttempt>& attempt =
+                                std::shared_ptr<barrier::ClipboardSendAttempt>());
     barrier::IStream*      getSendStream(barrier::IStream* fallback) const;
+    bool                   isSendRouteActive() const;
+    ClipboardID            getClipboardId() const;
+    std::shared_ptr<barrier::ClipboardSendAttempt> getSendAttempt() const;
+    void                   failSendAttempt();
 
 private:
     barrier::IStream*      m_sendStream;
     std::shared_ptr<barrier::BulkChannel> m_bulkChannelLease;
+    std::shared_ptr<barrier::ClipboardSendAttempt> m_sendAttempt;
 
 };

@@ -20,6 +20,7 @@
 
 #include "ipc/DesktopSwitchPolicy.h"
 #include "platform/MSWindowsSession.h"
+#include "barrier/ServiceLaunchState.h"
 #include "barrier/XBarrier.h"
 #include "arch/IArchMultithread.h"
 #include "common/basic_types.h"
@@ -27,6 +28,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <list>
 #include <mutex>
@@ -38,20 +42,88 @@ class FileLogOutputter;
 
 class MSWindowsWatchdog {
 public:
+    typedef std::function<ServiceLaunchCommitResult (
+        const ServiceLaunchCandidate&)>
+        LaunchReadyCallback;
+    typedef std::function<void (unsigned long long)>
+        StopCompletedCallback;
+    typedef std::function<bool (unsigned char*, std::size_t)>
+        RandomBytesProvider;
+
+    struct LaunchProfile {
+        bool authenticated = false;
+        UInt32 sessionId = 0;
+        std::string userSid;
+        std::string profileDirectory;
+        std::string generation;
+        std::string digest;
+    };
+
+    // The service-only standby flag is derived for CreateProcess and must
+    // never become part of the externally supplied or durable command.
+    static bool         containsInternalStandbyOption(
+                            const std::string& command);
+    static bool         isExternalCommandAccepted(
+                            const std::string& command);
+    static std::string  makeStandbyLaunchCommand(
+                            const std::string& command);
+    static bool         isSameAuthenticatedLaunchOwner(
+                            const LaunchProfile& left,
+                            const LaunchProfile& right);
+    static bool         shouldAbortPendingActivation(
+                            bool monitoring,
+                            bool commandEmpty,
+                            bool ownerMatches,
+                            bool sessionChanged);
+    static bool         shouldDiscardFailedActivation(
+                            bool monitoring,
+                            bool commandEmpty,
+                            bool ownerMatches);
+    static double       boundedShutdownWaitSeconds(
+                            double deadlineSeconds,
+                            double nowSeconds,
+                            double maximumWaitSeconds);
+    static bool         stopConfirmationReady(
+                            bool commandEmpty,
+                            bool publishedProcessExists,
+                            bool pendingProcessExists);
+    static bool         generateReadinessNonce(
+                            std::uint64_t& nonce,
+                            const RandomBytesProvider& provider);
+
     MSWindowsWatchdog(
         bool daemonized,
         bool autoDetectCommand,
         IpcServer& ipcServer,
         IpcLogOutputter& ipcLogOutputter);
+    ~MSWindowsWatchdog();
 
     void                startAsync();
     std::string            getCommand() const;
-    void                setCommand(const std::string& command, UInt8 elevateMode);
+    bool                setCommand(const std::string& command, UInt8 elevateMode);
+    bool                setCommand(const std::string& command, UInt8 elevateMode,
+                                  const LaunchProfile& launchProfile);
+    bool                setCommand(const std::string& command, UInt8 elevateMode,
+                                  const LaunchProfile& launchProfile,
+                                  const ServiceLaunchCandidate& candidate);
+    bool                requestStop(unsigned long long& commandGeneration);
+    void                setLaunchReadyCallback(
+                                  const LaunchReadyCallback& callback);
+    void                setStopCompletedCallback(
+                                  const StopCompletedCallback& callback);
+    bool                isStopConfirmed(
+                                  unsigned long long commandGeneration) const;
     void                stop();
     bool                isProcessActive();
     void                setFileLogOutputter(FileLogOutputter* outputter);
 
 private:
+    enum class LaunchOwnerState {
+        Ready,
+        TemporarilyInactive,
+        Invalid
+    };
+
     struct CommandState {
         std::string command;
         UInt8 elevateMode;
@@ -59,25 +131,68 @@ private:
         int processFailures;
         unsigned long long generation;
         std::string lastDesktopName;
+        LaunchProfile launchProfile;
+        bool hasLaunchCandidate;
+        ServiceLaunchCandidate launchCandidate;
     };
 
     void main_loop();
     void output_loop();
-	void                shutdownProcess(HANDLE handle, DWORD pid, int timeout,
-                                        bool notifyIpc = true, UInt32 notifyProcessId = 0);
-	void                shutdownExistingProcesses();
-	void                closeProcessInfoHandles();
-	void                createOutputPipeHandles();
-	void                closeOutputPipeHandles();
-	HANDLE                duplicateProcessToken(HANDLE process, LPSECURITY_ATTRIBUTES security);
+    bool shutdownProcess(HANDLE handle, DWORD pid, int timeout,
+                         bool notifyIpc = true, UInt32 notifyProcessId = 0);
+    bool shutdownAndCloseProcess(PROCESS_INFORMATION& processInfo, int timeout,
+                                 bool notifyIpc = true);
+    bool shutdownOwnedProcessBeforeDeadline(
+                            PROCESS_INFORMATION& processInfo,
+                            double deadlineSeconds);
+    bool shutdownManagedProcess(int timeout = 20);
+    bool shutdownPendingProcess(int timeout = 3, bool notifyIpc = true);
+    void discardPendingProcessOrFailFast(const char* reason, int timeout = 3,
+                                         bool notifyIpc = true);
+    void closeProcessInfoHandles();
+    void createManagedProcessJob();
+    void closeManagedProcessJob();
+    void failFastOwnedProcesses(const char* reason);
+    bool assignPendingProcessToJob();
+    bool resumePendingProcess();
+    bool waitForPendingInputReadiness(
+        const PROCESS_INFORMATION& processInfo,
+        UInt32 expectedSessionId,
+        const std::string& expectedDesktopName,
+        bool expectedDesktopKnown,
+        std::string& reportedDesktopName,
+        const char* readinessPhase,
+        const LaunchProfile* activationOwner = nullptr);
+    bool activatePendingProcess(
+        const PROCESS_INFORMATION& processInfo,
+        UInt32 expectedSessionId,
+        const std::string& expectedDesktopName,
+        bool expectedDesktopKnown,
+        std::string& reportedDesktopName,
+        const LaunchProfile& activationOwner);
+    bool pendingActivationShouldAbort(
+        const LaunchProfile& activationOwner,
+        std::string& reason);
+    void createOutputPipeHandles();
+    void closeOutputPipeHandles();
+    HANDLE duplicateProcessToken(HANDLE process, LPSECURITY_ATTRIBUTES security);
     HANDLE                getUserToken(LPSECURITY_ATTRIBUTES security, UInt8 elevateMode, bool autoElevated);
     bool                shouldElevateProcess(UInt8 elevateMode) const;
     bool                shouldAutoElevate(UInt8 elevateMode, const std::string& desktopName) const;
-    void                startProcess();
+    bool                startProcess();
+    bool                setCommandInternal(
+                            const std::string& command, UInt8 elevateMode,
+                            const LaunchProfile& launchProfile,
+                            const ServiceLaunchCandidate* candidate,
+                            unsigned long long* acceptedGeneration = nullptr);
+    void                confirmStoppedGenerationIfReady(
+                            unsigned long long commandGeneration);
     std::string         autoDetectedCommand() const;
     CommandState        commandState() const;
     void                incrementProcessFailures();
-    void                clearLaunchStateForGeneration(unsigned long long generation);
+    void                deferLaunchForGeneration(unsigned long long generation);
+    LaunchOwnerState    validateLaunchOwner(const LaunchProfile& launchProfile,
+                                             std::string& reason);
     void                rememberDesktopName(const std::string& desktopName);
     bool                shouldRelaunchForDesktopChange(const std::string& oldDesktop,
                                                        const std::string& newDesktop);
@@ -99,10 +214,20 @@ private:
     IpcServer&            m_ipcServer;
     IpcLogOutputter&    m_ipcLogOutputter;
     UInt8               m_elevateMode;
+    LaunchProfile       m_launchProfile;
+    bool                m_hasLaunchCandidate;
+    ServiceLaunchCandidate m_launchCandidate;
+    LaunchReadyCallback m_launchReadyCallback;
+    StopCompletedCallback m_stopCompletedCallback;
     MSWindowsSession    m_session;
+    // Only the watchdog thread moves a ready candidate into the published slot.
     PROCESS_INFORMATION m_processInfo;
+    PROCESS_INFORMATION m_pendingProcessInfo;
+    HANDLE              m_processJob;
     int                    m_processFailures;
-    bool                m_processRunning;
+    std::atomic<bool>   m_processRunning;
+    std::atomic<unsigned long long> m_confirmedStopGeneration;
+    std::atomic<bool>   m_hasConfirmedStopGeneration;
     FileLogOutputter*    m_fileLogOutputter;
     bool                m_daemonized;
     mutable std::mutex  m_commandMutex;

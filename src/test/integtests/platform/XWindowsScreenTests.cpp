@@ -26,6 +26,7 @@
 #include "test/global/gtest.h"
 #include <cstdlib>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 using ::testing::_;
@@ -33,6 +34,9 @@ using ::testing::Invoke;
 using ::testing::ReturnRef;
 
 namespace {
+
+static_assert(std::has_virtual_destructor<IXWindowsImpl>::value,
+	"IXWindowsImpl is deleted through its interface and requires a virtual destructor");
 
 int
 testIOErrorHandler(Display*)

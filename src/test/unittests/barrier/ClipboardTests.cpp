@@ -233,6 +233,112 @@ TEST(ClipboardTests, marshall_withTextAdded_lastSizeCharIs14)
     EXPECT_EQ(14, (int)actual[11]);
 }
 
+TEST(ClipboardTests, marshalledFormatProbeFindsFileListWithoutUnmarshalling)
+{
+    Clipboard clipboard;
+    clipboard.open(0);
+    clipboard.add(IClipboard::kText, "text");
+    clipboard.add(IClipboard::kFileList, "file metadata");
+    clipboard.close();
+
+    const String data = clipboard.marshall();
+
+    EXPECT_TRUE(Clipboard::marshalledHasFormat(data, IClipboard::kFileList));
+    EXPECT_TRUE(Clipboard::marshalledHasFormat(data, IClipboard::kText));
+    EXPECT_FALSE(Clipboard::marshalledHasFormat(data, IClipboard::kPNG));
+}
+
+TEST(ClipboardTests, marshalledFormatProbeRejectsTruncatedPayload)
+{
+    Clipboard clipboard;
+    clipboard.open(0);
+    clipboard.add(IClipboard::kFileList, "file metadata");
+    clipboard.close();
+
+    String data = clipboard.marshall();
+    data.resize(data.size() - 1);
+
+    EXPECT_FALSE(Clipboard::isValidMarshalled(data));
+    EXPECT_FALSE(Clipboard::marshalledHasFormat(data, IClipboard::kFileList));
+}
+
+TEST(ClipboardTests, unmarshallIgnoresUnsignedOutOfRangeFormat)
+{
+    String data;
+    const auto appendUInt32 = [&data](UInt32 value) {
+        data.push_back(static_cast<char>((value >> 24) & 0xffu));
+        data.push_back(static_cast<char>((value >> 16) & 0xffu));
+        data.push_back(static_cast<char>((value >> 8) & 0xffu));
+        data.push_back(static_cast<char>(value & 0xffu));
+    };
+    appendUInt32(1);
+    appendUInt32(0xffffffffu);
+    appendUInt32(1);
+    data.push_back('x');
+
+    ASSERT_TRUE(Clipboard::isValidMarshalled(data));
+
+    Clipboard clipboard;
+    IClipboard::unmarshall(&clipboard, data, 0);
+
+    ASSERT_TRUE(clipboard.open(0));
+    for (SInt32 format = 0; format < IClipboard::kNumFormats; ++format) {
+        EXPECT_FALSE(clipboard.has(static_cast<IClipboard::EFormat>(format)));
+    }
+    clipboard.close();
+}
+
+TEST(ClipboardTests, unmarshallRejectsTruncatedDataWithoutChangingClipboard)
+{
+    Clipboard clipboard;
+    ASSERT_TRUE(clipboard.open(0));
+    clipboard.empty();
+    clipboard.add(IClipboard::kText, "committed text");
+    clipboard.close();
+
+    String truncated;
+    truncated.push_back('\0');
+    truncated.push_back('\0');
+    truncated.push_back('\0');
+    truncated.push_back('\1');
+    truncated.push_back('\0');
+
+    IClipboard::unmarshall(&clipboard, truncated, 0);
+
+    ASSERT_TRUE(clipboard.open(0));
+    ASSERT_TRUE(clipboard.has(IClipboard::kText));
+    EXPECT_EQ("committed text", clipboard.get(IClipboard::kText));
+    clipboard.close();
+}
+
+TEST(ClipboardTests, unmarshallRejectsPayloadThatConsumesNextEntryHeader)
+{
+    String data;
+    const auto appendUInt32 = [&data](UInt32 value) {
+        data.push_back(static_cast<char>((value >> 24) & 0xffu));
+        data.push_back(static_cast<char>((value >> 16) & 0xffu));
+        data.push_back(static_cast<char>((value >> 8) & 0xffu));
+        data.push_back(static_cast<char>(value & 0xffu));
+    };
+    appendUInt32(2);
+    appendUInt32(static_cast<UInt32>(IClipboard::kText));
+    appendUInt32(8);
+    data.append(8, 'x');
+
+    Clipboard clipboard;
+    ASSERT_TRUE(clipboard.open(0));
+    clipboard.empty();
+    clipboard.add(IClipboard::kText, "committed text");
+    clipboard.close();
+
+    IClipboard::unmarshall(&clipboard, data, 0);
+
+    ASSERT_TRUE(clipboard.open(0));
+    ASSERT_TRUE(clipboard.has(IClipboard::kText));
+    EXPECT_EQ("committed text", clipboard.get(IClipboard::kText));
+    clipboard.close();
+}
+
 // TODO: there's some integer -> char encoding going on here. i find it
 // hard to believe that the clipboard is the only thing doing this. maybe
 // we should refactor this stuff out of the clipboard.

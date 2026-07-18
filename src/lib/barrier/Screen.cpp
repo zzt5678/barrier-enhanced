@@ -89,6 +89,12 @@ Screen::prepareInputBackend()
     return m_screen->prepareInputBackend();
 }
 
+bool
+Screen::probeInputBackend(std::string& desktopName) const
+{
+    return m_screen->probeInputBackend(desktopName);
+}
+
 void
 Screen::disable()
 {
@@ -182,13 +188,45 @@ Screen::warpCursor(SInt32 x, SInt32 y)
 void
 Screen::setClipboard(ClipboardID id, const IClipboard* clipboard)
 {
-    m_screen->setClipboard(id, clipboard);
+    if (!m_mock) {
+        m_screen->setClipboard(id, clipboard);
+    }
+}
+
+bool
+Screen::setClipboardChecked(ClipboardID id, const IClipboard* clipboard)
+{
+    return !m_mock && m_screen->setClipboard(id, clipboard);
+}
+
+bool
+Screen::setClipboardSnapshot(
+    ClipboardID id, const std::shared_ptr<const String>& data)
+{
+    return !m_mock && m_screen->setClipboardSnapshot(id, data);
+}
+
+bool
+Screen::setClipboardSnapshot(
+    ClipboardID id, const std::shared_ptr<const String>& data,
+    std::uint64_t publicationId)
+{
+    return !m_mock &&
+        m_screen->setClipboardSnapshot(id, data, publicationId);
+}
+
+bool
+Screen::hasAsyncClipboardPublications() const
+{
+    return !m_mock && m_screen->hasAsyncClipboardPublications();
 }
 
 void
 Screen::grabClipboard(ClipboardID id)
 {
-    m_screen->setClipboard(id, NULL);
+    if (!m_mock) {
+        m_screen->setClipboard(id, NULL);
+    }
 }
 
 void
@@ -535,6 +573,15 @@ bool
 Screen::getClipboard(ClipboardID id, IClipboard* clipboard) const
 {
     return m_screen->getClipboard(id, clipboard);
+}
+
+bool
+Screen::getClipboardSnapshot(
+    ClipboardID id, std::shared_ptr<const String>* data,
+    UInt32* snapshotTime) const
+{
+    return !m_mock &&
+        m_screen->getClipboardSnapshot(id, data, snapshotTime);
 }
 
 void

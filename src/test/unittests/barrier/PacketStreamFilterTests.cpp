@@ -11,6 +11,7 @@
 #include "test/global/gtest.h"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,10 @@ public:
     {
         return static_cast<UInt32>(m_primary.size() + m_lowPriority.size());
     }
+    std::uint64_t getOutputBytesWritten() const override
+    {
+        return m_outputBytesWritten;
+    }
 
     void drainOnce(size_t maxBytes)
     {
@@ -54,6 +59,7 @@ public:
         const size_t size = std::min(maxBytes, selected.size());
         m_wire.insert(m_wire.end(), selected.begin(), selected.begin() + size);
         selected.erase(selected.begin(), selected.begin() + size);
+        m_outputBytesWritten += size;
     }
 
     void drainAll(size_t maxBytes)
@@ -75,6 +81,75 @@ private:
     std::vector<UInt8> m_primary;
     std::vector<UInt8> m_lowPriority;
     std::vector<UInt8> m_wire;
+    std::uint64_t m_outputBytesWritten = 0;
+};
+
+class BufferedPacketInputStream : public barrier::IStream {
+public:
+    explicit BufferedPacketInputStream(size_t frameCount, UInt32 payloadSize)
+    {
+        const UInt8 length[] = {
+            static_cast<UInt8>((payloadSize >> 24) & 0xff),
+            static_cast<UInt8>((payloadSize >> 16) & 0xff),
+            static_cast<UInt8>((payloadSize >> 8) & 0xff),
+            static_cast<UInt8>(payloadSize & 0xff)
+        };
+        for (size_t frame = 0; frame < frameCount; ++frame) {
+            input.insert(input.end(), length, length + sizeof(length));
+            input.insert(input.end(), payloadSize,
+                         static_cast<UInt8>('a' + frame % 26));
+        }
+    }
+
+    void close() override { }
+    UInt32 read(void* buffer, UInt32 count) override
+    {
+        const size_t available = input.size() - offset;
+        const UInt32 copied = static_cast<UInt32>(
+            std::min<size_t>(available, count));
+        if (copied != 0 && buffer != nullptr) {
+            std::memcpy(buffer, input.data() + offset, copied);
+        }
+        offset += copied;
+        bytesRead += copied;
+        return copied;
+    }
+    void write(const void*, UInt32) override { }
+    void writeLowPriority(const void*, UInt32) override { }
+    void flush() override { }
+    void shutdownInput() override { }
+    void shutdownOutput() override { }
+    void* getEventTarget() const override
+    {
+        return const_cast<BufferedPacketInputStream*>(this);
+    }
+    bool isReady() const override { return offset < input.size(); }
+    UInt32 getSize() const override
+    {
+        return static_cast<UInt32>(input.size() - offset);
+    }
+    UInt32 getBufferedOutputSize() const override { return 0; }
+
+    size_t totalSize() const { return input.size(); }
+
+    size_t bytesRead = 0;
+
+private:
+    std::vector<UInt8> input;
+    size_t offset = 0;
+};
+
+class TestPacketStreamFilter : public PacketStreamFilter {
+public:
+    TestPacketStreamFilter(IEventQueue* events, barrier::IStream* stream) :
+        PacketStreamFilter(events, stream, false)
+    {
+    }
+
+    void deliverInputReady(Event::Type type)
+    {
+        filterEvent(Event(type, getEventTarget()));
+    }
 };
 
 std::vector<UInt8> captureBytes(const void* buffer, UInt32 size)
@@ -344,4 +419,73 @@ TEST(PacketStreamFilterTests, getBufferedOutputSize_forwardsToUnderlyingStream)
 
     PacketStreamFilter filter(&events, &stream, false);
     EXPECT_EQ(42u, filter.getBufferedOutputSize());
+}
+
+TEST(PacketStreamFilterTests, getOutputBytesWritten_forwardsToUnderlyingStream)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    setupStreamEvents(events, streamEvents);
+    PartialWritePriorityStream stream;
+
+    EXPECT_CALL(events, removeHandlers(stream.getEventTarget()));
+    EXPECT_CALL(events, adoptHandler(Event::kUnknown, stream.getEventTarget(), _));
+    EXPECT_CALL(events, removeHandler(Event::kUnknown, stream.getEventTarget()));
+
+    PacketStreamFilter filter(&events, &stream, false);
+    const char payload[] = "abc";
+    filter.write(payload, 3);
+    EXPECT_EQ(0u, filter.getOutputBytesWritten());
+
+    stream.drainOnce(5);
+
+    EXPECT_EQ(5u, filter.getOutputBytesWritten());
+}
+
+TEST(PacketStreamFilterTests, getInputBytesReceivedForwardsToUnderlyingStream)
+{
+    NiceMock<MockEventQueue> events;
+    NiceMock<MockStream> stream;
+
+    ON_CALL(stream, getEventTarget()).WillByDefault(Return(reinterpret_cast<void*>(0x3)));
+    ON_CALL(stream, getInputBytesReceived()).WillByDefault(Return(42u));
+    EXPECT_CALL(events, removeHandlers(stream.getEventTarget()));
+    EXPECT_CALL(events, adoptHandler(Event::kUnknown, stream.getEventTarget(), _));
+    EXPECT_CALL(events, removeHandler(Event::kUnknown, stream.getEventTarget()));
+
+    PacketStreamFilter filter(&events, &stream, false);
+
+    EXPECT_EQ(42u, filter.getInputBytesReceived());
+}
+
+TEST(PacketStreamFilterTests, inputPauseKeepsMultiFramePrefetchBounded)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    setupStreamEvents(events, streamEvents);
+    const UInt32 payloadSize = 1024 * 1024;
+    BufferedPacketInputStream stream(8, payloadSize);
+
+    TestPacketStreamFilter filter(&events, &stream);
+    filter.deliverInputReady(streamEvents.inputReady());
+
+    EXPECT_EQ(payloadSize, filter.getSize());
+    EXPECT_LT(stream.bytesRead, stream.totalSize());
+    EXPECT_LE(stream.bytesRead,
+              static_cast<size_t>(payloadSize) + 4u + 4096u);
+
+    filter.setInputPaused(true);
+    const size_t pausedBytes = stream.bytesRead;
+    for (int event = 0; event < 100; ++event) {
+        filter.deliverInputReady(streamEvents.inputReady());
+    }
+    EXPECT_EQ(pausedBytes, stream.bytesRead);
+
+    ASSERT_EQ(payloadSize, filter.read(nullptr, payloadSize));
+    EXPECT_EQ(0u, filter.getSize());
+    filter.setInputPaused(false);
+    EXPECT_EQ(payloadSize, filter.getSize());
+    EXPECT_GT(stream.bytesRead, pausedBytes);
+    EXPECT_LE(stream.bytesRead,
+              pausedBytes + static_cast<size_t>(payloadSize) + 4u + 4096u);
 }

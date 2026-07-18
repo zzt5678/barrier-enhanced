@@ -20,6 +20,7 @@ public:
 
     void enter(SInt32 xAbs, SInt32 yAbs, UInt32 seqNum,
                KeyModifierMask mask, bool forScreensaver) override;
+    UInt32 getInputEpoch() const override { return m_inputEpoch; }
     void keyDown(KeyID key, KeyModifierMask mask, KeyButton button) override;
     void keyDownBroadcast(KeyID key, KeyModifierMask mask,
                           KeyButton button) override;

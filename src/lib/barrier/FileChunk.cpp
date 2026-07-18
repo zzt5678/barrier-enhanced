@@ -23,7 +23,27 @@
 #include "io/filesystem.h"
 #include "base/Log.h"
 
+#include <charconv>
+#include <system_error>
+
 static const size_t kFileReceiveReserveLimit = 64 * 1024 * 1024;
+
+namespace {
+
+bool parseExpectedSize(const String& value, size_t& expectedSize)
+{
+    expectedSize = 0;
+    if (value.empty()) {
+        return false;
+    }
+    const char* first = value.data();
+    const char* last = first + value.size();
+    const std::from_chars_result result =
+        std::from_chars(first, last, expectedSize, 10);
+    return result.ec == std::errc() && result.ptr == last;
+}
+
+}
 
 const size_t FileChunk::kMaxReceiveSize = 512 * 1024 * 1024;
 const size_t FileChunk::kMemoryReceiveLimit = 32 * 1024 * 1024;
@@ -49,13 +69,16 @@ FileChunk::releaseReceiveBuffer(String& dataReceived,
 
 FileChunk::FileChunk(size_t size) :
     Chunk(size),
-    m_transferId(0)
+    m_transferId(0),
+    m_offset(0),
+    m_transactional(false),
+    m_transferReason(barrier::FileTransferReason::kNone)
 {
         m_dataSize = size - FILE_CHUNK_META_SIZE;
 }
 
 FileChunk*
-FileChunk::start(const String& size)
+FileChunk::start(const String& size, bool transactional)
 {
     size_t sizeLength = size.size();
     FileChunk* start = new FileChunk(sizeLength + FILE_CHUNK_META_SIZE);
@@ -63,6 +86,7 @@ FileChunk::start(const String& size)
     chunk[0] = kDataStart;
     memcpy(&chunk[1], size.c_str(), sizeLength);
     chunk[sizeLength + 1] = '\0';
+    start->m_transactional = transactional;
 
     return start;
 }
@@ -76,6 +100,15 @@ FileChunk::data(const UInt8* data, size_t dataSize)
     memcpy(&chunkData[1], data, dataSize);
     chunkData[dataSize + 1] = '\0';
 
+    return chunk;
+}
+
+FileChunk*
+FileChunk::data(const UInt8* data, size_t dataSize, UInt32 offset)
+{
+    FileChunk* chunk = FileChunk::data(data, dataSize);
+    chunk->m_offset = offset;
+    chunk->m_transactional = true;
     return chunk;
 }
 
@@ -94,6 +127,15 @@ FileChunk::end(const String& digest)
 }
 
 FileChunk*
+FileChunk::end(const String& digest, UInt32 finalOffset)
+{
+    FileChunk* end = FileChunk::end(digest);
+    end->m_offset = finalOffset;
+    end->m_transactional = true;
+    return end;
+}
+
+FileChunk*
 FileChunk::cancel()
 {
     FileChunk* cancel = new FileChunk(FILE_CHUNK_META_SIZE);
@@ -101,6 +143,15 @@ FileChunk::cancel()
     chunk[0] = kDataCancel;
     chunk[1] = '\0';
 
+    return cancel;
+}
+
+FileChunk*
+FileChunk::cancel(barrier::FileTransferReason reason)
+{
+    FileChunk* cancel = FileChunk::cancel();
+    cancel->m_transactional = true;
+    cancel->m_transferReason = reason;
     return cancel;
 }
 
@@ -117,10 +168,36 @@ FileChunk::assemble(barrier::IStream* stream,
         return kError;
     }
 
+    if (session.state() == FileReceiveSession::kDiscarding) {
+        if (mark == kDataChunk) {
+            return kNotFinish;
+        }
+        if (mark == kDataEnd || mark == kDataCancel) {
+            session.reset();
+            return kCancelled;
+        }
+        LOG((CLOG_WARN "invalid file transfer marker while discarding payload"));
+        return kError;
+    }
+
     switch (mark) {
     case kDataStart:
     {
-        const size_t expectedSize = barrier::string::stringToSizeType(content);
+        size_t expectedSize = 0;
+        if (!parseExpectedSize(content, expectedSize)) {
+            LOG((CLOG_WARN "rejecting malformed file transfer size"));
+            session.fail();
+            return kError;
+        }
+        const FileReceiveSession::State receiveState = session.state();
+        if (receiveState != FileReceiveSession::kIdle &&
+            receiveState != FileReceiveSession::kFailed) {
+            LOG((CLOG_WARN
+                "rejecting duplicate file transfer start while receive session state=%d generation=%llu",
+                static_cast<int>(receiveState),
+                static_cast<unsigned long long>(session.generation())));
+            return kError;
+        }
         if (expectedSize > kMaxReceiveSize) {
             LOG((CLOG_ERR "refusing file transfer larger than receive limit, expected size=%llu limit=%llu",
                 static_cast<unsigned long long>(expectedSize),
@@ -152,7 +229,9 @@ FileChunk::assemble(barrier::IStream* stream,
             LOG((CLOG_WARN "ignoring file chunk without an active receive"));
             return kError;
         }
-        if (!session.append(std::move(content))) {
+        const FileReceiveSession::AppendResult appendResult =
+            session.append(std::move(content));
+        if (appendResult == FileReceiveSession::kAppendFailed) {
             LOG((CLOG_ERR "failed to append file data, expected size=%llu current size=%llu chunk size=%llu",
                 static_cast<unsigned long long>(session.expectedSize()),
                 static_cast<unsigned long long>(session.receivedSize()),
@@ -162,7 +241,8 @@ FileChunk::assemble(barrier::IStream* stream,
         }
         LOG((CLOG_DEBUG2 "recv file chunk size=%llu",
             static_cast<unsigned long long>(contentSize)));
-        return kNotFinish;
+        return appendResult == FileReceiveSession::kAppendBackpressure ?
+            kBackpressure : kNotFinish;
     }
 
     case kDataEnd:
@@ -185,7 +265,7 @@ FileChunk::assemble(barrier::IStream* stream,
     case kDataCancel:
         LOG((CLOG_WARN "file transfer cancelled by sender"));
         session.fail();
-        return kError;
+        return kCancelled;
     }
 
     session.fail();

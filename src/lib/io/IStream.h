@@ -23,6 +23,8 @@
 #include "base/IEventQueue.h"
 #include "base/EventTypes.h"
 
+#include <cstdint>
+
 class IEventQueue;
 
 namespace barrier {
@@ -94,6 +96,13 @@ public:
     */
     virtual void        shutdownOutput() = 0;
 
+    //! Pause or resume upstream input consumption
+    /*!
+    Filters that prefetch input should stop draining their source while paused.
+    The default is a no-op for streams that do not prefetch.
+    */
+    virtual void        setInputPaused(bool paused) { (void)paused; }
+
     //@}
     //! @name accessors
     //@{
@@ -128,6 +137,23 @@ public:
     output but not yet written to the underlying transport.
     */
     virtual UInt32        getBufferedOutputSize() const = 0;
+
+    //! Get total bytes successfully removed from the output buffer
+    /*!
+    Returns a monotonic count of bytes successfully drained from the stream's
+    output buffer by its underlying writer. Streams that cannot expose this
+    progress signal return zero.
+    */
+    virtual std::uint64_t getOutputBytesWritten() const { return 0; }
+
+    //! Get total bytes received from the underlying input transport
+    /*!
+    Returns a monotonic count of bytes successfully accepted from the
+    underlying input transport.  Filters should forward this signal even when
+    those bytes do not yet form a complete higher-level frame.  Streams that
+    cannot expose this progress signal return zero.
+    */
+    virtual std::uint64_t getInputBytesReceived() const { return 0; }
 
     //@}
 };

@@ -70,6 +70,7 @@ typedef struct {
 
 class IXWindowsImpl {
 public:
+    virtual ~IXWindowsImpl() = default;
 
     virtual Status XInitThreads() = 0;
     virtual XIOErrorHandler XSetIOErrorHandler(XIOErrorHandler handler) = 0;

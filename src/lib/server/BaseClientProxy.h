@@ -87,7 +87,13 @@ public:
     virtual bool        leave() = 0;
     virtual bool        supportsInputHandoff() const { return false; }
     virtual bool        supportsInputHandoffCommitAck() const { return false; }
+    virtual bool        supportsInputLeaseRevokeAck() const { return false; }
+    virtual UInt32      getInputEpoch() const { return 0; }
     virtual bool        supportsBulkChannel() const { return false; }
+    virtual bool        supportsTransactionalFileTransfer() const
+                            { return false; }
+    virtual std::string getConnectionBinding() const
+                            { return std::string(); }
     virtual void        offerBulkChannel(const std::string&) { }
     virtual bool        attachBulkChannel(barrier::IStream*) { return false; }
     virtual void        detachBulkChannel() { }
@@ -97,6 +103,7 @@ public:
     virtual void        prepareEnter(SInt32, SInt32, UInt32,
                             KeyModifierMask) { }
     virtual void        abortEnter(UInt32) { }
+    virtual void        requestInputLeaseRevoke(UInt32, UInt32) { }
     virtual void        setClipboard(ClipboardID, const IClipboard*) = 0;
     virtual void        grabClipboard(ClipboardID) = 0;
     virtual void        setClipboardDirty(ClipboardID, bool) = 0;

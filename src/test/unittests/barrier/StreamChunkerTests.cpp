@@ -5,11 +5,14 @@
 
 #include "barrier/StreamChunker.h"
 #include "barrier/ClipboardChunk.h"
+#include "barrier/FileTransferProtocol.h"
+#include "barrier/FileTransferSendState.h"
 #include "barrier/protocol_types.h"
 #include "base/Event.h"
 #include "base/EventTypes.h"
 #include "barrier/FileChunk.h"
 #include "io/filesystem.h"
+#include "mt/Thread.h"
 
 #include "test/global/gmock.h"
 #include "test/global/gtest.h"
@@ -17,9 +20,11 @@
 #include "test/mock/io/MockStream.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <thread>
 
@@ -58,6 +63,22 @@ barrier::fs::path writeTempFile(size_t size)
         written += toWrite;
     }
     return path;
+}
+
+void overwriteTempFile(
+    const barrier::fs::path& path, size_t size, char value)
+{
+    std::ofstream output;
+    barrier::open_utf8_path(
+        output, path, std::ios::out | std::ios::binary | std::ios::trunc);
+    const std::string block(4096, value);
+    size_t written = 0;
+    while (written < size) {
+        const size_t toWrite = std::min(block.size(), size - written);
+        output.write(block.data(), toWrite);
+        written += toWrite;
+    }
+    output.close();
 }
 
 barrier::fs::path writeSparseTempFile(size_t size)
@@ -159,6 +180,45 @@ TEST(StreamChunkerTests, largeFileChunksDoNotExceedAtomicityFallbackSize)
     EXPECT_GT(largestDataChunk, 0u);
     EXPECT_LE(largestDataChunk, 64u * 1024u);
 
+    barrier::fs::remove(path);
+}
+
+TEST(StreamChunkerTests, sendFileRejectsPayloadOverReceiveLimitBeforeStart)
+{
+    NiceMock<MockEventQueue> events;
+    NiceMock<MockStream> stream;
+    FileEvents fileEvents;
+    fileEvents.setEvents(&events);
+    Event::Type nextType = Event::kLast;
+    std::vector<UInt8> fileMarks;
+    StreamChunker chunker;
+
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    ON_CALL(events, registerTypeOnce(_, _))
+        .WillByDefault(Invoke([&nextType](Event::Type& type, const char*) {
+            if (type == Event::kUnknown) {
+                type = nextType++;
+            }
+            return type;
+        }));
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&fileEvents, &fileMarks, &chunker](const Event& event) {
+            if (event.getType() == fileEvents.fileChunkSending() &&
+                event.getData() != NULL) {
+                const auto* chunk = static_cast<const FileChunk*>(event.getData());
+                fileMarks.push_back(chunk->m_chunk[0]);
+                chunker.interruptFile();
+            }
+            Event::deleteData(event);
+        }));
+    ON_CALL(events, getQueuedEventCount()).WillByDefault(Return(0u));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+
+    const barrier::fs::path path =
+        writeSparseTempFile(FileChunk::kMaxReceiveSize + 1);
+    chunker.sendFile(path.u8string().c_str(), &events, &events, &stream);
+
+    EXPECT_TRUE(fileMarks.empty());
     barrier::fs::remove(path);
 }
 
@@ -629,6 +689,364 @@ TEST(StreamChunkerTests, sendFileQueuesCancelWhenOutputStallsAfterStart)
     ASSERT_EQ(2u, fileMarks.size());
     EXPECT_EQ(kDataStart, fileMarks[0]);
     EXPECT_EQ(kDataCancel, fileMarks[1]);
+
+    barrier::fs::remove(path);
+}
+
+TEST(StreamChunkerTests, transactionalFileWaitsForStartAckAndRecordsOffsets)
+{
+    NiceMock<MockEventQueue> events;
+    NiceMock<MockStream> stream;
+    FileEvents fileEvents;
+    fileEvents.setEvents(&events);
+    Event::Type nextType = Event::kLast;
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 41);
+    auto state = std::make_shared<barrier::FileTransferSendState>(
+        transferId, std::chrono::milliseconds(500),
+        std::chrono::milliseconds(500));
+    StreamChunker chunker;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool startSeen = false;
+    bool endSeen = false;
+    std::vector<UInt32> offsets;
+    std::vector<size_t> sizes;
+    UInt32 finalOffset = 0;
+    char firstPayloadByte = '\0';
+
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    ON_CALL(events, registerTypeOnce(_, _))
+        .WillByDefault(Invoke([&nextType](Event::Type& type, const char*) {
+            if (type == Event::kUnknown) {
+                type = nextType++;
+            }
+            return type;
+        }));
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&](const Event& event) {
+            if (event.getType() == fileEvents.fileChunkSending() &&
+                event.getData() != nullptr) {
+                const auto* chunk = static_cast<const FileChunk*>(event.getData());
+                std::lock_guard<std::mutex> lock(mutex);
+                if (chunk->m_chunk[0] == kDataStart) {
+                    startSeen = true;
+                }
+                else if (chunk->m_chunk[0] == kDataChunk) {
+                    offsets.push_back(chunk->m_offset);
+                    sizes.push_back(chunk->m_dataSize);
+                    if (firstPayloadByte == '\0' && chunk->m_dataSize != 0) {
+                        firstPayloadByte = chunk->m_chunk[1];
+                    }
+                }
+                else if (chunk->m_chunk[0] == kDataEnd) {
+                    endSeen = true;
+                    finalOffset = chunk->m_offset;
+                }
+                changed.notify_all();
+            }
+            Event::deleteData(event);
+        }));
+    ON_CALL(events, getQueuedEventCount()).WillByDefault(Return(0u));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+
+    const barrier::fs::path path = writeTempFile(100000);
+    Thread worker([&]() {
+        chunker.sendFile(path.u8string().c_str(), &events, &events, &stream,
+                         transferId, state);
+    });
+
+    bool startArrived = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        startArrived = changed.wait_for(
+            lock, std::chrono::milliseconds(250),
+            [&]() { return startSeen; });
+        EXPECT_TRUE(offsets.empty());
+    }
+    if (!startArrived) {
+        chunker.interruptFile();
+        worker.wait(1.0);
+        barrier::fs::remove(path);
+        FAIL() << "transactional Start event was not queued";
+    }
+    overwriteTempFile(path, 100000, 'y');
+    EXPECT_FALSE(state->signalStartAck(
+        transferId + 1, barrier::FileTransferReason::kNone));
+    EXPECT_FALSE(state->readyForData());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        EXPECT_TRUE(offsets.empty());
+    }
+    ASSERT_TRUE(state->signalStartAck(
+        transferId, barrier::FileTransferReason::kNone));
+    bool endArrived = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        endArrived = changed.wait_for(
+            lock, std::chrono::milliseconds(250),
+            [&]() { return endSeen; });
+    }
+    if (!endArrived) {
+        chunker.interruptFile();
+        worker.wait(1.0);
+        barrier::fs::remove(path);
+        FAIL() << "transactional End event was not queued";
+    }
+    const bool commitAccepted = state->signalCommitAck(
+        transferId, barrier::FileTransferReason::kNone);
+    if (!commitAccepted) {
+        state->interrupt();
+    }
+    ASSERT_TRUE(worker.wait(1.0));
+
+    ASSERT_TRUE(commitAccepted);
+    ASSERT_FALSE(offsets.empty());
+    UInt32 expectedOffset = 0;
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        EXPECT_EQ(expectedOffset, offsets[i]);
+        expectedOffset += static_cast<UInt32>(sizes[i]);
+    }
+    EXPECT_EQ(100000u, expectedOffset);
+    EXPECT_EQ(expectedOffset, finalOffset);
+    EXPECT_EQ('y', firstPayloadByte);
+    EXPECT_TRUE(state->committed());
+
+    barrier::fs::remove(path);
+}
+
+TEST(StreamChunkerTests, transactionalFileStopsWhenStartIsRejected)
+{
+    NiceMock<MockEventQueue> events;
+    NiceMock<MockStream> stream;
+    FileEvents fileEvents;
+    fileEvents.setEvents(&events);
+    Event::Type nextType = Event::kLast;
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kSecondary, 7);
+    auto state = std::make_shared<barrier::FileTransferSendState>(
+        transferId, std::chrono::milliseconds(50),
+        std::chrono::milliseconds(50));
+    std::vector<UInt8> marks;
+
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    ON_CALL(events, registerTypeOnce(_, _))
+        .WillByDefault(Invoke([&nextType](Event::Type& type, const char*) {
+            if (type == Event::kUnknown) {
+                type = nextType++;
+            }
+            return type;
+        }));
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&](const Event& event) {
+            if (event.getType() == fileEvents.fileChunkSending() &&
+                event.getData() != nullptr) {
+                const auto* chunk = static_cast<const FileChunk*>(event.getData());
+                marks.push_back(chunk->m_chunk[0]);
+                if (chunk->m_chunk[0] == kDataStart) {
+                    state->signalStartAck(
+                        transferId, barrier::FileTransferReason::kRejected);
+                }
+            }
+            Event::deleteData(event);
+        }));
+    ON_CALL(events, getQueuedEventCount()).WillByDefault(Return(0u));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+
+    const barrier::fs::path path = writeTempFile(1024);
+    StreamChunker chunker;
+    chunker.sendFile(path.u8string().c_str(), &events, &events, &stream,
+                     transferId, state);
+
+    ASSERT_EQ(1u, marks.size());
+    EXPECT_EQ(kDataStart, marks.front());
+    EXPECT_EQ(barrier::FileTransferReason::kRejected, state->result());
+    EXPECT_FALSE(state->committed());
+
+    barrier::fs::remove(path);
+}
+
+TEST(StreamChunkerTests, transactionalFileCommitTimeoutIsBounded)
+{
+    NiceMock<MockEventQueue> events;
+    NiceMock<MockStream> stream;
+    FileEvents fileEvents;
+    fileEvents.setEvents(&events);
+    Event::Type nextType = Event::kLast;
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 8);
+    auto state = std::make_shared<barrier::FileTransferSendState>(
+        transferId, std::chrono::milliseconds(5),
+        std::chrono::milliseconds(5));
+    std::vector<UInt8> marks;
+
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    ON_CALL(events, registerTypeOnce(_, _))
+        .WillByDefault(Invoke([&nextType](Event::Type& type, const char*) {
+            if (type == Event::kUnknown) {
+                type = nextType++;
+            }
+            return type;
+        }));
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&](const Event& event) {
+            if (event.getType() == fileEvents.fileChunkSending() &&
+                event.getData() != nullptr) {
+                const auto* chunk = static_cast<const FileChunk*>(event.getData());
+                marks.push_back(chunk->m_chunk[0]);
+                if (chunk->m_chunk[0] == kDataStart) {
+                    state->signalStartAck(
+                        transferId, barrier::FileTransferReason::kNone);
+                }
+            }
+            Event::deleteData(event);
+        }));
+    ON_CALL(events, getQueuedEventCount()).WillByDefault(Return(0u));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+
+    const barrier::fs::path path = writeTempFile(1024);
+    StreamChunker chunker;
+    chunker.sendFile(path.u8string().c_str(), &events, &events, &stream,
+                     transferId, state);
+
+    ASSERT_EQ(3u, marks.size());
+    EXPECT_EQ(kDataStart, marks[0]);
+    EXPECT_EQ(kDataChunk, marks[1]);
+    EXPECT_EQ(kDataEnd, marks[2]);
+    EXPECT_EQ(barrier::FileTransferReason::kTimeout, state->result());
+    EXPECT_FALSE(state->committed());
+
+    barrier::fs::remove(path);
+}
+
+TEST(StreamChunkerTests, transactionalEmptyFileSkipsDataAndCommits)
+{
+    NiceMock<MockEventQueue> events;
+    NiceMock<MockStream> stream;
+    FileEvents fileEvents;
+    fileEvents.setEvents(&events);
+    Event::Type nextType = Event::kLast;
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 10);
+    auto state = std::make_shared<barrier::FileTransferSendState>(
+        transferId, std::chrono::milliseconds(50),
+        std::chrono::milliseconds(50));
+    std::vector<UInt8> marks;
+    UInt32 finalOffset = 1;
+
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    ON_CALL(events, registerTypeOnce(_, _))
+        .WillByDefault(Invoke([&nextType](Event::Type& type, const char*) {
+            if (type == Event::kUnknown) {
+                type = nextType++;
+            }
+            return type;
+        }));
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&](const Event& event) {
+            if (event.getType() == fileEvents.fileChunkSending() &&
+                event.getData() != nullptr) {
+                const auto* chunk = static_cast<const FileChunk*>(event.getData());
+                marks.push_back(chunk->m_chunk[0]);
+                EXPECT_TRUE(chunk->m_transactional);
+                if (chunk->m_chunk[0] == kDataStart) {
+                    state->signalStartAck(
+                        transferId, barrier::FileTransferReason::kNone);
+                }
+                else if (chunk->m_chunk[0] == kDataEnd) {
+                    finalOffset = chunk->m_offset;
+                    state->signalCommitAck(
+                        transferId, barrier::FileTransferReason::kNone);
+                }
+            }
+            Event::deleteData(event);
+        }));
+    ON_CALL(events, getQueuedEventCount()).WillByDefault(Return(0u));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+
+    const barrier::fs::path path = writeTempFile(0);
+    StreamChunker chunker;
+    chunker.sendFile(path.u8string().c_str(), &events, &events, &stream,
+                     transferId, state);
+
+    ASSERT_EQ(2u, marks.size());
+    EXPECT_EQ(kDataStart, marks[0]);
+    EXPECT_EQ(kDataEnd, marks[1]);
+    EXPECT_EQ(0u, finalOffset);
+    EXPECT_TRUE(state->committed());
+
+    barrier::fs::remove(path);
+}
+
+TEST(StreamChunkerTests, transactionalFileInterruptWakesStartAckWait)
+{
+    NiceMock<MockEventQueue> events;
+    NiceMock<MockStream> stream;
+    FileEvents fileEvents;
+    fileEvents.setEvents(&events);
+    Event::Type nextType = Event::kLast;
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 9);
+    auto state = std::make_shared<barrier::FileTransferSendState>(
+        transferId, std::chrono::milliseconds(250),
+        std::chrono::milliseconds(250));
+    StreamChunker chunker;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool startSeen = false;
+    std::vector<UInt8> marks;
+
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    ON_CALL(events, registerTypeOnce(_, _))
+        .WillByDefault(Invoke([&nextType](Event::Type& type, const char*) {
+            if (type == Event::kUnknown) {
+                type = nextType++;
+            }
+            return type;
+        }));
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&](const Event& event) {
+            if (event.getType() == fileEvents.fileChunkSending() &&
+                event.getData() != nullptr) {
+                const auto* chunk = static_cast<const FileChunk*>(event.getData());
+                std::lock_guard<std::mutex> lock(mutex);
+                marks.push_back(chunk->m_chunk[0]);
+                if (chunk->m_chunk[0] == kDataStart) {
+                    startSeen = true;
+                    changed.notify_all();
+                }
+            }
+            Event::deleteData(event);
+        }));
+    ON_CALL(events, getQueuedEventCount()).WillByDefault(Return(0u));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+
+    const barrier::fs::path path = writeTempFile(1024);
+    Thread worker([&]() {
+        chunker.sendFile(path.u8string().c_str(), &events, &events, &stream,
+                         transferId, state);
+    });
+    bool startArrived = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        startArrived = changed.wait_for(
+            lock, std::chrono::milliseconds(100),
+            [&]() { return startSeen; });
+    }
+    if (!startArrived) {
+        chunker.interruptFile();
+        worker.wait(1.0);
+        barrier::fs::remove(path);
+        FAIL() << "transactional Start event was not queued";
+    }
+    chunker.interruptFile();
+    ASSERT_TRUE(worker.wait(1.0));
+
+    ASSERT_EQ(2u, marks.size());
+    EXPECT_EQ(kDataStart, marks[0]);
+    EXPECT_EQ(kDataCancel, marks[1]);
+    EXPECT_EQ(barrier::FileTransferReason::kCancelled, state->result());
+    EXPECT_FALSE(state->committed());
 
     barrier::fs::remove(path);
 }

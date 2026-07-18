@@ -232,10 +232,13 @@ ClientListener::handleUnknownClient(const Event&, void* vclient)
     else {
         std::string bulkName;
         std::string bulkToken;
+        std::string bulkConnectionBinding;
         barrier::IStream* bulkStream =
-            unknownClient->orphanBulkStream(bulkName, bulkToken);
+            unknownClient->orphanBulkStream(
+                bulkName, bulkToken, bulkConnectionBinding);
         if (bulkStream != NULL) {
-            if (!m_server->attachBulkStream(bulkName, bulkToken, bulkStream)) {
+            if (!m_server->attachBulkStream(
+                    bulkName, bulkToken, bulkConnectionBinding, bulkStream)) {
                 ProtocolUtil::writef(bulkStream, kMsgDBulkRejected);
                 bulkStream->close();
                 delete bulkStream;

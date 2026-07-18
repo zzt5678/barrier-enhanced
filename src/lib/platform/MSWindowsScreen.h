@@ -26,6 +26,7 @@
 #include "platform/synwinhk.h"
 #include "mt/CondVar.h"
 #include "mt/Mutex.h"
+#include <memory>
 #include <string>
 
 #define WIN32_LEAN_AND_MEAN
@@ -37,7 +38,7 @@ class MSWindowsKeyState;
 class MSWindowsScreenSaver;
 class Thread;
 class MSWindowsDropTarget;
-class MSWindowsClipboardBridge;
+struct MSWindowsClipboardSnapshotWorkerContext;
 
 //! Implementation of IPlatformScreen for Microsoft Windows
 class MSWindowsScreen : public PlatformScreen {
@@ -74,6 +75,18 @@ public:
     // IScreen overrides
     virtual void*        getEventTarget() const override;
     virtual bool        getClipboard(ClipboardID id, IClipboard*) const override;
+    virtual bool        getClipboardSnapshot(
+                            ClipboardID id,
+                            std::shared_ptr<const String>* data,
+                            UInt32* snapshotTime) const override;
+    virtual bool        setClipboardSnapshot(
+                            ClipboardID id,
+                            const std::shared_ptr<const String>& data) override;
+    virtual bool        setClipboardSnapshot(
+                            ClipboardID id,
+                            const std::shared_ptr<const String>& data,
+                            std::uint64_t publicationId) override;
+    virtual bool        hasAsyncClipboardPublications() const override;
     virtual void        getShape(SInt32& x, SInt32& y,
                             SInt32& width, SInt32& height) const override;
     virtual void        getCursorPos(SInt32& x, SInt32& y) const override;
@@ -109,12 +122,15 @@ public:
     // IPlatformScreen overrides
     virtual void        enable() override;
     virtual bool        prepareInputBackend() override;
+    virtual bool        probeInputBackend(
+                            std::string& desktopName) const override;
     virtual void        disable() override;
     virtual void        enter() override;
     virtual bool        tryEnter() override;
     virtual bool        leave() override;
     virtual bool        setClipboard(ClipboardID, const IClipboard*) override;
     virtual void        checkClipboards() override;
+    virtual bool        hasAsyncClipboardSnapshots() const override;
     virtual void        openScreensaver(bool notify) override;
     virtual void        closeScreensaver() override;
     virtual void        screensaver(bool activate) override;
@@ -178,6 +194,14 @@ private: // HACK
     bool                onScreensaver(bool activated);
     bool                onDisplayChange();
     bool                onClipboardChange();
+    void                onClipboardSnapshotReady(std::uint64_t token);
+    void                onClipboardPublicationReady(std::uint64_t token);
+    bool                queueClipboardSnapshot(UInt32 windowsSequence,
+                            bool announceGrab);
+    void                wakeClipboardSnapshotWorker();
+    void                stopClipboardSnapshotWorker();
+    bool                reapSendDragThreadIfReady();
+    void                stopSendDragThread();
 
     // warp cursor without discarding queued events
     void                warpCursorNoFlush(SInt32 x, SInt32 y);
@@ -306,8 +330,9 @@ private:
     bool                m_ownClipboard;
     MSWindowsClipboardChangeTracker
                         m_clipboardChangeTracker;
-    MSWindowsClipboardBridge*
-                        m_clipboardBridge;
+    std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext>
+                        m_clipboardSnapshotContext;
+    Thread*             m_clipboardSnapshotThread;
 
     // one desk per desktop and a cond var to communicate with it
     MSWindowsDesks*    m_desks;

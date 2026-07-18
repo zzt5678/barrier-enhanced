@@ -23,6 +23,8 @@
 #include "base/EventTypes.h"
 #include "common/IInterface.h"
 
+#include <cstdint>
+
 class IClipboard;
 
 //! Screen interface
@@ -31,10 +33,23 @@ This interface defines the methods common to all screens.
 */
 class IScreen : public IInterface {
 public:
+    enum class ClipboardPublicationResult {
+        Succeeded,
+        Failed,
+        Superseded
+    };
+
     struct ClipboardInfo {
     public:
         ClipboardID        m_id;
         UInt32            m_sequenceNumber;
+    };
+
+    struct ClipboardPublicationInfo {
+        ClipboardID m_id;
+        std::uint64_t m_publicationId;
+        ClipboardPublicationResult m_result;
+        UInt32 m_platformSequence;
     };
 
     //! @name accessors

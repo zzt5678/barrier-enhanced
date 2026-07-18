@@ -221,6 +221,9 @@ public:
     //! Return true when the active Windows desktop can process input.
     bool                canEnter() const;
 
+    //! Probe access to the input desktop without starting a desk thread/hook.
+    bool                probeInputDesktop(std::string& desktopName) const;
+
     //! Monotonically increasing identity for the active desktop backend.
     std::uint64_t       inputDesktopGeneration() const;
 
@@ -274,6 +277,9 @@ public:
     static double        deskCommandExecutionGraceForTest(
                             bool lowLatencyMode,
                             bool nestedRemoteMode);
+
+    static double        boundedDeskCommandWaitTimeoutForTest(
+                            double timeout);
 
     static bool         canActivateDesktopForTest(
                             bool startupComplete,
@@ -429,9 +435,10 @@ private:
     HWND                getForegroundWindow() const;
 
     // desk API wrappers
-    HDESK                openInputDesktop();
-    void                closeDesktop(HDESK);
-    std::string getDesktopName(HDESK);
+    HDESK                openInputDesktop() const;
+    HDESK                openInputDesktopForProbe() const;
+    void                 closeDesktop(HDESK) const;
+    std::string getDesktopName(HDESK) const;
 
     // our desk window procs
     static LRESULT CALLBACK primaryDeskProc(HWND, UINT, WPARAM, LPARAM);

@@ -20,6 +20,7 @@
 #include "barrier/ClipboardChunk.h"
 #include "server/ClientProxy1_5.h"
 
+#include <cstdint>
 #include <memory>
 
 namespace barrier { class BulkChannel; }
@@ -27,6 +28,7 @@ class Server;
 class IEventQueue;
 class StreamChunker;
 class Thread;
+class EventQueueTimer;
 
 //! Proxy for client implementing protocol version 1.6
 class ClientProxy1_6 : public ClientProxy1_5 {
@@ -47,10 +49,33 @@ public:
     barrier::IStream*   testClipboardSendStream() const { return m_clipboardSendStream; }
     bool                testHasClipboardBulkChannel() const
                             { return static_cast<bool>(m_clipboardBulkChannel); }
+    void                testSetClipboardBulkSender(
+                            const std::shared_ptr<StreamChunker>& chunker,
+                            const std::shared_ptr<barrier::BulkChannel>& channel)
+                            { m_clipboardChunker = chunker;
+                              m_clipboardBulkChannel = channel; }
+    void                testHandleBulkSendDisconnected(
+                            barrier::BulkChannel* channel)
+                            { handleBulkSendDisconnected(channel); }
+    void                testHandleClipboardSendingChunk(ClipboardChunk* chunk)
+                            { handleClipboardSendingChunk(chunk); }
+    bool                testHasClipboardSendRetryTimer() const
+                            { return m_clipboardSendRetryTimer != NULL; }
+    void                testRunClipboardSendRetry()
+                            { handleClipboardSendRetry(Event(), NULL); }
 #endif
+
+protected:
+    void                retryOneDirtyClipboard();
+    void                handleBulkSendDisconnected(
+                            barrier::BulkChannel* channel);
 
 private:
     void                handleClipboardSendingEvent(const Event&, void*);
+    void                handleClipboardSendingChunk(ClipboardChunk* chunk);
+    void                handleClipboardSendRetry(const Event&, void*);
+    void                scheduleClipboardSendRetry();
+    void                cleanupClipboardSendRetry();
     void                sendClipboardThread(
                             const std::shared_ptr<const std::string>& data,
                             ClipboardID id,
@@ -64,6 +89,10 @@ private:
     ClipboardID         m_clipboardSendId;
     bool                m_clipboardSendSucceeded;
     bool                m_clipboardSendResultAvailable;
+    std::shared_ptr<barrier::ClipboardSendAttempt> m_clipboardSendAttempt;
+    std::uint64_t       m_nextClipboardSendAttempt;
+    std::uint64_t       m_latestClipboardSendAttempt[kClipboardEnd];
     std::shared_ptr<barrier::BulkChannel> m_clipboardBulkChannel;
     barrier::IStream*   m_clipboardSendStream;
+    EventQueueTimer*    m_clipboardSendRetryTimer;
 };

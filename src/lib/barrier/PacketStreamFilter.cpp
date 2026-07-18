@@ -33,6 +33,10 @@
 
 namespace {
 
+const UInt32 kPacketReadBufferSize = 4096;
+const UInt32 kMaxPrefetchedInput =
+    PROTOCOL_MAX_MESSAGE_LENGTH + kPacketReadBufferSize;
+
 bool
 rejectOversizedOutputPacket(IEventQueue* events, void* eventTarget, UInt32 count)
 {
@@ -53,6 +57,7 @@ PacketStreamFilter::PacketStreamFilter(IEventQueue* events, barrier::IStream* st
     StreamFilter(events, stream, adoptStream),
     m_size(0),
     m_inputShutdown(false),
+    m_inputPaused(false),
     m_events(events)
 {
     // do nothing
@@ -69,6 +74,7 @@ PacketStreamFilter::close()
     Lock lock(&m_mutex);
     m_size = 0;
     m_buffer.pop(m_buffer.getSize());
+    m_inputPaused = false;
     StreamFilter::close();
 }
 
@@ -101,6 +107,9 @@ PacketStreamFilter::read(void* buffer, UInt32 n)
     // get next packet's size if we've finished with this packet and
     // there's enough data to do so.
     readPacketSize();
+    if (!m_inputPaused && !isReadyNoLock()) {
+        readMore();
+    }
 
     if (m_inputShutdown && m_size == 0) {
         m_events->addEvent(Event(m_events->forIStream().inputShutdown(),
@@ -147,7 +156,23 @@ PacketStreamFilter::shutdownInput()
     Lock lock(&m_mutex);
     m_size = 0;
     m_buffer.pop(m_buffer.getSize());
+    m_inputPaused = false;
     StreamFilter::shutdownInput();
+}
+
+void
+PacketStreamFilter::setInputPaused(bool paused)
+{
+    Lock lock(&m_mutex);
+    if (m_inputPaused == paused) {
+        return;
+    }
+
+    m_inputPaused = paused;
+    StreamFilter::setInputPaused(paused);
+    if (!paused && !m_inputShutdown && !isReadyNoLock()) {
+        readMore();
+    }
 }
 
 bool
@@ -200,10 +225,21 @@ bool PacketStreamFilter::readPacketSize()
 bool
 PacketStreamFilter::readMore()
 {
+    if (m_inputPaused || isReadyNoLock()) {
+        return isReadyNoLock();
+    }
+
     // read more data
-    char buffer[4096];
-    UInt32 n = getStream()->read(buffer, sizeof(buffer));
-    while (n > 0) {
+    char buffer[kPacketReadBufferSize];
+    while (!m_inputPaused && !isReadyNoLock() &&
+           m_buffer.getSize() < kMaxPrefetchedInput) {
+        const UInt32 remaining = kMaxPrefetchedInput - m_buffer.getSize();
+        const UInt32 request = remaining < sizeof(buffer)
+            ? remaining : static_cast<UInt32>(sizeof(buffer));
+        const UInt32 n = getStream()->read(buffer, request);
+        if (n == 0) {
+            break;
+        }
         m_buffer.write(buffer, n);
 
         // if we don't yet have the next packet size then get it, if possible.
@@ -212,8 +248,6 @@ PacketStreamFilter::readMore()
         if (!readPacketSize()) {
             break;
         }
-
-        n = getStream()->read(buffer, sizeof(buffer));
     }
 
     // Forward readiness whenever a complete packet is buffered.  The upstream
@@ -227,6 +261,9 @@ PacketStreamFilter::filterEvent(const Event& event)
 {
     if (event.getType() == m_events->forIStream().inputReady()) {
         Lock lock(&m_mutex);
+        if (m_inputPaused) {
+            return;
+        }
         if (!readMore()) {
             return;
         }

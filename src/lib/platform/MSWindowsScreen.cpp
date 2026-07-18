@@ -26,6 +26,7 @@
 #include "platform/MSWindowsEventQueueBuffer.h"
 #include "platform/MSWindowsKeyState.h"
 #include "platform/MSWindowsScreenSaver.h"
+#include "platform/MSWindowsClipboardSnapshotState.h"
 #include "barrier/Clipboard.h"
 #include "barrier/KeyMap.h"
 #include "barrier/XScreen.h"
@@ -34,6 +35,8 @@
 #include "barrier/ClientApp.h"
 #include "mt/Lock.h"
 #include "mt/Thread.h"
+#include "mt/ThreadShutdown.h"
+#include "mt/XThread.h"
 #include "arch/win32/ArchMiscWindows.h"
 #include "arch/Arch.h"
 #include "base/Log.h"
@@ -47,6 +50,13 @@
 #include <Shlobj.h>
 #include <comutil.h>
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <utility>
 
 //
 // add backwards compatible multihead support (and suppress bogus warning).
@@ -90,6 +100,393 @@
 HINSTANCE                MSWindowsScreen::s_windowInstance = NULL;
 MSWindowsScreen*        MSWindowsScreen::s_screen   = NULL;
 
+struct MSWindowsClipboardSnapshotWorkerContext {
+    explicit MSWindowsClipboardSnapshotWorkerContext(DWORD ownerThreadId_) :
+        ownerThreadId(ownerThreadId_)
+    {
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    MSWindowsClipboardWorkerLifetime lifetime;
+    MSWindowsClipboardSnapshotState snapshots;
+    MSWindowsClipboardPublishState publishes;
+    DWORD ownerThreadId;
+};
+
+namespace {
+
+const int kClipboardSnapshotReadAttempts = 8;
+const double kClipboardSnapshotReadRetrySeconds = 0.025;
+const UInt32 kClipboardSnapshotMaxRetryAttempts = 20;
+const UInt32 kClipboardPublishMaxRetryAttempts = 8;
+const double kClipboardSnapshotRetryBackoffSeconds = 0.05;
+const double kClipboardSnapshotShutdownWaitSeconds = 0.5;
+const UINT kClipboardSnapshotReadyMessage = WM_APP + 0x001a;
+const UINT kClipboardPublicationReadyMessage = WM_APP + 0x001b;
+
+enum class ClipboardPublishResult {
+    Succeeded,
+    Retry,
+    Superseded
+};
+
+double clipboardPublishRetrySeconds(UInt32 attempt)
+{
+    double delay = kClipboardSnapshotRetryBackoffSeconds;
+    const UInt32 steps = attempt < 5 ? attempt : 5;
+    for (UInt32 i = 0; i < steps; ++i) {
+        delay *= 2.0;
+    }
+    return delay;
+}
+
+class ClipboardWorkerCompletion {
+public:
+    explicit ClipboardWorkerCompletion(
+        const std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext>& context) :
+        m_context(context)
+    {
+    }
+
+    ~ClipboardWorkerCompletion()
+    {
+        m_context->lifetime.markFinished();
+    }
+
+private:
+    ClipboardWorkerCompletion(const ClipboardWorkerCompletion&);
+    ClipboardWorkerCompletion& operator=(const ClipboardWorkerCompletion&);
+
+    std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext> m_context;
+};
+
+WPARAM clipboardNotificationTokenLow(std::uint64_t token)
+{
+    return static_cast<WPARAM>(token & 0xffffffffULL);
+}
+
+LPARAM clipboardNotificationTokenHigh(std::uint64_t token)
+{
+    return static_cast<LPARAM>((token >> 32) & 0xffffffffULL);
+}
+
+std::uint64_t clipboardNotificationToken(WPARAM low, LPARAM high)
+{
+    return static_cast<std::uint64_t>(static_cast<std::uint32_t>(low)) |
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(high)) << 32);
+}
+
+bool postClipboardWorkerNotification(
+    const std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext>& context,
+    UINT message)
+{
+    const std::uint64_t token = context->lifetime.notificationToken();
+    return context->lifetime.acceptsNotification(token) &&
+        PostThreadMessage(
+            context->ownerThreadId,
+            message,
+            clipboardNotificationTokenLow(token),
+            clipboardNotificationTokenHigh(token)) != 0;
+}
+
+bool readClipboardSnapshot(
+    MSWindowsClipboardBridge& bridge,
+    const MSWindowsClipboardSnapshotState::Request& request,
+    std::shared_ptr<const String>* snapshot, std::string* error)
+{
+    snapshot->reset();
+    if (request.windowsSequence == 0 ||
+        GetClipboardSequenceNumber() != request.windowsSequence) {
+        if (error != NULL) {
+            *error = "clipboard revision changed before it could be read";
+        }
+        return false;
+    }
+
+    std::string marshalled;
+    const MSWindowsClipboardBridge::ReadResult bridgeResult =
+        bridge.readSnapshot(&marshalled, error);
+    if (bridgeResult == MSWindowsClipboardBridge::ReadResult::Failed) {
+        return false;
+    }
+
+    if (bridgeResult == MSWindowsClipboardBridge::ReadResult::NotRequired) {
+        Clipboard clipboard;
+        MSWindowsClipboard source(NULL);
+        bool copied = false;
+        for (int attempt = 0;
+             attempt < kClipboardSnapshotReadAttempts && !copied; ++attempt) {
+            copied = Clipboard::copy(&clipboard, &source);
+            if (!copied) {
+                ARCH->sleep(kClipboardSnapshotReadRetrySeconds);
+            }
+        }
+        if (!copied) {
+            if (error != NULL) {
+                *error = "the Windows clipboard is temporarily unavailable";
+            }
+            return false;
+        }
+        marshalled = clipboard.marshall();
+        if (!MSWindowsClipboardBridgeProtocol::validateSnapshot(
+                marshalled, error)) {
+            return false;
+        }
+    }
+
+    if (GetClipboardSequenceNumber() != request.windowsSequence) {
+        if (error != NULL) {
+            *error = "clipboard revision changed while it was being read";
+        }
+        return false;
+    }
+
+    snapshot->reset(new String(std::move(marshalled)));
+    return true;
+}
+
+ClipboardPublishResult publishClipboardSnapshot(
+    MSWindowsClipboardBridge& bridge,
+    const MSWindowsClipboardPublishState::Request& request,
+    UInt32* committedWindowsSequence,
+    std::string* error)
+{
+    if (committedWindowsSequence != NULL) {
+        *committedWindowsSequence = 0;
+    }
+    if (!request.snapshot ||
+        !Clipboard::isValidMarshalled(*request.snapshot)) {
+        if (error != NULL) {
+            *error = "remote clipboard snapshot is malformed";
+        }
+        return ClipboardPublishResult::Superseded;
+    }
+
+    const MSWindowsClipboardBridge::ReadResult bridgeResult =
+        bridge.publishSnapshot(*request.snapshot,
+                               request.expectedWindowsSequence,
+                               committedWindowsSequence, error);
+    if (bridgeResult == MSWindowsClipboardBridge::ReadResult::Succeeded) {
+        return ClipboardPublishResult::Succeeded;
+    }
+    if (bridgeResult == MSWindowsClipboardBridge::ReadResult::Superseded) {
+        return ClipboardPublishResult::Superseded;
+    }
+    if (bridgeResult == MSWindowsClipboardBridge::ReadResult::Failed) {
+        return ClipboardPublishResult::Retry;
+    }
+
+    Clipboard source;
+    source.unmarshall(*request.snapshot, 0);
+    MSWindowsClipboard destination(NULL);
+    const MSWindowsClipboard::ConditionalCopyResult copyResult =
+        destination.copyFromIfSequence(
+            &source, 0, request.expectedWindowsSequence,
+            committedWindowsSequence);
+    if (copyResult ==
+        MSWindowsClipboard::ConditionalCopyResult::SequenceChanged) {
+        if (error != NULL) {
+            *error = "the Windows clipboard revision was superseded";
+        }
+        return ClipboardPublishResult::Superseded;
+    }
+    if (copyResult != MSWindowsClipboard::ConditionalCopyResult::Succeeded) {
+        if (error != NULL) {
+            *error = "the Windows clipboard is temporarily unavailable";
+        }
+        return ClipboardPublishResult::Retry;
+    }
+    return ClipboardPublishResult::Succeeded;
+}
+
+void runClipboardSnapshotWorker(
+    const std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext>& context)
+{
+    ClipboardWorkerCompletion completion(context);
+    MSWindowsClipboardBridge bridge;
+    bridge.warmUp();
+
+    for (;;) {
+        Thread::testCancel();
+
+        MSWindowsClipboardSnapshotState::Request request;
+        MSWindowsClipboardPublishState::Request publishRequest;
+        bool hasPublishRequest = false;
+        {
+            std::unique_lock<std::mutex> lock(context->mutex);
+            context->wake.wait(lock, [&context]() {
+                return context->lifetime.stopRequested() ||
+                    context->publishes.hasPending() ||
+                    context->snapshots.hasPending();
+            });
+            if (context->lifetime.stopRequested()) {
+                return;
+            }
+            hasPublishRequest = context->publishes.takeNext(&publishRequest);
+            if (!hasPublishRequest &&
+                !context->snapshots.takeNext(&request)) {
+                continue;
+            }
+        }
+
+        if (hasPublishRequest) {
+            std::string error;
+            ClipboardPublishResult publishResult =
+                ClipboardPublishResult::Retry;
+            UInt32 committedWindowsSequence = 0;
+            try {
+                publishResult = publishClipboardSnapshot(
+                    bridge, publishRequest, &committedWindowsSequence, &error);
+            }
+            catch (XThread&) {
+                std::lock_guard<std::mutex> lock(context->mutex);
+                context->publishes.fail(publishRequest);
+                throw;
+            }
+            catch (const std::exception& exception) {
+                error = exception.what();
+            }
+            catch (...) {
+                error = "unknown Windows clipboard publication failure";
+            }
+            bool retryQueued = false;
+            bool stopping = false;
+            bool publicationCompleted = false;
+            {
+                std::lock_guard<std::mutex> lock(context->mutex);
+                if (context->lifetime.stopRequested()) {
+                    context->publishes.fail(publishRequest);
+                    stopping = true;
+                }
+                else if (publishResult == ClipboardPublishResult::Succeeded) {
+                    context->publishes.complete(
+                        publishRequest, committedWindowsSequence);
+                }
+                else if (publishResult == ClipboardPublishResult::Superseded) {
+                    context->publishes.fail(
+                        publishRequest,
+                        MSWindowsClipboardPublishState::CompletionResult::Superseded);
+                }
+                else {
+                    retryQueued = context->publishes.retry(
+                        publishRequest, kClipboardPublishMaxRetryAttempts);
+                }
+                publicationCompleted = context->publishes.hasCompletion();
+            }
+            if (stopping) {
+                return;
+            }
+            if (publishResult == ClipboardPublishResult::Succeeded) {
+                LOG((CLOG_INFO
+                    "published remote Windows clipboard snapshot: generation=%llu attempt=%u",
+                    static_cast<unsigned long long>(publishRequest.generation),
+                    publishRequest.attempt));
+            }
+            else {
+                const char* outcome = retryQueued ? "retrying" :
+                    (publishResult == ClipboardPublishResult::Superseded
+                        ? "superseded" : "failed");
+                LOG((CLOG_WARN
+                    "%s remote Windows clipboard snapshot: generation=%llu attempt=%u error=%s",
+                    outcome,
+                    static_cast<unsigned long long>(publishRequest.generation),
+                    publishRequest.attempt,
+                    error.empty() ? "unknown failure" : error.c_str()));
+            }
+            if (retryQueued) {
+                ARCH->sleep(clipboardPublishRetrySeconds(
+                    publishRequest.attempt));
+                context->wake.notify_one();
+            }
+            else if (publicationCompleted &&
+                     !postClipboardWorkerNotification(
+                         context, kClipboardPublicationReadyMessage)) {
+                LOG((CLOG_WARN
+                    "failed to notify the Windows event thread about clipboard publication generation=%llu",
+                    static_cast<unsigned long long>(publishRequest.generation)));
+            }
+            continue;
+        }
+
+        std::shared_ptr<const String> snapshot;
+        std::string error;
+        bool copied = false;
+        try {
+            copied = readClipboardSnapshot(
+                bridge, request, &snapshot, &error);
+        }
+        catch (XThread&) {
+            throw;
+        }
+        catch (const std::exception& exception) {
+            error = exception.what();
+        }
+        catch (...) {
+            error = "unknown Windows clipboard snapshot failure";
+        }
+        if (context->lifetime.stopRequested()) {
+            return;
+        }
+        const UInt32 currentSequence = GetClipboardSequenceNumber();
+
+        bool retryQueued = false;
+        bool notificationFailed = false;
+        {
+            std::lock_guard<std::mutex> lock(context->mutex);
+            if (context->lifetime.stopRequested()) {
+                return;
+            }
+
+            if (copied && context->snapshots.complete(
+                    request, currentSequence, snapshot)) {
+                const std::uint64_t token =
+                    context->lifetime.notificationToken();
+                if (context->lifetime.acceptsNotification(token) &&
+                    PostThreadMessage(
+                        context->ownerThreadId,
+                        kClipboardSnapshotReadyMessage,
+                        clipboardNotificationTokenLow(token),
+                        clipboardNotificationTokenHigh(token)) == 0) {
+                    // Without a notification the ready revision would never be
+                    // announced. Revoke it so the next safe poll can retry.
+                    context->snapshots.invalidate();
+                    notificationFailed = true;
+                }
+            }
+            else {
+                const bool revisionChanged =
+                    currentSequence != request.windowsSequence;
+                retryQueued = !revisionChanged &&
+                    context->snapshots.retry(
+                        request, kClipboardSnapshotMaxRetryAttempts);
+                if (!retryQueued) {
+                    context->snapshots.fail(request);
+                }
+                LOG((CLOG_DEBUG
+                    "%s unavailable or stale Windows clipboard snapshot: generation=%llu attempt=%u windowsSequence=%u currentSequence=%u error=%s",
+                    retryQueued ? "retrying" : "discarded",
+                    static_cast<unsigned long long>(request.generation),
+                    request.attempt, request.windowsSequence, currentSequence,
+                    error.empty() ? "revision superseded" : error.c_str()));
+            }
+        }
+
+        if (notificationFailed) {
+            LOG((CLOG_WARN
+                "failed to notify the Windows event thread about clipboard snapshot generation=%llu",
+                static_cast<unsigned long long>(request.generation)));
+        }
+
+        if (retryQueued) {
+            ARCH->sleep(kClipboardSnapshotRetryBackoffSeconds);
+            context->wake.notify_one();
+        }
+    }
+}
+
+} // namespace
+
 MSWindowsScreen::MSWindowsScreen(
     bool isPrimary,
     bool noHooks,
@@ -118,14 +515,16 @@ MSWindowsScreen::MSWindowsScreen(
     m_window(NULL),
     m_nextClipboardWindow(NULL),
     m_ownClipboard(false),
-    m_clipboardBridge(NULL),
+    m_clipboardSnapshotContext(),
+    m_clipboardSnapshotThread(NULL),
     m_desks(NULL),
     m_keyState(NULL),
     m_hasMouse(GetSystemMetrics(SM_MOUSEPRESENT) != 0),
     m_showingMouse(false),
     m_events(events),
     m_dropWindow(NULL),
-    m_dropWindowSize(20)
+    m_dropWindowSize(20),
+    m_sendDragThread(NULL)
 {
     assert(s_windowInstance != NULL);
     assert(s_screen   == NULL);
@@ -145,8 +544,9 @@ MSWindowsScreen::MSWindowsScreen(
         updateScreenShape();
         m_class       = createWindowClass();
         m_window      = createWindow(m_class, "Barrier");
-        m_clipboardBridge = new MSWindowsClipboardBridge();
-        m_clipboardBridge->warmUp();
+        m_clipboardSnapshotContext.reset(
+            new MSWindowsClipboardSnapshotWorkerContext(
+                GetCurrentThreadId()));
         forceShowCursor();
         LOG((CLOG_DEBUG "screen shape: %d,%d %dx%d %s", m_x, m_y, m_w, m_h, m_multimon ? "(multi-monitor)" : ""));
         LOG((CLOG_DEBUG "window is 0x%08x", m_window));
@@ -157,7 +557,6 @@ MSWindowsScreen::MSWindowsScreen(
         RegisterDragDrop(m_dropWindow, m_dropTarget);
     }
     catch (...) {
-        delete m_clipboardBridge;
         delete m_keyState;
         delete m_desks;
         delete m_screensaver;
@@ -180,13 +579,14 @@ MSWindowsScreen::~MSWindowsScreen()
 {
     assert(s_screen != NULL);
 
+    stopSendDragThread();
     disable();
+    stopClipboardSnapshotWorker();
     m_events->adoptBuffer(NULL);
     m_events->removeHandler(Event::kSystem, m_events->getSystemTarget());
     delete m_keyState;
     delete m_desks;
     delete m_screensaver;
-    delete m_clipboardBridge;
     destroyWindow(m_window);
     destroyClass(m_class);
 
@@ -228,6 +628,14 @@ MSWindowsScreen::enable()
     m_nextClipboardWindow = SetClipboardViewer(m_window);
     m_clipboardChangeTracker.reset(GetClipboardSequenceNumber());
     m_ownClipboard = MSWindowsClipboard::isOwnedByBarrier();
+    const UInt32 clipboardSequence = GetClipboardSequenceNumber();
+    if (m_ownClipboard || clipboardSequence == 0) {
+        std::lock_guard<std::mutex> lock(m_clipboardSnapshotContext->mutex);
+        m_clipboardSnapshotContext->snapshots.invalidate();
+    }
+    else if (queueClipboardSnapshot(clipboardSequence, true)) {
+        wakeClipboardSnapshotWorker();
+    }
 
     // track the active desk and (re)install the hooks
     m_desks->enable();
@@ -258,6 +666,13 @@ MSWindowsScreen::prepareInputBackend()
     return m_desks->canEnter();
 }
 
+bool
+MSWindowsScreen::probeInputBackend(std::string& desktopName) const
+{
+    desktopName.clear();
+    return m_desks != NULL && m_desks->probeInputDesktop(desktopName);
+}
+
 void
 MSWindowsScreen::disable()
 {
@@ -283,6 +698,15 @@ MSWindowsScreen::disable()
     // stop snooping the clipboard
     ChangeClipboardChain(m_window, m_nextClipboardWindow);
     m_nextClipboardWindow = NULL;
+
+    // A disabled screen no longer owns a valid clipboard observation epoch.
+    // Revoke ready and in-flight snapshots so reconnecting with the same
+    // Win32 sequence cannot publish data captured for the previous session.
+    if (m_clipboardSnapshotContext != NULL) {
+        std::lock_guard<std::mutex> lock(m_clipboardSnapshotContext->mutex);
+        m_clipboardSnapshotContext->snapshots.invalidate();
+        m_clipboardSnapshotContext->publishes.invalidate();
+    }
 
     // uninstall fix timer
     if (m_fixTimer != NULL) {
@@ -400,11 +824,50 @@ MSWindowsScreen::leave()
     m_initialMouseMovePending = false;
     forceShowCursor();
 
-    if (isDraggingStarted() && !m_isPrimary) {
+    const bool dragSenderReady = reapSendDragThreadIfReady();
+    if (isDraggingStarted() && !m_isPrimary && dragSenderReady) {
         m_sendDragThread = new Thread([this](){ send_drag_thread(); });
+    }
+    else if (isDraggingStarted() && !m_isPrimary) {
+        LOG((CLOG_WARN
+            "skipping duplicate Windows drag sender while the previous sender is still running"));
     }
 
     return true;
+}
+
+bool
+MSWindowsScreen::reapSendDragThreadIfReady()
+{
+    if (m_sendDragThread == NULL) {
+        return true;
+    }
+    if (!m_sendDragThread->wait(0.0)) {
+        return false;
+    }
+
+    delete m_sendDragThread;
+    m_sendDragThread = NULL;
+    return true;
+}
+
+void
+MSWindowsScreen::stopSendDragThread()
+{
+    if (reapSendDragThreadIfReady()) {
+        return;
+    }
+
+    m_sendDragThread->cancel();
+    m_sendDragThread->unblockPollSocket();
+    barrier::waitForFinalThreadShutdown(
+        "Windows drag sender",
+        barrier::kFinalThreadShutdownDeadlineSeconds,
+        [this](double timeout) {
+            return m_sendDragThread->wait(timeout);
+        });
+    delete m_sendDragThread;
+    m_sendDragThread = NULL;
 }
 
 void MSWindowsScreen::send_drag_thread()
@@ -450,20 +913,75 @@ MSWindowsScreen::setClipboard(ClipboardID id, const IClipboard* src)
         return true;
     }
 
-    MSWindowsClipboard dst(m_window);
+    Clipboard snapshot;
     if (src != NULL) {
-        // save clipboard data
-        return Clipboard::copy(&dst, src);
-    }
-    else {
-        // assert clipboard ownership
-        if (!dst.open(0)) {
+        if (!Clipboard::copy(&snapshot, src)) {
             return false;
         }
-        dst.empty();
-        dst.close();
-        return true;
     }
+    else {
+        if (!snapshot.open(0)) {
+            return false;
+        }
+        snapshot.empty();
+        snapshot.close();
+    }
+    const std::shared_ptr<const String> data(
+        new String(snapshot.marshall()));
+    return setClipboardSnapshot(id, data);
+}
+
+bool
+MSWindowsScreen::setClipboardSnapshot(
+    ClipboardID id, const std::shared_ptr<const String>& data)
+{
+    return setClipboardSnapshot(id, data, 0);
+}
+
+bool
+MSWindowsScreen::setClipboardSnapshot(
+    ClipboardID id, const std::shared_ptr<const String>& data,
+    std::uint64_t publicationId)
+{
+    if (id == kClipboardSelection || !data ||
+        !Clipboard::isValidMarshalled(*data) ||
+        m_clipboardSnapshotContext == NULL) {
+        return false;
+    }
+
+    if (m_clipboardSnapshotThread == NULL) {
+        const std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext> context =
+            m_clipboardSnapshotContext;
+        m_clipboardSnapshotThread = new Thread([context]() {
+            runClipboardSnapshotWorker(context);
+        });
+    }
+
+    const UInt32 expectedWindowsSequence = GetClipboardSequenceNumber();
+    bool publicationCompleted = false;
+    {
+        std::lock_guard<std::mutex> lock(m_clipboardSnapshotContext->mutex);
+        if (m_clipboardSnapshotContext->lifetime.stopRequested()) {
+            return false;
+        }
+        m_clipboardSnapshotContext->snapshots.invalidate();
+        m_clipboardSnapshotContext->publishes.queue(
+            data, expectedWindowsSequence, publicationId);
+        publicationCompleted =
+            m_clipboardSnapshotContext->publishes.hasCompletion();
+    }
+    if (publicationCompleted) {
+        onClipboardPublicationReady(
+            m_clipboardSnapshotContext->lifetime.notificationToken());
+    }
+    wakeClipboardSnapshotWorker();
+    return true;
+}
+
+bool
+MSWindowsScreen::hasAsyncClipboardPublications() const
+{
+    return m_clipboardSnapshotContext != NULL;
 }
 
 void
@@ -487,6 +1005,17 @@ MSWindowsScreen::checkClipboards()
         LOG((CLOG_DEBUG "clipboard changed: viewer notification was missed"));
         onClipboardChange();
     }
+    else if (!ownedByWeave && queueClipboardSnapshot(sequence, false)) {
+        // A failed snapshot may retain the same Windows sequence. A safe
+        // owner check retries it without reading provider data here.
+        wakeClipboardSnapshotWorker();
+    }
+}
+
+bool
+MSWindowsScreen::hasAsyncClipboardSnapshots() const
+{
+    return m_clipboardSnapshotContext != NULL;
 }
 
 void
@@ -582,39 +1111,77 @@ MSWindowsScreen::getEventTarget() const
 bool
 MSWindowsScreen::getClipboard(ClipboardID id, IClipboard* dst) const
 {
-    if (id == kClipboardSelection) {
+    if (id == kClipboardSelection || dst == NULL ||
+        m_clipboardSnapshotContext == NULL) {
         return false;
     }
 
-    std::string bridgeError;
-    const MSWindowsClipboardBridge::ReadResult bridgeResult =
-        m_clipboardBridge->readSnapshot(dst, dst->getTime(), &bridgeError);
-    if (bridgeResult == MSWindowsClipboardBridge::ReadResult::Succeeded) {
-        return true;
-    }
-    if (bridgeResult == MSWindowsClipboardBridge::ReadResult::Failed) {
-        LOG((CLOG_WARN "could not read the active-session clipboard: %s",
-             bridgeError.c_str()));
-        return false;
+    const UInt32 currentSequence = GetClipboardSequenceNumber();
+    std::shared_ptr<const String> snapshot;
+    UInt32 snapshotSequence = 0;
+    bool needsSnapshot = false;
+    {
+        std::lock_guard<std::mutex> lock(m_clipboardSnapshotContext->mutex);
+        m_clipboardSnapshotContext->snapshots.copyReady(
+            &snapshot, &snapshotSequence);
+        needsSnapshot =
+            m_clipboardSnapshotContext->snapshots.needsSnapshot(
+                currentSequence);
     }
 
-    MSWindowsClipboard src(m_window);
-    constexpr int kClipboardReadAttempts = 8;
-    constexpr double kClipboardReadRetrySeconds = 0.025;
-
-    for (int attempt = 0; attempt < kClipboardReadAttempts; ++attempt) {
-        if (Clipboard::copy(dst, &src)) {
-            if (attempt > 0) {
-                LOG((CLOG_DEBUG "clipboard read succeeded after %d retry attempt(s)", attempt));
-            }
+    if (snapshot && currentSequence != 0 &&
+        snapshotSequence == currentSequence) {
+        IClipboard::unmarshall(dst, *snapshot, dst->getTime());
+        if (GetClipboardSequenceNumber() == currentSequence) {
             return true;
         }
-
-        ARCH->sleep(kClipboardReadRetrySeconds);
+        needsSnapshot = true;
     }
 
-    LOG((CLOG_WARN "failed to read clipboard after %d attempts", kClipboardReadAttempts));
+    const UInt32 requestedSequence = needsSnapshot
+        ? GetClipboardSequenceNumber() : currentSequence;
+    if (needsSnapshot && requestedSequence != 0 &&
+        !MSWindowsClipboard::isOwnedByBarrier()) {
+        MSWindowsScreen* self = const_cast<MSWindowsScreen*>(this);
+        if (self->queueClipboardSnapshot(requestedSequence, false)) {
+            self->wakeClipboardSnapshotWorker();
+        }
+    }
+
+    // Provider reads, helper IPC, retries, and marshal work are worker-only.
+    // Pending and failed snapshots therefore return immediately here.
     return false;
+}
+
+bool
+MSWindowsScreen::getClipboardSnapshot(
+    ClipboardID id, std::shared_ptr<const String>* data,
+    UInt32* snapshotTime) const
+{
+    if (id == kClipboardSelection || data == NULL || snapshotTime == NULL ||
+        m_clipboardSnapshotContext == NULL) {
+        return false;
+    }
+
+    const UInt32 currentSequence = GetClipboardSequenceNumber();
+    std::shared_ptr<const String> snapshot;
+    UInt32 snapshotSequence = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_clipboardSnapshotContext->mutex);
+        if (!m_clipboardSnapshotContext->snapshots.copyReady(
+                &snapshot, &snapshotSequence)) {
+            return false;
+        }
+    }
+
+    if (!snapshot || currentSequence == 0 ||
+        snapshotSequence != currentSequence) {
+        return false;
+    }
+
+    *data = snapshot;
+    *snapshotTime = snapshotSequence;
+    return GetClipboardSequenceNumber() == currentSequence;
 }
 
 void
@@ -1150,6 +1717,16 @@ MSWindowsScreen::onPreDispatch(HWND hwnd,
     case BARRIER_MSG_SCREEN_SAVER:
         return onScreensaver(wParam != 0);
 
+    case kClipboardSnapshotReadyMessage:
+        onClipboardSnapshotReady(
+            clipboardNotificationToken(wParam, lParam));
+        return true;
+
+    case kClipboardPublicationReadyMessage:
+        onClipboardPublicationReady(
+            clipboardNotificationToken(wParam, lParam));
+        return true;
+
     case BARRIER_MSG_DEBUG:
         LOG((CLOG_DEBUG1 "hook: 0x%08x 0x%08x", wParam, lParam));
         return true;
@@ -1670,25 +2247,204 @@ MSWindowsScreen::onDisplayChange()
 bool
 MSWindowsScreen::onClipboardChange()
 {
+    const UInt32 windowsSequence = GetClipboardSequenceNumber();
     const bool ownedByWeave = MSWindowsClipboard::isOwnedByBarrier();
     const bool notify = m_clipboardChangeTracker.observe(
-        GetClipboardSequenceNumber(), ownedByWeave);
+        windowsSequence, ownedByWeave);
 
     // Notify on every new external clipboard revision, not only on the first
     // transition away from a clipboard published by Weave.
     if (!ownedByWeave) {
+        bool publicationCompleted = false;
+        {
+            std::lock_guard<std::mutex> lock(
+                m_clipboardSnapshotContext->mutex);
+            m_clipboardSnapshotContext->publishes.invalidate();
+            publicationCompleted =
+                m_clipboardSnapshotContext->publishes.hasCompletion();
+        }
+        if (publicationCompleted) {
+            onClipboardPublicationReady(
+                m_clipboardSnapshotContext->lifetime.notificationToken());
+        }
         if (notify) {
             LOG((CLOG_DEBUG "clipboard changed: new external revision"));
-            sendClipboardEvent(m_events->forClipboard().clipboardGrabbed(), kClipboardClipboard);
+            if (queueClipboardSnapshot(windowsSequence, true)) {
+                wakeClipboardSnapshotWorker();
+            }
         }
         m_ownClipboard = false;
     }
     else if (!m_ownClipboard) {
         LOG((CLOG_DEBUG "clipboard changed: barrier owned"));
+        std::lock_guard<std::mutex> lock(m_clipboardSnapshotContext->mutex);
+        m_clipboardSnapshotContext->snapshots.invalidate();
         m_ownClipboard = true;
     }
 
     return true;
+}
+
+bool
+MSWindowsScreen::queueClipboardSnapshot(UInt32 windowsSequence,
+                                        bool announceGrab)
+{
+    if (windowsSequence == 0 || m_clipboardSnapshotContext == NULL) {
+        return false;
+    }
+
+    if (m_clipboardSnapshotThread == NULL) {
+        const std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext> context =
+            m_clipboardSnapshotContext;
+        m_clipboardSnapshotThread = new Thread([context]() {
+            runClipboardSnapshotWorker(context);
+        });
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_clipboardSnapshotContext->mutex);
+        if (m_clipboardSnapshotContext->lifetime.stopRequested() ||
+            !m_clipboardSnapshotContext->snapshots.needsSnapshot(
+                windowsSequence)) {
+            return false;
+        }
+    }
+
+    // Announce ownership before making work visible to the snapshot thread.
+    // EventQueue calls remain outside the context mutex because custom queue
+    // buffers and tests may synchronously touch handlers.
+    if (announceGrab) {
+        sendClipboardEvent(
+            m_events->forClipboard().clipboardGrabbed(),
+            kClipboardClipboard);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_clipboardSnapshotContext->mutex);
+        if (m_clipboardSnapshotContext->lifetime.stopRequested() ||
+            !m_clipboardSnapshotContext->snapshots.needsSnapshot(
+                windowsSequence)) {
+            return false;
+        }
+        m_clipboardSnapshotContext->snapshots.queue(
+            windowsSequence, m_sequenceNumber);
+    }
+    return true;
+}
+
+void
+MSWindowsScreen::onClipboardSnapshotReady(std::uint64_t token)
+{
+    const std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext> context =
+        m_clipboardSnapshotContext;
+    if (!context) {
+        return;
+    }
+
+    UInt32 protocolSequence = 0;
+    {
+        std::lock_guard<std::mutex> lock(context->mutex);
+        if (!context->lifetime.acceptsNotification(token) ||
+            !context->snapshots.takeReadyNotification(&protocolSequence)) {
+            return;
+        }
+    }
+
+    ClipboardInfo* info =
+        static_cast<ClipboardInfo*>(std::malloc(sizeof(ClipboardInfo)));
+    if (info == NULL) {
+        LOG((CLOG_ERR "malloc failed on %s:%s", __FILE__, __LINE__));
+        return;
+    }
+    info->m_id = kClipboardClipboard;
+    info->m_sequenceNumber = protocolSequence;
+    sendEvent(m_events->forClipboard().clipboardChanged(), info);
+}
+
+void
+MSWindowsScreen::onClipboardPublicationReady(std::uint64_t token)
+{
+    const std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext> context =
+        m_clipboardSnapshotContext;
+    if (!context) {
+        return;
+    }
+
+    for (;;) {
+        MSWindowsClipboardPublishState::Completion completion;
+        {
+            std::lock_guard<std::mutex> lock(context->mutex);
+            if (!context->lifetime.acceptsNotification(token) ||
+                !context->publishes.takeCompletion(&completion)) {
+                return;
+            }
+        }
+
+        ClipboardPublicationInfo* info =
+            static_cast<ClipboardPublicationInfo*>(
+                std::malloc(sizeof(ClipboardPublicationInfo)));
+        if (info == NULL) {
+            LOG((CLOG_ERR "malloc failed on %s:%s", __FILE__, __LINE__));
+            continue;
+        }
+        info->m_id = kClipboardClipboard;
+        info->m_publicationId = completion.publicationId;
+        info->m_platformSequence = completion.committedWindowsSequence;
+        switch (completion.result) {
+        case MSWindowsClipboardPublishState::CompletionResult::Succeeded:
+            info->m_result = ClipboardPublicationResult::Succeeded;
+            break;
+        case MSWindowsClipboardPublishState::CompletionResult::Superseded:
+            info->m_result = ClipboardPublicationResult::Superseded;
+            break;
+        default:
+            info->m_result = ClipboardPublicationResult::Failed;
+            break;
+        }
+        sendEvent(m_events->forClipboard().clipboardPublished(), info);
+    }
+}
+
+void
+MSWindowsScreen::wakeClipboardSnapshotWorker()
+{
+    if (m_clipboardSnapshotContext != NULL) {
+        m_clipboardSnapshotContext->wake.notify_one();
+    }
+}
+
+void
+MSWindowsScreen::stopClipboardSnapshotWorker()
+{
+    const std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext> context =
+        m_clipboardSnapshotContext;
+    if (context) {
+        context->lifetime.requestStop();
+        {
+            std::lock_guard<std::mutex> lock(context->mutex);
+            context->snapshots.invalidate();
+            context->publishes.invalidate();
+        }
+        context->wake.notify_all();
+    }
+
+    if (m_clipboardSnapshotThread != NULL) {
+        m_clipboardSnapshotThread->cancel();
+        const bool finished = context && context->lifetime.waitForFinished(
+            std::chrono::milliseconds(static_cast<long long>(
+                kClipboardSnapshotShutdownWaitSeconds * 1000.0)));
+        if (!finished) {
+            LOG((CLOG_WARN
+                "Windows clipboard snapshot worker did not stop within %.3fs; revoking its owner notification token",
+                kClipboardSnapshotShutdownWaitSeconds));
+        }
+        // Thread is a reference-counted handle. The worker retains the shared
+        // context and the architecture retains its own thread reference until
+        // it exits, so releasing this handle after the deadline is safe.
+        delete m_clipboardSnapshotThread;
+        m_clipboardSnapshotThread = NULL;
+    }
+    m_clipboardSnapshotContext.reset();
 }
 
 void

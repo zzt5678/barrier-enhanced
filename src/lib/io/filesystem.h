@@ -22,11 +22,18 @@
 #include <iosfwd>
 #include <ios>
 #include <filesystem>
+#include <system_error>
 
 namespace barrier {
 
 using namespace std::filesystem;
 namespace fs = std::filesystem;
+
+enum class RenameNoReplaceResult {
+    kSuccess,
+    kTargetExists,
+    kError
+};
 
 void open_utf8_path(std::ifstream& stream, const fs::path& path,
                     std::ios_base::openmode mode = std::ios_base::in);
@@ -37,11 +44,14 @@ void open_utf8_path(std::fstream& stream, const fs::path& path,
 
 std::FILE* fopen_utf8_path(const fs::path& path, const std::string& mode);
 bool create_secure_temp_file(const std::string& prefix, const std::string& suffix,
-                             fs::path& path);
+                             fs::path& path) noexcept;
 bool create_secure_temp_file_in_directory(const fs::path& directory,
                                           const std::string& prefix,
                                           const std::string& suffix,
-                                          fs::path& path);
+                                          fs::path& path) noexcept;
+RenameNoReplaceResult rename_no_replace(const fs::path& source,
+                                        const fs::path& target,
+                                        std::error_code& error) noexcept;
 
 } // namespace barrier
 

@@ -204,8 +204,7 @@ void AppConfig::loadSettings()
     }
     m_AutoConfigPrompted = settings().value("autoConfigPrompted", false).toBool();
     m_CryptoEnabled = settings().value("cryptoEnabled", true).toBool();
-    // TODO: set default value of requireClientCertificate to true on Barrier 2.5.0
-    m_RequireClientCertificate = settings().value("requireClientCertificate", false).toBool();
+    m_RequireClientCertificate = settings().value("requireClientCertificate", true).toBool();
     m_AutoHide = settings().value("autoHide", false).toBool();
     m_AutoStart = settings().value("autoStart", false).toBool();
     m_MinimizeToTray = settings().value("minimizeToTray", false).toBool();

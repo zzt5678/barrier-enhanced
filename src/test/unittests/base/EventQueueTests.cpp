@@ -18,6 +18,8 @@
 #include "test/global/gtest.h"
 #include "test/mock/barrier/MockEventQueue.h"
 
+#include <cstring>
+#include <new>
 #include <vector>
 
 namespace {
@@ -205,6 +207,34 @@ TEST(EventQueueTests, destructorDeletesPendingEventData)
     }
 
     EXPECT_EQ(1, deletedCount);
+}
+
+TEST(EventTypesTests, streamInputFormatErrorRegistersAUniqueNamedType)
+{
+    alignas(IStreamEvents) unsigned char storage[sizeof(IStreamEvents)];
+    std::memset(storage, 0xa5, sizeof(storage));
+    IStreamEvents* streamEvents = new (storage) IStreamEvents;
+    EventQueue events;
+    streamEvents->setEvents(&events);
+
+    const Event::Type types[] = {
+        streamEvents->inputReady(),
+        streamEvents->outputFlushed(),
+        streamEvents->outputError(),
+        streamEvents->inputShutdown(),
+        streamEvents->outputShutdown(),
+        streamEvents->inputFormatError()
+    };
+
+    EXPECT_STREQ("inputFormatError", events.getTypeName(types[5]));
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
+        EXPECT_GE(types[i], static_cast<Event::Type>(Event::kLast));
+        for (size_t j = i + 1; j < sizeof(types) / sizeof(types[0]); ++j) {
+            EXPECT_NE(types[i], types[j]);
+        }
+    }
+
+    streamEvents->~IStreamEvents();
 }
 
 TEST(EventQueueTests, destructorDeletesAdoptedHandlers)

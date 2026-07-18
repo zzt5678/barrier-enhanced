@@ -1,24 +1,30 @@
 #include "barrier/RemoteFileClipboard.h"
 
 #include "barrier/IClipboard.h"
+#include "barrier/SecureRandom.h"
 #include "barrier/TransferArchive.h"
+#include "barrier/TransferDigest.h"
+#include "base/Unicode.h"
 #include "mt/Thread.h"
 #include "mt/XThread.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <ctime>
 #include <cctype>
-#include <iomanip>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
-#include <thread>
 #include <unordered_set>
 
 namespace {
 
 constexpr std::array<char, 8> kRemoteClipboardMagic{{'W', 'F', 'C', 'L', 'I', 'P', '1', 0}};
+
+enum class SessionPolicy {
+    RequireAssigned,
+    AllowUnassignedLocalSource
+};
 
 void writeUInt32(std::string& output, UInt32 value)
 {
@@ -61,6 +67,9 @@ bool validatePathUtf8ForAppendImpl(std::size_t currentPathCount,
         return setPathValidationError(error, "remote file clipboard path count is too large");
     }
     if (pathUtf8.empty()) {
+        return setPathValidationError(error, "remote file clipboard path entry is invalid");
+    }
+    if (pathUtf8.find('\0') != std::string::npos || !Unicode::isUTF8(pathUtf8)) {
         return setPathValidationError(error, "remote file clipboard path entry is invalid");
     }
     if (pathUtf8.size() > RemoteFileClipboard::kMaxClipboardPathBytes) {
@@ -162,43 +171,37 @@ bool textLooksLikeImagePathList(const std::string& text)
     return foundPath;
 }
 
-std::string uniqueToken()
+bool isValidSessionId(const std::string& sessionId, bool allowEmpty)
 {
-    std::ostringstream stream;
-    stream << std::hex
-           << static_cast<unsigned long long>(std::time(nullptr))
-           << "-"
-           << static_cast<unsigned long long>(
-               std::hash<std::thread::id>{}(std::this_thread::get_id()))
-           << "-"
-           << static_cast<unsigned long long>(std::rand());
-    return stream.str();
+    if (sessionId.empty()) {
+        // A local source snapshot may be unassigned until normalizeClipboard().
+        return allowEmpty;
+    }
+    if (sessionId.size() != RemoteFileClipboard::kSessionIdHexBytes) {
+        return false;
+    }
+
+    for (const unsigned char value : sessionId) {
+        const bool lowercaseHex =
+            (value >= 'a' && value <= 'f') ||
+            (value >= '0' && value <= '9');
+        if (!lowercaseHex) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::string safeSessionDirectoryName(const std::string& sessionId)
 {
-    std::ostringstream stream;
-    for (size_t i = 0; i < sessionId.size(); ++i) {
-        const unsigned char c = static_cast<unsigned char>(sessionId[i]);
-        if (std::isalnum(c) != 0 || c == '-' || c == '_') {
-            stream << static_cast<char>(c);
-        }
-        else {
-            stream << '_'
-                   << std::hex << std::setw(2) << std::setfill('0')
-                   << static_cast<unsigned int>(c)
-                   << std::dec;
-        }
+    barrier::TransferDigest digest;
+    std::string encoded;
+    if (!digest.update(sessionId.data(), sessionId.size()) ||
+        !digest.finish(encoded) ||
+        encoded.compare(0, 7, "sha256:") != 0) {
+        throw std::runtime_error("could not hash remote file clipboard session id");
     }
-
-    std::string directoryName = stream.str();
-    if (directoryName.empty()) {
-        directoryName = "session";
-    }
-    if (directoryName.size() > 128) {
-        directoryName.resize(128);
-    }
-    return directoryName;
+    return encoded.substr(7);
 }
 
 std::vector<std::pair<IClipboard::EFormat, std::string>> snapshotClipboard(const Clipboard& clipboard)
@@ -298,6 +301,139 @@ bool collectMaterializedRoots(const barrier::fs::path& destinationRoot,
                               std::vector<barrier::fs::path>& roots,
                               std::string& error);
 
+template <typename PackageExtractor>
+bool extractPackageAtomically(const barrier::fs::path& destinationRoot,
+                              std::vector<barrier::fs::path>& roots,
+                              std::string& error,
+                              PackageExtractor extract,
+                              void (*beforeCommit)(const barrier::fs::path&) = nullptr)
+{
+    roots.clear();
+    barrier::fs::path stagingRoot;
+
+    const auto cleanupStaging = [&stagingRoot]() {
+        if (!stagingRoot.empty()) {
+            std::error_code ignored;
+            barrier::fs::remove_all(stagingRoot, ignored);
+        }
+    };
+
+    const auto ensureDestinationAbsent = [&destinationRoot, &error]() {
+        std::error_code statusError;
+        const barrier::fs::file_status status =
+            barrier::fs::symlink_status(destinationRoot, statusError);
+        if (statusError && statusError.default_error_condition() ==
+                std::errc::no_such_file_or_directory) {
+            return true;
+        }
+        if (statusError) {
+            error = "remote file clipboard destination could not be inspected: " +
+                statusError.message();
+            return false;
+        }
+        if (status.type() != barrier::fs::file_type::not_found) {
+            error = "remote file clipboard destination already exists";
+            return false;
+        }
+        return true;
+    };
+
+    try {
+        if (destinationRoot.empty() || destinationRoot.filename().empty()) {
+            error = "remote file clipboard destination is invalid";
+            return false;
+        }
+        const barrier::fs::path parent = destinationRoot.parent_path();
+        if (parent.empty()) {
+            error = "remote file clipboard destination parent is invalid";
+            return false;
+        }
+        barrier::fs::create_directories(parent);
+        if (!ensureDestinationAbsent()) {
+            return false;
+        }
+
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const std::string token = createSessionId();
+            if (token.empty()) {
+                error = "remote file clipboard staging token could not be created";
+                return false;
+            }
+
+            const barrier::fs::path candidate = parent / barrier::fs::u8path(
+                destinationRoot.filename().u8string() + ".staging-" + token);
+            std::error_code createError;
+            if (barrier::fs::create_directory(candidate, createError)) {
+                stagingRoot = candidate;
+                break;
+            }
+            if (createError &&
+                createError != std::make_error_code(std::errc::file_exists)) {
+                error = "remote file clipboard staging directory could not be created: " +
+                    createError.message();
+                return false;
+            }
+        }
+
+        if (stagingRoot.empty()) {
+            error = "remote file clipboard staging directory could not be reserved";
+            return false;
+        }
+        if (!extract(stagingRoot, error)) {
+            cleanupStaging();
+            return false;
+        }
+
+        std::vector<barrier::fs::path> stagingRoots;
+        if (!collectMaterializedRoots(stagingRoot, stagingRoots, error)) {
+            cleanupStaging();
+            return false;
+        }
+        std::vector<barrier::fs::path> committedRoots;
+        committedRoots.reserve(stagingRoots.size());
+        for (const barrier::fs::path& stagingPath : stagingRoots) {
+            committedRoots.push_back(destinationRoot / stagingPath.filename());
+        }
+        if (!ensureDestinationAbsent()) {
+            cleanupStaging();
+            return false;
+        }
+        if (beforeCommit != nullptr) {
+            beforeCommit(destinationRoot);
+        }
+
+        std::error_code commitError;
+        const barrier::RenameNoReplaceResult commitResult =
+            barrier::rename_no_replace(stagingRoot, destinationRoot, commitError);
+        if (commitResult != barrier::RenameNoReplaceResult::kSuccess) {
+            if (commitResult == barrier::RenameNoReplaceResult::kTargetExists) {
+                error = "remote file clipboard destination already exists";
+            }
+            else {
+                error = "remote file clipboard commit failed";
+                if (commitError) {
+                    error += ": " + commitError.message();
+                }
+            }
+            cleanupStaging();
+            return false;
+        }
+        stagingRoot.clear();
+        roots.swap(committedRoots);
+        return true;
+    }
+    catch (XThread&) {
+        cleanupStaging();
+        throw;
+    }
+    catch (const std::exception& exception) {
+        cleanupStaging();
+        roots.clear();
+        error = exception.what();
+        return false;
+    }
+}
+
 bool validatePathList(const std::vector<barrier::fs::path>& paths,
                       std::string* error)
 {
@@ -314,7 +450,11 @@ bool validatePathUtf8ForAppend(std::size_t currentPathCount,
 
 std::string createSessionId()
 {
-    return uniqueToken();
+    std::string sessionId;
+    if (!barrier::SecureRandom::generateHex(kSessionIdRandomBytes, sessionId)) {
+        return std::string();
+    }
+    return sessionId;
 }
 
 std::string serialize(const Data& data)
@@ -336,7 +476,9 @@ std::string serialize(const Data& data)
     return output;
 }
 
-bool parse(const std::string& payload, Data& data, std::string* error)
+static bool parseWithSessionPolicy(const std::string& payload, Data& data,
+                                   SessionPolicy sessionPolicy,
+                                   std::string* error)
 {
     auto fail = [error](const char* message) {
         if (error != nullptr) {
@@ -356,18 +498,35 @@ bool parse(const std::string& payload, Data& data, std::string* error)
     size_t offset = kRemoteClipboardMagic.size();
     const unsigned char mode = static_cast<unsigned char>(payload[offset++]);
     const unsigned char cut = static_cast<unsigned char>(payload[offset++]);
+    if (mode > 1) {
+        return fail("remote file clipboard mode is invalid");
+    }
+    if (cut > 1) {
+        return fail("remote file clipboard cut flag is invalid");
+    }
 
     bool ok = true;
     const UInt32 sessionSize = readUInt32(payload, offset, ok);
-    if (!ok || offset + sessionSize > payload.size()) {
+    const bool allowUnassignedLocalSource =
+        sessionPolicy == SessionPolicy::AllowUnassignedLocalSource &&
+        mode == 0;
+    const bool sessionSizeIsValid = sessionSize == kSessionIdHexBytes ||
+        (allowUnassignedLocalSource && sessionSize == 0);
+    if (!ok || !sessionSizeIsValid || sessionSize > payload.size() - offset) {
         return fail("remote file clipboard session id is invalid");
     }
 
-    data = Data();
-    data.mode = mode == 1 ? Mode::MaterializedPaths : Mode::SourcePaths;
-    data.cut = cut != 0;
-    data.sessionId.assign(payload.data() + offset, payload.data() + offset + sessionSize);
+    Data parsed;
+    parsed.mode = mode == 1 ? Mode::MaterializedPaths : Mode::SourcePaths;
+    parsed.cut = cut == 1;
+    parsed.sessionId.assign(payload.data() + offset,
+                            payload.data() + offset + sessionSize);
     offset += sessionSize;
+    if (!isValidSessionId(parsed.sessionId,
+            allowUnassignedLocalSource &&
+            parsed.mode == Mode::SourcePaths)) {
+        return fail("remote file clipboard session id is invalid");
+    }
 
     const UInt32 pathCount = readUInt32(payload, offset, ok);
     if (!ok) {
@@ -378,30 +537,53 @@ bool parse(const std::string& payload, Data& data, std::string* error)
         return fail("remote file clipboard path count is too large");
     }
 
-    data.paths.reserve(pathCount);
+    parsed.paths.reserve(pathCount);
     std::size_t totalPathBytes = 0;
     for (UInt32 i = 0; i < pathCount; ++i) {
         const UInt32 size = readUInt32(payload, offset, ok);
-        if (!ok || offset + size > payload.size()) {
+        if (!ok || size > payload.size() - offset) {
             return fail("remote file clipboard path entry is invalid");
         }
 
         const std::string pathUtf8(payload.data() + offset, payload.data() + offset + size);
         std::string validationError;
-        if (!validatePathUtf8ForAppend(data.paths.size(), totalPathBytes, pathUtf8, &validationError)) {
+        if (!validatePathUtf8ForAppend(parsed.paths.size(), totalPathBytes,
+                                       pathUtf8, &validationError)) {
             return fail(validationError.c_str());
         }
 
-        data.paths.push_back(barrier::fs::u8path(pathUtf8));
+        try {
+            parsed.paths.push_back(barrier::fs::u8path(pathUtf8));
+        }
+        catch (const std::exception&) {
+            return fail("remote file clipboard path entry is invalid");
+        }
         totalPathBytes += pathUtf8.size();
         offset += size;
     }
 
-    if (!validatePathList(data.paths, error)) {
+    if (offset != payload.size()) {
+        return fail("remote file clipboard payload has trailing data");
+    }
+    if (!validatePathList(parsed.paths, error)) {
         return false;
     }
 
+    data = std::move(parsed);
     return true;
+}
+
+bool parse(const std::string& payload, Data& data, std::string* error)
+{
+    return parseWithSessionPolicy(
+        payload, data, SessionPolicy::RequireAssigned, error);
+}
+
+bool parseLocalClipboard(const std::string& payload, Data& data,
+                         std::string* error)
+{
+    return parseWithSessionPolicy(
+        payload, data, SessionPolicy::AllowUnassignedLocalSource, error);
 }
 
 bool readFromClipboard(const IClipboard& clipboard, Data& data, std::string* error)
@@ -442,7 +624,7 @@ bool normalizeClipboard(Clipboard& clipboard, Data* normalized, std::string* err
     bool found = false;
     for (size_t i = 0; i < formats.size(); ++i) {
         if (formats[i].first == IClipboard::kFileList) {
-            if (!parse(formats[i].second, data, error)) {
+            if (!parseLocalClipboard(formats[i].second, data, error)) {
                 return false;
             }
             found = true;
@@ -466,6 +648,12 @@ bool normalizeClipboard(Clipboard& clipboard, Data* normalized, std::string* err
 
     if (data.sessionId.empty()) {
         data.sessionId = createSessionId();
+        if (data.sessionId.empty()) {
+            if (error != nullptr) {
+                *error = "remote file clipboard session id could not be created";
+            }
+            return false;
+        }
     }
 
     std::vector<std::pair<IClipboard::EFormat, std::string>> rewritten = formats;
@@ -495,17 +683,32 @@ bool pathsMatch(const Data& data, const std::vector<std::string>& paths)
         return false;
     }
 
-    for (size_t i = 0; i < data.paths.size(); ++i) {
-        barrier::fs::path actual = data.paths[i].lexically_normal();
-        barrier::fs::path expected = barrier::fs::u8path(paths[i]).lexically_normal();
-        actual.make_preferred();
-        expected.make_preferred();
-        if (actual != expected) {
-            return false;
-        }
-    }
+    const auto normalizedKey = [](const barrier::fs::path& path) {
+        std::string key = path.lexically_normal().generic_u8string();
+#if defined(_WIN32)
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+#endif
+        return key;
+    };
 
-    return true;
+    try {
+        std::vector<std::string> actual;
+        std::vector<std::string> expected;
+        actual.reserve(data.paths.size());
+        expected.reserve(paths.size());
+        for (size_t i = 0; i < data.paths.size(); ++i) {
+            actual.push_back(normalizedKey(data.paths[i]));
+            expected.push_back(normalizedKey(barrier::fs::u8path(paths[i])));
+        }
+        std::sort(actual.begin(), actual.end());
+        std::sort(expected.begin(), expected.end());
+        return actual == expected;
+    }
+    catch (const std::exception&) {
+        return false;
+    }
 }
 
 bool allPathsLookLikeImages(const Data& data)
@@ -540,7 +743,7 @@ bool stripImageFileTransferMetadata(Clipboard& clipboard)
             hasImagePayload = true;
         }
         else if (formats[i].first == IClipboard::kFileList) {
-            if (!parse(formats[i].second, fileList)) {
+            if (!parseLocalClipboard(formats[i].second, fileList)) {
                 return false;
             }
             hasFileList = true;
@@ -600,7 +803,8 @@ bool buildMaterializedClipboard(const std::vector<barrier::fs::path>& paths,
     data.mode = Mode::MaterializedPaths;
     data.sessionId = sessionId;
     data.paths = paths;
-    if (!validatePathList(data.paths)) {
+    if (!isValidSessionId(data.sessionId, false) ||
+        !validatePathList(data.paths)) {
         return false;
     }
 
@@ -619,6 +823,16 @@ barrier::fs::path materializedSessionRoot(const barrier::fs::path& cacheRoot,
     return cacheRoot / barrier::fs::u8path(safeSessionDirectoryName(sessionId));
 }
 
+barrier::fs::path materializedSessionRoot(const barrier::fs::path& cacheRoot,
+                                          const std::string& origin,
+                                          std::uint64_t revision,
+                                          const std::string& sessionId)
+{
+    const std::string scopedKey = std::to_string(origin.size()) + ":" + origin +
+        ":" + std::to_string(revision) + ":" + sessionId;
+    return cacheRoot / barrier::fs::u8path(safeSessionDirectoryName(scopedKey));
+}
+
 bool createPackage(const Data& data, barrier::fs::path& packagePath, std::string& error)
 {
     if (!validatePathList(data.paths, &error)) {
@@ -634,23 +848,13 @@ bool extractPackage(const std::string& packageData,
                     std::vector<barrier::fs::path>& roots,
                     std::string& error)
 {
-    roots.clear();
-
-    try {
-        barrier::fs::remove_all(destinationRoot);
-        barrier::fs::create_directories(destinationRoot);
-
-        if (!TransferArchive::extractPackage(packageData, destinationRoot, error)) {
-            barrier::fs::remove_all(destinationRoot);
-            return false;
-        }
-
-        return collectMaterializedRoots(destinationRoot, roots, error);
-    }
-    catch (XThread&) {
-        barrier::fs::remove_all(destinationRoot);
-        throw;
-    }
+    return extractPackageAtomically(
+        destinationRoot, roots, error,
+        [&packageData](const barrier::fs::path& stagingRoot,
+                       std::string& extractError) {
+            return TransferArchive::extractPackage(
+                packageData, stagingRoot, extractError);
+        });
 }
 
 bool extractPackageFile(const barrier::fs::path& packagePath,
@@ -658,23 +862,30 @@ bool extractPackageFile(const barrier::fs::path& packagePath,
                         std::vector<barrier::fs::path>& roots,
                         std::string& error)
 {
-    roots.clear();
+    return extractPackageAtomically(
+        destinationRoot, roots, error,
+        [&packagePath](const barrier::fs::path& stagingRoot,
+                       std::string& extractError) {
+            return TransferArchive::extractPackageFile(
+                packagePath, stagingRoot, extractError);
+        });
+}
 
-    try {
-        barrier::fs::remove_all(destinationRoot);
-        barrier::fs::create_directories(destinationRoot);
-
-        if (!TransferArchive::extractPackageFile(packagePath, destinationRoot, error)) {
-            barrier::fs::remove_all(destinationRoot);
-            return false;
-        }
-
-        return collectMaterializedRoots(destinationRoot, roots, error);
-    }
-    catch (XThread&) {
-        barrier::fs::remove_all(destinationRoot);
-        throw;
-    }
+bool extractPackageFileWithCommitHookForTest(
+    const barrier::fs::path& packagePath,
+    const barrier::fs::path& destinationRoot,
+    std::vector<barrier::fs::path>& roots,
+    std::string& error,
+    void (*beforeCommit)(const barrier::fs::path&))
+{
+    return extractPackageAtomically(
+        destinationRoot, roots, error,
+        [&packagePath](const barrier::fs::path& stagingRoot,
+                       std::string& extractError) {
+            return TransferArchive::extractPackageFile(
+                packagePath, stagingRoot, extractError);
+        },
+        beforeCommit);
 }
 
 void pruneMaterializedCache(const barrier::fs::path& cacheRoot,
@@ -682,13 +893,20 @@ void pruneMaterializedCache(const barrier::fs::path& cacheRoot,
                             std::size_t maxSessions,
                             std::uintmax_t maxBytes)
 {
-    if (cacheRoot.empty() || !barrier::fs::exists(cacheRoot)) {
-        return;
-    }
-
     const barrier::fs::path keepRoot = keepSessionId.empty()
         ? barrier::fs::path()
         : materializedSessionRoot(cacheRoot, keepSessionId);
+    pruneMaterializedCacheKeepingRoot(cacheRoot, keepRoot, maxSessions, maxBytes);
+}
+
+void pruneMaterializedCacheKeepingRoot(const barrier::fs::path& cacheRoot,
+                                       const barrier::fs::path& keepRoot,
+                                       std::size_t maxSessions,
+                                       std::uintmax_t maxBytes)
+{
+    if (cacheRoot.empty() || !barrier::fs::exists(cacheRoot)) {
+        return;
+    }
 
     std::vector<CacheSession> sessions;
     std::error_code error;

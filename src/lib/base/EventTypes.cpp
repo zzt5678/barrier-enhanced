@@ -195,6 +195,7 @@ REGISTER_EVENT(IpcServer, messageReceived)
 
 REGISTER_EVENT(Clipboard, clipboardGrabbed)
 REGISTER_EVENT(Clipboard, clipboardChanged)
+REGISTER_EVENT(Clipboard, clipboardPublished)
 REGISTER_EVENT(Clipboard, clipboardSending)
 
 //

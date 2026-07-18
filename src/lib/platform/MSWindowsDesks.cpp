@@ -24,6 +24,7 @@
 #include "barrier/XScreen.h"
 #include "mt/Lock.h"
 #include "mt/Thread.h"
+#include "mt/ThreadShutdown.h"
 #include "arch/win32/ArchMiscWindows.h"
 #include "base/Log.h"
 #include "base/IEventQueue.h"
@@ -32,6 +33,7 @@
 
 #include <malloc.h>
 #include <limits>
+#include <vector>
 #include <VersionHelpers.h>
 
 // these are only defined when WINVER >= 0x0500
@@ -584,6 +586,20 @@ MSWindowsDesks::canEnter() const
         m_observedDeskName == m_activeDeskName);
 }
 
+bool
+MSWindowsDesks::probeInputDesktop(std::string& desktopName) const
+{
+    desktopName.clear();
+    HDESK desktop = openInputDesktopForProbe();
+    if (desktop == NULL) {
+        return false;
+    }
+
+    desktopName = getDesktopName(desktop);
+    closeDesktop(desktop);
+    return !desktopName.empty();
+}
+
 std::uint64_t
 MSWindowsDesks::inputDesktopGeneration() const
 {
@@ -689,6 +705,12 @@ MSWindowsDesks::deskCommandExecutionGraceForTest(
         kLowLatencyDeskCommandExecutionGrace : kDeskCommandExecutionGrace;
 }
 
+double
+MSWindowsDesks::boundedDeskCommandWaitTimeoutForTest(double timeout)
+{
+    return timeout >= 0.0 ? timeout : 0.0;
+}
+
 bool
 MSWindowsDesks::canActivateDesktopForTest(
     bool startupComplete, bool threadRunning,
@@ -730,9 +752,11 @@ MSWindowsDesks::coalesceMouseMotionForTest(
     }
 
     if (nextCommand == kDeskInputAbsoluteMove) {
-        pendingFirst = nextFirst;
-        pendingSecond = nextSecond;
-        return true;
+        // The server has already rate-limited absolute motion. Replacing the
+        // pending desk command here creates a second latest-value stage and
+        // turns short desktop-thread stalls into visibly large cursor jumps.
+        // Keep each sample in the existing bounded desk command queue.
+        return false;
     }
 
     if (nextCommand != kDeskInputRelativeMove) {
@@ -929,8 +953,9 @@ MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam,
                 return true;
             }
 
-            // A change between absolute and relative mode is an ordering
-            // boundary. The old command remains queued with immutable data.
+            // Absolute samples and changes between absolute/relative mode
+            // remain queued with immutable data. Relative samples may still
+            // accumulate so their total movement is never lost.
             desk->m_pendingMotionCommand = NULL;
         }
 
@@ -1881,7 +1906,16 @@ MSWindowsDesks::removeDesks()
                 static_cast<unsigned long>(threadID),
                 static_cast<unsigned long>(postError)));
         }
-        desk->m_thread->wait();
+        if (!desk->m_thread->wait(0.0)) {
+            desk->m_thread->cancel();
+            desk->m_thread->unblockPollSocket();
+            barrier::waitForFinalThreadShutdown(
+                "Windows input desktop thread",
+                barrier::kFinalThreadShutdownDeadlineSeconds,
+                [desk](double timeout) {
+                    return desk->m_thread->wait(timeout);
+                });
+        }
         delete desk->m_thread;
         delete desk;
     }
@@ -2158,8 +2192,8 @@ MSWindowsDesks::waitForDeskCommand(const Desk* desk,
         if (!desk->m_threadRunning) {
             break;
         }
-        const bool signalled = timeout < 0.0 ?
-            m_deskReady.wait() : m_deskReady.wait(timer, timeout);
+        const bool signalled = m_deskReady.wait(
+            timer, boundedDeskCommandWaitTimeoutForTest(timeout));
         if (!signalled) {
             break;
         }
@@ -2189,34 +2223,48 @@ MSWindowsDesks::handleCheckDesk(const Event&, void*)
 }
 
 HDESK
-MSWindowsDesks::openInputDesktop()
+MSWindowsDesks::openInputDesktop() const
 {
     return OpenInputDesktop(
-        DF_ALLOWOTHERACCOUNTHOOK, TRUE,
-        DESKTOP_CREATEWINDOW | DESKTOP_HOOKCONTROL | GENERIC_WRITE);
+        DF_ALLOWOTHERACCOUNTHOOK, FALSE,
+        DESKTOP_CREATEWINDOW | DESKTOP_HOOKCONTROL |
+        DESKTOP_READOBJECTS | GENERIC_WRITE);
+}
+
+HDESK
+MSWindowsDesks::openInputDesktopForProbe() const
+{
+    // Standby readiness only identifies the current desktop. It must not ask
+    // Windows for hook or write capabilities before the previous owner exits.
+    return OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
 }
 
 void
-MSWindowsDesks::closeDesktop(HDESK desk)
+MSWindowsDesks::closeDesktop(HDESK desk) const
 {
     if (desk != NULL) {
         CloseDesktop(desk);
     }
 }
 
-std::string MSWindowsDesks::getDesktopName(HDESK desk)
+std::string MSWindowsDesks::getDesktopName(HDESK desk) const
 {
     if (desk == NULL) {
         return {};
     }
-    else {
-        DWORD size;
-        GetUserObjectInformation(desk, UOI_NAME, NULL, 0, &size);
-        TCHAR* name = (TCHAR*)alloca(size + sizeof(TCHAR));
-        GetUserObjectInformation(desk, UOI_NAME, name, size, &size);
-        std::string result(name);
-        return result;
+
+    DWORD size = 0;
+    GetUserObjectInformationA(desk, UOI_NAME, NULL, 0, &size);
+    if (size == 0) {
+        return {};
     }
+
+    std::vector<char> name(size, '\0');
+    if (GetUserObjectInformationA(
+            desk, UOI_NAME, name.data(), size, &size) == FALSE) {
+        return {};
+    }
+    return std::string(name.data());
 }
 
 HWND

@@ -19,6 +19,7 @@
 #include "platform/MSWindowsClipboard.h"
 #include "platform/MSWindowsClipboardChangeTracker.h"
 #include "platform/IMSWindowsClipboardFacade.h"
+#include "barrier/Clipboard.h"
 
 #include "test/global/gmock.h"
 #include "test/global/gtest.h"
@@ -48,7 +49,7 @@ private:
 class MockFacade : public IMSWindowsClipboardFacade
 {
 public:
-    MOCK_METHOD2(write, void(HANDLE, UINT));
+    MOCK_METHOD2(write, bool(HANDLE, UINT));
 };
 
 TEST(MSWindowsClipboardChangeTrackerTests, consecutiveExternalRevisionsNotify)
@@ -125,13 +126,100 @@ TEST_F(MSWindowsClipboardTests, add_newValue_valueWasStored)
 TEST_F(MSWindowsClipboardTests, add_newValue_writeWasCalled)
 {
     MockFacade facade;
-    EXPECT_CALL(facade, write(testing::_, testing::_));
+    EXPECT_CALL(facade, write(testing::_, testing::_))
+        .WillOnce(testing::Return(true));
 
     MSWindowsClipboard clipboard(NULL);
     clipboard.setFacade(facade);
     clipboard.open(0);
 
     clipboard.add(IClipboard::kText, "barrier rocks!");
+}
+
+TEST_F(MSWindowsClipboardTests,
+       conditionalCopyWithImplicitOwnerWindowPublishesText)
+{
+    Clipboard source;
+    ASSERT_TRUE(source.open(0));
+    ASSERT_TRUE(source.empty());
+    source.add(IClipboard::kText, "weave clipboard publish");
+    source.close();
+
+    const UInt32 expectedSequence = GetClipboardSequenceNumber();
+    ASSERT_NE(0u, expectedSequence);
+
+    MSWindowsClipboard destination(NULL);
+    UInt32 committedSequence = 0;
+    EXPECT_EQ(MSWindowsClipboard::ConditionalCopyResult::Succeeded,
+              destination.copyFromIfSequence(
+                  &source, 0, expectedSequence, &committedSequence));
+    EXPECT_NE(0u, committedSequence);
+
+    ASSERT_TRUE(destination.open(0));
+    EXPECT_TRUE(destination.has(IClipboard::kText));
+    EXPECT_EQ("weave clipboard publish",
+              destination.get(IClipboard::kText));
+    destination.close();
+}
+
+TEST_F(MSWindowsClipboardTests,
+       conditionalCopyDoesNotReportPayloadWriteFailureAsSuccess)
+{
+    Clipboard source;
+    ASSERT_TRUE(source.open(0));
+    ASSERT_TRUE(source.empty());
+    source.add(IClipboard::kText, "unpublished");
+    source.close();
+
+    MockFacade facade;
+    EXPECT_CALL(facade, write(testing::_, testing::_))
+        .WillRepeatedly(testing::Invoke([](HANDLE data, UINT) {
+            GlobalFree(data);
+            return false;
+        }));
+    MSWindowsClipboard destination(NULL);
+    destination.setFacade(facade);
+    UInt32 committedSequence = 0;
+
+    EXPECT_EQ(MSWindowsClipboard::ConditionalCopyResult::Failed,
+              destination.copyFromIfSequence(
+                  &source, 0, GetClipboardSequenceNumber(),
+                  &committedSequence));
+    EXPECT_EQ(0u, committedSequence);
+}
+
+TEST_F(MSWindowsClipboardTests,
+       conditionalCopyPreparationFailurePreservesExistingClipboard)
+{
+    const std::string sentinel = "keep this local clipboard";
+    MSWindowsClipboard existing(NULL);
+    ASSERT_TRUE(existing.open(0));
+    ASSERT_TRUE(existing.emptyUnowned());
+    existing.add(IClipboard::kText, sentinel);
+    existing.close();
+
+    const UInt32 sentinelSequence = GetClipboardSequenceNumber();
+    ASSERT_NE(0u, sentinelSequence);
+
+    Clipboard source;
+    ASSERT_TRUE(source.open(0));
+    ASSERT_TRUE(source.empty());
+    source.add(IClipboard::kText, "must not replace sentinel");
+    source.add(IClipboard::kPNG, "not a png payload");
+    source.close();
+
+    MSWindowsClipboard destination(NULL);
+    UInt32 committedSequence = 0;
+    EXPECT_EQ(MSWindowsClipboard::ConditionalCopyResult::Failed,
+              destination.copyFromIfSequence(
+                  &source, 0, sentinelSequence, &committedSequence));
+    EXPECT_EQ(0u, committedSequence);
+    EXPECT_EQ(sentinelSequence, GetClipboardSequenceNumber());
+
+    ASSERT_TRUE(destination.open(0));
+    EXPECT_TRUE(destination.has(IClipboard::kText));
+    EXPECT_EQ(sentinel, destination.get(IClipboard::kText));
+    destination.close();
 }
 
 TEST_F(MSWindowsClipboardTests, add_replaceValue_valueWasReplaced)
@@ -307,4 +395,43 @@ TEST(MSWindowsClipboardConversionTests, bitfields32Dib_convertsToPng)
                       (static_cast<UInt32>(static_cast<unsigned char>(png[21])) << 16) |
                       (static_cast<UInt32>(static_cast<unsigned char>(png[22])) << 8) |
                       static_cast<UInt32>(static_cast<unsigned char>(png[23])));
+}
+
+TEST(MSWindowsClipboardConversionTests, minimumSignedDibHeightIsRejected)
+{
+    std::string dib(40, '\0');
+    const auto writeLE16 = [&dib](size_t offset, UInt16 value) {
+        dib[offset] = static_cast<char>(value & 0xffu);
+        dib[offset + 1] = static_cast<char>((value >> 8) & 0xffu);
+    };
+    const auto writeLE32 = [&dib](size_t offset, UInt32 value) {
+        dib[offset] = static_cast<char>(value & 0xffu);
+        dib[offset + 1] = static_cast<char>((value >> 8) & 0xffu);
+        dib[offset + 2] = static_cast<char>((value >> 16) & 0xffu);
+        dib[offset + 3] = static_cast<char>((value >> 24) & 0xffu);
+    };
+
+    writeLE32(0, 40);
+    writeLE32(4, 1);
+    writeLE32(8, 0x80000000u);
+    writeLE16(12, 1);
+    writeLE16(14, 32);
+    writeLE32(16, BI_RGB);
+
+    EXPECT_TRUE(MSWindowsClipboard::convertDIBToPNGForTest(dib).empty());
+}
+
+TEST(MSWindowsClipboardConversionTests,
+     utf8FromWideUsesExactPayloadCapacityWithoutTrailingNull)
+{
+    EXPECT_EQ("A", MSWindowsClipboard::utf8FromWideForTest(L"A"));
+    EXPECT_EQ("\xe4\xbd\xa0",
+              MSWindowsClipboard::utf8FromWideForTest(L"\x4f60"));
+    EXPECT_EQ("\xf0\x9f\x99\x82",
+              MSWindowsClipboard::utf8FromWideForTest(L"\U0001f642"));
+
+    const std::wstring unpairedHighSurrogate(
+        1, static_cast<wchar_t>(0xd800));
+    EXPECT_TRUE(MSWindowsClipboard::utf8FromWideForTest(
+        unpairedHighSurrogate).empty());
 }

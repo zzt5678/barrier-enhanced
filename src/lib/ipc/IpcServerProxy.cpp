@@ -21,10 +21,82 @@
 #include "ipc/IpcMessage.h"
 #include "ipc/Ipc.h"
 #include "barrier/ProtocolUtil.h"
-#include "barrier/XBarrier.h"
+#include "barrier/protocol_types.h"
 #include "io/IStream.h"
 #include "base/TMethodEventJob.h"
 #include "base/Log.h"
+
+#include <algorithm>
+#include <cstring>
+
+namespace {
+
+enum class FrameProbeState {
+    NeedData,
+    Complete,
+    Invalid
+};
+
+struct FrameProbe {
+    FrameProbeState state;
+    std::size_t frameSize;
+    std::size_t bytesNeeded;
+};
+
+UInt32 readUInt32(const UInt8* bytes)
+{
+    return (static_cast<UInt32>(bytes[0]) << 24) |
+           (static_cast<UInt32>(bytes[1]) << 16) |
+           (static_cast<UInt32>(bytes[2]) << 8) |
+            static_cast<UInt32>(bytes[3]);
+}
+
+FrameProbe needBytes(const std::vector<UInt8>& buffer, std::size_t target)
+{
+    if (buffer.size() < target) {
+        return { FrameProbeState::NeedData, 0, target - buffer.size() };
+    }
+    return { FrameProbeState::Complete, target, 0 };
+}
+
+FrameProbe probeServerFrame(const std::vector<UInt8>& buffer)
+{
+    if (buffer.size() < 4) {
+        return needBytes(buffer, 4);
+    }
+
+    if (std::memcmp(buffer.data(), kIpcMsgLogLine, 4) == 0) {
+        if (buffer.size() < 8) {
+            return needBytes(buffer, 8);
+        }
+        const UInt32 logLength = readUInt32(buffer.data() + 4);
+        if (logLength > PROTOCOL_MAX_STRING_LENGTH) {
+            return { FrameProbeState::Invalid, 0, 0 };
+        }
+        return needBytes(buffer, 8u + logLength);
+    }
+    if (std::memcmp(buffer.data(), kIpcMsgShutdown, 4) == 0) {
+        return needBytes(buffer, 4);
+    }
+    if (std::memcmp(buffer.data(), kIpcMsgReadyQuery, 4) == 0 ||
+        std::memcmp(buffer.data(), kIpcMsgActivate, 4) == 0) {
+        return needBytes(buffer, 12);
+    }
+
+    return { FrameProbeState::Invalid, 0, 0 };
+}
+
+std::string readString(const std::vector<UInt8>& buffer, std::size_t& offset)
+{
+    const UInt32 length = readUInt32(buffer.data() + offset);
+    offset += 4;
+    const char* begin = reinterpret_cast<const char*>(buffer.data() + offset);
+    std::string result(begin, begin + length);
+    offset += length;
+    return result;
+}
+
+}
 
 //
 // IpcServerProxy
@@ -32,7 +104,8 @@
 
 IpcServerProxy::IpcServerProxy(barrier::IStream& stream, IEventQueue* events) :
     m_stream(stream),
-    m_events(events)
+    m_events(events),
+    m_disconnected(false)
 {
     m_events->adoptHandler(m_events->forIStream().inputReady(),
         stream.getEventTarget(),
@@ -51,46 +124,49 @@ IpcServerProxy::handleData(const Event&, void*)
 {
     LOG((CLOG_DEBUG "start ipc handle data"));
 
-    UInt8 code[4];
-    UInt32 n = m_stream.read(code, 4);
-    while (n != 0) {
-
-        LOG((CLOG_DEBUG "ipc read: %c%c%c%c",
-            code[0], code[1], code[2], code[3]));
-
-        IpcMessage* m = nullptr;
-        try {
-            if (memcmp(code, kIpcMsgLogLine, 4) == 0) {
-                m = parseLogLine();
-            }
-            else if (memcmp(code, kIpcMsgShutdown, 4) == 0) {
-                m = new IpcShutdownMessage();
-            }
-            else if (memcmp(code, kIpcMsgReadyQuery, 4) == 0) {
-                m = parseInputReadyQuery();
-            }
-            else {
-                LOG((CLOG_ERR "invalid ipc message"));
-                disconnect();
-                return;
-            }
-        }
-        catch (const XBase& e) {
-            LOG((CLOG_WARN "rejecting malformed ipc message: %s", e.what()));
+    while (!m_disconnected) {
+        const FrameProbe probe = probeServerFrame(m_receiveBuffer);
+        if (probe.state == FrameProbeState::Invalid) {
+            LOG((CLOG_ERR "invalid ipc message"));
             disconnect();
             return;
         }
 
-        if (m == nullptr) {
-            return;
+        if (probe.state == FrameProbeState::Complete) {
+            LOG((CLOG_DEBUG "ipc read: %c%c%c%c",
+                 m_receiveBuffer[0], m_receiveBuffer[1],
+                 m_receiveBuffer[2], m_receiveBuffer[3]));
+            IpcMessage* message = parseBufferedMessage();
+            if (message == nullptr) {
+                return;
+            }
+
+            m_receiveBuffer.erase(
+                m_receiveBuffer.begin(),
+                m_receiveBuffer.begin() + probe.frameSize);
+
+            // don't delete with this event; the data is passed to a new event.
+            Event event(m_events->forIpcServerProxy().messageReceived(),
+                        this, NULL, Event::kDontFreeData);
+            event.setDataObject(message);
+            m_events->addEvent(event);
+            continue;
         }
 
-        // don't delete with this event; the data is passed to a new event.
-        Event e(m_events->forIpcServerProxy().messageReceived(), this, NULL, Event::kDontFreeData);
-        e.setDataObject(m);
-        m_events->addEvent(e);
-
-        n = m_stream.read(code, 4);
+        UInt8 bytes[4096];
+        const UInt32 requested = static_cast<UInt32>(
+            std::min<std::size_t>(probe.bytesNeeded, sizeof(bytes)));
+        const UInt32 count = m_stream.read(bytes, requested);
+        if (count == 0) {
+            break;
+        }
+        if (count > requested) {
+            LOG((CLOG_ERR "ipc stream returned more bytes than requested"));
+            disconnect();
+            return;
+        }
+        m_receiveBuffer.insert(
+            m_receiveBuffer.end(), bytes, bytes + count);
     }
 
     LOG((CLOG_DEBUG "finished ipc handle data"));
@@ -134,6 +210,18 @@ IpcServerProxy::send(const IpcMessage& message)
         break;
     }
 
+    case kIpcActivated: {
+        const IpcNodeActivatedMessage& activated =
+            static_cast<const IpcNodeActivatedMessage&>(message);
+        const UInt32 nonceHigh =
+            static_cast<UInt32>(activated.activationNonce() >> 32);
+        const UInt32 nonceLow =
+            static_cast<UInt32>(activated.activationNonce() & 0xffffffffu);
+        ProtocolUtil::writef(&m_stream, kIpcMsgActivated,
+                             activated.processId(), nonceHigh, nonceLow);
+        break;
+    }
+
     case kIpcCommand: {
         const IpcCommandMessage& cm = static_cast<const IpcCommandMessage&>(message);
         std::string command = cm.command();
@@ -147,37 +235,64 @@ IpcServerProxy::send(const IpcMessage& message)
     }
 }
 
-IpcLogLineMessage*
-IpcServerProxy::parseLogLine()
+IpcMessage*
+IpcServerProxy::parseBufferedMessage()
 {
-    std::string logLine;
-    ProtocolUtil::readf(&m_stream, kIpcMsgLogLine + 4, &logLine);
+    std::size_t offset = 4;
+    if (std::memcmp(m_receiveBuffer.data(), kIpcMsgLogLine, 4) == 0) {
+        return parseLogLine(readString(m_receiveBuffer, offset));
+    }
+    if (std::memcmp(m_receiveBuffer.data(), kIpcMsgShutdown, 4) == 0) {
+        return new IpcShutdownMessage();
+    }
 
+    const UInt32 nonceHigh = readUInt32(m_receiveBuffer.data() + offset);
+    offset += 4;
+    const UInt32 nonceLow = readUInt32(m_receiveBuffer.data() + offset);
+    const std::uint64_t nonce =
+        (static_cast<std::uint64_t>(nonceHigh) << 32) | nonceLow;
+    if (std::memcmp(m_receiveBuffer.data(), kIpcMsgReadyQuery, 4) == 0) {
+        return parseInputReadyQuery(nonce);
+    }
+    if (std::memcmp(m_receiveBuffer.data(), kIpcMsgActivate, 4) == 0) {
+        return parseActivateNode(nonce);
+    }
+
+    disconnect();
+    return nullptr;
+}
+
+IpcLogLineMessage*
+IpcServerProxy::parseLogLine(const std::string& logLine)
+{
     // must be deleted by event handler.
     return new IpcLogLineMessage(logLine);
 }
 
 IpcInputReadyQueryMessage*
-IpcServerProxy::parseInputReadyQuery()
+IpcServerProxy::parseInputReadyQuery(std::uint64_t queryNonce)
 {
-    UInt32 queryNonceHigh = 0;
-    UInt32 queryNonceLow = 0;
-    if (!ProtocolUtil::readf(&m_stream, kIpcMsgReadyQuery + 4,
-                             &queryNonceHigh, &queryNonceLow)) {
-        LOG((CLOG_WARN "incomplete ipc input readiness query"));
+    return new IpcInputReadyQueryMessage(queryNonce);
+}
+
+IpcActivateNodeMessage*
+IpcServerProxy::parseActivateNode(std::uint64_t activationNonce)
+{
+    if (activationNonce == 0) {
+        LOG((CLOG_WARN "rejecting zero ipc activation nonce"));
         disconnect();
         return nullptr;
     }
-
-    const std::uint64_t queryNonce =
-        (static_cast<std::uint64_t>(queryNonceHigh) << 32) |
-        queryNonceLow;
-    return new IpcInputReadyQueryMessage(queryNonce);
+    return new IpcActivateNodeMessage(activationNonce);
 }
 
 void
 IpcServerProxy::disconnect()
 {
+    if (m_disconnected) {
+        return;
+    }
+    m_disconnected = true;
     LOG((CLOG_DEBUG "ipc disconnect, closing stream"));
     m_stream.close();
 }

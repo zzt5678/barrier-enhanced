@@ -27,6 +27,7 @@
 #include "barrier/option_types.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 class IClipboard;
@@ -46,6 +47,33 @@ public:
 
     IPlatformScreen(IEventQueue* events) : IKeyState(events) { }
 
+    // Platforms with an asynchronous clipboard reader can expose its already
+    // validated wire snapshot. The default keeps existing platform behavior.
+    virtual bool getClipboardSnapshot(
+        ClipboardID, std::shared_ptr<const String>*, UInt32*) const
+    {
+        return false;
+    }
+
+    virtual bool setClipboardSnapshot(
+        ClipboardID, const std::shared_ptr<const String>&)
+    {
+        return false;
+    }
+
+    virtual bool setClipboardSnapshot(
+        ClipboardID id, const std::shared_ptr<const String>& data,
+        std::uint64_t publicationId)
+    {
+        (void)publicationId;
+        return setClipboardSnapshot(id, data);
+    }
+
+    virtual bool hasAsyncClipboardPublications() const
+    {
+        return false;
+    }
+
     //! Enable screen
     /*!
     Enable the screen, preparing it to report system and user events.
@@ -56,6 +84,13 @@ public:
 
     //! Prepare only the platform input backend before remote handshaking.
     virtual bool        prepareInputBackend() { return true; }
+
+    //! Probe input-desktop access without installing hooks or capturing input.
+    virtual bool        probeInputBackend(std::string& desktopName) const
+    {
+        desktopName = inputDesktopName();
+        return canEnter();
+    }
 
     //! Disable screen
     /*!

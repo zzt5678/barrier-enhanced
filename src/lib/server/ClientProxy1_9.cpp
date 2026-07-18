@@ -43,12 +43,17 @@ ClientProxy1_9::attachBulkChannel(barrier::IStream* stream)
     if (stream == NULL) {
         return false;
     }
+    if (m_bulkChannel) {
+        handleBulkSendDisconnected(m_bulkChannel.get());
+        m_bulkServer->handleBulkDisconnected(this, m_bulkChannel.get());
+    }
     detachBulkChannel();
     ProtocolUtil::writef(stream, kMsgDBulkAccepted);
     m_bulkChannel = std::make_shared<barrier::BulkChannel>(stream, this,
                                                            m_bulkEvents);
     LOG((CLOG_NOTE "bulk channel attached for client \"%s\"",
          getName().c_str()));
+    retryOneDirtyClipboard();
     if (stream->isReady()) {
         m_bulkEvents->addEvent(Event(m_bulkEvents->forIStream().inputReady(),
                                      stream->getEventTarget()));
@@ -78,9 +83,14 @@ bool
 ClientProxy1_9::handleBulkMessage(const UInt8* code,
                                   barrier::IStream* stream)
 {
+    if (!m_bulkChannel || !m_bulkChannel->isActive() ||
+        m_bulkChannel->getStream() != stream) {
+        LOG((CLOG_WARN "rejecting payload from a stale bulk route for client \"%s\"",
+             getName().c_str()));
+        return false;
+    }
     if (memcmp(code, kMsgDFileTransfer, 4) == 0) {
-        fileChunkReceived(stream);
-        return true;
+        return discardLegacyFileChunk(stream);
     }
     if (memcmp(code, kMsgDClipboard, 4) == 0) {
         return recvClipboard(stream);
@@ -89,8 +99,12 @@ ClientProxy1_9::handleBulkMessage(const UInt8* code,
 }
 
 void
-ClientProxy1_9::handleBulkDisconnected(barrier::BulkChannel* channel)
+ClientProxy1_9::handleBulkDisconnected(barrier::BulkChannel* channel,
+                                       std::uint64_t pausedGeneration)
 {
+    handleBulkSendDisconnected(channel);
+    m_bulkServer->handleBulkDisconnected(this, channel, pausedGeneration);
+
     if (!m_bulkChannel || m_bulkChannel.get() != channel) {
         return;
     }

@@ -26,7 +26,59 @@
 #include <Windows.h>
 #include <tchar.h>
 
+#include <functional>
+#include <string>
+
 #define ARCH_DAEMON ArchDaemonWindows
+
+namespace ArchDaemonWindowsPolicy {
+
+typedef BOOL (WINAPI* ServiceHandleCloser)(SC_HANDLE);
+
+class ScopedServiceHandle {
+public:
+    explicit ScopedServiceHandle(
+        SC_HANDLE handle = nullptr,
+        ServiceHandleCloser closer = &CloseServiceHandle) noexcept;
+    ~ScopedServiceHandle();
+
+    ScopedServiceHandle(ScopedServiceHandle&& other) noexcept;
+    ScopedServiceHandle& operator=(ScopedServiceHandle&& other) noexcept;
+
+    SC_HANDLE get() const noexcept;
+    void reset(SC_HANDLE handle = nullptr) noexcept;
+
+private:
+    ScopedServiceHandle(const ScopedServiceHandle&) = delete;
+    ScopedServiceHandle& operator=(const ScopedServiceHandle&) = delete;
+
+    SC_HANDLE m_handle;
+    ServiceHandleCloser m_closer;
+};
+
+bool deleteServiceSucceeded(BOOL result) noexcept;
+
+// The caller supplies paths resolved through GetFinalPathNameByHandleW.
+// This remains a pure policy check so it can be regression tested without
+// opening or mutating the service control manager.
+bool isSafeLegacyServiceMigrationPath(
+    const std::wstring& serviceImagePath,
+    const std::wstring& programFilesPath,
+    const std::wstring& serviceBinaryFinalPath,
+    const std::wstring& expectedBinaryFinalPath);
+
+struct PostInstallMigrationState {
+    bool serviceConfigured = false;
+    bool parametersConfigured = false;
+};
+
+bool migrateLegacyServiceAfterInstall(
+    const char* installedServiceName,
+    const PostInstallMigrationState& state,
+    const std::function<bool()>& isEligible,
+    const std::function<void()>& removeLegacyService);
+
+} // namespace ArchDaemonWindowsPolicy
 
 //! Win32 implementation of IArchDaemon
 class ArchDaemonWindows : public IArchDaemon {
@@ -88,6 +140,10 @@ public:
     virtual bool        isDaemonInstalled(const char* name);
     std::string            commandLine() const { return m_commandLine; }
 
+    // Read-only eligibility probe for migrating pre-Weave-service-name
+    // installations. It never stops, deletes, or reconfigures a service.
+    static bool            isLegacyWeaveDaemonEligibleForMigration();
+
 private:
     static HKEY            openNTServicesKey();
 
@@ -137,15 +193,4 @@ private:
     UINT                m_quitMessage;
 
     std::string            m_commandLine;
-};
-
-#define DEFAULT_DAEMON_NAME _T("Barrier")
-#define DEFAULT_DAEMON_INFO _T("Manages the Barrier foreground processes.")
-
-static const TCHAR* const g_daemonKeyPath[] = {
-    _T("SOFTWARE"),
-    _T("The Barrier Project"),
-    _T("Barrier"),
-    _T("Service"),
-    NULL
 };

@@ -22,5 +22,6 @@ enum class CloseAction {
 CloseAction closeAction(bool explicitQuitRequested, bool trayAvailable);
 bool shouldHideOnMinimize(Qt::WindowStates state, bool minimizeToTray,
                           bool trayAvailable);
+bool canCompleteExplicitQuit(bool serviceMode, bool stopAcknowledged);
 
 } // namespace WindowLifecyclePolicy

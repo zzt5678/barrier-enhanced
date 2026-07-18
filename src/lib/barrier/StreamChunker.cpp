@@ -18,6 +18,7 @@
 #include "barrier/StreamChunker.h"
 
 #include "barrier/FileChunk.h"
+#include "barrier/FileTransferSendState.h"
 #include "barrier/ClipboardChunk.h"
 #include "barrier/protocol_types.h"
 #include "barrier/TransferDigest.h"
@@ -33,6 +34,7 @@
 #include "mt/Thread.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <functional>
 #include <stdexcept>
@@ -83,6 +85,37 @@ public:
 private:
     IEventQueue* m_events;
     void* m_eventTarget;
+};
+
+class ActiveFileSendStateGuard {
+public:
+    ActiveFileSendStateGuard(
+        std::shared_ptr<barrier::FileTransferSendState>* active,
+        const std::shared_ptr<barrier::FileTransferSendState>& state) :
+        m_active(active),
+        m_state(state)
+    {
+        if (m_state) {
+            std::atomic_store(m_active, m_state);
+        }
+    }
+
+    ~ActiveFileSendStateGuard()
+    {
+        if (!m_state) {
+            return;
+        }
+
+        std::shared_ptr<barrier::FileTransferSendState> expected = m_state;
+        std::atomic_compare_exchange_strong(
+            m_active,
+            &expected,
+            std::shared_ptr<barrier::FileTransferSendState>());
+    }
+
+private:
+    std::shared_ptr<barrier::FileTransferSendState>* m_active;
+    std::shared_ptr<barrier::FileTransferSendState> m_state;
 };
 
 size_t getChunkSize(size_t totalSize)
@@ -211,8 +244,9 @@ bool queueClipboardChunks(
                 UInt32 sequence,
                 IEventQueue* events,
                 void* eventTarget,
-                barrier::IStream* stream,
-                const std::shared_ptr<barrier::BulkChannel>& bulkChannel,
+    barrier::IStream* stream,
+    const std::shared_ptr<barrier::BulkChannel>& bulkChannel,
+    const std::shared_ptr<barrier::ClipboardSendAttempt>& attempt,
                 size_t maxQueuedBulkEvents,
                 bool waitForBudgets,
                 const std::function<bool()>& shouldInterrupt)
@@ -238,7 +272,7 @@ bool queueClipboardChunks(
 
     String dataSize = barrier::string::sizeTypeToString(size);
     ClipboardChunk* sizeMessage = ClipboardChunk::start(id, sequence, dataSize);
-    sizeMessage->setSendRoute(stream, bulkChannel);
+    sizeMessage->setSendRoute(stream, bulkChannel, attempt);
 
     Event sizeEvent(events->forClipboard().clipboardSending(), eventTarget, sizeMessage);
     sizeEvent.setDataObject(sizeMessage);
@@ -282,7 +316,7 @@ bool queueClipboardChunks(
 
         String chunk(data.data() + sentLength, bytesToSend);
         ClipboardChunk* dataChunk = ClipboardChunk::data(id, sequence, chunk);
-        dataChunk->setSendRoute(stream, bulkChannel);
+        dataChunk->setSendRoute(stream, bulkChannel, attempt);
 
         Event dataEvent(events->forClipboard().clipboardSending(), eventTarget, dataChunk);
         dataEvent.setDataObject(dataChunk);
@@ -301,7 +335,7 @@ bool queueClipboardChunks(
         LOG((CLOG_WARN "clipboard transmission stopped before completion, sent=%d expected=%d",
             sentLength, size));
         ClipboardChunk* cancel = ClipboardChunk::cancel(id, sequence);
-        cancel->setSendRoute(stream, bulkChannel);
+        cancel->setSendRoute(stream, bulkChannel, attempt);
         Event cancelEvent(events->forClipboard().clipboardSending(), eventTarget, cancel);
         cancelEvent.setDataObject(cancel);
         events->addEvent(cancelEvent);
@@ -309,7 +343,7 @@ bool queueClipboardChunks(
     }
 
     ClipboardChunk* end = ClipboardChunk::end(id, sequence);
-    end->setSendRoute(stream, bulkChannel);
+    end->setSendRoute(stream, bulkChannel, attempt);
     Event endEvent(events->forClipboard().clipboardSending(), eventTarget, end);
     endEvent.setDataObject(end);
     events->addEvent(endEvent);
@@ -332,66 +366,154 @@ StreamChunker::sendFile(const char* filename,
                 barrier::IStream* stream,
                 UInt32 transferId)
 {
+    sendFile(filename, events, eventTarget, stream, transferId,
+             std::shared_ptr<barrier::FileTransferSendState>());
+}
+
+void
+StreamChunker::sendFile(const char* filename,
+                IEventQueue* events,
+                void* eventTarget,
+                barrier::IStream* stream,
+                UInt32 transferId,
+                const std::shared_ptr<barrier::FileTransferSendState>&
+                    transactionState)
+{
     FileMaintenanceEventGuard maintenanceEvent(events, eventTarget);
+    ActiveFileSendStateGuard activeState(
+        &m_activeFileSendState, transactionState);
+    if (transactionState && transactionState->transferId() != transferId) {
+        transactionState->fail(
+            barrier::FileTransferReason::kProtocolError);
+        throw std::invalid_argument(
+            "transaction state transfer id does not match sendFile");
+    }
+
     std::fstream file(filename, std::ios::in | std::ios::binary);
 
     if (!file.is_open()) {
+        if (transactionState) {
+            transactionState->fail(barrier::FileTransferReason::kIoError);
+        }
         throw runtime_error("failed to open file");
     }
     FileInterruptResetGuard resetInterrupt(m_interruptFile);
     barrier::TransferDigest digest;
     if (!digest.isReady()) {
+        if (transactionState) {
+            transactionState->fail(barrier::FileTransferReason::kIoError);
+        }
         throw runtime_error("failed to initialize file transfer digest");
     }
 
     // check file size
     file.seekg (0, std::ios::end);
-    size_t size = (size_t)file.tellg();
+    const std::streamoff measuredSize = file.tellg();
+    if (measuredSize < 0) {
+        if (transactionState) {
+            transactionState->fail(barrier::FileTransferReason::kIoError);
+        }
+        throw runtime_error("failed to determine file size");
+    }
+    if (static_cast<std::uintmax_t>(measuredSize) > FileChunk::kMaxReceiveSize) {
+        LOG((CLOG_WARN
+            "refusing file transfer larger than receive limit, size=%llu limit=%llu",
+            static_cast<unsigned long long>(measuredSize),
+            static_cast<unsigned long long>(FileChunk::kMaxReceiveSize)));
+        if (transactionState) {
+            transactionState->fail(barrier::FileTransferReason::kSizeLimit);
+        }
+        return;
+    }
+    const size_t size = static_cast<size_t>(measuredSize);
+    const auto shouldStop = [this, transactionState]() {
+        return shouldInterrupt() ||
+            (transactionState && transactionState->stopped());
+    };
 
     const size_t maxQueuedBulkEvents = getMaxQueuedFileEvents(size, stream);
     if (!waitForQueuedEventBudget(events, maxQueuedBulkEvents, 0.001,
-            kMaxFileQueuedEventWaits,
-            [this]() { return shouldInterrupt(); }) ||
+            kMaxFileQueuedEventWaits, shouldStop) ||
         !waitForBufferedOutputBudget(stream, kMaxFileBufferedOutputBytes, 0.001,
-            kMaxFileOutputThrottleWaits,
-            [this]() { return shouldInterrupt(); })) {
+            kMaxFileOutputThrottleWaits, shouldStop)) {
         LOG((CLOG_DEBUG "file transmission not started because output is not ready"));
+        if (transactionState && !transactionState->stopped()) {
+            transactionState->fail(barrier::FileTransferReason::kTimeout);
+        }
         file.close();
         return;
     }
 
     // send first message (file size)
     String fileSize = barrier::string::sizeTypeToString(size);
-    FileChunk* sizeMessage = FileChunk::start(fileSize);
+    if (transactionState &&
+        !transactionState->markStartQueued(static_cast<UInt32>(size))) {
+        return;
+    }
+    FileChunk* sizeMessage = FileChunk::start(
+        fileSize, static_cast<bool>(transactionState));
     sizeMessage->m_transferId = transferId;
 
     Event sizeEvent(events->forFile().fileChunkSending(), eventTarget, sizeMessage);
     sizeEvent.setDataObject(sizeMessage);
     events->addEvent(sizeEvent);
 
+    if (transactionState) {
+        const barrier::FileTransferReason startResult =
+            transactionState->waitForStartAck();
+        if (startResult != barrier::FileTransferReason::kNone) {
+            if (startResult == barrier::FileTransferReason::kTimeout ||
+                startResult == barrier::FileTransferReason::kCancelled) {
+                transactionState->markCancelQueued(startResult);
+                FileChunk* cancel = FileChunk::cancel(startResult);
+                cancel->m_transferId = transferId;
+                Event cancelEvent(
+                    events->forFile().fileChunkSending(), eventTarget, cancel);
+                cancelEvent.setDataObject(cancel);
+                events->addEvent(cancelEvent);
+            }
+            return;
+        }
+    }
+
     // send chunk messages with a fixed chunk size
     size_t sentLength = 0;
     size_t bytesSinceYield = 0;
+    barrier::FileTransferReason failureReason =
+        barrier::FileTransferReason::kNone;
     const size_t chunkSize = getChunkSize(size);
     std::vector<char> chunkBuffer(chunkSize);
     file.seekg (0, std::ios::beg);
 
-    while (true) {
+    while (!transactionState || size != 0) {
         Thread::testCancel();
-        if (shouldInterrupt()) {
+        if (shouldStop()) {
             LOG((CLOG_DEBUG "file transmission interrupted"));
+            failureReason = transactionState &&
+                    transactionState->result() !=
+                        barrier::FileTransferReason::kNone ?
+                transactionState->result() :
+                barrier::FileTransferReason::kCancelled;
             break;
         }
 
         events->addEvent(Event(events->forFile().keepAlive(), eventTarget));
         if (!waitForQueuedEventBudget(events, maxQueuedBulkEvents, 0.001,
-                kMaxFileQueuedEventWaits,
-                [this]() { return shouldInterrupt(); })) {
+                kMaxFileQueuedEventWaits, shouldStop)) {
+            failureReason = transactionState &&
+                    transactionState->result() !=
+                        barrier::FileTransferReason::kNone ?
+                transactionState->result() :
+                barrier::FileTransferReason::kTimeout;
             break;
         }
         if (!waitForBufferedOutputBudget(stream, kMaxFileBufferedOutputBytes, 0.001,
-                kMaxFileOutputThrottleWaits,
-                [this]() { return shouldInterrupt(); })) {
+                kMaxFileOutputThrottleWaits, shouldStop)) {
+            failureReason = transactionState &&
+                    transactionState->result() !=
+                        barrier::FileTransferReason::kNone ?
+                transactionState->result() :
+                barrier::FileTransferReason::kTimeout;
             break;
         }
 
@@ -404,14 +526,34 @@ StreamChunker::sendFile(const char* filename,
         file.read(chunkBuffer.data(), bytesToRead);
         Thread::testCancel();
         if (!file) {
+            if (transactionState) {
+                failureReason = barrier::FileTransferReason::kIoError;
+                break;
+            }
             throw runtime_error("failed to read file");
         }
         if (!digest.update(chunkBuffer.data(), bytesToRead)) {
             LOG((CLOG_ERR "failed to update file transfer digest"));
+            failureReason = barrier::FileTransferReason::kIoError;
             break;
         }
-        FileChunk* fileChunk = FileChunk::data(
-            reinterpret_cast<const UInt8*>(chunkBuffer.data()), bytesToRead);
+        if (transactionState && !transactionState->markDataQueued(
+                static_cast<UInt32>(sentLength),
+                static_cast<UInt32>(bytesToRead))) {
+            failureReason = transactionState->result() !=
+                    barrier::FileTransferReason::kNone ?
+                transactionState->result() :
+                barrier::FileTransferReason::kProtocolError;
+            break;
+        }
+        FileChunk* fileChunk = transactionState ?
+            FileChunk::data(
+                reinterpret_cast<const UInt8*>(chunkBuffer.data()),
+                bytesToRead,
+                static_cast<UInt32>(sentLength)) :
+            FileChunk::data(
+                reinterpret_cast<const UInt8*>(chunkBuffer.data()),
+                bytesToRead);
         fileChunk->m_transferId = transferId;
 
         Event dataEvent(events->forFile().fileChunkSending(), eventTarget, fileChunk);
@@ -430,13 +572,26 @@ StreamChunker::sendFile(const char* filename,
     String encodedDigest;
     if (sentLength == size && !digest.finish(encodedDigest)) {
         LOG((CLOG_ERR "failed to finalize file transfer digest"));
+        failureReason = barrier::FileTransferReason::kIoError;
         sentLength = 0;
     }
 
     if (sentLength != size) {
         LOG((CLOG_DEBUG "file transmission stopped before completion, sent=%d expected=%d",
             sentLength, size));
-        FileChunk* cancel = FileChunk::cancel();
+        if (transactionState &&
+            failureReason == barrier::FileTransferReason::kNone) {
+            failureReason = barrier::FileTransferReason::kCancelled;
+        }
+        if (transactionState &&
+            failureReason == barrier::FileTransferReason::kConnectionLost) {
+            return;
+        }
+        if (transactionState) {
+            transactionState->markCancelQueued(failureReason);
+        }
+        FileChunk* cancel = transactionState ?
+            FileChunk::cancel(failureReason) : FileChunk::cancel();
         cancel->m_transferId = transferId;
         Event cancelEvent(events->forFile().fileChunkSending(), eventTarget, cancel);
         cancelEvent.setDataObject(cancel);
@@ -446,13 +601,35 @@ StreamChunker::sendFile(const char* filename,
     }
 
     // send last message
-    FileChunk* end = FileChunk::end(encodedDigest);
+    if (transactionState && !transactionState->markEndQueued(
+            static_cast<UInt32>(sentLength))) {
+        const barrier::FileTransferReason reason =
+            transactionState->result() != barrier::FileTransferReason::kNone ?
+                transactionState->result() :
+                barrier::FileTransferReason::kProtocolError;
+        if (reason != barrier::FileTransferReason::kConnectionLost) {
+            transactionState->markCancelQueued(reason);
+            FileChunk* cancel = FileChunk::cancel(reason);
+            cancel->m_transferId = transferId;
+            Event cancelEvent(
+                events->forFile().fileChunkSending(), eventTarget, cancel);
+            cancelEvent.setDataObject(cancel);
+            events->addEvent(cancelEvent);
+        }
+        return;
+    }
+    FileChunk* end = transactionState ?
+        FileChunk::end(encodedDigest, static_cast<UInt32>(sentLength)) :
+        FileChunk::end(encodedDigest);
     end->m_transferId = transferId;
     Event endEvent(events->forFile().fileChunkSending(), eventTarget, end);
     endEvent.setDataObject(end);
     events->addEvent(endEvent);
 
     file.close();
+    if (transactionState) {
+        transactionState->waitForCommitAck();
+    }
 }
 
 bool
@@ -464,7 +641,8 @@ StreamChunker::sendClipboardData(
                 IEventQueue* events,
                 void* eventTarget,
                 barrier::IStream* stream,
-                const std::shared_ptr<barrier::BulkChannel>& bulkChannel)
+                const std::shared_ptr<barrier::BulkChannel>& bulkChannel,
+                const std::shared_ptr<barrier::ClipboardSendAttempt>& attempt)
 {
     const size_t maxQueuedBulkEvents = stream == nullptr ? 0 : 32;
     FileInterruptResetGuard resetInterrupt(m_interruptFile);
@@ -477,6 +655,7 @@ StreamChunker::sendClipboardData(
         eventTarget,
         stream,
         bulkChannel,
+        attempt,
         maxQueuedBulkEvents,
         true,
         [this]() { return shouldInterrupt(); });
@@ -491,7 +670,8 @@ StreamChunker::sendClipboard(
                 IEventQueue* events,
                 void* eventTarget,
                 barrier::IStream* stream,
-                const std::shared_ptr<barrier::BulkChannel>& bulkChannel)
+                const std::shared_ptr<barrier::BulkChannel>& bulkChannel,
+                const std::shared_ptr<barrier::ClipboardSendAttempt>& attempt)
 {
     return queueClipboardChunks(
         data,
@@ -502,6 +682,7 @@ StreamChunker::sendClipboard(
         eventTarget,
         stream,
         bulkChannel,
+        attempt,
         0,
         false,
         std::function<bool()>());
@@ -511,6 +692,11 @@ void
 StreamChunker::interruptFile()
 {
     m_interruptFile.store(true);
+    const std::shared_ptr<barrier::FileTransferSendState> activeState =
+        std::atomic_load(&m_activeFileSendState);
+    if (activeState) {
+        activeState->interrupt();
+    }
     LOG((CLOG_INFO "previous dragged file has become invalid"));
 }
 

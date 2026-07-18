@@ -103,6 +103,8 @@ public:
     bool ipcInputReady() const override;
     std::uint64_t ipcInputGeneration() const override;
     std::string ipcInputDesktopName() const override;
+    bool ipcStandbyInputProbe(std::uint64_t& inputGeneration,
+                              std::string& desktopName) const override;
 
     static ServerApp& instance() { return (ServerApp&)App::instance(); }
 

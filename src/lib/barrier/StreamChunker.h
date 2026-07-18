@@ -27,6 +27,8 @@
 class IEventQueue;
 namespace barrier {
 class BulkChannel;
+class ClipboardSendAttempt;
+class FileTransferSendState;
 class IStream;
 }
 
@@ -36,6 +38,10 @@ public:
 
     void sendFile(const char* filename, IEventQueue* events, void* eventTarget,
                   barrier::IStream* stream = nullptr, UInt32 transferId = 0);
+    void sendFile(const char* filename, IEventQueue* events, void* eventTarget,
+                  barrier::IStream* stream, UInt32 transferId,
+                  const std::shared_ptr<barrier::FileTransferSendState>&
+                      transactionState);
     bool                   sendClipboardData(
                             const String& data,
                             size_t size,
@@ -45,7 +51,9 @@ public:
                             void* eventTarget,
                             barrier::IStream* stream = nullptr,
                             const std::shared_ptr<barrier::BulkChannel>& bulkChannel =
-                                std::shared_ptr<barrier::BulkChannel>());
+                                std::shared_ptr<barrier::BulkChannel>(),
+                            const std::shared_ptr<barrier::ClipboardSendAttempt>& attempt =
+                                std::shared_ptr<barrier::ClipboardSendAttempt>());
     static bool            sendClipboard(
                             const String& data,
                             size_t size,
@@ -55,7 +63,9 @@ public:
                             void* eventTarget,
                             barrier::IStream* stream = nullptr,
                             const std::shared_ptr<barrier::BulkChannel>& bulkChannel =
-                                std::shared_ptr<barrier::BulkChannel>());
+                                std::shared_ptr<barrier::BulkChannel>(),
+                            const std::shared_ptr<barrier::ClipboardSendAttempt>& attempt =
+                                std::shared_ptr<barrier::ClipboardSendAttempt>());
     void                   interruptFile();
 
 #if defined(BARRIER_TEST_ENV)
@@ -67,4 +77,5 @@ private:
 
 private:
     std::atomic<bool>      m_interruptFile;
+    std::shared_ptr<barrier::FileTransferSendState> m_activeFileSendState;
 };

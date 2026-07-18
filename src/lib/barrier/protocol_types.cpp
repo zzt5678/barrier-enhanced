@@ -18,14 +18,18 @@
 
 #include "barrier/protocol_types.h"
 
+#include <algorithm>
+
 const char*                kMsgHello            = "Barrier%2i%2i";
 const char*                kMsgHelloBack        = "Barrier%2i%2i%s";
 const char*                kMsgHelloBulkBack    = "WBUL%2i%2i%s%s";
+const char*                kMsgHelloBulkBack1_12 = "WBU2%2i%2i%s%s%s";
 const char*                kMsgCNoop             = "CNOP";
 const char*                kMsgCClose             = "CBYE";
 const char*                kMsgCEnter             = "CINN%2i%2i%4i%2i";
 const char*                kMsgCPrepareEnter      = "CIPR%2i%2i%4i%2i";
 const char*                kMsgCAbortEnter        = "CIAB%4i";
+const char*                kMsgCRevokeInput       = "CIRV%4i%4i";
 const char*                kMsgCLeave             = "COUT";
 const char*                kMsgCClipboard         = "CCLP%1i%4i";
 const char*                kMsgCScreenSaver     = "CSEC%1i";
@@ -33,6 +37,7 @@ const char*                kMsgCResetOptions    = "CROP";
 const char*                kMsgCInfoAck        = "CIAK";
 const char*                kMsgCKeepAlive        = "CALV";
 const char*                kMsgCBulkOffer        = "CBLK%s";
+const char*                kMsgCBulkOffer1_12    = "CBL2%s%s";
 const char*                kMsgDBulkAccepted     = "BACC";
 const char*                kMsgDBulkRejected     = "BREJ";
 const char*                kMsgBulkKeepAlive     = "BPNG";
@@ -58,13 +63,31 @@ const char*                kMsgDMouseMove1_8     = "D8MM%4i%4i%2i%2i";
 const char*                kMsgDMouseRelMove1_8  = "D8RM%4i%4i%2i%2i";
 const char*                kMsgDMouseWheel1_8    = "D8MW%4i%4i%2i%2i";
 const char*                kMsgDEnterReady       = "DIRE%4i%1i";
+const char*                kMsgDRevokeInputAck   = "DIRV%4i%1i";
 const char*                kMsgDClipboard        = "DCLP%1i%4i%1i%s";
 const char*                kMsgDInfo            = "DINF%2i%2i%2i%2i%2i%2i%2i";
 const char*                kMsgDSetOptions        = "DSOP%4I";
 const char*                kMsgDFileTransfer    = "DFTR%1i%s";
+const char*                kMsgDFileTransferStart1_12 = "D12S%s%4i%1i%4i%4i%s%4i";
+const char*                kMsgDFileTransferStartAck1_12 = "D12A%s%4i%1i";
+const char*                kMsgDFileTransferData1_12 = "D12D%s%4i%4i%s";
+const char*                kMsgDFileTransferEnd1_12 = "D12E%s%4i%4i%s";
+const char*                kMsgDFileTransferCancel1_12 = "D12C%s%4i%1i";
+const char*                kMsgDFileTransferCancelAck1_12 = "D12X%s%4i%1i";
+const char*                kMsgDFileTransferCommitAck1_12 = "D12K%s%4i%1i";
 const char*                kMsgDDragInfo        = "DDRG%2i%s";
 const char*                kMsgQInfo            = "QINF";
 const char*                kMsgEIncompatible    = "EICV%2i%2i";
 const char*                kMsgEBusy             = "EBSY";
 const char*                kMsgEUnknown        = "EUNK";
 const char*                kMsgEBad            = "EBAD";
+
+bool
+isValidConnectionBinding(const std::string& binding)
+{
+    return binding.size() == 32u &&
+        std::all_of(binding.begin(), binding.end(), [](char value) {
+            return (value >= '0' && value <= '9') ||
+                (value >= 'a' && value <= 'f');
+        });
+}
