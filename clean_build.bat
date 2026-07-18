@@ -41,7 +41,9 @@ rmdir /q /s build
 mkdir build
 if ERRORLEVEL 1 goto failed
 cd build
-cmake -G "%cmake_gen%" -A x64 -D CMAKE_BUILD_TYPE=%B_BUILD_TYPE% -D CMAKE_PREFIX_PATH="%B_QT_FULLPATH%" -D DNSSD_LIB="%B_BONJOUR%\Lib\x64\dnssd.lib" -D QT_VERSION=%B_QT_VER% ..
+set B_GTEST_CMAKE_ARG=-D BARRIER_USE_EXTERNAL_GTEST=ON
+if /I "%B_BUILD_TYPE%"=="Debug" set B_GTEST_CMAKE_ARG=-D CMAKE_DISABLE_FIND_PACKAGE_GTest=TRUE
+cmake -G "%cmake_gen%" -A x64 -D CMAKE_BUILD_TYPE=%B_BUILD_TYPE% %B_GTEST_CMAKE_ARG% -D CMAKE_PREFIX_PATH="%B_QT_FULLPATH%" -D DNSSD_LIB="%B_BONJOUR%\Lib\x64\dnssd.lib" -D QT_VERSION=%B_QT_VER% ..
 if ERRORLEVEL 1 goto failed
 cmake --build . --config %B_BUILD_TYPE%
 if ERRORLEVEL 1 goto failed
@@ -64,6 +66,7 @@ set B_QT_MSVC=
 set B_BONJOUR=
 set BONJOUR_SDK_HOME=
 set B_QT_FULLPATH=
+set B_GTEST_CMAKE_ARG=
 set savedir=
 set cmake_gen=
 

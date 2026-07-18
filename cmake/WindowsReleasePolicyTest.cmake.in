@@ -158,6 +158,22 @@ set(expected_release_files
 set(clean_build "${SOURCE_ROOT}/clean_build.bat")
 assert_file_contains("${clean_build}" "Visual Studio 17 2022")
 assert_file_contains("${clean_build}" "set cmake_gen=Visual Studio 17 2022")
+assert_file_contains("${clean_build}"
+                     "CMAKE_DISABLE_FIND_PACKAGE_GTest=TRUE")
+assert_file_contains("${clean_build}"
+                     "set B_GTEST_CMAKE_ARG=-D BARRIER_USE_EXTERNAL_GTEST=ON")
+
+set(project_cmake "${SOURCE_ROOT}/CMakeLists.txt")
+assert_file_contains("${project_cmake}"
+                     [=[add_compile_definitions($<$<NOT:$<CONFIG:Debug>>:NDEBUG>)]=])
+assert_file_excludes("${project_cmake}"
+                     [=[if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")]=])
+
+set(unit_test_cmake "${SOURCE_ROOT}/src/test/unittests/CMakeLists.txt")
+assert_file_contains("${unit_test_cmake}"
+                     [=[set_source_files_properties(
+        server/ServerReconnectTests.cpp
+        PROPERTIES COMPILE_OPTIONS "/bigobj")]=])
 
 set(gui_cmake "${SOURCE_ROOT}/src/gui/CMakeLists.txt")
 assert_file_contains("${gui_cmake}"
