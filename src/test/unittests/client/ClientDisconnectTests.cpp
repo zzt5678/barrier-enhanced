@@ -2675,19 +2675,20 @@ TEST(ClientDisconnectTests, protocol18LeaveReleasesOnlyEpochOwnedPressedInput)
     EXPECT_EQ(1u, platform->leaveCount);
 }
 
-TEST(ClientDisconnectTests, protocolNegotiationFallsBackToPreviousStableMinor)
+TEST(ClientDisconnectTests, protocolNegotiationRequiresTransactionalInputVersion)
 {
     SInt16 negotiatedMinor = 0;
-    EXPECT_TRUE(Client::negotiateProtocolVersion(1, 6, negotiatedMinor));
-    EXPECT_EQ(6, negotiatedMinor);
-    EXPECT_TRUE(Client::negotiateProtocolVersion(1, 7, negotiatedMinor));
-    EXPECT_EQ(7, negotiatedMinor);
-    EXPECT_TRUE(Client::negotiateProtocolVersion(1, 9, negotiatedMinor));
-    EXPECT_EQ(9, negotiatedMinor);
-    EXPECT_TRUE(Client::negotiateProtocolVersion(1, 10, negotiatedMinor));
-    EXPECT_EQ(10, negotiatedMinor);
+    EXPECT_FALSE(Client::negotiateProtocolVersion(1, 6, negotiatedMinor));
+    EXPECT_FALSE(Client::negotiateProtocolVersion(1, 7, negotiatedMinor));
+    EXPECT_FALSE(Client::negotiateProtocolVersion(1, 9, negotiatedMinor));
+    EXPECT_FALSE(Client::negotiateProtocolVersion(1, 10, negotiatedMinor));
+    EXPECT_FALSE(Client::negotiateProtocolVersion(1, 11, negotiatedMinor));
     EXPECT_FALSE(Client::negotiateProtocolVersion(1, 5, negotiatedMinor));
     EXPECT_FALSE(Client::negotiateProtocolVersion(2, 0, negotiatedMinor));
+    EXPECT_TRUE(Client::negotiateProtocolVersion(1, 12, negotiatedMinor));
+    EXPECT_EQ(12, negotiatedMinor);
+    EXPECT_TRUE(Client::negotiateProtocolVersion(1, 13, negotiatedMinor));
+    EXPECT_EQ(12, negotiatedMinor);
 }
 
 TEST(ClientDisconnectTests, newestFileClipboardSupersedesActivePrefetchWithoutWaiting)

@@ -31,19 +31,17 @@ class IpcLogLineMessage;
 class IpcInputReadyQueryMessage;
 class IpcActivateNodeMessage;
 class IEventQueue;
+class IpcProxyTestAccess;
 
 class IpcServerProxy {
     friend class IpcClient;
+    friend class IpcProxyTestAccess;
 
 public:
     IpcServerProxy(barrier::IStream& stream, IEventQueue* events);
     virtual ~IpcServerProxy();
 
-#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
-public:
-#else
 private:
-#endif
     void                send(const IpcMessage& message);
 
     void                handleData(const Event&, void*);
@@ -55,11 +53,7 @@ private:
                             std::uint64_t activationNonce);
     void                disconnect();
 
-#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
-public:
-#else
 private:
-#endif
     barrier::IStream&    m_stream;
     IEventQueue*        m_events;
     std::vector<UInt8>  m_receiveBuffer;

@@ -117,6 +117,10 @@ public:
     static void            setValue(HKEY key, const TCHAR* name,
                             const std::string& value);
 
+    //! Set a UTF-8 string as a UTF-16 REG_SZ value
+    static void            setValueUtf8(HKEY key, const char* name,
+                            const std::string& value);
+
     //! Set a DWORD value in the registry
     static void            setValue(HKEY key, const TCHAR* name, DWORD value);
 
@@ -129,6 +133,9 @@ public:
 
     //! Read a string value from the registry
     static std::string    readValueString(HKEY, const TCHAR* name);
+
+    //! Read a UTF-16 REG_SZ value as strict UTF-8
+    static std::string    readValueStringUtf8(HKEY, const char* name);
 
     //! Read a DWORD value from the registry
     static DWORD        readValueInt(HKEY, const TCHAR* name);

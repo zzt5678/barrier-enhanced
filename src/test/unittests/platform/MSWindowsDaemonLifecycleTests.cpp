@@ -13,7 +13,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -39,6 +41,72 @@ TEST(MSWindowsDaemonLifecycleTests, deleteServiceUsesWin32SuccessPolarity)
 {
     EXPECT_TRUE(ArchDaemonWindowsPolicy::deleteServiceSucceeded(TRUE));
     EXPECT_FALSE(ArchDaemonWindowsPolicy::deleteServiceSucceeded(FALSE));
+}
+
+TEST(MSWindowsDaemonLifecycleTests, serviceTextConversionPreservesUnicode)
+{
+    const std::string utf8 =
+        u8"C:\\Users\\\u7528\u6237\\Weave\\weaved.exe \U0001f600";
+    std::wstring wide;
+
+    ASSERT_TRUE(ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+        utf8, false, wide));
+    EXPECT_EQ(
+        L"C:\\Users\\\u7528\u6237\\Weave\\weaved.exe \U0001f600",
+        wide);
+}
+
+TEST(MSWindowsDaemonLifecycleTests, serviceTextConversionFailsClosed)
+{
+    std::wstring wide = L"must be cleared";
+    EXPECT_FALSE(ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+        std::string("bad\xc0\xaf", 5u), false, wide));
+    EXPECT_TRUE(wide.empty());
+
+    wide = L"must be cleared";
+    EXPECT_FALSE(ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+        std::string("weaved.exe\0--hidden", 20u), false, wide));
+    EXPECT_TRUE(wide.empty());
+
+    EXPECT_FALSE(ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+        std::string(), false, wide));
+    EXPECT_TRUE(ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+        std::string(), true, wide));
+    EXPECT_TRUE(wide.empty());
+}
+
+TEST(MSWindowsDaemonLifecycleTests, serviceArgumentsPreserveUnicode)
+{
+    const WCHAR serviceName[] = L"Weave\u670d\u52a1";
+    const WCHAR screenName[] = L"\u663e\u793a\u5668\U0001f600";
+    const WCHAR empty[] = L"";
+    LPCWSTR wideArguments[] = { serviceName, screenName, empty };
+    std::vector<std::string> utf8Arguments;
+
+    ASSERT_TRUE(ArchDaemonWindowsPolicy::wideServiceArgumentsToUtf8(
+        3u, wideArguments, utf8Arguments));
+    ASSERT_EQ(3u, utf8Arguments.size());
+    EXPECT_EQ(u8"Weave\u670d\u52a1", utf8Arguments[0]);
+    EXPECT_EQ(u8"\u663e\u793a\u5668\U0001f600", utf8Arguments[1]);
+    EXPECT_TRUE(utf8Arguments[2].empty());
+}
+
+TEST(MSWindowsDaemonLifecycleTests, serviceArgumentsRejectInvalidBoundaries)
+{
+    const WCHAR serviceName[] = L"WeaveService";
+    const WCHAR malformed[] = { 0xd800, 0 };
+    LPCWSTR malformedArguments[] = { serviceName, malformed };
+    std::vector<std::string> utf8Arguments(1u, "must be cleared");
+
+    EXPECT_FALSE(ArchDaemonWindowsPolicy::wideServiceArgumentsToUtf8(
+        2u, malformedArguments, utf8Arguments));
+    EXPECT_TRUE(utf8Arguments.empty());
+    EXPECT_FALSE(ArchDaemonWindowsPolicy::wideServiceArgumentsToUtf8(
+        0u, nullptr, utf8Arguments));
+
+    LPCWSTR nullArguments[] = { serviceName, nullptr };
+    EXPECT_FALSE(ArchDaemonWindowsPolicy::wideServiceArgumentsToUtf8(
+        2u, nullArguments, utf8Arguments));
 }
 
 TEST(MSWindowsDaemonLifecycleTests, scopedHandlesCloseManagerAndServiceOnException)

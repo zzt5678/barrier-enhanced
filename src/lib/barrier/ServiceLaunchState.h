@@ -81,6 +81,7 @@ bool serviceLaunchCandidateMatchesCommandProfile(
     const std::string& digest);
 bool serviceLaunchInputCapabilityReady(bool secureDesktop,
                                        bool uiAccessEnabled);
+bool serviceInputDesktopRequiresUiAccess(const std::string& desktopName);
 bool serviceNodeInputReadinessReady(bool uiAccessRequired,
                                     bool backendReady,
                                     bool uiAccessQuerySucceeded,

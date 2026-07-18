@@ -16,6 +16,7 @@
  */
 
 #include "arch/win32/ArchInternetWindows.h"
+#include "common/ProductIdentity.h"
 #include "arch/win32/XArchWindows.h"
 #include "arch/Arch.h"
 #include "base/String.h"
@@ -143,7 +144,7 @@ std::string WinINetRequest::send()
 void WinINetRequest::openSession()
 {
     std::stringstream userAgent;
-    userAgent << "Barrier ";
+    userAgent << WEAVE_PRODUCT_NAME << " ";
     userAgent << kVersion;
 
     m_session = InternetOpen(

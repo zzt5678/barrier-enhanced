@@ -196,9 +196,9 @@ private:
     void                rememberDesktopName(const std::string& desktopName);
     bool                shouldRelaunchForDesktopChange(const std::string& oldDesktop,
                                                        const std::string& newDesktop);
-    BOOL doStartProcessAsUser(std::string& command, HANDLE userToken, LPSECURITY_ATTRIBUTES sa,
+    BOOL doStartProcessAsUser(const std::string& command, HANDLE userToken, LPSECURITY_ATTRIBUTES sa,
                               const std::string& desktop, PROCESS_INFORMATION& processInfo);
-    BOOL doStartProcessAsSelf(std::string& command, const std::string& desktop,
+    BOOL doStartProcessAsSelf(const std::string& command, const std::string& desktop,
                               PROCESS_INFORMATION& processInfo);
 
 private:

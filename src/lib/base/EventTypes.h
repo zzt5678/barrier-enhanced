@@ -37,7 +37,8 @@ private:
 Event::Type                                                            \
 type_##Events::name_()                                                    \
 {                                                                        \
-    return getEvents()->registerTypeOnce(m_##name_, __FUNCTION__);            \
+    return getEvents()->registerTypeOnce(                                 \
+        m_##name_, #type_ "Events::" #name_);                            \
 }
 
 class ClientEvents : public EventTypes {

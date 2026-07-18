@@ -8,10 +8,51 @@
  */
 
 #include "platform/MSWindowsWatchdog.h"
+#include "common/win32/encoding_utilities.h"
 
 #include "test/global/gtest.h"
 
 #include <algorithm>
+
+TEST(MSWindowsWatchdogLaunchTests, windowsLaunchEncodingPreservesUnicode)
+{
+    const std::string command =
+        u8"C:\\Users\\\u7528\u6237\\Weave\\weavec.exe --name "
+        u8"\u663e\u793a\u5668\U0001f600";
+
+    const std::vector<WCHAR> wide = utf8_to_win_char(command);
+
+    ASSERT_GT(wide.size(), 1u);
+    EXPECT_EQ(0, wide.back());
+    EXPECT_EQ(command, win_wchar_to_utf8(wide.data()));
+}
+
+TEST(MSWindowsWatchdogLaunchTests, windowsLaunchEncodingRejectsMalformedUtf8)
+{
+    const std::string malformed("bad\xc0\xaf", 5u);
+
+    const std::vector<WCHAR> wide = utf8_to_win_char(malformed);
+
+    ASSERT_EQ(1u, wide.size());
+    EXPECT_EQ(0, wide.front());
+}
+
+TEST(MSWindowsWatchdogLaunchTests, windowsLaunchEncodingRejectsEmbeddedNull)
+{
+    const std::string embeddedNull("weavec.exe\0--name hidden", 24u);
+
+    const std::vector<WCHAR> wide = utf8_to_win_char(embeddedNull);
+
+    ASSERT_EQ(1u, wide.size());
+    EXPECT_EQ(0, wide.front());
+}
+
+TEST(MSWindowsWatchdogLaunchTests, windowsLaunchEncodingRejectsUnpairedSurrogate)
+{
+    const WCHAR malformed[] = { 0xd800, 0 };
+
+    EXPECT_TRUE(win_wchar_to_utf8(malformed).empty());
+}
 
 TEST(MSWindowsWatchdogLaunchTests, readinessNonceFailsClosedWhenRandomSourceFails)
 {

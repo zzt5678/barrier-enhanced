@@ -226,7 +226,8 @@ TEST(EventTypesTests, streamInputFormatErrorRegistersAUniqueNamedType)
         streamEvents->inputFormatError()
     };
 
-    EXPECT_STREQ("inputFormatError", events.getTypeName(types[5]));
+    EXPECT_STREQ("IStreamEvents::inputFormatError",
+                 events.getTypeName(types[5]));
     for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
         EXPECT_GE(types[i], static_cast<Event::Type>(Event::kLast));
         for (size_t j = i + 1; j < sizeof(types) / sizeof(types[0]); ++j) {
@@ -235,6 +236,28 @@ TEST(EventTypesTests, streamInputFormatErrorRegistersAUniqueNamedType)
     }
 
     streamEvents->~IStreamEvents();
+}
+
+TEST(EventTypesTests, sameAccessorNameKeepsItsEventDomain)
+{
+    EventQueue events;
+    ClientEvents clientEvents;
+    IDataSocketEvents socketEvents;
+    clientEvents.setEvents(&events);
+    socketEvents.setEvents(&events);
+
+    const Event::Type clientConnected = clientEvents.connected();
+    const Event::Type socketConnected = socketEvents.connected();
+
+    EXPECT_NE(clientConnected, socketConnected);
+    EXPECT_STREQ("ClientEvents::connected",
+                 events.getTypeName(clientConnected));
+    EXPECT_STREQ("IDataSocketEvents::connected",
+                 events.getTypeName(socketConnected));
+    EXPECT_EQ(clientConnected,
+              events.getRegisteredType("ClientEvents::connected"));
+    EXPECT_EQ(socketConnected,
+              events.getRegisteredType("IDataSocketEvents::connected"));
 }
 
 TEST(EventQueueTests, destructorDeletesAdoptedHandlers)

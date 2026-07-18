@@ -29,6 +29,20 @@ TEST(MSWindowsDesksTests, secondaryDesktopDoesNotRequireCaptureHooks)
         false, false, true, true, false));
 }
 
+TEST(MSWindowsDesksTests, secondaryDesktopRequiresSuccessfulInjectionProbe)
+{
+    EXPECT_FALSE(MSWindowsDesks::isDesktopReadyForTest(
+        false, false, true, true, false, true, false));
+    EXPECT_TRUE(MSWindowsDesks::isDesktopReadyForTest(
+        false, false, true, true, false, true, true));
+}
+
+TEST(MSWindowsDesksTests, primaryDesktopUsesHookInsteadOfInjectionProbe)
+{
+    EXPECT_TRUE(MSWindowsDesks::isDesktopReadyForTest(
+        true, false, true, true, true, true, false));
+}
+
 TEST(MSWindowsDesksTests, primaryDesktopRequiresInstalledHooks)
 {
     EXPECT_FALSE(MSWindowsDesks::isDesktopReadyForTest(

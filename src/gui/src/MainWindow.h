@@ -26,7 +26,6 @@
 #include <QSystemTrayIcon>
 #include <QSettings>
 #include <QProcess>
-#include <QThread>
 #include <QElapsedTimer>
 #include <QTimer>
 
@@ -52,15 +51,12 @@ class QCheckBox;
 class QRadioButton;
 class QTemporaryFile;
 class QMessageBox;
-class QAbstractButton;
 class QResizeEvent;
 
 class LogDialog;
 class QBarrierApplication;
 class SetupWizard;
 class ZeroconfService;
-class DataDownloader;
-class CommandProcess;
 class SslCertificate;
 class ActionBus;
 class WorkflowStore;
@@ -137,7 +133,6 @@ public slots:
         void stopBarrier();
         void logOutput();
         void logError();
-        void bonjourInstallFinished();
         void showLogWindow();
         void showWorkflowHub();
         void showCommandPalette();
@@ -184,7 +179,7 @@ public slots:
         bool isServiceRunning();
 #endif
         bool isBonjourRunning();
-        void downloadBonjour();
+        void openBonjourInstallationGuide();
         void promptAutoConfig();
         void checkConnected(const QString& line);
         void checkFingerprint(const QString& line);
@@ -216,12 +211,8 @@ public slots:
         QMenu* m_pMenuBarrier;
         QMenu* m_pMenuHelp;
         ZeroconfService* m_pZeroconfService;
-        DataDownloader* m_pDataDownloader;
-        QMessageBox* m_DownloadMessageBox;
-        QAbstractButton* m_pCancelButton;
         QMutex m_UpdateZeroconfMutex;
         bool m_SuppressAutoConfigWarning;
-        CommandProcess* m_BonjourInstall;
         bool m_SuppressEmptyServerWarning;
         qRuningState m_ExpectedRunningState;
         QMutex m_StopDesktopMutex;
@@ -252,7 +243,6 @@ private slots:
     void on_m_pCheckBoxAutoConfig_toggled(bool checked);
     void on_m_pComboServerList_currentIndexChanged(QString );
     void on_m_pButtonReload_clicked();
-    void installBonjour();
     void on_m_pCheckBoxEnableDragDrop_clicked(bool checked);
     void on_m_pCheckBoxGameMode_clicked(bool checked);
     void handleServiceStopAcknowledged(quint64 requestId,

@@ -137,6 +137,27 @@ assert_file_contains("${SHIPPED_README}"
 assert_file_excludes("${SHIPPED_README}" "https://github.com/debauchee/barrier")
 assert_legacy_branding_whitelisted("${SHIPPED_README}")
 
+set(SETTINGS_DIALOG "${SOURCE_ROOT}/src/gui/src/SettingsDialog.cpp")
+assert_file_contains("${SETTINGS_DIALOG}" "WEAVE_PROJECT_URL")
+assert_file_excludes("${SETTINGS_DIALOG}" "github.com/debauchee/barrier")
+
+set(SETUP_WIZARD "${SOURCE_ROOT}/src/gui/src/SetupWizard.cpp")
+assert_file_contains("${SETUP_WIZARD}" "WEAVE_PROJECT_URL")
+assert_file_excludes("${SETUP_WIZARD}" "github.com/debauchee/barrier")
+
+foreach(internet_source
+        "${SOURCE_ROOT}/src/lib/arch/unix/ArchInternetUnix.cpp"
+        "${SOURCE_ROOT}/src/lib/arch/win32/ArchInternetWindows.cpp")
+    assert_file_contains("${internet_source}"
+                         "userAgent << WEAVE_PRODUCT_NAME << \" \"")
+    assert_file_excludes("${internet_source}" "userAgent << \"Barrier \"")
+endforeach()
+
+if (EXISTS "${SOURCE_ROOT}/src/gui/res/mac/Info.plist")
+    message(FATAL_ERROR
+            "obsolete Barrier macOS plist must not coexist with the Weave bundle plist")
+endif()
+
 set(DOXYGEN_CONFIG "${SOURCE_ROOT}/res/doxygen.cfg.in")
 assert_file_contains("${DOXYGEN_CONFIG}" "PROJECT_NAME           = \"Weave\"")
 assert_legacy_branding_whitelisted("${DOXYGEN_CONFIG}")

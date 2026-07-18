@@ -112,12 +112,6 @@ foreach(ssl_dll IN ITEMS libssl-3-x64.dll libcrypto-3-x64.dll)
 endforeach()
 
 file(REMOVE "${OUTPUT_DIR}/zlib.dll" "${OUTPUT_DIR}/zlib1.dll")
-if (EXISTS "${QT_BIN_DIR}/zlib1.dll")
-    file(COPY "${QT_BIN_DIR}/zlib1.dll" DESTINATION "${OUTPUT_DIR}")
-else()
-    message(FATAL_ERROR
-            "Required Qt zlib runtime not found: ${QT_BIN_DIR}/zlib1.dll")
-endif()
 
 foreach(legacy_dll IN ITEMS libssl-1_1-x64.dll libcrypto-1_1-x64.dll)
     if (EXISTS "${OUTPUT_DIR}/${legacy_dll}")
@@ -158,7 +152,6 @@ set(release_runtime_files
     libGLESv2.dll
     libcrypto-3-x64.dll
     libssl-3-x64.dll
-    zlib1.dll
     bearer/qgenericbearer.dll
     iconengines/qsvgicon.dll
     imageformats/qgif.dll

@@ -12,10 +12,18 @@
 #include <array>
 #include <cstdint>
 #include <cctype>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <unordered_set>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
 
 namespace {
 
@@ -25,6 +33,99 @@ enum class SessionPolicy {
     RequireAssigned,
     AllowUnassignedLocalSource
 };
+
+#if defined(_WIN32)
+
+std::wstring normalizeWindowsPathText(std::wstring path)
+{
+    static const std::wstring kExtendedUncPrefix = L"\\\\?\\UNC\\";
+    static const std::wstring kExtendedPrefix = L"\\\\?\\";
+    if (path.compare(0, kExtendedUncPrefix.size(), kExtendedUncPrefix) == 0) {
+        path = L"\\\\" + path.substr(kExtendedUncPrefix.size());
+    }
+    else if (path.compare(0, kExtendedPrefix.size(), kExtendedPrefix) == 0) {
+        path.erase(0, kExtendedPrefix.size());
+    }
+
+    for (wchar_t& character : path) {
+        if (character == L'/') {
+            character = L'\\';
+        }
+    }
+
+    while (path.size() > 3 && path.back() == L'\\') {
+        path.pop_back();
+    }
+    return path;
+}
+
+int compareWindowsPaths(const std::wstring& lhs, const std::wstring& rhs)
+{
+    const std::size_t maxLength =
+        static_cast<std::size_t>((std::numeric_limits<int>::max)());
+    if (lhs.size() <= maxLength && rhs.size() <= maxLength) {
+        const int result = CompareStringOrdinal(
+            lhs.c_str(), static_cast<int>(lhs.size()),
+            rhs.c_str(), static_cast<int>(rhs.size()), TRUE);
+        if (result != 0) {
+            return result;
+        }
+    }
+
+    // Invalid or oversized input must not be considered equal through a
+    // failed Win32 comparison. Keep a deterministic, fail-closed ordering.
+    if (lhs == rhs) {
+        return CSTR_EQUAL;
+    }
+    return lhs < rhs ? CSTR_LESS_THAN : CSTR_GREATER_THAN;
+}
+
+bool windowsPathsEqual(const std::wstring& lhs, const std::wstring& rhs)
+{
+    return compareWindowsPaths(lhs, rhs) == CSTR_EQUAL;
+}
+
+bool makeWindowsPathKey(const barrier::fs::path& source, std::wstring& key)
+{
+    barrier::fs::path normalized = source.lexically_normal();
+    normalized.make_preferred();
+    while (normalized != normalized.root_path() && !normalized.has_filename()) {
+        const barrier::fs::path parent = normalized.parent_path();
+        if (parent == normalized) {
+            break;
+        }
+        normalized = parent;
+    }
+
+    key = normalized.native();
+    if (key.empty() || key.find(L'\0') != std::wstring::npos) {
+        return false;
+    }
+    key = normalizeWindowsPathText(std::move(key));
+    return !key.empty();
+}
+
+bool ordinalPathMultisetsEqual(std::vector<std::wstring> lhs,
+                               std::vector<std::wstring> rhs)
+{
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+
+    const auto less = [](const std::wstring& left, const std::wstring& right) {
+        return compareWindowsPaths(left, right) == CSTR_LESS_THAN;
+    };
+    std::sort(lhs.begin(), lhs.end(), less);
+    std::sort(rhs.begin(), rhs.end(), less);
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (!windowsPathsEqual(lhs[i], rhs[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#endif
 
 void writeUInt32(std::string& output, UInt32 value)
 {
@@ -683,14 +784,31 @@ bool pathsMatch(const Data& data, const std::vector<std::string>& paths)
         return false;
     }
 
-    const auto normalizedKey = [](const barrier::fs::path& path) {
-        std::string key = path.lexically_normal().generic_u8string();
 #if defined(_WIN32)
-        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char value) {
-            return static_cast<char>(std::tolower(value));
-        });
-#endif
-        return key;
+    try {
+        std::vector<std::wstring> actual;
+        std::vector<std::wstring> expected;
+        actual.reserve(data.paths.size());
+        expected.reserve(paths.size());
+        for (std::size_t i = 0; i < data.paths.size(); ++i) {
+            std::wstring actualPath;
+            std::wstring expectedPath;
+            if (!makeWindowsPathKey(data.paths[i], actualPath) ||
+                !makeWindowsPathKey(barrier::fs::u8path(paths[i]), expectedPath)) {
+                return false;
+            }
+            actual.push_back(std::move(actualPath));
+            expected.push_back(std::move(expectedPath));
+        }
+        return ordinalPathMultisetsEqual(
+            std::move(actual), std::move(expected));
+    }
+    catch (const std::exception&) {
+        return false;
+    }
+#else
+    const auto normalizedKey = [](const barrier::fs::path& path) {
+        return path.lexically_normal().generic_u8string();
     };
 
     try {
@@ -709,6 +827,7 @@ bool pathsMatch(const Data& data, const std::vector<std::string>& paths)
     catch (const std::exception&) {
         return false;
     }
+#endif
 }
 
 bool allPathsLookLikeImages(const Data& data)

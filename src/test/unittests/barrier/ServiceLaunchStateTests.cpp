@@ -275,10 +275,11 @@ TEST(ServiceLaunchStateTests, durableCommitPrecedesOwnershipPublication)
                   ServiceLaunchCommitResult::kCommitted, false));
 }
 
-TEST(ServiceLaunchStateTests, secureDesktopRequiresUiAccessCapability)
+TEST(ServiceLaunchStateTests, serviceLaunchRequiresUiAccessOnEveryDesktop)
 {
-    EXPECT_TRUE(serviceLaunchInputCapabilityReady(false, false));
+    EXPECT_FALSE(serviceLaunchInputCapabilityReady(false, false));
     EXPECT_FALSE(serviceLaunchInputCapabilityReady(true, false));
+    EXPECT_TRUE(serviceLaunchInputCapabilityReady(false, true));
     EXPECT_TRUE(serviceLaunchInputCapabilityReady(true, true));
 }
 
@@ -288,6 +289,32 @@ TEST(ServiceLaunchStateTests, windowsNodeReadinessRequiresObservedUiAccess)
     EXPECT_FALSE(serviceNodeInputReadinessReady(true, true, false, true));
     EXPECT_FALSE(serviceNodeInputReadinessReady(true, true, true, false));
     EXPECT_TRUE(serviceNodeInputReadinessReady(true, true, true, true));
+}
+
+TEST(ServiceLaunchStateTests, defaultDesktopRequiresUiAccessForElevatedWindows)
+{
+    EXPECT_TRUE(serviceInputDesktopRequiresUiAccess("Default"));
+    EXPECT_TRUE(serviceInputDesktopRequiresUiAccess("default"));
+    EXPECT_TRUE(serviceInputDesktopRequiresUiAccess("DEFAULT"));
+    EXPECT_FALSE(serviceNodeInputReadinessReady(
+        serviceInputDesktopRequiresUiAccess("Default"),
+        true, false, false));
+    EXPECT_TRUE(serviceNodeInputReadinessReady(
+        serviceInputDesktopRequiresUiAccess("Default"),
+        true, true, true));
+}
+
+TEST(ServiceLaunchStateTests, secureOrUnknownDesktopRequiresUiAccess)
+{
+    EXPECT_TRUE(serviceInputDesktopRequiresUiAccess("Winlogon"));
+    EXPECT_TRUE(serviceInputDesktopRequiresUiAccess("Screen-saver"));
+    EXPECT_TRUE(serviceInputDesktopRequiresUiAccess(""));
+    EXPECT_FALSE(serviceNodeInputReadinessReady(
+        serviceInputDesktopRequiresUiAccess("Winlogon"),
+        true, true, false));
+    EXPECT_TRUE(serviceNodeInputReadinessReady(
+        serviceInputDesktopRequiresUiAccess("Winlogon"),
+        true, true, true));
 }
 
 TEST(ServiceLaunchStateTests, nonWindowsNodeReadinessOnlyRequiresBackend)

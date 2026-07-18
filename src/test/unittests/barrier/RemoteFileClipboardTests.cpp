@@ -6,9 +6,18 @@
 
 #include "io/filesystem.h"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <string>
+#include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
 
 namespace {
 
@@ -483,6 +492,127 @@ TEST(RemoteFileClipboardTests, pathsMatchUsesNormalizedUnorderedMultiset)
     EXPECT_FALSE(RemoteFileClipboard::pathsMatch(
         payload, {"/tmp/first.txt", "/tmp/first.txt"}));
 }
+
+TEST(RemoteFileClipboardTests, pathsMatchPreservesDuplicateMultiplicityWhenReordered)
+{
+    RemoteFileClipboard::Data payload;
+    payload.paths.push_back(barrier::fs::u8path("/tmp/repeated.txt"));
+    payload.paths.push_back(barrier::fs::u8path("/tmp/unique.txt"));
+    payload.paths.push_back(barrier::fs::u8path("/tmp/repeated.txt"));
+
+    EXPECT_TRUE(RemoteFileClipboard::pathsMatch(
+        payload,
+        {"/tmp/repeated.txt", "/tmp/repeated.txt", "/tmp/unique.txt"}));
+    EXPECT_FALSE(RemoteFileClipboard::pathsMatch(
+        payload,
+        {"/tmp/repeated.txt", "/tmp/unique.txt", "/tmp/unique.txt"}));
+}
+
+TEST(RemoteFileClipboardTests, pathsMatchHandlesMaximumReorderedSelection)
+{
+    RemoteFileClipboard::Data payload;
+    std::vector<std::string> expected;
+    payload.paths.reserve(RemoteFileClipboard::kMaxClipboardPathCount);
+    expected.reserve(RemoteFileClipboard::kMaxClipboardPathCount);
+    for (std::size_t i = 0;
+         i < RemoteFileClipboard::kMaxClipboardPathCount; ++i) {
+        const std::string path = "/tmp/weave-selection/file-" +
+            std::to_string(i) + ".txt";
+        payload.paths.push_back(barrier::fs::u8path(path));
+        expected.push_back(path);
+    }
+    std::reverse(expected.begin(), expected.end());
+
+    EXPECT_TRUE(RemoteFileClipboard::pathsMatch(payload, expected));
+}
+
+#if defined(_WIN32)
+
+TEST(RemoteFileClipboardTests, pathsMatchUsesUnicodeOrdinalCaseAndEitherSeparatorOnWindows)
+{
+    RemoteFileClipboard::Data payload;
+    payload.paths.push_back(barrier::fs::u8path(
+        "C:\\Weave-Clipboard\\\xC3\x84" "PFEL\\File.txt"));
+
+    EXPECT_TRUE(RemoteFileClipboard::pathsMatch(
+        payload, {"c:/weave-clipboard/\xC3\xA4" "pfel/file.TXT"}));
+}
+
+TEST(RemoteFileClipboardTests, pathsMatchDoesNotFoldDistinctUnicodePathsOnWindows)
+{
+    RemoteFileClipboard::Data payload;
+    payload.paths.push_back(barrier::fs::u8path(
+        "C:\\Weave-Clipboard\\\xC3\x84" "PFEL\\File.txt"));
+
+    EXPECT_FALSE(RemoteFileClipboard::pathsMatch(
+        payload, {"c:/weave-clipboard/apfel/file.txt"}));
+}
+
+TEST(RemoteFileClipboardTests, pathsMatchFailsClosedForExistingShortAndLongWindowsAliases)
+{
+    const auto unique = std::chrono::high_resolution_clock::now()
+                            .time_since_epoch().count();
+    const barrier::fs::path root = barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-clipboard-long-path-test-" +
+                            std::to_string(unique));
+    const barrier::fs::path longDirectory =
+        root / barrier::fs::u8path("directory-name-that-requires-a-short-alias");
+    const barrier::fs::path longPath =
+        longDirectory / barrier::fs::u8path("filename-that-requires-a-short-alias.txt");
+    barrier::fs::create_directories(longDirectory);
+    {
+        std::ofstream file(longPath, std::ios::out | std::ios::binary);
+        if (!file.is_open()) {
+            barrier::fs::remove_all(root);
+            FAIL() << "test file could not be created";
+        }
+        file << "weave";
+    }
+
+    const DWORD required = GetShortPathNameW(longPath.c_str(), nullptr, 0);
+    if (required == 0) {
+        barrier::fs::remove_all(root);
+        GTEST_SKIP() << "8.3 short names are unavailable on this volume";
+    }
+
+    std::vector<wchar_t> shortPathBuffer(required, L'\0');
+    const DWORD written = GetShortPathNameW(
+        longPath.c_str(), shortPathBuffer.data(),
+        static_cast<DWORD>(shortPathBuffer.size()));
+    if (written == 0 || written >= shortPathBuffer.size()) {
+        barrier::fs::remove_all(root);
+        GTEST_SKIP() << "8.3 short path could not be read";
+    }
+
+    const barrier::fs::path shortPath(
+        std::wstring(shortPathBuffer.data(), written));
+    if (shortPath.wstring().find(L'~') == std::wstring::npos) {
+        barrier::fs::remove_all(root);
+        GTEST_SKIP() << "volume returned no distinct 8.3 alias";
+    }
+
+    RemoteFileClipboard::Data payload;
+    payload.paths.push_back(longPath);
+    // Core path comparison is deliberately filesystem-free. A real alias is
+    // still rejected unless both clipboard representations are lexical peers.
+    EXPECT_FALSE(RemoteFileClipboard::pathsMatch(
+        payload, {shortPath.u8string()}));
+
+    barrier::fs::remove_all(root);
+}
+
+TEST(RemoteFileClipboardTests, pathsMatchFailsClosedWhenWindowsAliasesCannotBeResolved)
+{
+    RemoteFileClipboard::Data payload;
+    payload.paths.push_back(barrier::fs::u8path(
+        R"(C:\weave-path-that-does-not-exist\long-filename.txt)"));
+
+    EXPECT_FALSE(RemoteFileClipboard::pathsMatch(
+        payload,
+        {R"(C:\weave-path-that-does-not-exist\LONGFI~1.TXT)"}));
+}
+
+#endif
 
 TEST(RemoteFileClipboardTests, failedNewSessionExtractionPreservesPreviousSessionFiles)
 {

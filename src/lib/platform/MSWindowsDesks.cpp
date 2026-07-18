@@ -618,10 +618,13 @@ bool
 MSWindowsDesks::isDesktopReadyForTest(bool isPrimary, bool noHooks,
                                       bool threadAttached, bool windowReady,
                                       bool hookInstalled,
-                                      bool commandResponsive)
+                                      bool commandResponsive,
+                                      bool injectionProbeSucceeded)
 {
     return threadAttached && windowReady && commandResponsive &&
-        (!isPrimary || noHooks || hookInstalled);
+        (isPrimary
+            ? (noHooks || hookInstalled)
+            : injectionProbeSucceeded);
 }
 
 bool
@@ -1600,6 +1603,7 @@ void MSWindowsDesks::desk_thread(Desk* desk)
         case BARRIER_MSG_SWITCH:
         {
             bool hookInstalled = false;
+            bool injectionProbeSucceeded = m_isPrimary;
             if (m_isPrimary && !m_noHooks) {
                 MSWindowsHook::uninstall();
                 if (m_screensaverNotify) {
@@ -1617,9 +1621,28 @@ void MSWindowsDesks::desk_thread(Desk* desk)
                 if (desk->m_window)
                     EnableWindow(desk->m_window, FALSE);
             }
+            else if (!m_isPrimary) {
+                // Exercise the same Win32 injection API used for remote
+                // pointer motion without changing the cursor position. This
+                // is a runtime capability check for the current desktop, not
+                // proof that a signed build can cross every future UAC prompt.
+                SetLastError(ERROR_SUCCESS);
+                injectionProbeSucceeded = sendMouseInput(
+                    0, 0, MOUSEEVENTF_MOVE, 0);
+                if (!injectionProbeSucceeded) {
+                    commandSucceeded = false;
+                    commandError = GetLastError();
+                    LOG((CLOG_WARN
+                        "zero-motion SendInput readiness probe failed on desktop %s error=%lu",
+                        desk->m_name.c_str(),
+                        static_cast<unsigned long>(commandError)));
+                }
+            }
             {
                 Lock lock(&m_mutex);
                 desk->m_hookInstalled = hookInstalled;
+                desk->m_injectionProbeSucceeded =
+                    injectionProbeSucceeded;
             }
             break;
         }
@@ -1799,6 +1822,7 @@ void MSWindowsDesks::desk_thread(Desk* desk)
     {
         Lock lock(&m_mutex);
         desk->m_hookInstalled = false;
+        desk->m_injectionProbeSucceeded = false;
         desk->m_windowReady = false;
         desk->m_threadAttached = false;
         desk->m_commandResponsive = false;
@@ -1835,6 +1859,7 @@ MSWindowsDesks::Desk* MSWindowsDesks::addDesk(const std::string& name, HDESK hde
     desk->m_threadAttached = false;
     desk->m_windowReady = false;
     desk->m_hookInstalled = false;
+    desk->m_injectionProbeSucceeded = false;
     desk->m_startupComplete = false;
     desk->m_startupDeadline =
         static_cast<std::uint64_t>(GetTickCount64() + kDeskStartupDeadline);
@@ -2071,6 +2096,7 @@ MSWindowsDesks::checkDesk()
                 // A cached desktop is not ready for a new activation until
                 // its switch command has reinstalled the active hook state.
                 desk->m_commandResponsive = false;
+                desk->m_injectionProbeSucceeded = false;
                 generation = ++m_inputDesktopGeneration;
             }
         }
@@ -2098,19 +2124,22 @@ MSWindowsDesks::checkDesk()
         const DeskReadinessSnapshot readiness = getDeskReadiness(desk);
         if (readiness.ready) {
             LOG((CLOG_INFO
-                "Windows input desktop generation=%llu name=%s attached=yes window=yes hook=%s ready=yes",
+                "Windows input desktop generation=%llu name=%s attached=yes window=yes hook=%s injectionProbe=%s ready=yes",
                 static_cast<unsigned long long>(generation),
                 name.empty() ? "<unavailable>" : name.c_str(),
-                (m_isPrimary && !m_noHooks) ? "yes" : "not-required"));
+                (m_isPrimary && !m_noHooks) ? "yes" : "not-required",
+                m_isPrimary ? "not-required" : "yes"));
         }
         else {
             LOG((CLOG_WARN
-                "Windows input desktop generation=%llu name=%s attached=%s window=%s hook=%s responsive=%s ready=no",
+                "Windows input desktop generation=%llu name=%s attached=%s window=%s hook=%s injectionProbe=%s responsive=%s ready=no",
                 static_cast<unsigned long long>(generation),
                 name.empty() ? "<unavailable>" : name.c_str(),
                 readiness.threadAttached ? "yes" : "no",
                 readiness.windowReady ? "yes" : "no",
                 readiness.hookInstalled ? "yes" : "no",
+                m_isPrimary ? "not-required" :
+                    (readiness.injectionProbeSucceeded ? "yes" : "no"),
                 readiness.commandResponsive ? "yes" : "no"));
         }
 
@@ -2161,7 +2190,8 @@ MSWindowsDesks::isDeskReadyLocked(const Desk* desk) const
     return desk != NULL && isDesktopReadyForTest(
         m_isPrimary, m_noHooks, desk->m_threadAttached,
         desk->m_windowReady, desk->m_hookInstalled,
-        desk->m_commandResponsive);
+        desk->m_commandResponsive,
+        desk->m_injectionProbeSucceeded);
 }
 
 MSWindowsDesks::DeskReadinessSnapshot
@@ -2173,6 +2203,8 @@ MSWindowsDesks::getDeskReadiness(const Desk* desk) const
         snapshot.threadAttached = desk->m_threadAttached;
         snapshot.windowReady = desk->m_windowReady;
         snapshot.hookInstalled = desk->m_hookInstalled;
+        snapshot.injectionProbeSucceeded =
+            desk->m_injectionProbeSucceeded;
         snapshot.commandResponsive = desk->m_commandResponsive;
         snapshot.ready = isDeskReadyLocked(desk);
     }

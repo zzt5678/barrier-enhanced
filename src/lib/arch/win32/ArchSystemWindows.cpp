@@ -121,7 +121,7 @@ ArchSystemWindows::setting(const std::string& valueName) const
         return "";
     ScopedRegistryKey registryKey(key);
 
-    return ArchMiscWindows::readValueString(
+    return ArchMiscWindows::readValueStringUtf8(
         registryKey.get(), valueName.c_str());
 }
 
@@ -132,8 +132,8 @@ ArchSystemWindows::setting(const std::string& valueName, const std::string& valu
     if (key == NULL)
         throw XArch(std::string("could not access registry key: ") + valueName);
     ScopedRegistryKey registryKey(key);
-    ArchMiscWindows::setValue(
-        registryKey.get(), valueName.c_str(), valueString.c_str());
+    ArchMiscWindows::setValueUtf8(
+        registryKey.get(), valueName.c_str(), valueString);
 }
 
 bool

@@ -257,6 +257,22 @@ TEST(IpcCommandValidatorTests, appendsOnlyTrustedAbsoluteProfileDirectory)
         augmented, &reason));
 }
 
+TEST(IpcCommandValidatorTests, preservesUtf8TrustedProfileDirectory)
+{
+    const std::string profileDirectory =
+        u8"C:\\Users\\\u7528\u6237 \u540d\\Weave\\LaunchProfiles\\v1";
+    std::string augmented;
+    std::string reason;
+
+    ASSERT_TRUE(IpcCommandValidator::appendTrustedProfileDirectory(
+        "weavec --ipc server:24800", profileDirectory,
+        augmented, &reason)) << reason;
+    EXPECT_EQ(
+        std::string("weavec --ipc server:24800 --profile-dir \"") +
+            profileDirectory + "\"",
+        augmented);
+}
+
 TEST(IpcCommandValidatorTests, refusesDuplicateTrustedProfileDirectory)
 {
     std::string augmented;

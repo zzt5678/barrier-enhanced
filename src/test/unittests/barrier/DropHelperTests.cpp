@@ -47,6 +47,23 @@ bool hasUnpackStagingDirs(const barrier::fs::path& root)
     return false;
 }
 
+barrier::fs::path withWindowsExtendedLengthPrefix(
+    const barrier::fs::path& path)
+{
+#if defined(_WIN32)
+    const std::wstring native = barrier::fs::absolute(path).native();
+    if (native.compare(0, 4, L"\\\\?\\") == 0) {
+        return barrier::fs::path(native);
+    }
+    if (native.compare(0, 2, L"\\\\") == 0) {
+        return barrier::fs::path(L"\\\\?\\UNC\\" + native.substr(2));
+    }
+    return barrier::fs::path(L"\\\\?\\" + native);
+#else
+    return path;
+#endif
+}
+
 } // namespace
 
 TEST(DropHelperTests, writeToDir_clearsTransferStateWhenDestinationIsEmpty)
@@ -292,25 +309,34 @@ TEST(DropHelperTests, writeToDirFromFile_extractsPackageForDirectoryDrop)
 TEST(DropHelperTests, writeToDirFromFile_keepsPublishedRootsWhenLaterRootFails)
 {
     const barrier::fs::path tempRoot =
-        barrier::fs::temp_directory_path() /
-        barrier::fs::u8path("weave-drop-helper-partial-bundle-test");
+        withWindowsExtendedLengthPrefix(
+            barrier::fs::temp_directory_path() /
+            barrier::fs::u8path("weave-drop-helper-partial-bundle-test"));
     barrier::fs::remove_all(tempRoot);
     barrier::fs::create_directories(tempRoot / "source");
     barrier::fs::create_directories(tempRoot / "drop");
 
     const std::string longName(255, 'z');
     {
-        std::ofstream first(
-            (tempRoot / "source" / "a-success.txt").u8string().c_str(),
+        std::ofstream first;
+        barrier::open_utf8_path(
+            first, tempRoot / "source" / "a-success.txt",
             std::ios::out | std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(first.is_open());
         first << "published";
-        std::ofstream blocked(
-            (tempRoot / "source" / barrier::fs::u8path(longName)).u8string().c_str(),
+        std::ofstream blocked;
+        barrier::open_utf8_path(
+            blocked,
+            tempRoot / "source" / barrier::fs::u8path(longName),
             std::ios::out | std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(blocked.is_open());
         blocked << "incoming";
-        std::ofstream existing(
-            (tempRoot / "drop" / barrier::fs::u8path(longName)).u8string().c_str(),
+        std::ofstream existing;
+        barrier::open_utf8_path(
+            existing,
+            tempRoot / "drop" / barrier::fs::u8path(longName),
             std::ios::out | std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(existing.is_open());
         existing << "existing";
     }
 

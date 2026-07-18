@@ -53,11 +53,13 @@ struct PlatformInputCapability {
     bool uiAccessEnabled = false;
 };
 
-PlatformInputCapability platformInputCapability()
+PlatformInputCapability platformInputCapability(
+    const std::string& desktopName)
 {
     PlatformInputCapability capability;
 #if SYSAPI_WIN32
-    capability.uiAccessRequired = true;
+    capability.uiAccessRequired =
+        serviceInputDesktopRequiresUiAccess(desktopName);
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
         return capability;
@@ -344,7 +346,8 @@ App::sendIpcInputReadiness(std::uint64_t queryNonce)
     }
 
     const bool backendReady = inputReady;
-    const PlatformInputCapability capability = platformInputCapability();
+    const PlatformInputCapability capability =
+        platformInputCapability(desktopName);
     inputReady = serviceNodeInputReadinessReady(
         capability.uiAccessRequired, backendReady,
         capability.querySucceeded, capability.uiAccessEnabled);

@@ -38,6 +38,7 @@
 #include "base/log_outputters.h"
 #include "base/Log.h"
 #include "common/ProductIdentity.h"
+#include "common/win32/encoding_utilities.h"
 
 #include "arch/win32/ArchMiscWindows.h"
 #include "arch/win32/XArchWindows.h"
@@ -54,7 +55,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cctype>
 #include <condition_variable>
 #include <limits>
 #include <memory>
@@ -224,28 +224,10 @@ bool acquireCurrentCommandOriginToken(const CommandOrigin& origin,
     return true;
 }
 
-bool narrowProfilePath(const std::wstring& path, std::string& narrow)
+bool encodeProfilePathUtf8(const std::wstring& path, std::string& utf8)
 {
-    if (path.empty()) {
-        return false;
-    }
-    BOOL usedDefault = FALSE;
-    const int required = WideCharToMultiByte(
-        CP_ACP, WC_NO_BEST_FIT_CHARS, path.c_str(), -1,
-        nullptr, 0, nullptr, &usedDefault);
-    if (required <= 1 || usedDefault) {
-        return false;
-    }
-    std::vector<char> buffer(static_cast<std::size_t>(required), '\0');
-    usedDefault = FALSE;
-    if (WideCharToMultiByte(
-            CP_ACP, WC_NO_BEST_FIT_CHARS, path.c_str(), -1,
-            buffer.data(), required, nullptr, &usedDefault) != required ||
-        usedDefault) {
-        return false;
-    }
-    narrow.assign(buffer.data(), static_cast<std::size_t>(required - 1));
-    return true;
+    utf8 = path.empty() ? std::string() : win_wchar_to_utf8(path.c_str());
+    return !utf8.empty();
 }
 
 ServiceLaunchRole launchRole(const std::string& command)
@@ -262,7 +244,7 @@ bool makeWatchdogLaunchProfile(const ServiceLaunchProfileResult& result,
     std::string profileDirectory;
     if (!result.success() || sessionId == 0 || result.ownerSid.empty() ||
         result.generation.empty() || result.digest.empty() ||
-        !narrowProfilePath(result.profilePath, profileDirectory)) {
+        !encodeProfilePathUtf8(result.profilePath, profileDirectory)) {
         reason = result.detail.empty()
             ? "service launch profile metadata is incomplete"
             : result.detail;
@@ -303,46 +285,67 @@ readElevateModeSetting()
         ARCH->setting("Elevate"));
 }
 
-static std::string
-normalizedWindowsPath(std::string path)
+static bool
+normalizedWindowsPath(const std::string& path, std::wstring& normalized)
 {
-    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char ch) {
-        if (ch == '/') {
-            return '\\';
-        }
-        return static_cast<char>(std::tolower(ch));
-    });
-    while (path.size() > 3 && path.back() == '\\') {
-        path.pop_back();
+    const std::vector<WCHAR> widePath = utf8_to_win_char(path);
+    if (widePath.size() <= 1u) {
+        normalized.clear();
+        return false;
     }
-    return path;
-}
-
-static std::string
-environmentPath(const char* name)
-{
-    const DWORD required = GetEnvironmentVariableA(name, nullptr, 0);
-    if (required == 0) {
-        return std::string();
+    normalized.assign(widePath.data());
+    std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+    while (normalized.size() > 3u && normalized.back() == L'\\') {
+        normalized.pop_back();
     }
-
-    std::vector<char> buffer(required);
-    const DWORD written = GetEnvironmentVariableA(name, buffer.data(), required);
-    if (written == 0 || written >= required) {
-        return std::string();
-    }
-    return std::string(buffer.data(), written);
+    return true;
 }
 
 static bool
 isBelowDirectory(const std::string& path, const std::string& directory)
 {
-    const std::string normalizedPath = normalizedWindowsPath(path);
-    const std::string normalizedDirectory = normalizedWindowsPath(directory);
-    return !normalizedDirectory.empty() &&
-           normalizedPath.size() > normalizedDirectory.size() &&
-           normalizedPath.compare(0, normalizedDirectory.size(), normalizedDirectory) == 0 &&
-           normalizedPath[normalizedDirectory.size()] == '\\';
+    std::wstring normalizedPath;
+    std::wstring normalizedDirectory;
+    if (!normalizedWindowsPath(path, normalizedPath) ||
+        !normalizedWindowsPath(directory, normalizedDirectory) ||
+        normalizedPath.size() <= normalizedDirectory.size() ||
+        normalizedDirectory.size() >
+            static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        return false;
+    }
+
+    const int directoryLength = static_cast<int>(normalizedDirectory.size());
+    return CompareStringOrdinal(
+               normalizedPath.data(), directoryLength,
+               normalizedDirectory.data(), directoryLength, TRUE) ==
+               CSTR_EQUAL &&
+           normalizedPath[normalizedDirectory.size()] == L'\\';
+}
+
+static std::string
+environmentPath(const char* name)
+{
+    if (name == nullptr) {
+        return std::string();
+    }
+    const std::vector<WCHAR> wideName = utf8_to_win_char(name);
+    if (wideName.size() <= 1u) {
+        return std::string();
+    }
+
+    const DWORD required = GetEnvironmentVariableW(
+        wideName.data(), nullptr, 0);
+    if (required == 0) {
+        return std::string();
+    }
+
+    std::vector<WCHAR> buffer(required, L'\0');
+    const DWORD written = GetEnvironmentVariableW(
+        wideName.data(), buffer.data(), required);
+    if (written == 0 || written >= required) {
+        return std::string();
+    }
+    return win_wchar_to_utf8(buffer.data());
 }
 
 static void
@@ -373,7 +376,12 @@ protectedServiceLogFilename()
     ensureProtectedServiceDirectory(logDirectory);
 
     const std::string logFile = logDirectory + "\\" LOG_FILENAME;
-    const DWORD attributes = GetFileAttributesA(logFile.c_str());
+    const std::vector<WCHAR> wideLogFile = utf8_to_win_char(logFile);
+    if (wideLogFile.size() <= 1u) {
+        throw std::runtime_error(
+            "Weave service log path is not valid UTF-8");
+    }
+    const DWORD attributes = GetFileAttributesW(wideLogFile.data());
     if (attributes != INVALID_FILE_ATTRIBUTES &&
         ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
          (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)) {
@@ -784,14 +792,18 @@ DaemonApp::mainLoop(bool daemonized)
 void
 DaemonApp::initializeTrustedExecutables()
 {
-    std::vector<char> modulePath(32768);
-    const DWORD length = GetModuleFileNameA(nullptr, modulePath.data(),
+    std::vector<WCHAR> modulePath(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, modulePath.data(),
                                             static_cast<DWORD>(modulePath.size()));
     if (length == 0 || length >= modulePath.size()) {
         throw std::runtime_error("unable to resolve the daemon executable path");
     }
 
-    const std::string daemonPath(modulePath.data(), length);
+    const std::string daemonPath = win_wchar_to_utf8(modulePath.data());
+    if (daemonPath.empty()) {
+        throw std::runtime_error(
+            "daemon executable path is not valid Unicode");
+    }
     if (!isProtectedProgramFilesPath(daemonPath)) {
         throw std::runtime_error(
             "refusing to run the SYSTEM service from outside Program Files");
@@ -838,7 +850,15 @@ DaemonApp::prepareWatchdogCommand(std::string& command,
 void
 DaemonApp::foregroundError(const char* message)
 {
-    MessageBox(NULL, message, WEAVE_SERVICE_DISPLAY_NAME, MB_OK | MB_ICONERROR);
+    const std::vector<WCHAR> wideMessage = utf8_to_win_char(
+        message == nullptr ? std::string() : std::string(message));
+    const std::vector<WCHAR> wideTitle = utf8_to_win_char(
+        WEAVE_SERVICE_DISPLAY_NAME);
+    MessageBoxW(
+        NULL,
+        wideMessage.size() > 1u ? wideMessage.data() : L"Weave service error",
+        wideTitle.size() > 1u ? wideTitle.data() : L"Weave",
+        MB_OK | MB_ICONERROR);
 }
 
 std::string

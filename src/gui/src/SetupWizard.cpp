@@ -18,6 +18,7 @@
 #include "SetupWizard.h"
 #include "MainWindow.h"
 #include "QBarrierApplication.h"
+#include "common/ProductIdentity.h"
 #include "QUtility.h"
 #include "AppConfig.h"
 #include "DisplayIsValid.h"
@@ -238,7 +239,7 @@ void SetupWizard::triggerPermissionAction()
     CFRelease(options);
 #elif defined(WINAPI_XWINDOWS)
     if (QGuiApplication::platformName() == QStringLiteral("wayland")) {
-        QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/debauchee/barrier/wiki/FAQ")));
+        QDesktopServices::openUrl(QUrl(QString::fromLatin1(WEAVE_PROJECT_URL)));
     }
 #endif
 }

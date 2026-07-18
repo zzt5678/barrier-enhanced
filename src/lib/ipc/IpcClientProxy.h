@@ -41,20 +41,18 @@ class IpcNodeReadyV2Message;
 class IpcNodeActivatedMessage;
 class IpcStopRequestMessage;
 class IEventQueue;
+class IpcProxyTestAccess;
 
 class IpcClientProxy {
     friend class IpcServer;
+    friend class IpcProxyTestAccess;
 
 public:
     IpcClientProxy(barrier::IStream& stream, IEventQueue* events,
                    const IpcPeerAuthContext& peerAuth = IpcPeerAuthContext());
     virtual ~IpcClientProxy();
 
-#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
-public:
-#else
 private:
-#endif
     void                send(const IpcMessage& message);
     bool                tryAddSendRef();
     void                releaseSendRef();
@@ -93,11 +91,7 @@ private:
     bool                matchesActivation(UInt32 processId,
                                           std::uint64_t activationNonce) const;
 
-#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
-public:
-#else
 private:
-#endif
     barrier::IStream&    m_stream;
     std::atomic<EIpcClientType> m_clientType;
     std::atomic<UInt32> m_processId;

@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 using ::testing::_;
@@ -22,6 +23,157 @@ using ::testing::Invoke;
 using ::testing::NiceMock;
 using ::testing::ReturnRef;
 using ::testing::Return;
+
+class IpcProxyTestAccess {
+public:
+    static void send(IpcClientProxy& proxy, const IpcMessage& message)
+    {
+        proxy.send(message);
+    }
+
+    static void send(IpcServerProxy& proxy, const IpcMessage& message)
+    {
+        proxy.send(message);
+    }
+
+    static void handleData(IpcClientProxy& proxy)
+    {
+        proxy.handleData(Event(Event::kUnknown), nullptr);
+    }
+
+    static void handleData(IpcServerProxy& proxy)
+    {
+        proxy.handleData(Event(Event::kUnknown), nullptr);
+    }
+
+    static void handleDisconnect(IpcClientProxy& proxy)
+    {
+        proxy.handleDisconnect(Event(Event::kUnknown), nullptr);
+    }
+
+    static void handleWriteError(IpcClientProxy& proxy)
+    {
+        proxy.handleWriteError(Event(Event::kUnknown), nullptr);
+    }
+
+    static IpcCommandMessage* parseCommand(
+        IpcClientProxy& proxy, const std::string& command, UInt8 elevate)
+    {
+        return proxy.parseCommand(command, elevate);
+    }
+
+    static void setClientType(IpcClientProxy& proxy, EIpcClientType type)
+    {
+        proxy.m_clientType = type;
+    }
+
+    static EIpcClientType clientType(const IpcClientProxy& proxy)
+    {
+        return proxy.m_clientType.load();
+    }
+
+    static void setProcessId(IpcClientProxy& proxy, UInt32 processId)
+    {
+        proxy.m_processId = processId;
+    }
+
+    static UInt32 processId(const IpcClientProxy& proxy)
+    {
+        return proxy.m_processId.load();
+    }
+
+    static bool ready(const IpcClientProxy& proxy)
+    {
+        return proxy.m_ready.load();
+    }
+
+    static bool disconnecting(const IpcClientProxy& proxy)
+    {
+        return proxy.m_disconnecting.load();
+    }
+
+    static void setDisconnecting(IpcClientProxy& proxy, bool disconnecting)
+    {
+        proxy.m_disconnecting = disconnecting;
+    }
+
+    static void setReady(IpcClientProxy& proxy, bool ready)
+    {
+        proxy.m_ready = ready;
+    }
+
+    static bool tryAddSendRef(IpcClientProxy& proxy)
+    {
+        return proxy.tryAddSendRef();
+    }
+
+    static void releaseSendRef(IpcClientProxy& proxy)
+    {
+        proxy.releaseSendRef();
+    }
+
+    static UInt32 sendRefCount(const IpcClientProxy& proxy)
+    {
+        return proxy.m_sendRefCount;
+    }
+
+    static void waitForSendRefs(
+        IpcClientProxy& proxy, double timeoutSeconds,
+        const barrier::FinalProcessTerminator& terminator)
+    {
+        proxy.waitForSendRefs(timeoutSeconds, terminator);
+    }
+
+    static void setActivationChallengeNonce(
+        IpcClientProxy& proxy, std::uint64_t nonce)
+    {
+        proxy.m_activationChallengeNonce = nonce;
+    }
+
+    static bool matchesActivation(
+        const IpcClientProxy& proxy, UInt32 processId, std::uint64_t nonce)
+    {
+        return proxy.matchesActivation(processId, nonce);
+    }
+
+    static void setReadyReceivedAt(
+        IpcClientProxy& proxy,
+        std::chrono::steady_clock::time_point receivedAt)
+    {
+        proxy.m_readyReceivedAt = receivedAt;
+    }
+
+    static void setProofReceivedAt(
+        IpcClientProxy& proxy,
+        std::chrono::steady_clock::time_point receivedAt)
+    {
+        proxy.m_proofReceivedAt = receivedAt;
+    }
+
+    static bool disconnected(const IpcServerProxy& proxy)
+    {
+        return proxy.m_disconnected;
+    }
+};
+
+template <typename T>
+class HasPublicDisconnect {
+private:
+    template <typename U>
+    static auto test(int) -> decltype(
+        static_cast<void (U::*)()>(&U::disconnect), std::true_type());
+
+    template <typename>
+    static std::false_type test(...);
+
+public:
+    static const bool value = decltype(test<T>(0))::value;
+};
+
+static_assert(!HasPublicDisconnect<IpcClientProxy>::value,
+              "IpcClientProxy test access must not change production ABI");
+static_assert(!HasPublicDisconnect<IpcServerProxy>::value,
+              "IpcServerProxy test access must not change production ABI");
 
 namespace {
 
@@ -308,8 +460,9 @@ TEST(IpcProxyTests, authenticatedCommandOriginIsNotSerializedOnWire)
         *sourceStream, &sourceEvents,
         authenticatedTestPeer(
             12345, kIpcClientGui, 9, "S-1-5-21-2000"));
-    sourceProxy.m_processId = 999;
-    IpcCommandMessage* parsed = sourceProxy.parseCommand(
+    IpcProxyTestAccess::setProcessId(sourceProxy, 999);
+    IpcCommandMessage* parsed = IpcProxyTestAccess::parseCommand(
+        sourceProxy,
         command, IpcCommandMessage::kElevateNever);
     ASSERT_NE(nullptr, parsed);
     ASSERT_TRUE(parsed->origin().kernelVerified());
@@ -337,7 +490,7 @@ TEST(IpcProxyTests, authenticatedCommandOriginIsNotSerializedOnWire)
         }));
 
     IpcServerProxy destinationProxy(destinationStream, &destinationEvents);
-    destinationProxy.send(*parsed);
+    IpcProxyTestAccess::send(destinationProxy, *parsed);
     delete parsed;
 }
 
@@ -363,7 +516,7 @@ TEST(IpcProxyTests, clientProxyInvalidHeaderDisconnectsWithoutNullMessageEvent)
         EXPECT_EQ(&proxy, event.getTarget());
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
 }
 
 TEST(IpcProxyTests, clientProxyDisconnectIsIdempotent)
@@ -385,8 +538,8 @@ TEST(IpcProxyTests, clientProxyDisconnectIsIdempotent)
         EXPECT_EQ(&proxy, event.getTarget());
     }));
 
-    proxy.handleDisconnect(Event(Event::kUnknown), NULL);
-    proxy.handleWriteError(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleDisconnect(proxy);
+    IpcProxyTestAccess::handleWriteError(proxy);
 }
 
 TEST(IpcProxyTests, clientProxySendRefWaitTimeoutTerminates)
@@ -404,10 +557,11 @@ TEST(IpcProxyTests, clientProxySendRefWaitTimeoutTerminates)
                 Invoke([stream]() { return stream; }));
 
             IpcClientProxy* proxy = new IpcClientProxy(*stream, &events);
-            if (!proxy->tryAddSendRef()) {
+            if (!IpcProxyTestAccess::tryAddSendRef(*proxy)) {
                 std::_Exit(72);
             }
-            proxy->waitForSendRefs(0.0, []() { std::_Exit(73); });
+            IpcProxyTestAccess::waitForSendRefs(
+                *proxy, 0.0, []() { std::_Exit(73); });
             std::_Exit(74);
         },
         ::testing::ExitedWithCode(73),
@@ -449,7 +603,7 @@ TEST(IpcProxyTests, clientProxyRejectsNodeCommand)
         }
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_EQ(1, messageEvents);
 }
 
@@ -495,7 +649,7 @@ TEST(IpcProxyTests, clientProxyAllowsGuiCommand)
         delete message;
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_EQ(2, messageEvents);
     EXPECT_TRUE(sawCommand);
 }
@@ -535,7 +689,7 @@ TEST(IpcProxyTests, clientProxyAllowsAuthenticatedGuiStopRequest)
         delete message;
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_TRUE(sawStopRequest);
 }
 
@@ -579,9 +733,9 @@ TEST(IpcProxyTests, clientProxyRejectsNodeStopRequest)
             }
         }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_EQ(1, messageEvents);
-    EXPECT_TRUE(proxy.m_disconnecting.load());
+    EXPECT_TRUE(IpcProxyTestAccess::disconnecting(proxy));
 }
 
 TEST(IpcProxyTests, clientProxySerializesStopAckWithRequestAndGeneration)
@@ -606,7 +760,7 @@ TEST(IpcProxyTests, clientProxySerializesStopAckWithRequestAndGeneration)
         }));
 
     IpcStopAckMessage ack(0x1020304050607080ull, 42);
-    proxy.send(ack);
+    IpcProxyTestAccess::send(proxy, ack);
 }
 
 TEST(IpcProxyTests, clientProxyParsesNodeFramesDeliveredOneByteAtATime)
@@ -624,7 +778,7 @@ TEST(IpcProxyTests, clientProxyParsesNodeFramesDeliveredOneByteAtATime)
         authenticatedTestPeer(12345, kIpcClientNode));
 
     const std::uint64_t activationNonce = 0x1020304050607080ull;
-    proxy.m_activationChallengeNonce = activationNonce;
+    IpcProxyTestAccess::setActivationChallengeNonce(proxy, activationNonce);
     std::vector<UInt8> bytes = nodeReadyV2Frames(
         12345, 12345, 7, 42, true, "Default", "test-build", 91);
     appendActivatedFrame(bytes, 12345, activationNonce);
@@ -647,18 +801,19 @@ TEST(IpcProxyTests, clientProxyParsesNodeFramesDeliveredOneByteAtATime)
             delete message;
         }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     while (offset < bytes.size()) {
         byteAvailable = true;
-        proxy.handleData(Event(Event::kUnknown), NULL);
+        IpcProxyTestAccess::handleData(proxy);
     }
 
     const std::vector<UInt8> expectedTypes = {
         kIpcHello, kIpcReadyV2, kIpcActivated
     };
     EXPECT_EQ(expectedTypes, messageTypes);
-    EXPECT_TRUE(proxy.m_ready.load());
-    EXPECT_TRUE(proxy.matchesActivation(12345, activationNonce));
+    EXPECT_TRUE(IpcProxyTestAccess::ready(proxy));
+    EXPECT_TRUE(IpcProxyTestAccess::matchesActivation(
+        proxy, 12345, activationNonce));
 }
 
 TEST(IpcProxyTests, clientProxyParsesGuiCommandDeliveredOneByteAtATime)
@@ -701,10 +856,10 @@ TEST(IpcProxyTests, clientProxyParsesGuiCommandDeliveredOneByteAtATime)
             delete message;
         }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     while (offset < bytes.size()) {
         byteAvailable = true;
-        proxy.handleData(Event(Event::kUnknown), NULL);
+        IpcProxyTestAccess::handleData(proxy);
     }
 
     const std::vector<UInt8> expectedTypes = { kIpcHello, kIpcCommand };
@@ -739,9 +894,9 @@ TEST(IpcProxyTests, authenticatedNodeCannotSpoofGuiAndSendCommand)
         EXPECT_EQ(&proxy, event.getTarget());
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
-    EXPECT_EQ(kIpcClientUnknown, proxy.m_clientType.load());
-    EXPECT_EQ(0u, proxy.m_processId.load());
+    IpcProxyTestAccess::handleData(proxy);
+    EXPECT_EQ(kIpcClientUnknown, IpcProxyTestAccess::clientType(proxy));
+    EXPECT_EQ(0u, IpcProxyTestAccess::processId(proxy));
 }
 
 TEST(IpcProxyTests, authenticatedGuiCannotSpoofNodeReadiness)
@@ -771,8 +926,8 @@ TEST(IpcProxyTests, authenticatedGuiCannotSpoofNodeReadiness)
         EXPECT_EQ(&proxy, event.getTarget());
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
-    EXPECT_FALSE(proxy.m_ready.load());
+    IpcProxyTestAccess::handleData(proxy);
+    EXPECT_FALSE(IpcProxyTestAccess::ready(proxy));
 }
 
 TEST(IpcProxyTests, authenticatedPeerCannotClaimAnotherProcessId)
@@ -802,9 +957,9 @@ TEST(IpcProxyTests, authenticatedPeerCannotClaimAnotherProcessId)
         EXPECT_EQ(&proxy, event.getTarget());
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
-    EXPECT_EQ(kIpcClientUnknown, proxy.m_clientType.load());
-    EXPECT_EQ(0u, proxy.m_processId.load());
+    IpcProxyTestAccess::handleData(proxy);
+    EXPECT_EQ(kIpcClientUnknown, IpcProxyTestAccess::clientType(proxy));
+    EXPECT_EQ(0u, IpcProxyTestAccess::processId(proxy));
 }
 
 TEST(IpcProxyTests, failedPeerAuthenticationCannotFallBackToClaimedHello)
@@ -835,9 +990,9 @@ TEST(IpcProxyTests, failedPeerAuthenticationCannotFallBackToClaimedHello)
         EXPECT_EQ(&proxy, event.getTarget());
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
-    EXPECT_EQ(kIpcClientUnknown, proxy.m_clientType.load());
-    EXPECT_EQ(0u, proxy.m_processId.load());
+    IpcProxyTestAccess::handleData(proxy);
+    EXPECT_EQ(kIpcClientUnknown, IpcProxyTestAccess::clientType(proxy));
+    EXPECT_EQ(0u, IpcProxyTestAccess::processId(proxy));
 }
 
 TEST(IpcProxyTests, serverSendDoesNotHoldClientListLockWhileWriting)
@@ -851,7 +1006,7 @@ TEST(IpcProxyTests, serverSendDoesNotHoldClientListLockWhileWriting)
     ON_CALL(*stream, getEventTarget()).WillByDefault(Invoke([stream]() { return stream; }));
 
     IpcClientProxy proxy(*stream, &events);
-    proxy.m_clientType = kIpcClientNode;
+    IpcProxyTestAccess::setClientType(proxy, kIpcClientNode);
 
     IpcServer server;
     server.m_clients.push_back(&proxy);
@@ -886,9 +1041,9 @@ TEST(IpcProxyTests, serverSendReleasesEveryRecipientWhenFirstWriteThrows)
     IpcClientProxy first(*firstStream, &events);
     IpcClientProxy second(*secondStream, &events);
     IpcClientProxy third(*thirdStream, &events);
-    first.m_clientType = kIpcClientNode;
-    second.m_clientType = kIpcClientNode;
-    third.m_clientType = kIpcClientNode;
+    IpcProxyTestAccess::setClientType(first, kIpcClientNode);
+    IpcProxyTestAccess::setClientType(second, kIpcClientNode);
+    IpcProxyTestAccess::setClientType(third, kIpcClientNode);
 
     IpcServer server;
     server.m_clients.push_back(&first);
@@ -903,17 +1058,17 @@ TEST(IpcProxyTests, serverSendReleasesEveryRecipientWhenFirstWriteThrows)
     IpcShutdownMessage message;
     EXPECT_THROW(server.send(message, kIpcClientNode), std::runtime_error);
 
-    const UInt32 firstRefs = first.m_sendRefCount;
-    const UInt32 secondRefs = second.m_sendRefCount;
-    const UInt32 thirdRefs = third.m_sendRefCount;
-    while (first.m_sendRefCount != 0) {
-        first.releaseSendRef();
+    const UInt32 firstRefs = IpcProxyTestAccess::sendRefCount(first);
+    const UInt32 secondRefs = IpcProxyTestAccess::sendRefCount(second);
+    const UInt32 thirdRefs = IpcProxyTestAccess::sendRefCount(third);
+    while (IpcProxyTestAccess::sendRefCount(first) != 0) {
+        IpcProxyTestAccess::releaseSendRef(first);
     }
-    while (second.m_sendRefCount != 0) {
-        second.releaseSendRef();
+    while (IpcProxyTestAccess::sendRefCount(second) != 0) {
+        IpcProxyTestAccess::releaseSendRef(second);
     }
-    while (third.m_sendRefCount != 0) {
-        third.releaseSendRef();
+    while (IpcProxyTestAccess::sendRefCount(third) != 0) {
+        IpcProxyTestAccess::releaseSendRef(third);
     }
 
     EXPECT_EQ(0u, firstRefs);
@@ -941,12 +1096,12 @@ TEST(IpcProxyTests, serverSendToProcessReleasesEveryRecipientWhenFirstWriteThrow
     IpcClientProxy first(*firstStream, &events);
     IpcClientProxy second(*secondStream, &events);
     IpcClientProxy third(*thirdStream, &events);
-    first.m_clientType = kIpcClientNode;
-    second.m_clientType = kIpcClientNode;
-    third.m_clientType = kIpcClientNode;
-    first.m_processId = 1001;
-    second.m_processId = 1001;
-    third.m_processId = 1001;
+    IpcProxyTestAccess::setClientType(first, kIpcClientNode);
+    IpcProxyTestAccess::setClientType(second, kIpcClientNode);
+    IpcProxyTestAccess::setClientType(third, kIpcClientNode);
+    IpcProxyTestAccess::setProcessId(first, 1001);
+    IpcProxyTestAccess::setProcessId(second, 1001);
+    IpcProxyTestAccess::setProcessId(third, 1001);
 
     IpcServer server;
     server.m_clients.push_back(&first);
@@ -962,17 +1117,17 @@ TEST(IpcProxyTests, serverSendToProcessReleasesEveryRecipientWhenFirstWriteThrow
     EXPECT_THROW(server.sendToProcess(message, kIpcClientNode, 1001),
                  std::runtime_error);
 
-    const UInt32 firstRefs = first.m_sendRefCount;
-    const UInt32 secondRefs = second.m_sendRefCount;
-    const UInt32 thirdRefs = third.m_sendRefCount;
-    while (first.m_sendRefCount != 0) {
-        first.releaseSendRef();
+    const UInt32 firstRefs = IpcProxyTestAccess::sendRefCount(first);
+    const UInt32 secondRefs = IpcProxyTestAccess::sendRefCount(second);
+    const UInt32 thirdRefs = IpcProxyTestAccess::sendRefCount(third);
+    while (IpcProxyTestAccess::sendRefCount(first) != 0) {
+        IpcProxyTestAccess::releaseSendRef(first);
     }
-    while (second.m_sendRefCount != 0) {
-        second.releaseSendRef();
+    while (IpcProxyTestAccess::sendRefCount(second) != 0) {
+        IpcProxyTestAccess::releaseSendRef(second);
     }
-    while (third.m_sendRefCount != 0) {
-        third.releaseSendRef();
+    while (IpcProxyTestAccess::sendRefCount(third) != 0) {
+        IpcProxyTestAccess::releaseSendRef(third);
     }
 
     EXPECT_EQ(0u, firstRefs);
@@ -994,10 +1149,10 @@ TEST(IpcProxyTests, serverSendToProcessOnlyWritesMatchingNodePid)
 
 	IpcClientProxy oldProxy(*oldStream, &events);
 	IpcClientProxy newProxy(*newStream, &events);
-	oldProxy.m_clientType = kIpcClientNode;
-	oldProxy.m_processId = 1001;
-	newProxy.m_clientType = kIpcClientNode;
-	newProxy.m_processId = 1002;
+	IpcProxyTestAccess::setClientType(oldProxy, kIpcClientNode);
+	IpcProxyTestAccess::setProcessId(oldProxy, 1001);
+	IpcProxyTestAccess::setClientType(newProxy, kIpcClientNode);
+	IpcProxyTestAccess::setProcessId(newProxy, 1002);
 
 	IpcServer server;
 	server.m_clients.push_back(&oldProxy);
@@ -1024,8 +1179,8 @@ TEST(IpcProxyTests, activationAckRequiresExactTargetedChallenge)
     IpcClientProxy proxy(
         *stream, &events,
         authenticatedTestPeer(12345, kIpcClientNode));
-    proxy.m_clientType = kIpcClientNode;
-    proxy.m_processId = 12345;
+    IpcProxyTestAccess::setClientType(proxy, kIpcClientNode);
+    IpcProxyTestAccess::setProcessId(proxy, 12345);
     IpcServer server;
     server.m_clients.push_back(&proxy);
 
@@ -1055,7 +1210,7 @@ TEST(IpcProxyTests, activationAckRequiresExactTargetedChallenge)
             delete message;
         }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_TRUE(server.hasActivatedClientProcess(12345, activationNonce));
     EXPECT_FALSE(server.hasActivatedClientProcess(12345,
                                                    activationNonce + 1));
@@ -1094,8 +1249,8 @@ TEST(IpcProxyTests, unchallengedActivationAckDisconnects)
             }
         }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
-    EXPECT_TRUE(proxy.m_disconnecting.load());
+    IpcProxyTestAccess::handleData(proxy);
+    EXPECT_TRUE(IpcProxyTestAccess::disconnecting(proxy));
 }
 
 TEST(IpcProxyTests, serverFindsOnlyReadyMatchingProcess)
@@ -1113,11 +1268,11 @@ TEST(IpcProxyTests, serverFindsOnlyReadyMatchingProcess)
 
 	IpcClientProxy readyProxy(*readyStream, &events);
 	IpcClientProxy disconnectingProxy(*disconnectingStream, &events);
-	readyProxy.m_clientType = kIpcClientNode;
-	readyProxy.m_processId = 1001;
-	disconnectingProxy.m_clientType = kIpcClientNode;
-	disconnectingProxy.m_processId = 1002;
-	disconnectingProxy.m_disconnecting = true;
+	IpcProxyTestAccess::setClientType(readyProxy, kIpcClientNode);
+	IpcProxyTestAccess::setProcessId(readyProxy, 1001);
+	IpcProxyTestAccess::setClientType(disconnectingProxy, kIpcClientNode);
+	IpcProxyTestAccess::setProcessId(disconnectingProxy, 1002);
+	IpcProxyTestAccess::setDisconnecting(disconnectingProxy, true);
 
 	IpcServer server;
 	server.m_clients.push_back(&readyProxy);
@@ -1125,7 +1280,7 @@ TEST(IpcProxyTests, serverFindsOnlyReadyMatchingProcess)
 
 	EXPECT_TRUE(server.hasClientProcess(kIpcClientNode, 1001));
 	EXPECT_FALSE(server.hasReadyClientProcess(kIpcClientNode, 1001));
-	readyProxy.m_ready = true;
+	IpcProxyTestAccess::setReady(readyProxy, true);
 	EXPECT_TRUE(server.hasReadyClientProcess(kIpcClientNode, 1001));
 	EXPECT_FALSE(server.hasClientProcess(kIpcClientNode, 1002));
 	EXPECT_FALSE(server.hasReadyClientProcess(kIpcClientNode, 1002));
@@ -1167,10 +1322,10 @@ TEST(IpcProxyTests, clientProxyRequiresNodeReadyAfterHello)
 		delete message;
 	}));
 
-	proxy.handleData(Event(Event::kUnknown), NULL);
+	IpcProxyTestAccess::handleData(proxy);
 	EXPECT_EQ(2, messageEvents);
 	EXPECT_TRUE(sawReady);
-    EXPECT_TRUE(proxy.m_ready);
+    EXPECT_TRUE(IpcProxyTestAccess::ready(proxy));
 }
 
 TEST(IpcProxyTests, capabilityReadyMustMatchProcessSessionAndDesktop)
@@ -1215,7 +1370,7 @@ TEST(IpcProxyTests, capabilityReadyMustMatchProcessSessionAndDesktop)
         delete message;
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_EQ(2, messageEvents);
     EXPECT_TRUE(sawCapabilityReady);
     EXPECT_TRUE(server.hasInputReadyClientProcess(
@@ -1271,10 +1426,10 @@ TEST(IpcProxyTests, capabilityReadyMustMatchAuthenticatedTokenSession)
             }
         }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_EQ(1, messageEvents);
-    EXPECT_FALSE(proxy.m_ready.load());
-    EXPECT_TRUE(proxy.m_disconnecting.load());
+    EXPECT_FALSE(IpcProxyTestAccess::ready(proxy));
+    EXPECT_TRUE(IpcProxyTestAccess::disconnecting(proxy));
 }
 
 TEST(IpcProxyTests, capabilityProofMustMatchWatchdogQueryNonce)
@@ -1303,7 +1458,7 @@ TEST(IpcProxyTests, capabilityProofMustMatchWatchdogQueryNonce)
     EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
         [](const Event& event) { delete event.getDataObject(); }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_FALSE(server.hasInputReadyClientProcess(
         kIpcClientNode, 12345, 7, "Default", "test-build", 76));
     EXPECT_TRUE(server.hasInputReadyClientProcess(
@@ -1338,7 +1493,7 @@ TEST(IpcProxyTests, periodicInvalidationRetiresWatchdogQueryProof)
     EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
         [](const Event& event) { delete event.getDataObject(); }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_FALSE(server.hasInputReadyClientProcess(
         kIpcClientNode, 12345, 7, "Default", "test-build"));
     EXPECT_FALSE(server.hasInputReadyClientProcess(
@@ -1373,7 +1528,7 @@ TEST(IpcProxyTests, matchingPeriodicLeasePreservesWatchdogQueryProof)
     EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
         [](const Event& event) { delete event.getDataObject(); }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_TRUE(server.hasInputReadyClientProcess(
         kIpcClientNode, 12345, 7, "Default", "test-build"));
     EXPECT_TRUE(server.hasInputReadyClientProcess(
@@ -1406,8 +1561,8 @@ TEST(IpcProxyTests, capabilityReadyFalseCannotBeAdopted)
     EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
         [](const Event& event) { delete event.getDataObject(); }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
-    EXPECT_TRUE(proxy.m_ready.load());
+    IpcProxyTestAccess::handleData(proxy);
+    EXPECT_TRUE(IpcProxyTestAccess::ready(proxy));
     EXPECT_FALSE(server.hasInputReadyClientProcess(
         kIpcClientNode, 12345, 7, "Default", "test-build"));
 }
@@ -1449,7 +1604,7 @@ TEST(IpcProxyTests, capabilityReadinessUsesLatestRecoveryUpdate)
         delete message;
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_EQ(2, readinessUpdates);
     EXPECT_TRUE(server.hasInputReadyClientProcess(
         kIpcClientNode, 12345, 7, "Default", "test-build"));
@@ -1483,7 +1638,7 @@ TEST(IpcProxyTests, capabilityReadinessUsesLatestInvalidationUpdate)
     EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
         [](const Event& event) { delete event.getDataObject(); }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_FALSE(server.hasInputReadyClientProcess(
         kIpcClientNode, 12345, 7, "Default", "test-build"));
 }
@@ -1514,9 +1669,9 @@ TEST(IpcProxyTests, expiredCapabilityReadinessCannotBeAdopted)
     EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
         [](const Event& event) { delete event.getDataObject(); }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
-    proxy.m_readyReceivedAt = std::chrono::steady_clock::now() -
-        std::chrono::seconds(10);
+    IpcProxyTestAccess::handleData(proxy);
+    IpcProxyTestAccess::setReadyReceivedAt(
+        proxy, std::chrono::steady_clock::now() - std::chrono::seconds(10));
     EXPECT_FALSE(server.hasInputReadyClientProcess(
         kIpcClientNode, 12345, 7, "Default", "test-build"));
 }
@@ -1547,9 +1702,9 @@ TEST(IpcProxyTests, expiredCapabilityProofCannotBeAdopted)
     EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
         [](const Event& event) { delete event.getDataObject(); }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
-    proxy.m_proofReceivedAt = std::chrono::steady_clock::now() -
-        std::chrono::seconds(10);
+    IpcProxyTestAccess::handleData(proxy);
+    IpcProxyTestAccess::setProofReceivedAt(
+        proxy, std::chrono::steady_clock::now() - std::chrono::seconds(10));
     EXPECT_FALSE(server.hasInputReadyClientProcess(
         kIpcClientNode, 12345, 7, "Default", "test-build", 77));
 }
@@ -1596,9 +1751,9 @@ TEST(IpcProxyTests, oversizedCapabilityStringDisconnectsWithoutThrowing)
         }
     }));
 
-    EXPECT_NO_THROW(proxy.handleData(Event(Event::kUnknown), NULL));
+    EXPECT_NO_THROW(IpcProxyTestAccess::handleData(proxy));
     EXPECT_EQ(1, messageEvents);
-    EXPECT_TRUE(proxy.m_disconnecting.load());
+    EXPECT_TRUE(IpcProxyTestAccess::disconnecting(proxy));
 }
 
 TEST(IpcProxyTests, oversizedCommandStringDisconnectsBeforePayloadAllocation)
@@ -1636,9 +1791,9 @@ TEST(IpcProxyTests, oversizedCommandStringDisconnectsBeforePayloadAllocation)
             }
         }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_EQ(1, messageEvents);
-    EXPECT_TRUE(proxy.m_disconnecting.load());
+    EXPECT_TRUE(IpcProxyTestAccess::disconnecting(proxy));
 }
 
 TEST(IpcProxyTests, capabilityReadyWithDifferentProcessIdIsRejected)
@@ -1675,9 +1830,9 @@ TEST(IpcProxyTests, capabilityReadyWithDifferentProcessIdIsRejected)
         }
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_EQ(1, messageEvents);
-    EXPECT_FALSE(proxy.m_ready.load());
+    EXPECT_FALSE(IpcProxyTestAccess::ready(proxy));
 }
 
 TEST(IpcProxyTests, clientProxyRejectsReadyBeforeNodeHello)
@@ -1712,9 +1867,9 @@ TEST(IpcProxyTests, clientProxyRejectsReadyBeforeNodeHello)
 		}
 	}));
 
-	proxy.handleData(Event(Event::kUnknown), NULL);
+	IpcProxyTestAccess::handleData(proxy);
 	EXPECT_EQ(0, messageEvents);
-	EXPECT_FALSE(proxy.m_ready.load());
+    EXPECT_FALSE(IpcProxyTestAccess::ready(proxy));
 }
 
 TEST(IpcProxyTests, serverProxyInvalidHeaderDisconnectsWithoutNullMessageEvent)
@@ -1734,7 +1889,7 @@ TEST(IpcProxyTests, serverProxyInvalidHeaderDisconnectsWithoutNullMessageEvent)
     EXPECT_CALL(stream, close()).Times(1);
     EXPECT_CALL(events, addEvent(_)).Times(0);
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_NE(Event::kUnknown, messageType);
 }
 
@@ -1761,8 +1916,8 @@ TEST(IpcProxyTests, oversizedLogStringDisconnectsBeforePayloadAllocation)
     EXPECT_CALL(stream, close()).Times(1);
     EXPECT_CALL(events, addEvent(_)).Times(0);
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
-    EXPECT_TRUE(proxy.m_disconnected);
+    IpcProxyTestAccess::handleData(proxy);
+    EXPECT_TRUE(IpcProxyTestAccess::disconnected(proxy));
 }
 
 TEST(IpcProxyTests, serverProxySerializesCapabilityReadyAsOneMessage)
@@ -1794,7 +1949,7 @@ TEST(IpcProxyTests, serverProxySerializesCapabilityReadyAsOneMessage)
     IpcServerProxy proxy(stream, &events);
     IpcNodeReadyV2Message ready(
         12345, 7, 42, true, "Default", "test-build");
-    proxy.send(ready);
+    IpcProxyTestAccess::send(proxy, ready);
 }
 
 TEST(IpcProxyTests, serverProxyParsesInputReadinessQuery)
@@ -1828,7 +1983,7 @@ TEST(IpcProxyTests, serverProxyParsesInputReadinessQuery)
         delete query;
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_TRUE(sawQuery);
 }
 
@@ -1861,7 +2016,7 @@ TEST(IpcProxyTests, serverProxyParsesTargetedActivation)
         delete activate;
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
 }
 
 TEST(IpcProxyTests, serverProxyParsesFramesDeliveredOneByteAtATime)
@@ -1902,10 +2057,10 @@ TEST(IpcProxyTests, serverProxyParsesFramesDeliveredOneByteAtATime)
             delete message;
         }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     while (offset < bytes.size()) {
         byteAvailable = true;
-        proxy.handleData(Event(Event::kUnknown), NULL);
+        IpcProxyTestAccess::handleData(proxy);
     }
 
     const std::vector<UInt8> expectedTypes = {
@@ -1937,7 +2092,7 @@ TEST(IpcProxyTests, serverProxySerializesActivationAck)
     IpcServerProxy proxy(stream, &events);
     IpcNodeActivatedMessage activated(
         12345, 0x1020304050607080ull);
-    proxy.send(activated);
+    IpcProxyTestAccess::send(proxy, activated);
 }
 
 TEST(IpcProxyTests, partialInputReadinessQueryWaitsForRemainingBytes)
@@ -1977,11 +2132,11 @@ TEST(IpcProxyTests, partialInputReadinessQueryWaitsForRemainingBytes)
         delete query;
     }));
 
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_FALSE(sawQuery);
 
     availableBytes = bytes.size();
-    proxy.handleData(Event(Event::kUnknown), NULL);
+    IpcProxyTestAccess::handleData(proxy);
     EXPECT_TRUE(sawQuery);
 }
 
@@ -2005,5 +2160,5 @@ TEST(IpcProxyTests, clientProxySerializesInputReadinessQuery)
 
     IpcClientProxy proxy(*stream, &events);
     IpcInputReadyQueryMessage query(91);
-    proxy.send(query);
+    IpcProxyTestAccess::send(proxy, query);
 }

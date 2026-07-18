@@ -337,10 +337,18 @@ bool serviceLaunchCandidateMatchesCommandProfile(
         candidate.state.digest == digest;
 }
 
-bool serviceLaunchInputCapabilityReady(bool secureDesktop,
+bool serviceLaunchInputCapabilityReady(bool,
                                        bool uiAccessEnabled)
 {
-    return !secureDesktop || uiAccessEnabled;
+    return uiAccessEnabled;
+}
+
+bool serviceInputDesktopRequiresUiAccess(const std::string&)
+{
+    // Elevated applications normally remain on the Default desktop. A
+    // desktop-name check therefore cannot prove that SendInput may cross
+    // UIPI; every service-managed Windows input node must carry UIAccess.
+    return true;
 }
 
 bool serviceNodeInputReadinessReady(bool uiAccessRequired,

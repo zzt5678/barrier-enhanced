@@ -233,7 +233,8 @@ public:
     static bool         isDesktopReadyForTest(bool isPrimary, bool noHooks,
                             bool threadAttached, bool windowReady,
                             bool hookInstalled,
-                            bool commandResponsive = true);
+                            bool commandResponsive = true,
+                            bool injectionProbeSucceeded = true);
 
     static bool         isDeskCommandCompleteForTest(
                             std::uint64_t expectedSequence,
@@ -361,6 +362,7 @@ private:
         bool            m_threadAttached;
         bool            m_windowReady;
         bool            m_hookInstalled;
+        bool            m_injectionProbeSucceeded;
         bool            m_startupComplete;
         std::uint64_t   m_startupDeadline;
         bool            m_shutdownRequested;
@@ -380,6 +382,7 @@ private:
             threadAttached(false),
             windowReady(false),
             hookInstalled(false),
+            injectionProbeSucceeded(false),
             commandResponsive(false),
             ready(false)
         {
@@ -388,6 +391,7 @@ private:
         bool threadAttached;
         bool windowReady;
         bool hookInstalled;
+        bool injectionProbeSucceeded;
         bool commandResponsive;
         bool ready;
     };

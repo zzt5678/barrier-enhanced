@@ -35,6 +35,7 @@
 #include "base/Log.h"
 #include "base/XBase.h"
 #include "common/Version.h"
+#include "common/win32/encoding_utilities.h"
 
 #include <openssl/rand.h>
 
@@ -427,16 +428,23 @@ std::string activeDesktopName(bool warnOnFailure = true, DWORD* errorOut = NULL)
     HDESK desk = OpenInputDesktop(0, FALSE, GENERIC_READ);
     if (desk != NULL) {
         DWORD requiredBytes = 0;
-        if (GetUserObjectInformationA(desk, UOI_NAME, NULL, 0, &requiredBytes) == FALSE &&
+        if (GetUserObjectInformationW(desk, UOI_NAME, NULL, 0, &requiredBytes) == FALSE &&
             GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
             error = GetLastError();
         }
         else {
-            std::vector<char> buffer(requiredBytes + 1, 0);
-            if (GetUserObjectInformationA(
+            const std::size_t requiredCharacters =
+                (static_cast<std::size_t>(requiredBytes) + sizeof(WCHAR) - 1u) /
+                sizeof(WCHAR);
+            std::vector<WCHAR> buffer(requiredCharacters + 1u, L'\0');
+            if (GetUserObjectInformationW(
                     desk, UOI_NAME, buffer.data(),
-                    static_cast<DWORD>(buffer.size()), NULL) == TRUE) {
-                name = buffer.data();
+                    static_cast<DWORD>(buffer.size() * sizeof(WCHAR)),
+                    NULL) == TRUE) {
+                name = win_wchar_to_utf8(buffer.data());
+                if (name.empty()) {
+                    error = ERROR_NO_UNICODE_TRANSLATION;
+                }
             }
             else {
                 error = GetLastError();
@@ -1197,7 +1205,7 @@ MSWindowsWatchdog::shouldRelaunchForDesktopChange(const std::string& oldDesktop,
 void MSWindowsWatchdog::main_loop()
 {
 	SendSas sendSasFunc = NULL;
-	ScopedModule sasLib(LoadLibraryA("sas.dll"));
+	ScopedModule sasLib(LoadLibraryW(L"sas.dll"));
 	if (sasLib.get()) {
 		LOG((CLOG_DEBUG "found sas.dll"));
 		sendSasFunc = (SendSas)GetProcAddress(sasLib.get(), "SendSAS");
@@ -1305,7 +1313,8 @@ void MSWindowsWatchdog::main_loop()
 
             if (sendSasFunc != NULL) {
 
-                HANDLE sendSasEvent = CreateEventA(NULL, FALSE, FALSE, "Global\\SendSAS");
+                HANDLE sendSasEvent = CreateEventW(
+                    NULL, FALSE, FALSE, L"Global\\SendSAS");
                 if (sendSasEvent != NULL) {
 
                     // use SendSAS event to wait for next session (timeout 1 second).
@@ -1508,15 +1517,10 @@ MSWindowsWatchdog::startProcess()
         if (!serviceLaunchInputCapabilityReady(
                 secureDesktop, uiAccessEnabled)) {
             LOG((CLOG_ERR
-                "refusing secure desktop launch without UIAccess, desktop=%s error=%lu",
+                "refusing Windows input helper launch without UIAccess, desktop=%s error=%lu",
                 desktopName.c_str(), uiAccessError));
             throw XMSWindowsWatchdogError(
-                "secure desktop input capability is unavailable");
-        }
-        if (!uiAccessEnabled) {
-            LOG((CLOG_WARN
-                "could not enable UIAccess on default desktop launch, error=%lu; continuing",
-                uiAccessError));
+                "privileged input capability is unavailable");
         }
 
         // This flag is part of the local service-to-node launch contract. It
@@ -2009,7 +2013,7 @@ MSWindowsWatchdog::createOutputPipeHandles()
 	}
 }
 
-BOOL MSWindowsWatchdog::doStartProcessAsSelf(std::string& command,
+BOOL MSWindowsWatchdog::doStartProcessAsSelf(const std::string& command,
                                              const std::string& desktop,
                                              PROCESS_INFORMATION& processInfo)
 {
@@ -2021,23 +2025,32 @@ BOOL MSWindowsWatchdog::doStartProcessAsSelf(std::string& command,
         creationFlags |= CREATE_SUSPENDED;
     }
 
-    STARTUPINFOA si;
-    ZeroMemory(&si, sizeof(STARTUPINFOA));
-    si.cb = sizeof(STARTUPINFOA);
-    std::string desktopPath = std::string("winsta0\\") + desktop;
-    si.lpDesktop = LPSTR(desktopPath.c_str());
+    const std::string desktopPath = std::string("winsta0\\") + desktop;
+    std::vector<WCHAR> wideDesktopPath = utf8_to_win_char(desktopPath);
+    std::vector<WCHAR> commandLine = utf8_to_win_char(command);
+    if (wideDesktopPath.size() <= 1u || commandLine.size() <= 1u) {
+        SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        LOG((CLOG_ERR
+            "refusing process launch with invalid UTF-8 command or desktop"));
+        return FALSE;
+    }
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(STARTUPINFOW));
+    si.cb = sizeof(STARTUPINFOW);
+    si.lpDesktop = wideDesktopPath.data();
     si.dwFlags |= STARTF_USESTDHANDLES;
 
     LOG((CLOG_INFO "starting new process as self on desktop %s", desktopPath.c_str()));
     std::lock_guard<std::mutex> lock(m_outputPipeMutex);
     si.hStdError = m_stdOutWrite;
     si.hStdOutput = m_stdOutWrite;
-    std::vector<char> commandLine(command.begin(), command.end());
-    commandLine.push_back('\0');
-    return CreateProcessA(NULL, commandLine.data(), NULL, NULL, TRUE, creationFlags, NULL, NULL, &si, &processInfo);
+    return CreateProcessW(
+        NULL, commandLine.data(), NULL, NULL, TRUE, creationFlags,
+        NULL, NULL, &si, &processInfo);
 }
 
-BOOL MSWindowsWatchdog::doStartProcessAsUser(std::string& command, HANDLE userToken,
+BOOL MSWindowsWatchdog::doStartProcessAsUser(const std::string& command, HANDLE userToken,
                                              LPSECURITY_ATTRIBUTES sa,
                                              const std::string& desktop,
                                              PROCESS_INFORMATION& processInfo)
@@ -2046,11 +2059,20 @@ BOOL MSWindowsWatchdog::doStartProcessAsUser(std::string& command, HANDLE userTo
     ZeroMemory(&processInfo, sizeof(PROCESS_INFORMATION));
     ScopedHandle userTokenHandle(userToken);
 
-    STARTUPINFOA si;
-    ZeroMemory(&si, sizeof(STARTUPINFOA));
-    si.cb = sizeof(STARTUPINFOA);
-    std::string desktopPath = std::string("winsta0\\") + desktop;
-    si.lpDesktop = LPSTR(desktopPath.c_str());
+    const std::string desktopPath = std::string("winsta0\\") + desktop;
+    std::vector<WCHAR> wideDesktopPath = utf8_to_win_char(desktopPath);
+    std::vector<WCHAR> commandLine = utf8_to_win_char(command);
+    if (wideDesktopPath.size() <= 1u || commandLine.size() <= 1u) {
+        SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        LOG((CLOG_ERR
+            "refusing privileged process launch with invalid UTF-8 command or desktop"));
+        return FALSE;
+    }
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(STARTUPINFOW));
+    si.cb = sizeof(STARTUPINFOW);
+    si.lpDesktop = wideDesktopPath.data();
     si.dwFlags |= STARTF_USESTDHANDLES;
 
 	ScopedEnvironmentBlock environment;
@@ -2075,9 +2097,7 @@ BOOL MSWindowsWatchdog::doStartProcessAsUser(std::string& command, HANDLE userTo
         std::lock_guard<std::mutex> lock(m_outputPipeMutex);
         si.hStdError = m_stdOutWrite;
         si.hStdOutput = m_stdOutWrite;
-        std::vector<char> commandLine(command.begin(), command.end());
-        commandLine.push_back('\0');
-		createRet = CreateProcessAsUserA(
+		createRet = CreateProcessAsUserW(
 			userTokenHandle.get(), NULL, commandLine.data(),
 			sa, NULL, TRUE, creationFlags,
 			environment.get(), NULL, &si, &processInfo);

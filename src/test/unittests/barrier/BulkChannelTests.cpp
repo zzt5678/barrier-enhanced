@@ -128,6 +128,14 @@ std::vector<UInt8> encodeBoundBulkHello(
     return stream.output;
 }
 
+std::vector<UInt8> encodeControlHello(SInt16 minor, const std::string& name)
+{
+    DuplexMemoryStream stream;
+    ProtocolUtil::writef(&stream, kMsgHelloBack,
+                         kProtocolMajorVersion, minor, &name);
+    return stream.output;
+}
+
 std::vector<UInt8> encodeMessage(const char* message)
 {
     return std::vector<UInt8>(message, message + 4);
@@ -236,7 +244,7 @@ public:
 
 }
 
-TEST(BulkChannelTests, legacyBulkHelloCannotBecomeNormalScreenClient)
+TEST(BulkChannelTests, legacyBulkHelloIsRejected)
 {
     NiceMock<MockEventQueue> events;
     IStreamEvents streamEvents;
@@ -257,12 +265,31 @@ TEST(BulkChannelTests, legacyBulkHelloCannotBecomeNormalScreenClient)
     std::string actualName;
     std::string actualToken;
     std::string actualBinding;
-    EXPECT_EQ(stream, unknown.orphanBulkStream(
+    EXPECT_EQ(nullptr, unknown.orphanBulkStream(
         actualName, actualToken, actualBinding));
-    EXPECT_EQ(name, actualName);
-    EXPECT_EQ(token, actualToken);
     EXPECT_TRUE(actualBinding.empty());
-    delete stream;
+}
+
+TEST(BulkChannelTests, legacyControlHelloIsRejected)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClientProxyUnknownEvents unknownEvents;
+    ClientProxyEvents proxyEvents;
+    setEventDefaults(events, streamEvents, unknownEvents, proxyEvents);
+
+    NiceMock<MockServer> server;
+    DuplexMemoryStream* stream = new DuplexMemoryStream();
+    stream->queueInput(encodeControlHello(11, "legacy"));
+
+    ClientProxyUnknown unknown(stream, 30.0, &server, &events);
+    const size_t responseOffset = stream->output.size();
+    unknown.handleDataForTest();
+
+    EXPECT_EQ(nullptr, unknown.orphanClientProxy());
+    ASSERT_GE(stream->output.size(), responseOffset + 4u);
+    EXPECT_EQ(0, std::memcmp(stream->output.data() + responseOffset,
+                             kMsgEIncompatible, 4));
 }
 
 TEST(BulkChannelTests, protocol112BulkHelloCarriesControlConnectionBinding)

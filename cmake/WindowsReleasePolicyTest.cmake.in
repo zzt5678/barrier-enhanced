@@ -153,8 +153,7 @@ set(expected_release_files
     weave.exe
     weavec.exe
     weaved.exe
-    weaves.exe
-    zlib1.dll)
+    weaves.exe)
 
 set(clean_build "${SOURCE_ROOT}/clean_build.bat")
 assert_file_contains("${clean_build}" "Visual Studio 17 2022")
@@ -169,13 +168,38 @@ assert_file_contains("${gui_cmake}"
                      "DEPENDS barrier barriers barrierc barrierd")
 assert_file_contains("${gui_cmake}" "-DSTAGING_REQUIRED=TRUE")
 
+set(gui_main_window "${SOURCE_ROOT}/src/gui/src/MainWindow.cpp")
+set(gui_main_window_header "${SOURCE_ROOT}/src/gui/src/MainWindow.h")
+assert_file_contains("${gui_main_window}"
+                     "https://support.apple.com/106380")
+assert_file_contains("${gui_main_window}"
+                     "QDesktopServices::openUrl")
+foreach(insecure_bonjour_marker IN ITEMS
+        "http://binaries.symless.com/bonjour/"
+        "Bonjour.msi"
+        "Bonjour64.msi"
+        "msiexec"
+        "DataDownloader"
+        "CommandProcess"
+        "installBonjour")
+    assert_file_excludes("${gui_main_window}"
+                         "${insecure_bonjour_marker}")
+    assert_file_excludes("${gui_main_window_header}"
+                         "${insecure_bonjour_marker}")
+endforeach()
+assert_file_excludes("${gui_cmake}" "src/DataDownloader.cpp")
+assert_file_excludes("${gui_cmake}" "src/DataDownloader.h")
+assert_path_absent("${SOURCE_ROOT}/src/gui/src/DataDownloader.cpp")
+assert_path_absent("${SOURCE_ROOT}/src/gui/src/DataDownloader.h")
+
 set(gui_deploy "${SOURCE_ROOT}/src/gui/DeployWindowsGui.cmake")
 assert_file_contains("${gui_deploy}" "--debug")
 assert_file_contains("${gui_deploy}" "--release")
 assert_file_contains("${gui_deploy}" "libssl-3-x64.dll")
 assert_file_contains("${gui_deploy}" "libcrypto-3-x64.dll")
 assert_file_contains("${gui_deploy}"
-                     [=[if (EXISTS "${QT_BIN_DIR}/zlib1.dll")]=])
+                     [=[file(REMOVE "${OUTPUT_DIR}/zlib.dll" "${OUTPUT_DIR}/zlib1.dll")]=])
+assert_file_excludes("${gui_deploy}" "Required Qt zlib runtime")
 assert_file_excludes("${gui_deploy}" "$env:ProgramFiles")
 assert_file_excludes("${gui_deploy}" "ProgramFiles(x86)")
 assert_file_excludes("${gui_deploy}" "Get-ChildItem -Path $root")
@@ -194,6 +218,7 @@ assert_file_excludes("${wix_product}" "libeay32.dll")
 assert_file_excludes("${wix_product}" "ssleay32.dll")
 assert_file_excludes("${wix_product}" "$(var.OpenSSLBinPath)")
 assert_file_excludes("${wix_product}" "$(var.QtBinPath)")
+assert_file_excludes("${wix_product}" "$(var.BinPath)\\zlib1.dll")
 assert_file_excludes("${wix_product}" "LEGACY_BARRIER_SERVICE")
 assert_file_excludes("${wix_product}" "LegacyBarrierServiceSearch")
 assert_file_excludes("${wix_product}"
@@ -292,7 +317,6 @@ foreach(suffix IN ITEMS "" d)
         file(WRITE "${fixture_qt}/plugins/${plugin_entry}" "fixture")
     endforeach()
 endforeach()
-file(WRITE "${fixture_qt}/bin/zlib1.dll" "controlled fixture")
 file(WRITE "${fixture_openssl}/bin/libssl-3-x64.dll" "fixture")
 file(WRITE "${fixture_openssl}/bin/libcrypto-3-x64.dll" "fixture")
 
@@ -343,7 +367,7 @@ foreach(configuration IN ITEMS Debug Release)
     endif()
     assert_path_exists("${output_dir}/libssl-3-x64.dll")
     assert_path_exists("${output_dir}/libcrypto-3-x64.dll")
-    assert_path_exists("${output_dir}/zlib1.dll")
+    assert_path_absent("${output_dir}/zlib1.dll")
     assert_path_absent("${output_dir}/zlib.dll")
 
     if (configuration STREQUAL "Release")

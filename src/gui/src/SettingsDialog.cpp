@@ -20,6 +20,7 @@
 
 #include "BarrierLocale.h"
 #include "QBarrierApplication.h"
+#include "common/ProductIdentity.h"
 #include "QUtility.h"
 #include "AppConfig.h"
 
@@ -364,7 +365,7 @@ void SettingsDialog::onPlatformActionClicked()
     AXIsProcessTrustedWithOptions(options);
     CFRelease(options);
 #elif defined(WINAPI_XWINDOWS)
-    QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/debauchee/barrier/wiki/FAQ")));
+    QDesktopServices::openUrl(QUrl(QString::fromLatin1(WEAVE_PROJECT_URL)));
 #endif
     updatePlatformReadiness();
 }

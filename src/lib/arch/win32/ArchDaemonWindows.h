@@ -24,10 +24,10 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
-#include <tchar.h>
 
 #include <functional>
 #include <string>
+#include <vector>
 
 #define ARCH_DAEMON ArchDaemonWindows
 
@@ -57,6 +57,16 @@ private:
 };
 
 bool deleteServiceSucceeded(BOOL result) noexcept;
+
+bool utf8ServiceTextToWide(
+    const std::string& utf8,
+    bool allowEmpty,
+    std::wstring& wide);
+
+bool wideServiceArgumentsToUtf8(
+    DWORD argc,
+    const WCHAR* const* argv,
+    std::vector<std::string>& utf8Arguments);
 
 // The caller supplies paths resolved through GetFinalPathNameByHandleW.
 // This remains a pure policy check so it can be regression tested without
@@ -157,8 +167,8 @@ private:
 
     static bool            isRunState(DWORD state);
 
-    void                serviceMain(DWORD, LPTSTR*);
-    static void WINAPI    serviceMainEntry(DWORD, LPTSTR*);
+    void                serviceMain(DWORD, LPWSTR*);
+    static void WINAPI    serviceMainEntry(DWORD, LPWSTR*);
 
     void                serviceHandler(DWORD ctrl);
     static void WINAPI    serviceHandlerEntry(DWORD ctrl);
@@ -193,4 +203,5 @@ private:
     UINT                m_quitMessage;
 
     std::string            m_commandLine;
+    std::wstring           m_serviceName;
 };

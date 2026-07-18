@@ -21,9 +21,9 @@ input.
 - A GUI that may be hidden or minimized without stopping the data plane;
   explicit **Quit** stops it.
 
-Use the same current Weave build on every peer when file transfer or the bulk
-channel is required. Compatibility paths for older Barrier protocol peers are
-restricted and do not provide the same isolation guarantees.
+Use the same current Weave build on every peer. Protocol 1.12 is required so
+input epochs, transactional handoff, and the connection-bound bulk channel
+cannot be bypassed by a legacy peer.
 
 ## Release status
 

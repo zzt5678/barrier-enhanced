@@ -41,7 +41,7 @@
 // NOTE: with new version, barrier minor version should increment
 static const SInt16        kProtocolMajorVersion = 1;
 static const SInt16        kProtocolMinorVersion = 12;
-static const SInt16        kProtocolMinimumMinorVersion = 6;
+static const SInt16        kProtocolMinimumMinorVersion = 12;
 
 // default contact port number
 static const UInt16        kDefaultPort = 24800;

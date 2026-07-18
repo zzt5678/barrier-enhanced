@@ -22,10 +22,12 @@
 #include "arch/Arch.h"
 #include "common/stdvector.h"
 #include "common/ProductIdentity.h"
+#include "common/win32/encoding_utilities.h"
 
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -35,6 +37,7 @@ const char kLegacyServiceName[] = "Barrier";
 const wchar_t kLegacyServiceNameWide[] = L"Barrier";
 const wchar_t kWeaveInstallDirectory[] = L"Weave";
 const wchar_t kWeaveDaemonFilename[] = L"weaved.exe";
+const std::size_t kMaximumServiceDependencyBytes = 32768u;
 
 std::wstring
 normalizeWindowsPathForComparison(const std::wstring& input)
@@ -132,6 +135,92 @@ private:
     HANDLE m_handle;
 };
 
+class ScopedRegistryKey {
+public:
+    explicit ScopedRegistryKey(HKEY key = nullptr) noexcept : m_key(key) { }
+    ~ScopedRegistryKey()
+    {
+        if (m_key != nullptr) {
+            RegCloseKey(m_key);
+        }
+    }
+
+    HKEY get() const noexcept { return m_key; }
+
+private:
+    ScopedRegistryKey(const ScopedRegistryKey&) = delete;
+    ScopedRegistryKey& operator=(const ScopedRegistryKey&) = delete;
+
+    HKEY m_key;
+};
+
+HKEY
+openRegistrySubkeyWide(HKEY parent, const wchar_t* name, bool create)
+{
+    if (parent == nullptr || name == nullptr || name[0] == L'\0') {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    HKEY key = nullptr;
+    LONG result = RegOpenKeyExW(
+        parent, name, 0, KEY_WRITE | KEY_QUERY_VALUE, &key);
+    if (result != ERROR_SUCCESS && create) {
+        DWORD disposition = 0;
+        result = RegCreateKeyExW(
+            parent, name, 0, nullptr, 0,
+            KEY_WRITE | KEY_QUERY_VALUE, nullptr, &key, &disposition);
+    }
+    if (result != ERROR_SUCCESS) {
+        SetLastError(static_cast<DWORD>(result));
+        return nullptr;
+    }
+    return key;
+}
+
+bool
+wideServiceDependencies(
+    const char* dependencies,
+    std::vector<WCHAR>& wideDependencies)
+{
+    wideDependencies.clear();
+    if (dependencies == nullptr) {
+        return false;
+    }
+    if (dependencies[0] == '\0') {
+        return true;
+    }
+
+    const char* current = dependencies;
+    std::size_t remaining = kMaximumServiceDependencyBytes;
+    while (remaining > 1u && current[0] != '\0') {
+        const std::size_t length = strnlen_s(current, remaining);
+        if (length == 0u || length >= remaining) {
+            wideDependencies.clear();
+            return false;
+        }
+
+        std::wstring wide;
+        if (!ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+                std::string(current, length), false, wide)) {
+            wideDependencies.clear();
+            return false;
+        }
+        wideDependencies.insert(
+            wideDependencies.end(), wide.begin(), wide.end());
+        wideDependencies.push_back(L'\0');
+        current += length + 1u;
+        remaining -= length + 1u;
+    }
+
+    if (remaining == 0u || current[0] != '\0') {
+        wideDependencies.clear();
+        return false;
+    }
+    wideDependencies.push_back(L'\0');
+    return true;
+}
+
 bool
 resolveFinalFilePath(const std::wstring& path, std::wstring& finalPath)
 {
@@ -188,14 +277,22 @@ readProgramFilesPath(std::wstring& path)
 void
 requireServiceRemovalCommitted(const char* serviceName)
 {
+    std::wstring wideServiceName;
+    if (serviceName == nullptr ||
+        !ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+            serviceName, false, wideServiceName)) {
+        throw XArchDaemonUninstallFailed(
+            new XArchEvalWindows(ERROR_NO_UNICODE_TRANSLATION));
+    }
     ArchDaemonWindowsPolicy::ScopedServiceHandle manager(
-        OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT));
+        OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
     if (manager.get() == nullptr) {
         throw XArchDaemonUninstallFailed(new XArchEvalWindows);
     }
 
     ArchDaemonWindowsPolicy::ScopedServiceHandle service(
-        OpenService(manager.get(), serviceName, SERVICE_QUERY_STATUS));
+        OpenServiceW(
+            manager.get(), wideServiceName.c_str(), SERVICE_QUERY_STATUS));
     if (service.get() != nullptr) {
         throw XArchDaemonUninstallFailed(
             "legacy Barrier service remains installed");
@@ -269,6 +366,58 @@ deleteServiceSucceeded(BOOL result) noexcept
 }
 
 bool
+utf8ServiceTextToWide(
+    const std::string& utf8,
+    bool allowEmpty,
+    std::wstring& wide)
+{
+    wide.clear();
+    if (utf8.empty()) {
+        return allowEmpty;
+    }
+
+    const std::vector<WCHAR> converted = utf8_to_win_char(utf8);
+    if (converted.size() <= 1u) {
+        return false;
+    }
+    wide.assign(converted.data(), converted.size() - 1u);
+    return true;
+}
+
+bool
+wideServiceArgumentsToUtf8(
+    DWORD argc,
+    const WCHAR* const* argv,
+    std::vector<std::string>& utf8Arguments)
+{
+    utf8Arguments.clear();
+    if (argc == 0u || argv == nullptr ||
+        argc > static_cast<DWORD>((std::numeric_limits<int>::max)())) {
+        return false;
+    }
+
+    utf8Arguments.reserve(argc);
+    for (DWORD i = 0; i < argc; ++i) {
+        if (argv[i] == nullptr || (i == 0u && argv[i][0] == L'\0')) {
+            utf8Arguments.clear();
+            return false;
+        }
+        if (argv[i][0] == L'\0') {
+            utf8Arguments.push_back(std::string());
+            continue;
+        }
+
+        std::string argument = win_wchar_to_utf8(argv[i]);
+        if (argument.empty()) {
+            utf8Arguments.clear();
+            return false;
+        }
+        utf8Arguments.push_back(std::move(argument));
+    }
+    return true;
+}
+
+bool
 isSafeLegacyServiceMigrationPath(
     const std::wstring& serviceImagePath,
     const std::wstring& programFilesPath,
@@ -330,7 +479,11 @@ ArchDaemonWindows*        ArchDaemonWindows::s_daemon = NULL;
 ArchDaemonWindows::ArchDaemonWindows() :
 m_daemonThreadID(0)
 {
-    m_quitMessage = RegisterWindowMessage(WEAVE_SERVICE_QUIT_MESSAGE);
+    std::wstring quitMessage;
+    m_quitMessage = ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+        WEAVE_SERVICE_QUIT_MESSAGE, false, quitMessage)
+        ? RegisterWindowMessageW(quitMessage.c_str())
+        : 0;
 }
 
 ArchDaemonWindows::~ArchDaemonWindows()
@@ -378,31 +531,52 @@ ArchDaemonWindows::installDaemon(const char* name,
                 const char* commandLine,
                 const char* dependencies)
 {
+    if (name == nullptr || description == nullptr || pathname == nullptr ||
+        commandLine == nullptr || dependencies == nullptr) {
+        throw XArchDaemonInstallFailed(
+            new XArchEvalWindows(ERROR_INVALID_PARAMETER));
+    }
+
+    const char* displayName =
+        (std::strcmp(name, WEAVE_SERVICE_NAME) == 0) ?
+            WEAVE_SERVICE_DISPLAY_NAME : name;
+    std::wstring wideName;
+    std::wstring wideDisplayName;
+    std::wstring widePathname;
+    std::vector<WCHAR> wideDependencies;
+    if (!ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+            name, false, wideName) ||
+        !ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+            displayName, false, wideDisplayName) ||
+        !ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+            pathname, false, widePathname) ||
+        !wideServiceDependencies(dependencies, wideDependencies)) {
+        throw XArchDaemonInstallFailed(
+            new XArchEvalWindows(ERROR_NO_UNICODE_TRANSLATION));
+    }
+
     ArchDaemonWindowsPolicy::PostInstallMigrationState migrationState;
     {
         ArchDaemonWindowsPolicy::ScopedServiceHandle mgr(
-            OpenSCManager(NULL, NULL,
-                          SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE));
+            OpenSCManagerW(
+                NULL, NULL,
+                SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE));
         if (mgr.get() == NULL) {
             throw XArchDaemonInstallFailed(new XArchEvalWindows);
         }
 
-        const char* displayName =
-            (std::strcmp(name, WEAVE_SERVICE_NAME) == 0) ?
-                WEAVE_SERVICE_DISPLAY_NAME : name;
-
-        ArchDaemonWindowsPolicy::ScopedServiceHandle service(CreateService(
+        ArchDaemonWindowsPolicy::ScopedServiceHandle service(CreateServiceW(
             mgr.get(),
-            name,
-            displayName,
+            wideName.c_str(),
+            wideDisplayName.c_str(),
             0,
             SERVICE_WIN32_OWN_PROCESS | SERVICE_INTERACTIVE_PROCESS,
             SERVICE_AUTO_START,
             SERVICE_ERROR_NORMAL,
-            pathname,
+            widePathname.c_str(),
             NULL,
             NULL,
-            dependencies,
+            wideDependencies.empty() ? NULL : wideDependencies.data(),
             NULL,
             NULL));
 
@@ -412,23 +586,23 @@ ArchDaemonWindows::installDaemon(const char* name,
                 throw XArchDaemonInstallFailed(new XArchEvalWindows(err));
             }
 
-            service.reset(OpenService(
-                mgr.get(), name, SERVICE_CHANGE_CONFIG));
+            service.reset(OpenServiceW(
+                mgr.get(), wideName.c_str(), SERVICE_CHANGE_CONFIG));
             if (service.get() == NULL) {
                 err = GetLastError();
                 throw XArchDaemonInstallFailed(new XArchEvalWindows(err));
             }
-            if (!ChangeServiceConfig(service.get(),
+            if (!ChangeServiceConfigW(service.get(),
                                      SERVICE_NO_CHANGE,
                                      SERVICE_AUTO_START,
                                      SERVICE_NO_CHANGE,
-                                     pathname,
+                                     widePathname.c_str(),
                                      NULL,
                                      NULL,
                                      NULL,
                                      NULL,
                                      NULL,
-                                     displayName)) {
+                                     wideDisplayName.c_str())) {
                 err = GetLastError();
                 throw XArchDaemonInstallFailed(new XArchEvalWindows(err));
             }
@@ -437,9 +611,10 @@ ArchDaemonWindows::installDaemon(const char* name,
     migrationState.serviceConfigured = true;
 
     // open the registry key for this service
-    HKEY key = openNTServicesKey();
-    key      = ArchMiscWindows::addKey(key, name);
-    if (key == NULL) {
+    ScopedRegistryKey servicesKey(openNTServicesKey());
+    ScopedRegistryKey serviceKey(openRegistrySubkeyWide(
+        servicesKey.get(), wideName.c_str(), true));
+    if (serviceKey.get() == NULL) {
         // can't open key
         DWORD err = GetLastError();
         try {
@@ -452,14 +627,15 @@ ArchDaemonWindows::installDaemon(const char* name,
     }
 
     // set the description
-    ArchMiscWindows::setValue(key, _T("Description"), description);
+    ArchMiscWindows::setValueUtf8(
+        serviceKey.get(), "Description", description);
 
     // set command line
-    key = ArchMiscWindows::addKey(key, _T("Parameters"));
-    if (key == NULL) {
+    ScopedRegistryKey parametersKey(openRegistrySubkeyWide(
+        serviceKey.get(), L"Parameters", true));
+    if (parametersKey.get() == NULL) {
         // can't open key
         DWORD err = GetLastError();
-        ArchMiscWindows::closeKey(key);
         try {
             uninstallDaemon(name);
         }
@@ -468,10 +644,8 @@ ArchDaemonWindows::installDaemon(const char* name,
         }
         throw XArchDaemonInstallFailed(new XArchEvalWindows(err));
     }
-    ArchMiscWindows::setValue(key, _T("CommandLine"), commandLine);
-
-    // done with registry
-    ArchMiscWindows::closeKey(key);
+    ArchMiscWindows::setValueUtf8(
+        parametersKey.get(), "CommandLine", commandLine);
     migrationState.parametersConfigured = true;
 
     try {
@@ -494,25 +668,34 @@ ArchDaemonWindows::installDaemon(const char* name,
 void
 ArchDaemonWindows::uninstallDaemon(const char* name)
 {
+    std::wstring wideName;
+    if (name == nullptr ||
+        !ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+            name, false, wideName)) {
+        throw XArchDaemonUninstallFailed(
+            new XArchEvalWindows(ERROR_NO_UNICODE_TRANSLATION));
+    }
+
     // remove parameters for this service.  ignore failures.
-    HKEY key = openNTServicesKey();
-    key      = ArchMiscWindows::openKey(key, name);
-    if (key != NULL) {
-        ArchMiscWindows::deleteKey(key, _T("Parameters"));
-        ArchMiscWindows::closeKey(key);
+    ScopedRegistryKey servicesKey(openNTServicesKey());
+    ScopedRegistryKey serviceKey(openRegistrySubkeyWide(
+        servicesKey.get(), wideName.c_str(), false));
+    if (serviceKey.get() != NULL) {
+        RegDeleteKeyW(serviceKey.get(), L"Parameters");
     }
 
     bool okay = false;
     DWORD err = ERROR_SUCCESS;
     {
         ArchDaemonWindowsPolicy::ScopedServiceHandle mgr(
-            OpenSCManager(NULL, NULL, GENERIC_WRITE));
+            OpenSCManagerW(NULL, NULL, GENERIC_WRITE));
         if (mgr.get() == NULL) {
             throw XArchDaemonUninstallFailed(new XArchEvalWindows);
         }
 
         ArchDaemonWindowsPolicy::ScopedServiceHandle service(
-            OpenService(mgr.get(), name, DELETE | SERVICE_STOP));
+            OpenServiceW(
+                mgr.get(), wideName.c_str(), DELETE | SERVICE_STOP));
         if (service.get() == NULL) {
             err = GetLastError();
             if (err != ERROR_SERVICE_DOES_NOT_EXIST) {
@@ -558,15 +741,20 @@ ArchDaemonWindows::uninstallDaemon(const char* name)
 int
 ArchDaemonWindows::daemonize(const char* name, DaemonFunc func)
 {
-    assert(name != NULL);
     assert(func != NULL);
+    if (name == NULL ||
+        !ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+            name, false, m_serviceName)) {
+        throw XArchDaemonFailed(
+            new XArchEvalWindows(ERROR_NO_UNICODE_TRANSLATION));
+    }
 
     // save daemon function
     m_daemonFunc = func;
 
     // construct the service entry
-    SERVICE_TABLE_ENTRY entry[2];
-    entry[0].lpServiceName = const_cast<char*>(name);
+    SERVICE_TABLE_ENTRYW entry[2];
+    entry[0].lpServiceName = &m_serviceName[0];
     entry[0].lpServiceProc = &ArchDaemonWindows::serviceMainEntry;
     entry[1].lpServiceName = NULL;
     entry[1].lpServiceProc = NULL;
@@ -574,7 +762,7 @@ ArchDaemonWindows::daemonize(const char* name, DaemonFunc func)
     // hook us up to the service control manager.  this won't return
     // (if successful) until the processes have terminated.
     s_daemon = this;
-    if (StartServiceCtrlDispatcher(entry) == 0) {
+    if (StartServiceCtrlDispatcherW(entry) == 0) {
         // StartServiceCtrlDispatcher failed
         s_daemon = NULL;
         throw XArchDaemonFailed(new XArchEvalWindows);
@@ -589,14 +777,16 @@ ArchDaemonWindows::canInstallDaemon(const char* /*name*/)
 {
     // check if we can open service manager for write
     ArchDaemonWindowsPolicy::ScopedServiceHandle mgr(
-        OpenSCManager(NULL, NULL, GENERIC_WRITE));
+        OpenSCManagerW(NULL, NULL, GENERIC_WRITE));
     if (mgr.get() == NULL) {
         return false;
     }
 
     // check if we can open the registry key
     HKEY key = openNTServicesKey();
-    ArchMiscWindows::closeKey(key);
+    if (key != NULL) {
+        ArchMiscWindows::closeKey(key);
+    }
 
     return (key != NULL);
 }
@@ -604,14 +794,20 @@ ArchDaemonWindows::canInstallDaemon(const char* /*name*/)
 bool
 ArchDaemonWindows::isDaemonInstalled(const char* name)
 {
+    std::wstring wideName;
+    if (name == nullptr ||
+        !ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+            name, false, wideName)) {
+        return false;
+    }
     ArchDaemonWindowsPolicy::ScopedServiceHandle mgr(
-        OpenSCManager(NULL, NULL, GENERIC_READ));
+        OpenSCManagerW(NULL, NULL, GENERIC_READ));
     if (mgr.get() == NULL) {
         return false;
     }
 
     ArchDaemonWindowsPolicy::ScopedServiceHandle service(
-        OpenService(mgr.get(), name, GENERIC_READ));
+        OpenServiceW(mgr.get(), wideName.c_str(), GENERIC_READ));
     return service.get() != NULL;
 }
 
@@ -691,14 +887,26 @@ ArchDaemonWindows::isLegacyWeaveDaemonEligibleForMigration()
 HKEY
 ArchDaemonWindows::openNTServicesKey()
 {
-    static const char* s_keyNames[] = {
-        _T("SYSTEM"),
-        _T("CurrentControlSet"),
-        _T("Services"),
+    static const wchar_t* s_keyNames[] = {
+        L"SYSTEM",
+        L"CurrentControlSet",
+        L"Services",
         NULL
     };
 
-    return ArchMiscWindows::addKey(HKEY_LOCAL_MACHINE, s_keyNames);
+    HKEY parent = HKEY_LOCAL_MACHINE;
+    HKEY opened = nullptr;
+    for (std::size_t i = 0; s_keyNames[i] != nullptr; ++i) {
+        opened = openRegistrySubkeyWide(parent, s_keyNames[i], true);
+        if (parent != HKEY_LOCAL_MACHINE) {
+            RegCloseKey(parent);
+        }
+        if (opened == nullptr) {
+            return nullptr;
+        }
+        parent = opened;
+    }
+    return parent;
 }
 
 bool
@@ -831,107 +1039,103 @@ ArchDaemonWindows::setStatusError(DWORD error)
 }
 
 void
-ArchDaemonWindows::serviceMain(DWORD argc, LPTSTR* argvIn)
+ArchDaemonWindows::serviceMain(DWORD argc, LPWSTR* argvIn)
 {
-    typedef std::vector<LPCTSTR> ArgList;
     typedef std::vector<std::string> Arguments;
-    const char** argv = const_cast<const char**>(argvIn);
 
     // create synchronization objects
     m_serviceMutex        = ARCH->newMutex();
     m_serviceCondVar      = ARCH->newCondVar();
 
-    // register our service handler function
-    m_statusHandle = RegisterServiceCtrlHandler(argv[0],
-                                &ArchDaemonWindows::serviceHandlerEntry);
+    // The configured service name is already validated before the dispatcher
+    // starts, so handler registration never depends on unchecked SCM argv.
+    m_statusHandle = RegisterServiceCtrlHandlerW(
+        m_serviceName.c_str(), &ArchDaemonWindows::serviceHandlerEntry);
     if (m_statusHandle == 0) {
-        // cannot start as service
         m_daemonResult = -1;
         ARCH->closeCondVar(m_serviceCondVar);
         ARCH->closeMutex(m_serviceMutex);
         return;
     }
 
-    // tell service control manager that we're starting
     m_serviceState = SERVICE_START_PENDING;
     setStatus(m_serviceState, 0, 10000);
 
+    Arguments effectiveArguments;
+    if (!ArchDaemonWindowsPolicy::wideServiceArgumentsToUtf8(
+            argc, argvIn, effectiveArguments)) {
+        setStatusError(ERROR_NO_UNICODE_TRANSLATION);
+        m_daemonResult = -1;
+        ARCH->closeCondVar(m_serviceCondVar);
+        ARCH->closeMutex(m_serviceMutex);
+        return;
+    }
+
     std::string commandLine;
 
-    // if no arguments supplied then try getting them from the registry.
-    // the first argument doesn't count because it's the service name.
-    Arguments args;
-    ArgList myArgv;
-    if (argc <= 1) {
-        // read command line
-        HKEY key = openNTServicesKey();
-        key      = ArchMiscWindows::openKey(key, argvIn[0]);
-        key      = ArchMiscWindows::openKey(key, _T("Parameters"));
-        if (key != NULL) {
-            commandLine = ArchMiscWindows::readValueString(key,
-                                                _T("CommandLine"));
+    // If StartService supplied no arguments, use the persisted UTF-16 REG_SZ
+    // command and preserve UTF-8 at the application's DaemonFunc boundary.
+    if (argc <= 1u) {
+        ScopedRegistryKey servicesKey(openNTServicesKey());
+        ScopedRegistryKey serviceKey(openRegistrySubkeyWide(
+            servicesKey.get(), m_serviceName.c_str(), false));
+        ScopedRegistryKey parametersKey(openRegistrySubkeyWide(
+            serviceKey.get(), L"Parameters", false));
+        if (parametersKey.get() != NULL) {
+            commandLine = ArchMiscWindows::readValueStringUtf8(
+                parametersKey.get(), "CommandLine");
         }
 
-        // if the command line isn't empty then parse and use it
+        Arguments parsedArguments;
         if (!commandLine.empty()) {
-            // parse, honoring double quoted substrings
+            // Preserve the legacy quoting grammar used by installed configs.
             std::string::size_type i = commandLine.find_first_not_of(" \t");
             while (i != std::string::npos && i != commandLine.size()) {
-                // find end of string
                 std::string::size_type e;
                 if (commandLine[i] == '\"') {
-                    // quoted.  find closing quote.
                     ++i;
                     e = commandLine.find("\"", i);
-
-                    // whitespace must follow closing quote
                     if (e == std::string::npos ||
                         (e + 1 != commandLine.size() &&
-                        commandLine[e + 1] != ' ' &&
-                        commandLine[e + 1] != '\t')) {
-                        args.clear();
+                         commandLine[e + 1] != ' ' &&
+                         commandLine[e + 1] != '\t')) {
+                        parsedArguments.clear();
                         break;
                     }
-
-                    // extract
-                    args.push_back(commandLine.substr(i, e - i));
+                    parsedArguments.push_back(commandLine.substr(i, e - i));
                     i = e + 1;
                 }
                 else {
-                    // unquoted.  find next whitespace.
                     e = commandLine.find_first_of(" \t", i);
                     if (e == std::string::npos) {
                         e = commandLine.size();
                     }
-
-                    // extract
-                    args.push_back(commandLine.substr(i, e - i));
+                    parsedArguments.push_back(commandLine.substr(i, e - i));
                     i = e + 1;
                 }
-
-                // next argument
                 i = commandLine.find_first_not_of(" \t", i);
             }
-
-            // service name goes first
-            myArgv.push_back(argv[0]);
-
-            // get pointers
-            for (size_t j = 0; j < args.size(); ++j) {
-                myArgv.push_back(args[j].c_str());
-            }
-
-            // adjust argc/argv
-            argc = (DWORD)myArgv.size();
-            argv = &myArgv[0];
         }
+
+        const std::string serviceName = effectiveArguments.front();
+        effectiveArguments.clear();
+        effectiveArguments.push_back(serviceName);
+        effectiveArguments.insert(
+            effectiveArguments.end(),
+            parsedArguments.begin(), parsedArguments.end());
+    }
+
+    std::vector<const char*> argv;
+    argv.reserve(effectiveArguments.size());
+    for (const std::string& argument : effectiveArguments) {
+        argv.push_back(argument.c_str());
     }
 
     m_commandLine = commandLine;
 
     try {
-        // invoke daemon function
-        m_daemonResult = m_daemonFunc(static_cast<int>(argc), argv);
+        m_daemonResult = m_daemonFunc(
+            static_cast<int>(argv.size()), argv.data());
     }
     catch (XArchDaemonRunFailed& e) {
         setStatusError(e.m_result);
@@ -942,17 +1146,15 @@ ArchDaemonWindows::serviceMain(DWORD argc, LPTSTR* argvIn)
         m_daemonResult = -1;
     }
 
-    // clean up
     ARCH->closeCondVar(m_serviceCondVar);
     ARCH->closeMutex(m_serviceMutex);
 
-    // we're going to exit now, so set status to stopped
     m_serviceState = SERVICE_STOPPED;
     setStatus(m_serviceState, 0, 10000);
 }
 
 void WINAPI
-ArchDaemonWindows::serviceMainEntry(DWORD argc, LPTSTR* argv)
+ArchDaemonWindows::serviceMainEntry(DWORD argc, LPWSTR* argv)
 {
     s_daemon->serviceMain(argc, argv);
 }
@@ -1017,19 +1219,26 @@ ArchDaemonWindows::serviceHandlerEntry(DWORD ctrl)
 void
 ArchDaemonWindows::start(const char* name)
 {
+    std::wstring wideName;
+    if (name == nullptr ||
+        !ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+            name, false, wideName)) {
+        throw XArchDaemonFailed(
+            new XArchEvalWindows(ERROR_NO_UNICODE_TRANSLATION));
+    }
     ArchDaemonWindowsPolicy::ScopedServiceHandle mgr(
-        OpenSCManager(NULL, NULL, GENERIC_READ));
+        OpenSCManagerW(NULL, NULL, GENERIC_READ));
     if (mgr.get() == NULL) {
         throw XArchDaemonFailed(new XArchEvalWindows());
     }
 
     ArchDaemonWindowsPolicy::ScopedServiceHandle service(
-        OpenService(mgr.get(), name, SERVICE_START));
+        OpenServiceW(mgr.get(), wideName.c_str(), SERVICE_START));
     if (service.get() == NULL) {
         throw XArchDaemonFailed(new XArchEvalWindows());
     }
 
-    if (!StartService(service.get(), 0, NULL)) {
+    if (!StartServiceW(service.get(), 0, NULL)) {
         const DWORD error = GetLastError();
         if (error != ERROR_SERVICE_ALREADY_RUNNING) {
             throw XArchDaemonFailed(new XArchEvalWindows(error));
@@ -1040,14 +1249,21 @@ ArchDaemonWindows::start(const char* name)
 void
 ArchDaemonWindows::stop(const char* name)
 {
+    std::wstring wideName;
+    if (name == nullptr ||
+        !ArchDaemonWindowsPolicy::utf8ServiceTextToWide(
+            name, false, wideName)) {
+        throw XArchDaemonFailed(
+            new XArchEvalWindows(ERROR_NO_UNICODE_TRANSLATION));
+    }
     ArchDaemonWindowsPolicy::ScopedServiceHandle mgr(
-        OpenSCManager(NULL, NULL, GENERIC_READ));
+        OpenSCManagerW(NULL, NULL, GENERIC_READ));
     if (mgr.get() == NULL) {
         throw XArchDaemonFailed(new XArchEvalWindows());
     }
 
-    ArchDaemonWindowsPolicy::ScopedServiceHandle service(OpenService(
-        mgr.get(), name, SERVICE_STOP | SERVICE_QUERY_STATUS));
+    ArchDaemonWindowsPolicy::ScopedServiceHandle service(OpenServiceW(
+        mgr.get(), wideName.c_str(), SERVICE_STOP | SERVICE_QUERY_STATUS));
     if (service.get() == NULL) {
         throw XArchDaemonFailed(new XArchEvalWindows());
     }
@@ -1065,13 +1281,24 @@ ArchDaemonWindows::stop(const char* name)
 void
 ArchDaemonWindows::installDaemon()
 {
-    char path[MAX_PATH];
-    GetModuleFileName(ArchMiscWindows::instanceWin32(), path, MAX_PATH);
+    std::vector<WCHAR> path(32768u, L'\0');
+    const DWORD length = GetModuleFileNameW(
+        ArchMiscWindows::instanceWin32(), path.data(),
+        static_cast<DWORD>(path.size()));
+    if (length == 0u || length >= path.size()) {
+        throw XArchDaemonInstallFailed(new XArchEvalWindows);
+    }
+
+    const std::string utf8Path = win_wchar_to_utf8(path.data());
+    if (utf8Path.empty()) {
+        throw XArchDaemonInstallFailed(
+            new XArchEvalWindows(ERROR_NO_UNICODE_TRANSLATION));
+    }
 
     // Refresh the service path as part of every install/upgrade.
     std::stringstream ss;
     ss << '"';
-    ss << path;
+    ss << utf8Path;
     ss << '"';
 
     installDaemon(WEAVE_SERVICE_NAME, WEAVE_SERVICE_DESCRIPTION,
