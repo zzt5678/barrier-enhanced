@@ -47,6 +47,51 @@ function(assert_legacy_branding_whitelisted path)
     endforeach()
 endfunction()
 
+if (BUILD_VERSION_STAGE STREQUAL "snapshot")
+    string(REGEX REPLACE "-snapshot$" "" build_version_base "${BUILD_VERSION}")
+    set(expected_version_string "${build_version_base}-${BUILD_VERSION_TAG}")
+else()
+    set(expected_version_string "${BUILD_VERSION}")
+endif()
+if (NOT BUILD_VERSION_STRING STREQUAL expected_version_string)
+    message(FATAL_ERROR
+            "build version metadata '${BUILD_VERSION_STRING}' must equal '${expected_version_string}'")
+endif()
+if (BUILD_VERSION_STRING MATCHES "release-release")
+    message(FATAL_ERROR
+            "build version metadata repeats the release stage: ${BUILD_VERSION_STRING}")
+endif()
+
+string(LENGTH "${BUILD_REVISION}" build_revision_length)
+if (BUILD_REVISION STREQUAL "00000000" OR
+    NOT build_revision_length EQUAL 8 OR
+    NOT BUILD_REVISION MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR
+            "configured revision is not a traceable eight-digit Git revision: '${BUILD_REVISION}'")
+endif()
+
+if (GIT_BINARY AND NOT EXISTS "${GIT_BINARY}")
+    message(FATAL_ERROR
+            "configured Git executable no longer exists: ${GIT_BINARY}")
+endif()
+if (GIT_BINARY)
+    execute_process(
+        COMMAND "${GIT_BINARY}" rev-parse --short=8 HEAD
+        WORKING_DIRECTORY "${SOURCE_ROOT}"
+        RESULT_VARIABLE git_revision_result
+        OUTPUT_VARIABLE git_revision
+        ERROR_VARIABLE git_revision_error
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if (NOT git_revision_result EQUAL 0)
+        message(FATAL_ERROR
+                "failed to resolve source HEAD with ${GIT_BINARY}: ${git_revision_error}")
+    endif()
+    if (NOT BUILD_REVISION STREQUAL git_revision)
+        message(FATAL_ERROR
+                "configured revision '${BUILD_REVISION}' does not match HEAD '${git_revision}'")
+    endif()
+endif()
+
 assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_PRODUCT_NAME \"Weave\"")
 assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_PRODUCT_PUBLISHER \"Weave Project\"")
 assert_file_contains("${PRODUCT_IDENTITY_HEADER}" "#define WEAVE_SERVICE_NAME \"WeaveService\"")

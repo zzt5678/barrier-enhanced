@@ -81,7 +81,7 @@ public:
     UInt32 read(void* buffer, UInt32 count) override
     {
         const UInt32 available = getSize();
-        const UInt32 copied = std::min(count, available);
+        const UInt32 copied = (std::min)(count, available);
         if (copied != 0 && buffer != NULL) {
             std::memcpy(buffer, input.data() + inputOffset, copied);
         }

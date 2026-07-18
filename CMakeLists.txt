@@ -513,6 +513,12 @@ if (BARRIER_BUILD_TESTS)
             -DINNO_SCRIPT=${WEAVE_PRODUCT_IDENTITY_TEST_DIR}/weave.iss
             -DBINARY_ROOT=${CMAKE_CURRENT_BINARY_DIR}
             -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+            -DBUILD_VERSION=${BARRIER_VERSION}
+            -DBUILD_VERSION_STRING=${BARRIER_VERSION_STRING}
+            -DBUILD_VERSION_STAGE=${BARRIER_VERSION_STAGE}
+            -DBUILD_VERSION_TAG=${BARRIER_VERSION_TAG}
+            -DBUILD_REVISION=${BARRIER_REVISION}
+            -DGIT_BINARY=${GIT_BINARY}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/src/test/ProductIdentityGoldenTest.cmake.in)
     add_test (
         NAME windows_release_policy
