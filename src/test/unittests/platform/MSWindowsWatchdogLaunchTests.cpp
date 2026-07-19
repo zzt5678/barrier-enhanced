@@ -146,16 +146,33 @@ TEST(MSWindowsWatchdogLaunchTests, externalCommandsNeverAcceptStandbyOption)
 TEST(MSWindowsWatchdogLaunchTests, standbyCommandIsDerivedWithoutMutation)
 {
     const std::string persisted =
-        "\"C:\\Program Files\\Weave\\weavec.exe\" --name windows";
+        "\"C:\\Program Files\\Weave\\weaves.exe\" --name windows";
 
     const std::string launch =
         MSWindowsWatchdog::makeStandbyLaunchCommand(persisted);
 
-    EXPECT_EQ("\"C:\\Program Files\\Weave\\weavec.exe\" --name windows",
+    EXPECT_EQ("\"C:\\Program Files\\Weave\\weaves.exe\" --name windows",
               persisted);
     EXPECT_EQ(persisted + " --service-standby", launch);
     EXPECT_EQ(launch,
               MSWindowsWatchdog::makeStandbyLaunchCommand(launch));
+}
+
+TEST(MSWindowsWatchdogLaunchTests,
+     standbyCommandKeepsClientServerAddressAsFinalArgument)
+{
+    const std::string persisted =
+        "\"C:\\Program Files\\Weave\\weavec.exe\" --name windows "
+        "--ipc --enable-drag-drop 100.76.98.15:24800";
+
+    const std::string launch =
+        MSWindowsWatchdog::makeStandbyLaunchCommand(persisted);
+
+    EXPECT_EQ(
+        "\"C:\\Program Files\\Weave\\weavec.exe\" --name windows "
+        "--ipc --enable-drag-drop --service-standby "
+        "100.76.98.15:24800",
+        launch);
 }
 
 TEST(MSWindowsWatchdogLaunchTests, sameOwnerAllowsANewerProfileGeneration)

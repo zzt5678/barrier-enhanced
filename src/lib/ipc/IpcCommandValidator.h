@@ -52,5 +52,8 @@ bool appendTrustedProfileDirectory(const std::string& command,
                                    const std::string& profileDirectory,
                                    std::string& augmented,
                                    std::string* reason = nullptr);
+bool deriveServiceStandbyCommand(const std::string& command,
+                                 std::string& derived,
+                                 std::string* reason = nullptr);
 
 } // namespace IpcCommandValidator

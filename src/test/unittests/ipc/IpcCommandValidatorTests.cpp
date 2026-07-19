@@ -240,10 +240,11 @@ TEST(IpcCommandValidatorTests, appendsOnlyTrustedAbsoluteProfileDirectory)
         "C:\\ProgramData\\Weave\\LaunchProfiles\\owner\\v1-1234",
         augmented, &reason)) << reason;
     EXPECT_EQ(
-        "\"C:\\Program Files\\Weave\\weavec.exe\" --ipc server:24800 "
+        "\"C:\\Program Files\\Weave\\weavec.exe\" --ipc "
         "--profile-dir "
-        "C:\\ProgramData\\Weave\\LaunchProfiles\\owner\\v1-1234",
-        augmented);
+        "C:\\ProgramData\\Weave\\LaunchProfiles\\owner\\v1-1234 "
+        "server:24800",
+              augmented);
 
     EXPECT_FALSE(IpcCommandValidator::appendTrustedProfileDirectory(
         "weavec --ipc server:24800", "..\\attacker", augmented, &reason));
@@ -268,9 +269,65 @@ TEST(IpcCommandValidatorTests, preservesUtf8TrustedProfileDirectory)
         "weavec --ipc server:24800", profileDirectory,
         augmented, &reason)) << reason;
     EXPECT_EQ(
-        std::string("weavec --ipc server:24800 --profile-dir \"") +
-            profileDirectory + "\"",
+        std::string("weavec --ipc --profile-dir \"") +
+            profileDirectory + "\" server:24800",
         augmented);
+}
+
+TEST(IpcCommandValidatorTests, derivesStandbyBeforeClientServerAddress)
+{
+    std::string derived;
+    std::string reason;
+    ASSERT_TRUE(IpcCommandValidator::deriveServiceStandbyCommand(
+        "weavec --ipc server:24800", derived, &reason)) << reason;
+    EXPECT_EQ("weavec --ipc --service-standby server:24800", derived);
+    EXPECT_TRUE(IpcCommandValidator::deriveServiceStandbyCommand(
+        derived, derived, &reason)) << reason;
+    EXPECT_EQ("weavec --ipc --service-standby server:24800", derived);
+}
+
+TEST(IpcCommandValidatorTests, elevatedClientDerivationKeepsServerAddressLast)
+{
+    IpcCommandValidator::SanitizedDaemonRequest sanitized;
+    std::string restricted;
+    std::string profiled;
+    std::string standby;
+    std::string reason;
+
+    ASSERT_TRUE(IpcCommandValidator::sanitizeDaemonRequest(
+        "weavec --debug INFO --name windows --enable-drag-drop "
+        "--drop-dir C:\\Users\\user\\Inbox 100.76.98.15:24800",
+        IpcCommandMessage::kElevateAsNeeded,
+        "C:\\Program Files\\Weave\\weaves.exe",
+        "C:\\Program Files\\Weave\\weavec.exe",
+        sanitized,
+        &reason)) << reason;
+    ASSERT_TRUE(IpcCommandValidator::restrictElevatedDesktopCommand(
+        sanitized.command, restricted, &reason)) << reason;
+    ASSERT_TRUE(IpcCommandValidator::appendTrustedProfileDirectory(
+        restricted,
+        "C:\\ProgramData\\Weave\\LaunchProfiles\\owner\\v1-1234",
+        profiled,
+        &reason)) << reason;
+    ASSERT_TRUE(IpcCommandValidator::deriveServiceStandbyCommand(
+        profiled, standby, &reason)) << reason;
+
+    EXPECT_EQ(
+        "\"C:\\Program Files\\Weave\\weavec.exe\" --debug INFO "
+        "--name windows --no-daemon --no-tray --ipc "
+        "--stop-on-desk-switch --profile-dir "
+        "C:\\ProgramData\\Weave\\LaunchProfiles\\owner\\v1-1234 "
+        "--service-standby 100.76.98.15:24800",
+        standby);
+}
+
+TEST(IpcCommandValidatorTests, refusesStandbyWithoutClientServerAddress)
+{
+    std::string derived;
+    std::string reason;
+    EXPECT_FALSE(IpcCommandValidator::deriveServiceStandbyCommand(
+        "weavec --ipc", derived, &reason));
+    EXPECT_NE(std::string::npos, reason.find("server address"));
 }
 
 TEST(IpcCommandValidatorTests, refusesDuplicateTrustedProfileDirectory)
@@ -292,6 +349,7 @@ TEST(IpcCommandValidatorTests, refusesProfileAppendBeyondWindowsCommandLimit)
     for (int index = 0; index < 8; ++index) {
         command += " " + std::string(4090, 'a');
     }
+    command += " server:24800";
     EXPECT_FALSE(IpcCommandValidator::appendTrustedProfileDirectory(
         command, "C:\\ProgramData\\Weave\\Profile", augmented, &reason));
     EXPECT_TRUE(augmented.empty());

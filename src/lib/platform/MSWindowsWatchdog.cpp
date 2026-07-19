@@ -316,13 +316,6 @@ containsServiceStandbyOption(const std::string& command)
     return false;
 }
 
-void
-appendServiceStandbyOption(std::string& command)
-{
-    command.push_back(' ');
-    command.append(kServiceStandbyOption);
-}
-
 }
 
 bool
@@ -364,9 +357,13 @@ std::string
 MSWindowsWatchdog::makeStandbyLaunchCommand(
     const std::string& command)
 {
-    std::string launchCommand = command;
-    if (!containsServiceStandbyOption(launchCommand)) {
-        appendServiceStandbyOption(launchCommand);
+    std::string launchCommand;
+    std::string reason;
+    if (!IpcCommandValidator::deriveServiceStandbyCommand(
+            command, launchCommand, &reason)) {
+        LOG((CLOG_ERR "could not derive service standby command: %s",
+            reason.c_str()));
+        launchCommand.clear();
     }
     return launchCommand;
 }
@@ -1548,6 +1545,10 @@ MSWindowsWatchdog::startProcess()
             }
 
             command = makeStandbyLaunchCommand(command);
+            if (command.empty()) {
+                throw XMSWindowsWatchdogError(
+                    "could not derive a safe service standby command");
+            }
             createRet = doStartProcessAsUser(
                 command, userToken.release(), &sa, desktopName,
                 newProcessInfo);

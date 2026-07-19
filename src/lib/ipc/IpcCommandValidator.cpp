@@ -304,6 +304,35 @@ bool isEndpoint(const std::string& value)
     });
 }
 
+bool trustedArgumentInsertionIndex(const std::vector<std::string>& tokens,
+                                   std::size_t& insertionIndex,
+                                   std::string* reason)
+{
+    if (tokens.empty()) {
+        setReason(reason, "service launch command is empty");
+        return false;
+    }
+
+    const IpcCommandValidator::CommandRole role =
+        classifyBasename(basename(tokens.front()));
+    if (role == IpcCommandValidator::CommandRole::kClient) {
+        if (tokens.size() < 2u || !isEndpoint(tokens.back())) {
+            setReason(reason,
+                      "client service launch command must end with its server address");
+            return false;
+        }
+        insertionIndex = tokens.size() - 1u;
+        return true;
+    }
+    if (role == IpcCommandValidator::CommandRole::kServer) {
+        insertionIndex = tokens.size();
+        return true;
+    }
+
+    setReason(reason, "service launch executable is not a weave server/client");
+    return false;
+}
+
 bool parseScrollAmount(const std::string& value, std::string& canonical)
 {
     char* end = nullptr;
@@ -685,12 +714,47 @@ bool appendTrustedProfileDirectory(const std::string& command,
         return false;
     }
 
-    tokens.push_back("--profile-dir");
-    tokens.push_back(profileDirectory);
+    std::size_t insertionIndex = 0u;
+    if (!trustedArgumentInsertionIndex(tokens, insertionIndex, reason)) {
+        return false;
+    }
+    tokens.insert(tokens.begin() + insertionIndex, "--profile-dir");
+    tokens.insert(tokens.begin() + insertionIndex + 1u, profileDirectory);
     augmented = assembleCommand(tokens);
     if (augmented.size() > 32767u) {
         augmented.clear();
         setReason(reason, "service launch command exceeds the Windows command-line limit");
+        return false;
+    }
+    return true;
+}
+
+bool deriveServiceStandbyCommand(const std::string& command,
+                                 std::string& derived,
+                                 std::string* reason)
+{
+    if (reason != nullptr) {
+        reason->clear();
+    }
+
+    std::vector<std::string> tokens;
+    if (!tokenizeCommand(command, tokens, reason)) {
+        return false;
+    }
+
+    std::size_t insertionIndex = 0u;
+    if (!trustedArgumentInsertionIndex(tokens, insertionIndex, reason)) {
+        return false;
+    }
+
+    const std::string standbyOption = "--service-standby";
+    if (std::find(tokens.begin(), tokens.end(), standbyOption) == tokens.end()) {
+        tokens.insert(tokens.begin() + insertionIndex, standbyOption);
+    }
+    derived = assembleCommand(tokens);
+    if (derived.size() > 32767u) {
+        derived.clear();
+        setReason(reason, "service standby command exceeds the Windows command-line limit");
         return false;
     }
     return true;
