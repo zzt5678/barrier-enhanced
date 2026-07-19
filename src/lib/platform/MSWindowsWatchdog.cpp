@@ -1291,7 +1291,7 @@ void MSWindowsWatchdog::main_loop()
             bool desktopChanged = false;
             if (!state.command.empty() &&
                 ElevationPolicy::shouldRelaunchOnDesktopSwitch(state.elevateMode)) {
-                std::string desktopName = activeDesktopName();
+                std::string desktopName = activeDesktopName(false);
                 if (!desktopName.empty() &&
                     !state.lastDesktopName.empty() &&
                     desktopName != state.lastDesktopName) {
