@@ -128,12 +128,29 @@ TEST(DesktopSwitchPolicyTests, observedDesktopIsUsedForProcessLaunch)
 
 TEST(DesktopSwitchPolicyTests, daemonLaunchFallsBackWhenInputDesktopIsUnavailable)
 {
-    EXPECT_EQ("Default", DesktopSwitchPolicy::launchDesktopName("", true));
+    const DesktopSwitchPolicy::LaunchTarget target =
+        DesktopSwitchPolicy::resolveLaunchTarget("", true);
+
+    EXPECT_EQ("Default", target.desktopName);
+    EXPECT_FALSE(target.expectedDesktopKnown);
 }
 
 TEST(DesktopSwitchPolicyTests, foregroundLaunchDoesNotHideDesktopLookupFailure)
 {
-    EXPECT_TRUE(DesktopSwitchPolicy::launchDesktopName("", false).empty());
+    const DesktopSwitchPolicy::LaunchTarget target =
+        DesktopSwitchPolicy::resolveLaunchTarget("", false);
+
+    EXPECT_TRUE(target.desktopName.empty());
+    EXPECT_FALSE(target.expectedDesktopKnown);
+}
+
+TEST(DesktopSwitchPolicyTests, observedDesktopRemainsPartOfReadinessContract)
+{
+    const DesktopSwitchPolicy::LaunchTarget target =
+        DesktopSwitchPolicy::resolveLaunchTarget("Winlogon", true);
+
+    EXPECT_EQ("Winlogon", target.desktopName);
+    EXPECT_TRUE(target.expectedDesktopKnown);
 }
 
 TEST(DesktopSwitchPolicyTests, transientDesktopChangeMustSettleBeforeRelaunch)

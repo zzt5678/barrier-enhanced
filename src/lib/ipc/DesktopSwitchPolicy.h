@@ -30,7 +30,16 @@ struct RelaunchDecision {
     bool debounced;
 };
 
+struct LaunchTarget {
+    std::string desktopName;
+    bool expectedDesktopKnown;
+};
+
 std::string launchDesktopName(
+    const std::string& observedDesktopName,
+    bool daemonized);
+
+LaunchTarget resolveLaunchTarget(
     const std::string& observedDesktopName,
     bool daemonized);
 

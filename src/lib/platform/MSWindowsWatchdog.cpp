@@ -1442,23 +1442,19 @@ MSWindowsWatchdog::startProcess()
     const std::string observedDesktopName = m_daemonized
         ? activeDesktopName(false, &desktopError)
         : activeDesktopNameWithRetry(m_monitoring);
-    if (observedDesktopName.empty()) {
-        if (m_daemonized) {
-            LOG((CLOG_WARN
-                "active input desktop is unavailable to the service, error=%lu; deferring launch instead of assuming Default",
-                desktopError));
-            deferLaunchForGeneration(state.generation);
-            return false;
-        }
-        throw XMSWindowsWatchdogError(
-            "active input desktop is unavailable; delaying relaunch");
-    }
-    std::string desktopName = DesktopSwitchPolicy::launchDesktopName(
+    const DesktopSwitchPolicy::LaunchTarget launchTarget =
+        DesktopSwitchPolicy::resolveLaunchTarget(
         observedDesktopName, m_daemonized);
-    const bool expectedDesktopKnown = !observedDesktopName.empty();
+    std::string desktopName = launchTarget.desktopName;
+    const bool expectedDesktopKnown = launchTarget.expectedDesktopKnown;
     if (desktopName.empty()) {
         throw XMSWindowsWatchdogError(
             "active input desktop is unavailable; delaying relaunch");
+    }
+    if (!expectedDesktopKnown) {
+        LOG((CLOG_WARN
+            "active input desktop is unavailable to the service, error=%lu; bootstrapping on %s and requiring the node readiness proof to report its actual desktop",
+            desktopError, desktopName.c_str()));
     }
     BOOL createRet;
     bool autoElevated = false;

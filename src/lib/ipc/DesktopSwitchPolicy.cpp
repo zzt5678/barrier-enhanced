@@ -34,6 +34,15 @@ launchDesktopName(const std::string& observedDesktopName, bool daemonized)
     return daemonized ? "Default" : std::string();
 }
 
+LaunchTarget
+resolveLaunchTarget(const std::string& observedDesktopName, bool daemonized)
+{
+    LaunchTarget target;
+    target.desktopName = launchDesktopName(observedDesktopName, daemonized);
+    target.expectedDesktopKnown = !observedDesktopName.empty();
+    return target;
+}
+
 RelaunchDecision
 observeDesktop(
     RelaunchState& state,
