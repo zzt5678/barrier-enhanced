@@ -81,13 +81,12 @@ private:
                                        UInt8 elevate);
     IpcStopRequestMessage* parseStopRequest(std::uint64_t requestId);
     void                disconnect();
-    bool                matchesInputReadiness(UInt32 processId,
-                                              UInt32 sessionId,
-                                              const std::string& desktopName,
-                                              const std::string& buildId,
-                                              std::uint64_t queryNonce,
-                                              bool requireDesktopMatch,
-                                              std::string* reportedDesktopName) const;
+    IpcInputReadinessResult inputReadiness(
+                            UInt32 processId,
+                            UInt32 sessionId,
+                            const std::string& desktopName,
+                            const std::string& buildId,
+                            std::uint64_t queryNonce) const;
     bool                matchesActivation(UInt32 processId,
                                           std::uint64_t activationNonce) const;
 

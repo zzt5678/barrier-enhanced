@@ -19,6 +19,7 @@
 #pragma once
 
 #include "ipc/DesktopSwitchPolicy.h"
+#include "ipc/Ipc.h"
 #include "platform/MSWindowsSession.h"
 #include "barrier/ServiceLaunchState.h"
 #include "barrier/XBarrier.h"
@@ -155,19 +156,17 @@ private:
     void failFastOwnedProcesses(const char* reason);
     bool assignPendingProcessToJob();
     bool resumePendingProcess();
-    bool waitForPendingInputReadiness(
+    IpcInputReadinessResult waitForPendingInputReadiness(
         const PROCESS_INFORMATION& processInfo,
         UInt32 expectedSessionId,
         const std::string& expectedDesktopName,
-        bool expectedDesktopKnown,
-        std::string& reportedDesktopName,
         const char* readinessPhase,
+        DesktopSwitchPolicy::ReadinessPhase readinessPolicyPhase,
         const LaunchProfile* activationOwner = nullptr);
     bool activatePendingProcess(
         const PROCESS_INFORMATION& processInfo,
         UInt32 expectedSessionId,
         const std::string& expectedDesktopName,
-        bool expectedDesktopKnown,
         std::string& reportedDesktopName,
         const LaunchProfile& activationOwner);
     bool pendingActivationShouldAbort(

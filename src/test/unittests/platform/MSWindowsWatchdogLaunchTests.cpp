@@ -214,3 +214,34 @@ TEST(MSWindowsWatchdogLaunchTests, failedActivationOnlyDiscardsForProvenSuperses
     EXPECT_TRUE(MSWindowsWatchdog::shouldDiscardFailedActivation(
         true, false, false));
 }
+
+TEST(MSWindowsWatchdogLaunchTests,
+     unknownDesktopRequiresDiscoveryThenAnExactLaunch)
+{
+    const DesktopSwitchPolicy::LaunchTarget discovery =
+        DesktopSwitchPolicy::resolveLaunchTarget("", "", true);
+
+    EXPECT_EQ("Default", discovery.desktopName);
+    EXPECT_FALSE(discovery.expectedDesktopKnown);
+    EXPECT_EQ(DesktopSwitchPolicy::LaunchPurpose::Discovery,
+              discovery.purpose);
+
+    const DesktopSwitchPolicy::LaunchTarget exact =
+        DesktopSwitchPolicy::resolveLaunchTarget("", "Winlogon", true);
+
+    EXPECT_EQ("Winlogon", exact.desktopName);
+    EXPECT_TRUE(exact.expectedDesktopKnown);
+    EXPECT_EQ(DesktopSwitchPolicy::LaunchPurpose::Exact, exact.purpose);
+}
+
+TEST(MSWindowsWatchdogLaunchTests,
+     observedDesktopSupersedesTransactionLocalDiscoveryEvidence)
+{
+    const DesktopSwitchPolicy::LaunchTarget exact =
+        DesktopSwitchPolicy::resolveLaunchTarget(
+            "Default", "Winlogon", true);
+
+    EXPECT_EQ("Default", exact.desktopName);
+    EXPECT_TRUE(exact.expectedDesktopKnown);
+    EXPECT_EQ(DesktopSwitchPolicy::LaunchPurpose::Exact, exact.purpose);
+}

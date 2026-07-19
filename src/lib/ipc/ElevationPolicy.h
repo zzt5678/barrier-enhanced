@@ -20,6 +20,7 @@ UInt8 modeFromSettings(const std::string& elevateModeSetting,
                        const std::string& legacyElevateSetting);
 bool shouldElevateProcess(UInt8 mode);
 bool shouldAutoElevate(UInt8 mode, const std::string& desktopName);
+bool shouldElevateDesktopDiscovery(UInt8 mode);
 bool shouldRelaunchOnDesktopSwitch(UInt8 mode);
 bool commandRequiresRelaunch(const std::string& currentCommand, UInt8 currentMode,
                              const std::string& requestedCommand, UInt8 requestedMode);

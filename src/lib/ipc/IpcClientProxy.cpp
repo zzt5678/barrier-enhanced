@@ -632,18 +632,17 @@ IpcClientProxy::parseActivated(
     return new IpcNodeActivatedMessage(processId, activationNonce);
 }
 
-bool
-IpcClientProxy::matchesInputReadiness(UInt32 processId, UInt32 sessionId,
-                                      const std::string& desktopName,
-                                      const std::string& buildId,
-                                      std::uint64_t queryNonce,
-                                      bool requireDesktopMatch,
-                                      std::string* reportedDesktopName) const
+IpcInputReadinessResult
+IpcClientProxy::inputReadiness(UInt32 processId, UInt32 sessionId,
+                               const std::string& desktopName,
+                               const std::string& buildId,
+                               std::uint64_t queryNonce) const
 {
+    IpcInputReadinessResult result;
     if (m_disconnecting.load(std::memory_order_acquire) ||
         m_clientType.load(std::memory_order_acquire) != kIpcClientNode ||
         m_processId.load(std::memory_order_acquire) != processId) {
-        return false;
+        return result;
     }
 
     std::lock_guard<std::mutex> lock(m_readyMutex);
@@ -665,22 +664,23 @@ IpcClientProxy::matchesInputReadiness(UInt32 processId, UInt32 sessionId,
         ? m_proofQueryNonce : 0;
     const std::chrono::steady_clock::time_point receivedAt = useProof
         ? m_proofReceivedAt : m_readyReceivedAt;
-    const bool desktopMatches = requireDesktopMatch
-        ? readyDesktopName == desktopName
-        : !readyDesktopName.empty();
-
-    const bool matches = inputReady &&
+    const bool validProof = inputReady &&
         readySessionId == sessionId &&
-        desktopMatches &&
+        !readyDesktopName.empty() &&
         inputGeneration != 0 &&
         readyBuildId == buildId &&
         readyQueryNonce == queryNonce &&
         receivedAt != std::chrono::steady_clock::time_point() &&
+        receivedAt <= now &&
         now - receivedAt <= kInputReadinessLeaseLifetime;
-    if (matches && reportedDesktopName != NULL) {
-        *reportedDesktopName = readyDesktopName;
+    if (!validProof) {
+        return result;
     }
-    return matches;
+    result.match = readyDesktopName == desktopName
+        ? IpcInputReadinessMatch::Exact
+        : IpcInputReadinessMatch::DesktopMismatch;
+    result.desktopName = readyDesktopName;
+    return result;
 }
 
 bool

@@ -76,6 +76,13 @@ public:
     virtual bool        hasClients(EIpcClientType clientType) const;
     virtual bool        hasClientProcess(EIpcClientType clientType, UInt32 processId) const;
     virtual bool        hasReadyClientProcess(EIpcClientType clientType, UInt32 processId) const;
+    virtual IpcInputReadinessResult inputReadinessProof(
+                                                   EIpcClientType clientType,
+                                                   UInt32 processId,
+                                                   UInt32 sessionId,
+                                                   const std::string& desktopName,
+                                                   const std::string& buildId,
+                                                   std::uint64_t queryNonce) const;
     virtual bool        hasInputReadyClientProcess(EIpcClientType clientType,
                                                    UInt32 processId,
                                                    UInt32 sessionId,
@@ -95,6 +102,13 @@ private:
     IpcServer(IEventQueue* events, SocketMultiplexer* socketMultiplexer,
               int port, PeerAuthenticator peerAuthenticator);
     PeerAuthenticator testPeerAuthenticator() const;
+    IpcInputReadinessResult inputReadiness(
+                            EIpcClientType clientType,
+                            UInt32 processId,
+                            UInt32 sessionId,
+                            const std::string& desktopName,
+                            const std::string& buildId,
+                            std::uint64_t queryNonce) const;
     void                sendWithAcquiredRefs(
                             const IpcMessage& message,
                             const std::vector<IpcClientProxy*>& recipients);

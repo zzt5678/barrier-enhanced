@@ -79,6 +79,11 @@ bool shouldAutoElevate(UInt8 mode, const std::string& desktopName)
         desktopName != "Default";
 }
 
+bool shouldElevateDesktopDiscovery(UInt8 mode)
+{
+    return normalizeMode(mode) != IpcCommandMessage::kElevateNever;
+}
+
 bool shouldRelaunchOnDesktopSwitch(UInt8 mode)
 {
     return normalizeMode(mode) == IpcCommandMessage::kElevateAsNeeded;

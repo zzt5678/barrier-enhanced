@@ -255,6 +255,47 @@ IpcServer::hasReadyClientProcess(EIpcClientType clientType, UInt32 processId) co
     return false;
 }
 
+IpcInputReadinessResult
+IpcServer::inputReadiness(EIpcClientType clientType,
+                          UInt32 processId, UInt32 sessionId,
+                          const std::string& desktopName,
+                          const std::string& buildId,
+                          std::uint64_t queryNonce) const
+{
+    IpcInputReadinessResult result;
+    if (processId == 0 || clientType != kIpcClientNode) {
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (ClientList::const_iterator it = m_clients.begin(); it != m_clients.end(); ++it) {
+        const IpcInputReadinessResult candidate = (*it)->inputReadiness(
+            processId, sessionId, desktopName, buildId, queryNonce);
+        if (candidate.match == IpcInputReadinessMatch::Exact) {
+            return candidate;
+        }
+        if (candidate.match == IpcInputReadinessMatch::DesktopMismatch) {
+            result = candidate;
+        }
+    }
+
+    return result;
+}
+
+IpcInputReadinessResult
+IpcServer::inputReadinessProof(EIpcClientType clientType,
+                               UInt32 processId, UInt32 sessionId,
+                               const std::string& desktopName,
+                               const std::string& buildId,
+                               std::uint64_t queryNonce) const
+{
+    if (queryNonce == 0) {
+        return IpcInputReadinessResult();
+    }
+    return inputReadiness(
+        clientType, processId, sessionId, desktopName, buildId, queryNonce);
+}
+
 bool
 IpcServer::hasInputReadyClientProcess(EIpcClientType clientType,
                                       UInt32 processId, UInt32 sessionId,
@@ -264,20 +305,18 @@ IpcServer::hasInputReadyClientProcess(EIpcClientType clientType,
                                       bool requireDesktopMatch,
                                       std::string* reportedDesktopName) const
 {
-    if (processId == 0 || clientType != kIpcClientNode) {
-        return false;
+    if (reportedDesktopName != nullptr) {
+        reportedDesktopName->clear();
     }
-
-    std::lock_guard<std::mutex> lock(m_clientsMutex);
-    for (ClientList::const_iterator it = m_clients.begin(); it != m_clients.end(); ++it) {
-        if ((*it)->matchesInputReadiness(
-                processId, sessionId, desktopName, buildId, queryNonce,
-                requireDesktopMatch, reportedDesktopName)) {
-            return true;
-        }
+    const IpcInputReadinessResult result = inputReadiness(
+        clientType, processId, sessionId, desktopName, buildId, queryNonce);
+    const bool accepted = result.match == IpcInputReadinessMatch::Exact ||
+        (!requireDesktopMatch &&
+         result.match == IpcInputReadinessMatch::DesktopMismatch);
+    if (accepted && reportedDesktopName != nullptr) {
+        *reportedDesktopName = result.desktopName;
     }
-
-    return false;
+    return accepted;
 }
 
 bool

@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <string>
+
 #define IPC_HOST "127.0.0.1"
 #define IPC_PORT 24801
 
@@ -39,6 +41,17 @@ enum EIpcClientType {
     kIpcClientUnknown,
     kIpcClientGui,
     kIpcClientNode,
+};
+
+enum class IpcInputReadinessMatch {
+    None,
+    Exact,
+    DesktopMismatch,
+};
+
+struct IpcInputReadinessResult {
+    IpcInputReadinessMatch match = IpcInputReadinessMatch::None;
+    std::string desktopName;
 };
 
 // handshake: node/gui -> daemon

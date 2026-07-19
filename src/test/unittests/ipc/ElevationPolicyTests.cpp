@@ -48,6 +48,17 @@ TEST(ElevationPolicyTests, autoElevationFollowsDesktopAndNeverMode)
     EXPECT_TRUE(ElevationPolicy::shouldAutoElevate(99, "Winlogon"));
 }
 
+TEST(ElevationPolicyTests, unknownDesktopDiscoveryIsPrivilegedUnlessForbidden)
+{
+    EXPECT_TRUE(ElevationPolicy::shouldElevateDesktopDiscovery(
+        IpcCommandMessage::kElevateAsNeeded));
+    EXPECT_TRUE(ElevationPolicy::shouldElevateDesktopDiscovery(
+        IpcCommandMessage::kElevateAlways));
+    EXPECT_FALSE(ElevationPolicy::shouldElevateDesktopDiscovery(
+        IpcCommandMessage::kElevateNever));
+    EXPECT_TRUE(ElevationPolicy::shouldElevateDesktopDiscovery(99));
+}
+
 TEST(ElevationPolicyTests, onlyAsNeededModeRelaunchesOnDesktopSwitch)
 {
     EXPECT_TRUE(ElevationPolicy::shouldRelaunchOnDesktopSwitch(
@@ -129,28 +140,68 @@ TEST(DesktopSwitchPolicyTests, observedDesktopIsUsedForProcessLaunch)
 TEST(DesktopSwitchPolicyTests, daemonLaunchFallsBackWhenInputDesktopIsUnavailable)
 {
     const DesktopSwitchPolicy::LaunchTarget target =
-        DesktopSwitchPolicy::resolveLaunchTarget("", true);
+        DesktopSwitchPolicy::resolveLaunchTarget("", "", true);
 
     EXPECT_EQ("Default", target.desktopName);
     EXPECT_FALSE(target.expectedDesktopKnown);
+    EXPECT_EQ(DesktopSwitchPolicy::LaunchPurpose::Discovery, target.purpose);
 }
 
 TEST(DesktopSwitchPolicyTests, foregroundLaunchDoesNotHideDesktopLookupFailure)
 {
     const DesktopSwitchPolicy::LaunchTarget target =
-        DesktopSwitchPolicy::resolveLaunchTarget("", false);
+        DesktopSwitchPolicy::resolveLaunchTarget("", "Winlogon", false);
 
     EXPECT_TRUE(target.desktopName.empty());
     EXPECT_FALSE(target.expectedDesktopKnown);
+    EXPECT_EQ(DesktopSwitchPolicy::LaunchPurpose::Exact, target.purpose);
 }
 
 TEST(DesktopSwitchPolicyTests, observedDesktopRemainsPartOfReadinessContract)
 {
     const DesktopSwitchPolicy::LaunchTarget target =
-        DesktopSwitchPolicy::resolveLaunchTarget("Winlogon", true);
+        DesktopSwitchPolicy::resolveLaunchTarget(
+            "Winlogon", "Default", true);
 
     EXPECT_EQ("Winlogon", target.desktopName);
     EXPECT_TRUE(target.expectedDesktopKnown);
+    EXPECT_EQ(DesktopSwitchPolicy::LaunchPurpose::Exact, target.purpose);
+}
+
+TEST(DesktopSwitchPolicyTests, readinessEvidenceRequiresAnExactSecondProof)
+{
+    const DesktopSwitchPolicy::LaunchTarget target =
+        DesktopSwitchPolicy::resolveLaunchTarget(
+            "", "Winlogon", true);
+
+    EXPECT_EQ("Winlogon", target.desktopName);
+    EXPECT_TRUE(target.expectedDesktopKnown);
+    EXPECT_EQ(DesktopSwitchPolicy::LaunchPurpose::Exact, target.purpose);
+}
+
+TEST(DesktopSwitchPolicyTests,
+     standbyMismatchReturnsForRetargetWhileActiveMismatchKeepsWaiting)
+{
+    EXPECT_TRUE(DesktopSwitchPolicy::shouldReturnDesktopMismatch(
+        DesktopSwitchPolicy::ReadinessPhase::Standby));
+    EXPECT_FALSE(DesktopSwitchPolicy::shouldReturnDesktopMismatch(
+        DesktopSwitchPolicy::ReadinessPhase::Active));
+}
+
+TEST(DesktopSwitchPolicyTests, desktopRetargetIsBoundedToOneExactRetry)
+{
+    EXPECT_EQ(DesktopSwitchPolicy::DesktopRetargetDecision::Retarget,
+              DesktopSwitchPolicy::decideDesktopRetarget(
+                  DesktopSwitchPolicy::LaunchPurpose::Discovery,
+                  false, false));
+    EXPECT_EQ(DesktopSwitchPolicy::DesktopRetargetDecision::Keep,
+              DesktopSwitchPolicy::decideDesktopRetarget(
+                  DesktopSwitchPolicy::LaunchPurpose::Exact,
+                  false, true));
+    EXPECT_EQ(DesktopSwitchPolicy::DesktopRetargetDecision::Backoff,
+              DesktopSwitchPolicy::decideDesktopRetarget(
+                  DesktopSwitchPolicy::LaunchPurpose::Exact,
+                  true, true));
 }
 
 TEST(DesktopSwitchPolicyTests, transientDesktopChangeMustSettleBeforeRelaunch)

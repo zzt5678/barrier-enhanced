@@ -1465,6 +1465,143 @@ TEST(IpcProxyTests, capabilityProofMustMatchWatchdogQueryNonce)
         kIpcClientNode, 12345, 7, "Default", "test-build", 77));
 }
 
+TEST(IpcProxyTests, freshCapabilityProofReportsDesktopMismatchImmediately)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    const std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build", 77);
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [](const Event& event) { delete event.getDataObject(); }));
+
+    IpcProxyTestAccess::handleData(proxy);
+
+    const IpcInputReadinessResult mismatch = server.inputReadinessProof(
+        kIpcClientNode, 12345, 7, "Winlogon", "test-build", 77);
+    EXPECT_EQ(IpcInputReadinessMatch::DesktopMismatch, mismatch.match);
+    EXPECT_EQ("Default", mismatch.desktopName);
+
+    const IpcInputReadinessResult exact = server.inputReadinessProof(
+        kIpcClientNode, 12345, 7, "Default", "test-build", 77);
+    EXPECT_EQ(IpcInputReadinessMatch::Exact, exact.match);
+    EXPECT_EQ("Default", exact.desktopName);
+}
+
+TEST(IpcProxyTests, invalidCapabilityProofCannotReportDesktopMismatch)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 42, true, "Default", "test-build", 77);
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [](const Event& event) { delete event.getDataObject(); }));
+
+    IpcProxyTestAccess::handleData(proxy);
+
+    IpcInputReadinessResult invalid = server.inputReadinessProof(
+        kIpcClientNode, 12345, 8, "Winlogon", "test-build", 77);
+    EXPECT_EQ(IpcInputReadinessMatch::None, invalid.match);
+    EXPECT_TRUE(invalid.desktopName.empty());
+
+    invalid = server.inputReadinessProof(
+        kIpcClientNode, 12345, 7, "Winlogon", "other-build", 77);
+    EXPECT_EQ(IpcInputReadinessMatch::None, invalid.match);
+    EXPECT_TRUE(invalid.desktopName.empty());
+
+    invalid = server.inputReadinessProof(
+        kIpcClientNode, 12345, 7, "Winlogon", "test-build", 76);
+    EXPECT_EQ(IpcInputReadinessMatch::None, invalid.match);
+    EXPECT_TRUE(invalid.desktopName.empty());
+
+    invalid = server.inputReadinessProof(
+        kIpcClientNode, 54321, 7, "Winlogon", "test-build", 77);
+    EXPECT_EQ(IpcInputReadinessMatch::None, invalid.match);
+    EXPECT_TRUE(invalid.desktopName.empty());
+
+    invalid = server.inputReadinessProof(
+        kIpcClientNode, 12345, 7, "Winlogon", "test-build", 0);
+    EXPECT_EQ(IpcInputReadinessMatch::None, invalid.match);
+    EXPECT_TRUE(invalid.desktopName.empty());
+
+    appendReadyV2Frame(
+        bytes, 12345, 7, 43, true, "", "test-build", 88);
+    IpcProxyTestAccess::handleData(proxy);
+    invalid = server.inputReadinessProof(
+        kIpcClientNode, 12345, 7, "Winlogon", "test-build", 88);
+    EXPECT_EQ(IpcInputReadinessMatch::None, invalid.match);
+    EXPECT_TRUE(invalid.desktopName.empty());
+}
+
+TEST(IpcProxyTests, zeroGenerationCapabilityProofCannotRetargetDesktop)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    IpcClientProxyEvents ipcEvents;
+    setupClientProxyEvents(events, streamEvents, ipcEvents);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(
+        Invoke([stream]() { return stream; }));
+
+    IpcClientProxy proxy(
+        *stream, &events, authenticatedTestPeer(12345, kIpcClientNode));
+    IpcServer server;
+    server.m_clients.push_back(&proxy);
+    const std::vector<UInt8> bytes = nodeReadyV2Frames(
+        12345, 12345, 7, 0, true, "Default", "test-build", 77);
+    size_t offset = 0;
+
+    EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
+        [&](void* buffer, UInt32 size) {
+            return readFromBuffer(bytes, offset, buffer, size);
+        }));
+    EXPECT_CALL(*stream, close()).Times(0);
+    EXPECT_CALL(events, addEvent(_)).WillRepeatedly(Invoke(
+        [](const Event& event) { delete event.getDataObject(); }));
+
+    IpcProxyTestAccess::handleData(proxy);
+    const IpcInputReadinessResult result = server.inputReadinessProof(
+        kIpcClientNode, 12345, 7, "Winlogon", "test-build", 77);
+    EXPECT_EQ(IpcInputReadinessMatch::None, result.match);
+    EXPECT_TRUE(result.desktopName.empty());
+}
+
 TEST(IpcProxyTests, periodicInvalidationRetiresWatchdogQueryProof)
 {
     NiceMock<MockEventQueue> events;
@@ -1550,7 +1687,7 @@ TEST(IpcProxyTests, capabilityReadyFalseCannotBeAdopted)
     IpcServer server;
     server.m_clients.push_back(&proxy);
     const std::vector<UInt8> bytes = nodeReadyV2Frames(
-        12345, 12345, 7, 42, false, "Default", "test-build");
+        12345, 12345, 7, 42, false, "Default", "test-build", 77);
     size_t offset = 0;
 
     EXPECT_CALL(*stream, read(_, _)).WillRepeatedly(Invoke(
@@ -1565,6 +1702,10 @@ TEST(IpcProxyTests, capabilityReadyFalseCannotBeAdopted)
     EXPECT_TRUE(IpcProxyTestAccess::ready(proxy));
     EXPECT_FALSE(server.hasInputReadyClientProcess(
         kIpcClientNode, 12345, 7, "Default", "test-build"));
+    const IpcInputReadinessResult result = server.inputReadinessProof(
+        kIpcClientNode, 12345, 7, "Winlogon", "test-build", 77);
+    EXPECT_EQ(IpcInputReadinessMatch::None, result.match);
+    EXPECT_TRUE(result.desktopName.empty());
 }
 
 TEST(IpcProxyTests, capabilityReadinessUsesLatestRecoveryUpdate)
@@ -1704,9 +1845,20 @@ TEST(IpcProxyTests, expiredCapabilityProofCannotBeAdopted)
 
     IpcProxyTestAccess::handleData(proxy);
     IpcProxyTestAccess::setProofReceivedAt(
+        proxy, std::chrono::steady_clock::now() + std::chrono::seconds(10));
+    IpcInputReadinessResult result = server.inputReadinessProof(
+        kIpcClientNode, 12345, 7, "Winlogon", "test-build", 77);
+    EXPECT_EQ(IpcInputReadinessMatch::None, result.match);
+    EXPECT_TRUE(result.desktopName.empty());
+
+    IpcProxyTestAccess::setProofReceivedAt(
         proxy, std::chrono::steady_clock::now() - std::chrono::seconds(10));
     EXPECT_FALSE(server.hasInputReadyClientProcess(
         kIpcClientNode, 12345, 7, "Default", "test-build", 77));
+    result = server.inputReadinessProof(
+        kIpcClientNode, 12345, 7, "Winlogon", "test-build", 77);
+    EXPECT_EQ(IpcInputReadinessMatch::None, result.match);
+    EXPECT_TRUE(result.desktopName.empty());
 }
 
 TEST(IpcProxyTests, oversizedCapabilityStringDisconnectsWithoutThrowing)

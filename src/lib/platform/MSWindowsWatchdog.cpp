@@ -779,16 +779,16 @@ MSWindowsWatchdog::pendingActivationShouldAbort(
     return false;
 }
 
-bool
+IpcInputReadinessResult
 MSWindowsWatchdog::waitForPendingInputReadiness(
     const PROCESS_INFORMATION& processInfo,
     UInt32 expectedSessionId,
     const std::string& expectedDesktopName,
-    bool expectedDesktopKnown,
-    std::string& reportedDesktopName,
     const char* readinessPhase,
+    DesktopSwitchPolicy::ReadinessPhase readinessPolicyPhase,
     const LaunchProfile* activationOwner)
 {
+    IpcInputReadinessResult result;
     const double readyStart = ARCH->time();
     while (m_monitoring.load() &&
            ARCH->time() - readyStart < kProcessReadyTimeoutSeconds) {
@@ -801,7 +801,7 @@ MSWindowsWatchdog::waitForPendingInputReadiness(
                     processInfo.dwProcessId,
                     readinessPhase == nullptr ? "local" : readinessPhase,
                     abortReason.c_str()));
-                return false;
+                return result;
             }
         }
         if (!isProcessHandleActive(processInfo.hProcess)) {
@@ -819,7 +819,7 @@ MSWindowsWatchdog::waitForPendingInputReadiness(
             LOG((CLOG_ERR
                 "could not generate a secure input-readiness nonce for process %lu",
                 processInfo.dwProcessId));
-            return false;
+            return result;
         }
         IpcInputReadyQueryMessage query(queryNonce);
         bool querySent = false;
@@ -856,25 +856,29 @@ MSWindowsWatchdog::waitForPendingInputReadiness(
                         processInfo.dwProcessId,
                         readinessPhase == nullptr ? "local" : readinessPhase,
                         abortReason.c_str()));
-                    return false;
+                    return result;
                 }
             }
-            if (m_ipcServer.hasInputReadyClientProcess(
-                    kIpcClientNode, processInfo.dwProcessId,
-                    expectedSessionId, expectedDesktopName, kBuildId,
-                    queryNonce, expectedDesktopKnown,
-                    &reportedDesktopName)) {
-                return true;
+            result = m_ipcServer.inputReadinessProof(
+                kIpcClientNode, processInfo.dwProcessId,
+                expectedSessionId, expectedDesktopName, kBuildId,
+                queryNonce);
+            if (result.match == IpcInputReadinessMatch::Exact ||
+                (result.match ==
+                     IpcInputReadinessMatch::DesktopMismatch &&
+                 DesktopSwitchPolicy::shouldReturnDesktopMismatch(
+                     readinessPolicyPhase))) {
+                return result;
             }
             if (!m_monitoring.load() ||
                 !isProcessHandleActive(processInfo.hProcess)) {
-                return false;
+                return IpcInputReadinessResult();
             }
             ARCH->sleep(kProcessReadyPollSeconds);
         } while (ARCH->time() < proofDeadline &&
                  ARCH->time() - readyStart < kProcessReadyTimeoutSeconds);
     }
-    return false;
+    return result;
 }
 
 bool
@@ -882,7 +886,6 @@ MSWindowsWatchdog::activatePendingProcess(
     const PROCESS_INFORMATION& processInfo,
     UInt32 expectedSessionId,
     const std::string& expectedDesktopName,
-    bool expectedDesktopKnown,
     std::string& reportedDesktopName,
     const LaunchProfile& activationOwner)
 {
@@ -952,10 +955,24 @@ MSWindowsWatchdog::activatePendingProcess(
             // activation. A fresh readiness challenge below proves the active
             // local input backend; peer connectivity remains independently
             // recoverable and is deliberately not a publication prerequisite.
-            return waitForPendingInputReadiness(
-                processInfo, expectedSessionId, expectedDesktopName,
-                expectedDesktopKnown, reportedDesktopName, "active",
-                &activationOwner);
+            const IpcInputReadinessResult readiness =
+                waitForPendingInputReadiness(
+                    processInfo, expectedSessionId, expectedDesktopName,
+                    "active", DesktopSwitchPolicy::ReadinessPhase::Active,
+                    &activationOwner);
+            if (readiness.match == IpcInputReadinessMatch::Exact) {
+                reportedDesktopName = readiness.desktopName;
+                return true;
+            }
+            if (readiness.match ==
+                    IpcInputReadinessMatch::DesktopMismatch) {
+                LOG((CLOG_ERR
+                    "activated process %lu proved unexpected desktop=%s expected=%s",
+                    processInfo.dwProcessId,
+                    readiness.desktopName.c_str(),
+                    expectedDesktopName.c_str()));
+            }
+            return false;
         }
         ARCH->sleep(kProcessReadyPollSeconds);
     }
@@ -1415,8 +1432,6 @@ MSWindowsWatchdog::startProcess()
         closeProcessInfo(m_pendingProcessInfo);
     }
 
-    std::string command = state.command;
-
     UInt32 expectedSessionId = 0;
     if (m_daemonized) {
         std::string ownerReason;
@@ -1438,101 +1453,112 @@ MSWindowsWatchdog::startProcess()
         expectedSessionId = m_session.getActiveSessionId();
     }
 
-    DWORD desktopError = ERROR_SUCCESS;
-    const std::string observedDesktopName = m_daemonized
-        ? activeDesktopName(false, &desktopError)
-        : activeDesktopNameWithRetry(m_monitoring);
-    const DesktopSwitchPolicy::LaunchTarget launchTarget =
-        DesktopSwitchPolicy::resolveLaunchTarget(
-        observedDesktopName, m_daemonized);
-    std::string desktopName = launchTarget.desktopName;
-    const bool expectedDesktopKnown = launchTarget.expectedDesktopKnown;
-    if (desktopName.empty()) {
-        throw XMSWindowsWatchdogError(
-            "active input desktop is unavailable; delaying relaunch");
-    }
-    if (!expectedDesktopKnown) {
-        LOG((CLOG_WARN
-            "active input desktop is unavailable to the service, error=%lu; bootstrapping on %s and requiring the node readiness proof to report its actual desktop",
-            desktopError, desktopName.c_str()));
-    }
-    BOOL createRet;
+    std::string command;
+    std::string desktopName;
+    std::string desktopEvidence;
     bool autoElevated = false;
+    bool retargetAlreadyAttempted = false;
     PROCESS_INFORMATION& newProcessInfo = m_pendingProcessInfo;
-    ZeroMemory(&newProcessInfo, sizeof(PROCESS_INFORMATION));
-    if (!m_daemonized) {
-        createRet = doStartProcessAsSelf(command, desktopName, newProcessInfo);
-    } else {
-        autoElevated = shouldAutoElevate(state.elevateMode, desktopName);
-        if (shouldElevateProcess(state.elevateMode) || autoElevated) {
-            std::string restrictedCommand;
-            std::string restrictionError;
-            if (!IpcCommandValidator::restrictElevatedDesktopCommand(
-                    command, restrictedCommand, &restrictionError)) {
-                throw XMSWindowsWatchdogError(
-                    "refusing unsafe elevated desktop command: " +
-                    restrictionError);
-            }
-            if (restrictedCommand != command) {
-                LOG((CLOG_WARN
-                    "disabled file capabilities for elevated desktop launch"));
-                command = restrictedCommand;
-            }
-
-            std::string profiledCommand;
-            std::string profileError;
-            if (!state.launchProfile.authenticated ||
-                !IpcCommandValidator::appendTrustedProfileDirectory(
-                    command, state.launchProfile.profileDirectory,
-                    profiledCommand, &profileError)) {
-                throw XMSWindowsWatchdogError(
-                    "refusing unsafe service launch profile: " + profileError);
-            }
-            command = profiledCommand;
-        }
-
-        SECURITY_ATTRIBUTES sa;
-        ZeroMemory(&sa, sizeof(SECURITY_ATTRIBUTES));
-        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-        sa.bInheritHandle = TRUE;
-        sa.lpSecurityDescriptor = NULL;
-        ScopedHandle userToken(
-            getUserToken(&sa, state.elevateMode, autoElevated));
-
-        // patch by Jack Zhou and Henry Tung
-        // set UIAccess to fix Windows 8 GUI interaction
-        // http://symless.com/spit/issues/details/3338/#c70
-        DWORD uiAccess = 1;
-        const bool uiAccessEnabled = SetTokenInformation(
-            userToken.get(), TokenUIAccess, &uiAccess,
-            sizeof(DWORD)) != FALSE;
-        const DWORD uiAccessError = uiAccessEnabled
-            ? ERROR_SUCCESS : GetLastError();
-        const bool secureDesktop = _stricmp(
-            desktopName.c_str(), "Default") != 0;
-        if (!serviceLaunchInputCapabilityReady(
-                secureDesktop, uiAccessEnabled)) {
-            LOG((CLOG_ERR
-                "refusing Windows input helper launch without UIAccess, desktop=%s error=%lu",
-                desktopName.c_str(), uiAccessError));
+    for (;;) {
+        command = state.command;
+        autoElevated = false;
+        DWORD desktopError = ERROR_SUCCESS;
+        const std::string observedDesktopName = m_daemonized
+            ? activeDesktopName(false, &desktopError)
+            : activeDesktopNameWithRetry(m_monitoring);
+        const DesktopSwitchPolicy::LaunchTarget launchTarget =
+            DesktopSwitchPolicy::resolveLaunchTarget(
+                observedDesktopName, desktopEvidence, m_daemonized);
+        desktopName = launchTarget.desktopName;
+        if (desktopName.empty()) {
             throw XMSWindowsWatchdogError(
-                "privileged input capability is unavailable");
+                "active input desktop is unavailable; delaying relaunch");
+        }
+        if (launchTarget.purpose ==
+                DesktopSwitchPolicy::LaunchPurpose::Discovery) {
+            LOG((CLOG_WARN
+                "active input desktop is unavailable to the service, error=%lu; starting a non-activatable discovery process on %s",
+                desktopError, desktopName.c_str()));
         }
 
-        // This flag is part of the local service-to-node launch contract. It
-        // is never copied into CommandState or the durable Current/Pending
-        // registry values, and external commands containing it are rejected.
-        command = makeStandbyLaunchCommand(command);
-        createRet = doStartProcessAsUser(
-            command, userToken.release(), &sa, desktopName, newProcessInfo);
-    }
+        BOOL createRet = FALSE;
+        ZeroMemory(&newProcessInfo, sizeof(PROCESS_INFORMATION));
+        if (!m_daemonized) {
+            createRet = doStartProcessAsSelf(
+                command, desktopName, newProcessInfo);
+        }
+        else {
+            autoElevated =
+                shouldAutoElevate(state.elevateMode, desktopName) ||
+                (launchTarget.purpose ==
+                     DesktopSwitchPolicy::LaunchPurpose::Discovery &&
+                 ElevationPolicy::shouldElevateDesktopDiscovery(
+                     state.elevateMode));
+            if (shouldElevateProcess(state.elevateMode) || autoElevated) {
+                std::string restrictedCommand;
+                std::string restrictionError;
+                if (!IpcCommandValidator::restrictElevatedDesktopCommand(
+                        command, restrictedCommand, &restrictionError)) {
+                    throw XMSWindowsWatchdogError(
+                        "refusing unsafe elevated desktop command: " +
+                        restrictionError);
+                }
+                if (restrictedCommand != command) {
+                    LOG((CLOG_WARN
+                        "disabled file capabilities for elevated desktop launch"));
+                    command = restrictedCommand;
+                }
 
-    if (!createRet) {
-        LOG((CLOG_ERR "could not launch"));
-        closeProcessInfo(newProcessInfo);
-        throw XArch(new XArchEvalWindows);
-    }
-    else {
+                std::string profiledCommand;
+                std::string profileError;
+                if (!state.launchProfile.authenticated ||
+                    !IpcCommandValidator::appendTrustedProfileDirectory(
+                        command, state.launchProfile.profileDirectory,
+                        profiledCommand, &profileError)) {
+                    throw XMSWindowsWatchdogError(
+                        "refusing unsafe service launch profile: " +
+                        profileError);
+                }
+                command = profiledCommand;
+            }
+
+            SECURITY_ATTRIBUTES sa;
+            ZeroMemory(&sa, sizeof(SECURITY_ATTRIBUTES));
+            sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+            sa.bInheritHandle = TRUE;
+            sa.lpSecurityDescriptor = NULL;
+            ScopedHandle userToken(
+                getUserToken(&sa, state.elevateMode, autoElevated));
+
+            DWORD uiAccess = 1;
+            const bool uiAccessEnabled = SetTokenInformation(
+                userToken.get(), TokenUIAccess, &uiAccess,
+                sizeof(DWORD)) != FALSE;
+            const DWORD uiAccessError = uiAccessEnabled
+                ? ERROR_SUCCESS : GetLastError();
+            const bool secureDesktop = _stricmp(
+                desktopName.c_str(), "Default") != 0;
+            if (!serviceLaunchInputCapabilityReady(
+                    secureDesktop, uiAccessEnabled)) {
+                LOG((CLOG_ERR
+                    "refusing Windows input helper launch without UIAccess, desktop=%s error=%lu",
+                    desktopName.c_str(), uiAccessError));
+                throw XMSWindowsWatchdogError(
+                    "privileged input capability is unavailable");
+            }
+
+            command = makeStandbyLaunchCommand(command);
+            createRet = doStartProcessAsUser(
+                command, userToken.release(), &sa, desktopName,
+                newProcessInfo);
+        }
+
+        if (!createRet) {
+            LOG((CLOG_ERR "could not launch"));
+            closeProcessInfo(newProcessInfo);
+            throw XArch(new XArchEvalWindows);
+        }
+
         if (m_daemonized &&
             (!assignPendingProcessToJob() || !resumePendingProcess())) {
             const DWORD processId = newProcessInfo.dwProcessId;
@@ -1546,21 +1572,23 @@ MSWindowsWatchdog::startProcess()
                 "service process containment or resume failed");
         }
 
-        bool processReady = false;
-        std::string reportedDesktopName = desktopName;
+        IpcInputReadinessResult readiness;
         if (!m_daemonized) {
             // Foreground relaunches do not use daemon IPC. Preserve the startup
             // crash observation window before adopting the process.
             ARCH->sleep(1);
-            processReady = isProcessHandleActive(newProcessInfo.hProcess);
+            if (isProcessHandleActive(newProcessInfo.hProcess)) {
+                readiness.match = IpcInputReadinessMatch::Exact;
+                readiness.desktopName = desktopName;
+            }
         }
         else {
-            processReady = waitForPendingInputReadiness(
+            readiness = waitForPendingInputReadiness(
                 newProcessInfo, expectedSessionId, desktopName,
-                expectedDesktopKnown, reportedDesktopName, "standby");
+                "standby", DesktopSwitchPolicy::ReadinessPhase::Standby);
         }
 
-        if (!processReady) {
+        if (readiness.match == IpcInputReadinessMatch::None) {
             if (m_daemonized) {
                 std::string ownerReason;
                 if (validateLaunchOwner(state.launchProfile, ownerReason) !=
@@ -1579,7 +1607,8 @@ MSWindowsWatchdog::startProcess()
                 "process %lu did not prove local input readiness for session=%lu desktop=%s within %.1f seconds",
                 newProcessInfo.dwProcessId,
                 static_cast<unsigned long>(expectedSessionId),
-                expectedDesktopKnown ? desktopName.c_str() : "<service-unavailable>",
+                launchTarget.expectedDesktopKnown
+                    ? desktopName.c_str() : "<service-unavailable>",
                 kProcessReadyTimeoutSeconds));
             discardPendingProcessOrFailFast(
                 "process without an input readiness proof could not be discarded",
@@ -1587,8 +1616,8 @@ MSWindowsWatchdog::startProcess()
             throw XMSWindowsWatchdogError("process did not become ready");
         }
 
-        if (!reportedDesktopName.empty()) {
-            desktopName = reportedDesktopName;
+        if (!readiness.desktopName.empty()) {
+            desktopName = readiness.desktopName;
         }
 
         const CommandState latestState = commandState();
@@ -1625,6 +1654,45 @@ MSWindowsWatchdog::startProcess()
             }
         }
 
+        const DesktopSwitchPolicy::DesktopRetargetDecision retargetDecision =
+            DesktopSwitchPolicy::decideDesktopRetarget(
+                launchTarget.purpose,
+                readiness.match ==
+                    IpcInputReadinessMatch::DesktopMismatch,
+                retargetAlreadyAttempted);
+        if (retargetDecision ==
+                DesktopSwitchPolicy::DesktopRetargetDecision::Keep) {
+            break;
+        }
+
+        const DWORD probeProcessId = newProcessInfo.dwProcessId;
+        const std::string discoveredDesktopName = desktopName;
+        LOG((CLOG_INFO
+            "desktop probe process %lu proved session=%lu desktop=%s; discarding it before any commit, fence, activation, or publication",
+            probeProcessId,
+            static_cast<unsigned long>(expectedSessionId),
+            discoveredDesktopName.c_str()));
+        discardPendingProcessOrFailFast(
+            "desktop probe process could not be discarded before exact relaunch",
+            3, true);
+
+        if (retargetDecision ==
+                DesktopSwitchPolicy::DesktopRetargetDecision::Backoff) {
+            LOG((CLOG_WARN
+                "desktop changed again during exact readiness; applying launch-failure backoff before a fresh discovery transaction"));
+            throw XMSWindowsWatchdogError(
+                "desktop remained unstable during exact readiness");
+        }
+
+        desktopEvidence = discoveredDesktopName;
+        retargetAlreadyAttempted = true;
+        LOG((CLOG_INFO
+            "desktop probe process %lu exited; launching an exact standby for desktop=%s in the same generation=%llu",
+            probeProcessId, desktopEvidence.c_str(),
+            state.generation));
+    }
+
+        std::string reportedDesktopName = desktopName;
         ServiceLaunchCommitResult launchCommit =
             ServiceLaunchCommitResult::kCommitted;
         if (state.hasLaunchCandidate) {
@@ -1745,8 +1813,7 @@ MSWindowsWatchdog::startProcess()
 
             if (!activatePendingProcess(
                     newProcessInfo, expectedSessionId, desktopName,
-                    expectedDesktopKnown, reportedDesktopName,
-                    state.launchProfile)) {
+                    reportedDesktopName, state.launchProfile)) {
                 const CommandState activationFailureState = commandState();
                 const bool activationMonitoring = m_monitoring.load();
                 const bool stopRequested = !activationMonitoring ||
@@ -1893,7 +1960,6 @@ MSWindowsWatchdog::startProcess()
             (shouldElevateProcess(state.elevateMode) || autoElevated) ? "yes" : "no",
             command.c_str()));
         return true;
-    }
     }
     catch (...) {
         if (isValidHandle(m_pendingProcessInfo.hProcess)) {
