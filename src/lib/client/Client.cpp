@@ -749,7 +749,7 @@ Client::leave()
             m_clipboardRetryCount[id] = 0;
         }
         for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-            if (id == kClipboardClipboard || m_ownClipboard[id]) {
+            if (m_ownClipboard[id]) {
                 scheduleClipboardRetry(id);
             }
         }
@@ -2422,8 +2422,11 @@ Client::handleClipboardGrabbed(const Event& event, void*)
     m_clipboardRetryPending[info->m_id] = false;
     m_clipboardRetryCount[info->m_id] = 0;
 
-    // Do not push local clipboard changes while the user is still working on
-    // this machine. The clipboard is synchronized when this screen is left.
+    IPlatformScreen* platform = m_screen->getPlatformScreen();
+    if (!m_active && platform != NULL &&
+        !platform->hasAsyncClipboardSnapshots()) {
+        scheduleClipboardRetry(info->m_id);
+    }
 }
 
 void
@@ -2510,6 +2513,11 @@ Client::handleClipboardRetry(const Event&, void*)
 
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         if (!m_clipboardRetryPending[id]) {
+            continue;
+        }
+        if (!m_ownClipboard[id]) {
+            m_clipboardRetryPending[id] = false;
+            m_clipboardRetryCount[id] = 0;
             continue;
         }
 

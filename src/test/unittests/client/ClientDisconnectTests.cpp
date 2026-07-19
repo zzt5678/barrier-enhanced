@@ -927,11 +927,13 @@ TEST(ClientDisconnectTests, localClipboardGrabDoesNotSendUntilClipboardIsExplici
         new PendingClipboardServerProxy(&client, stream, &events);
     client.testSetStreamOnly(stream);
     client.testSetServerProxy(proxy);
+    client.testSetActive(true);
 
     client.testHandleClipboardGrabbed(kClipboardClipboard);
 
     EXPECT_TRUE(client.testOwnClipboard(kClipboardClipboard));
     EXPECT_FALSE(client.testClipboardSent(kClipboardClipboard));
+    EXPECT_FALSE(client.testClipboardRetryPending(kClipboardClipboard));
     EXPECT_EQ(0u, proxy->sendCalls);
 
     proxy->result = ServerProxy::kClipboardSendQueued;
@@ -939,6 +941,47 @@ TEST(ClientDisconnectTests, localClipboardGrabDoesNotSendUntilClipboardIsExplici
 
     EXPECT_EQ(1u, proxy->sendCalls);
     EXPECT_TRUE(client.testClipboardSent(kClipboardClipboard));
+}
+
+TEST(ClientDisconnectTests, inactiveLegacyClipboardGrabSchedulesDeferredSend)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->clipboardAvailable = true;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    proxy->result = ServerProxy::kClipboardSendQueued;
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+    client.testSetActive(false);
+
+    client.testHandleClipboardGrabbed(kClipboardClipboard);
+
+    EXPECT_TRUE(client.testClipboardRetryPending(kClipboardClipboard));
+    EXPECT_EQ(0u, proxy->sendCalls);
+
+    client.testHandleClipboardRetry();
+
+    EXPECT_FALSE(client.testClipboardRetryPending(kClipboardClipboard));
+    EXPECT_EQ(1u, proxy->sendCalls);
 }
 
 TEST(ClientDisconnectTests, validatedSnapshotUsesImmutableSendPath)
@@ -4608,6 +4651,7 @@ TEST(ClientDisconnectTests, leaveDefersClipboardReadAndDoesNotRetryUnsupportedSe
         new PendingClipboardServerProxy(&client, stream, &events);
     client.testSetStreamOnly(stream);
     client.testSetServerProxy(proxy);
+    client.testSetClipboardOwnership(kClipboardClipboard, true);
 
     client.enter(0, 0, 0, 0, false);
     EXPECT_TRUE(client.leave());
@@ -4623,6 +4667,85 @@ TEST(ClientDisconnectTests, leaveDefersClipboardReadAndDoesNotRetryUnsupportedSe
     EXPECT_EQ(1u, platform->getClipboardCount);
     EXPECT_EQ(1u, proxy->sendCalls);
     EXPECT_FALSE(client.testClipboardRetryPending(kClipboardClipboard));
+}
+
+TEST(ClientDisconnectTests, leaveDoesNotRetryClipboardWithoutLocalOwnership)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->clipboardAvailable = true;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+
+    client.enter(0, 0, 0, 0, false);
+    ASSERT_TRUE(client.leave());
+    client.testHandleClipboardRetry();
+
+    EXPECT_FALSE(client.testClipboardRetryPending(kClipboardClipboard));
+    EXPECT_EQ(0u, platform->getClipboardCount);
+    EXPECT_EQ(0u, proxy->sendCalls);
+}
+
+TEST(ClientDisconnectTests, clipboardRetrySkipsWhenOwnershipWasLostBeforeTimer)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+                                    streamEvents, clipboardEvents, dataSocketEvents,
+                                    socketEvents);
+
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    platform->clipboardAvailable = true;
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, args);
+
+    UInt32 streamDeletedCount = 0;
+    CountingStream* stream = new CountingStream(&streamDeletedCount);
+    PendingClipboardServerProxy* proxy =
+        new PendingClipboardServerProxy(&client, stream, &events);
+    client.testSetStreamOnly(stream);
+    client.testSetServerProxy(proxy);
+    client.testSetClipboardOwnership(kClipboardClipboard, true);
+
+    client.enter(0, 0, 0, 0, false);
+    ASSERT_TRUE(client.leave());
+    ASSERT_TRUE(client.testClipboardRetryPending(kClipboardClipboard));
+
+    client.testSetClipboardOwnership(kClipboardClipboard, false);
+    client.testHandleClipboardRetry();
+
+    EXPECT_FALSE(client.testClipboardRetryPending(kClipboardClipboard));
+    EXPECT_EQ(0u, client.testClipboardRetryCount(kClipboardClipboard));
+    EXPECT_EQ(0u, platform->getClipboardCount);
+    EXPECT_EQ(0u, proxy->sendCalls);
 }
 
 TEST(ClientDisconnectTests, repeatedLeaveRearmsDeferredClipboardSnapshot)
@@ -4664,6 +4787,7 @@ TEST(ClientDisconnectTests, repeatedLeaveRearmsDeferredClipboardSnapshot)
         new PendingClipboardServerProxy(&client, stream, &events);
     client.testSetStreamOnly(stream);
     client.testSetServerProxy(proxy);
+    client.testSetClipboardOwnership(kClipboardClipboard, true);
     const UInt32 baselineTimers = timersCreated;
 
     client.enter(0, 0, 1, 0, false);
