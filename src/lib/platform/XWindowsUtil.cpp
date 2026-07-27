@@ -1752,37 +1752,43 @@ XWindowsUtil::initKeyMaps()
 // XWindowsUtil::ErrorLock
 //
 
-XWindowsUtil::ErrorLock*    XWindowsUtil::ErrorLock::s_top = NULL;
+std::recursive_mutex XWindowsUtil::ErrorLock::s_processMutex;
+XWindowsUtil::ErrorLock* XWindowsUtil::ErrorLock::s_top = NULL;
 
 XWindowsUtil::ErrorLock::ErrorLock(Display* display) :
-    m_display(display)
+    m_display(display),
+    m_processLock(s_processMutex)
 {
     install(&XWindowsUtil::ErrorLock::ignoreHandler, NULL);
 }
 
 XWindowsUtil::ErrorLock::ErrorLock(Display* display, bool* flag) :
-    m_display(display)
+    m_display(display),
+    m_processLock(s_processMutex)
 {
     install(&XWindowsUtil::ErrorLock::saveHandler, flag);
 }
 
 XWindowsUtil::ErrorLock::ErrorLock(Display* display,
                 ErrorHandler handler, void* data) :
-    m_display(display)
+    m_display(display),
+    m_processLock(s_processMutex)
 {
     install(handler, data);
 }
 
 XWindowsUtil::ErrorLock::~ErrorLock()
 {
+    assert(s_top == this);
+
     // make sure everything finishes before uninstalling handler
     if (m_display != NULL) {
         XSync(m_display, False);
     }
 
-    // restore old handler
-    XSetErrorHandler(m_oldXHandler);
+    // Publish the previous live context before restoring an internal handler.
     s_top = m_next;
+    XSetErrorHandler(m_oldXHandler);
 }
 
 void
@@ -1793,18 +1799,26 @@ XWindowsUtil::ErrorLock::install(ErrorHandler handler, void* data)
         XSync(m_display, False);
     }
 
-    // install handler
+    // Publish a valid context before exposing the process-global handler.
     m_handler     = handler;
     m_userData    = data;
-    m_oldXHandler = XSetErrorHandler(
-                                &XWindowsUtil::ErrorLock::internalHandler);
     m_next        = s_top;
     s_top         = this;
+    m_oldXHandler = XSetErrorHandler(
+                                &XWindowsUtil::ErrorLock::internalHandler);
 }
 
 int
 XWindowsUtil::ErrorLock::internalHandler(Display* display, XErrorEvent* event)
 {
+    // Xlib's error handler is process-global. A foreign Xlib thread must not
+    // consume the active scope's handler or wait while Xlib holds its locks.
+    std::unique_lock<std::recursive_mutex> processLock(
+        s_processMutex, std::try_to_lock);
+    if (!processLock.owns_lock()) {
+        return 0;
+    }
+
     if (s_top != NULL && s_top->m_handler != NULL) {
         s_top->m_handler(display, event, s_top->m_userData);
     }
