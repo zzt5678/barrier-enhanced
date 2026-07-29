@@ -1813,6 +1813,29 @@ MSWindowsWatchdog::startProcess()
                 return false;
             }
 
+            const auto discardActivatedProcessAndRetry =
+                [&](const char* discardFailureReason) {
+                    discardPendingProcessOrFailFast(
+                        discardFailureReason, 3, true);
+                    durableCandidateCommitted = false;
+                    if (state.hasLaunchCandidate) {
+                        std::lock_guard<std::mutex> lock(m_commandMutex);
+                        if (m_hasLaunchCandidate &&
+                            sameServiceLaunchCandidate(
+                                m_launchCandidate,
+                                state.launchCandidate)) {
+                            m_hasLaunchCandidate = false;
+                            m_launchCandidate = ServiceLaunchCandidate();
+                        }
+                    }
+                    const CommandState retryState = commandState();
+                    if (m_monitoring.load() &&
+                        !retryState.command.empty()) {
+                        deferLaunchForGeneration(retryState.generation);
+                    }
+                    return false;
+                };
+
             const IpcInputReadinessResult activationReadiness =
                 activatePendingProcess(
                     newProcessInfo, expectedSessionId, desktopName,
@@ -1843,26 +1866,8 @@ MSWindowsWatchdog::startProcess()
                         observedDesktopName.empty()
                             ? "<unavailable>"
                             : observedDesktopName.c_str()));
-                    discardPendingProcessOrFailFast(
-                        "desktop-retargeted activated process could not be discarded",
-                        3, true);
-                    durableCandidateCommitted = false;
-                    if (state.hasLaunchCandidate) {
-                        std::lock_guard<std::mutex> lock(m_commandMutex);
-                        if (m_hasLaunchCandidate &&
-                            sameServiceLaunchCandidate(
-                                m_launchCandidate,
-                                state.launchCandidate)) {
-                            m_hasLaunchCandidate = false;
-                            m_launchCandidate = ServiceLaunchCandidate();
-                        }
-                    }
-                    const CommandState retryState = commandState();
-                    if (m_monitoring.load() &&
-                        !retryState.command.empty()) {
-                        deferLaunchForGeneration(retryState.generation);
-                    }
-                    return false;
+                    return discardActivatedProcessAndRetry(
+                        "desktop-retargeted activated process could not be discarded");
                 }
             }
             else if (activationReadiness.match !=
@@ -1898,6 +1903,19 @@ MSWindowsWatchdog::startProcess()
                             activationFailureState.generation);
                     }
                     return false;
+                }
+                const std::string observedDesktopName =
+                    activeDesktopName(false);
+                if (DesktopSwitchPolicy::
+                        shouldRetryFailedActivationAfterDesktopRetarget(
+                            desktopName, observedDesktopName)) {
+                    LOG((CLOG_WARN
+                        "discarding activated process %lu after input readiness vanished during desktop retarget expected=%s observed=%s",
+                        newProcessInfo.dwProcessId,
+                        desktopName.c_str(),
+                        observedDesktopName.c_str()));
+                    return discardActivatedProcessAndRetry(
+                        "desktop-retargeted process without active readiness could not be discarded");
                 }
                 // Current already names B and A has crossed the process fence.
                 // A normal retry could leave durable state and the live input
