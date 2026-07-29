@@ -79,9 +79,21 @@ decideDesktopRetarget(
 }
 
 bool
-shouldReturnDesktopMismatch(ReadinessPhase phase)
+shouldReturnDesktopMismatch(ReadinessPhase)
 {
-    return phase == ReadinessPhase::Standby;
+    return true;
+}
+
+bool
+canAdoptRetargetedActiveDesktop(
+    const std::string& expectedDesktopName,
+    const std::string& reportedDesktopName,
+    const std::string& observedDesktopName)
+{
+    return !expectedDesktopName.empty() &&
+        !reportedDesktopName.empty() &&
+        reportedDesktopName != expectedDesktopName &&
+        reportedDesktopName == observedDesktopName;
 }
 
 RelaunchDecision

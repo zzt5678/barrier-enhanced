@@ -180,12 +180,27 @@ TEST(DesktopSwitchPolicyTests, readinessEvidenceRequiresAnExactSecondProof)
 }
 
 TEST(DesktopSwitchPolicyTests,
-     standbyMismatchReturnsForRetargetWhileActiveMismatchKeepsWaiting)
+     desktopMismatchReturnsImmediatelyInEveryReadinessPhase)
 {
     EXPECT_TRUE(DesktopSwitchPolicy::shouldReturnDesktopMismatch(
         DesktopSwitchPolicy::ReadinessPhase::Standby));
-    EXPECT_FALSE(DesktopSwitchPolicy::shouldReturnDesktopMismatch(
+    EXPECT_TRUE(DesktopSwitchPolicy::shouldReturnDesktopMismatch(
         DesktopSwitchPolicy::ReadinessPhase::Active));
+}
+
+TEST(DesktopSwitchPolicyTests,
+     activeDesktopRetargetRequiresMatchingIndependentObservation)
+{
+    EXPECT_TRUE(DesktopSwitchPolicy::canAdoptRetargetedActiveDesktop(
+        "Winlogon", "Default", "Default"));
+    EXPECT_FALSE(DesktopSwitchPolicy::canAdoptRetargetedActiveDesktop(
+        "Winlogon", "Default", "Winlogon"));
+    EXPECT_FALSE(DesktopSwitchPolicy::canAdoptRetargetedActiveDesktop(
+        "Winlogon", "Default", ""));
+    EXPECT_FALSE(DesktopSwitchPolicy::canAdoptRetargetedActiveDesktop(
+        "Winlogon", "", "Default"));
+    EXPECT_FALSE(DesktopSwitchPolicy::canAdoptRetargetedActiveDesktop(
+        "Default", "Default", "Default"));
 }
 
 TEST(DesktopSwitchPolicyTests, desktopRetargetIsBoundedToOneExactRetry)

@@ -163,11 +163,10 @@ private:
         const char* readinessPhase,
         DesktopSwitchPolicy::ReadinessPhase readinessPolicyPhase,
         const LaunchProfile* activationOwner = nullptr);
-    bool activatePendingProcess(
+    IpcInputReadinessResult activatePendingProcess(
         const PROCESS_INFORMATION& processInfo,
         UInt32 expectedSessionId,
         const std::string& expectedDesktopName,
-        std::string& reportedDesktopName,
         const LaunchProfile& activationOwner);
     bool pendingActivationShouldAbort(
         const LaunchProfile& activationOwner,

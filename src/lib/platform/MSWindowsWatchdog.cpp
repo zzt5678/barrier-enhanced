@@ -878,16 +878,18 @@ MSWindowsWatchdog::waitForPendingInputReadiness(
     return result;
 }
 
-bool
+IpcInputReadinessResult
 MSWindowsWatchdog::activatePendingProcess(
     const PROCESS_INFORMATION& processInfo,
     UInt32 expectedSessionId,
     const std::string& expectedDesktopName,
-    std::string& reportedDesktopName,
     const LaunchProfile& activationOwner)
 {
     if (!m_daemonized) {
-        return true;
+        IpcInputReadinessResult readiness;
+        readiness.match = IpcInputReadinessMatch::Exact;
+        readiness.desktopName = expectedDesktopName;
+        return readiness;
     }
 
     std::string abortReason;
@@ -895,7 +897,7 @@ MSWindowsWatchdog::activatePendingProcess(
         LOG((CLOG_INFO
             "not activating standby process %lu: %s",
             processInfo.dwProcessId, abortReason.c_str()));
-        return false;
+        return IpcInputReadinessResult();
     }
 
     std::uint64_t activationNonce = 0;
@@ -903,7 +905,7 @@ MSWindowsWatchdog::activatePendingProcess(
         LOG((CLOG_ERR
             "could not generate a secure activation nonce for process %lu",
             processInfo.dwProcessId));
-        return false;
+        return IpcInputReadinessResult();
     }
     bool activationSent = false;
     try {
@@ -919,7 +921,7 @@ MSWindowsWatchdog::activatePendingProcess(
             "could not send activation nonce=%llu to standby process %lu",
             static_cast<unsigned long long>(activationNonce),
             processInfo.dwProcessId));
-        return false;
+        return IpcInputReadinessResult();
     }
 
     LOG((CLOG_INFO
@@ -934,13 +936,13 @@ MSWindowsWatchdog::activatePendingProcess(
             LOG((CLOG_INFO
                 "aborting standby process %lu activation wait: %s",
                 processInfo.dwProcessId, abortReason.c_str()));
-            return false;
+            return IpcInputReadinessResult();
         }
         if (!isProcessHandleActive(processInfo.hProcess)) {
             LOG((CLOG_ERR
                 "standby process %lu exited before activation acknowledgement",
                 processInfo.dwProcessId));
-            return false;
+            return IpcInputReadinessResult();
         }
         if (m_ipcServer.hasActivatedClientProcess(
                 processInfo.dwProcessId, activationNonce)) {
@@ -958,18 +960,17 @@ MSWindowsWatchdog::activatePendingProcess(
                     "active", DesktopSwitchPolicy::ReadinessPhase::Active,
                     &activationOwner);
             if (readiness.match == IpcInputReadinessMatch::Exact) {
-                reportedDesktopName = readiness.desktopName;
-                return true;
+                return readiness;
             }
             if (readiness.match ==
                     IpcInputReadinessMatch::DesktopMismatch) {
-                LOG((CLOG_ERR
+                LOG((CLOG_WARN
                     "activated process %lu proved unexpected desktop=%s expected=%s",
                     processInfo.dwProcessId,
                     readiness.desktopName.c_str(),
                     expectedDesktopName.c_str()));
             }
-            return false;
+            return readiness;
         }
         ARCH->sleep(kProcessReadyPollSeconds);
     }
@@ -979,7 +980,7 @@ MSWindowsWatchdog::activatePendingProcess(
         processInfo.dwProcessId,
         static_cast<unsigned long long>(activationNonce),
         kProcessActivationTimeoutSeconds));
-    return false;
+    return IpcInputReadinessResult();
 }
 
 HANDLE
@@ -1812,9 +1813,60 @@ MSWindowsWatchdog::startProcess()
                 return false;
             }
 
-            if (!activatePendingProcess(
+            const IpcInputReadinessResult activationReadiness =
+                activatePendingProcess(
                     newProcessInfo, expectedSessionId, desktopName,
-                    reportedDesktopName, state.launchProfile)) {
+                    state.launchProfile);
+            if (activationReadiness.match ==
+                    IpcInputReadinessMatch::DesktopMismatch) {
+                const std::string observedDesktopName =
+                    activeDesktopName(false);
+                if (DesktopSwitchPolicy::canAdoptRetargetedActiveDesktop(
+                        desktopName, activationReadiness.desktopName,
+                        observedDesktopName)) {
+                    reportedDesktopName = activationReadiness.desktopName;
+                    LOG((CLOG_INFO
+                        "adopting activated process %lu after desktop retarget expected=%s reported=%s observed=%s",
+                        newProcessInfo.dwProcessId,
+                        desktopName.c_str(),
+                        activationReadiness.desktopName.c_str(),
+                        observedDesktopName.c_str()));
+                }
+                else {
+                    LOG((CLOG_WARN
+                        "discarding activated process %lu after unconfirmed desktop retarget expected=%s reported=%s observed=%s",
+                        newProcessInfo.dwProcessId,
+                        desktopName.c_str(),
+                        activationReadiness.desktopName.empty()
+                            ? "<none>"
+                            : activationReadiness.desktopName.c_str(),
+                        observedDesktopName.empty()
+                            ? "<unavailable>"
+                            : observedDesktopName.c_str()));
+                    discardPendingProcessOrFailFast(
+                        "desktop-retargeted activated process could not be discarded",
+                        3, true);
+                    durableCandidateCommitted = false;
+                    if (state.hasLaunchCandidate) {
+                        std::lock_guard<std::mutex> lock(m_commandMutex);
+                        if (m_hasLaunchCandidate &&
+                            sameServiceLaunchCandidate(
+                                m_launchCandidate,
+                                state.launchCandidate)) {
+                            m_hasLaunchCandidate = false;
+                            m_launchCandidate = ServiceLaunchCandidate();
+                        }
+                    }
+                    const CommandState retryState = commandState();
+                    if (m_monitoring.load() &&
+                        !retryState.command.empty()) {
+                        deferLaunchForGeneration(retryState.generation);
+                    }
+                    return false;
+                }
+            }
+            else if (activationReadiness.match !=
+                    IpcInputReadinessMatch::Exact) {
                 const CommandState activationFailureState = commandState();
                 const bool activationMonitoring = m_monitoring.load();
                 const bool stopRequested = !activationMonitoring ||

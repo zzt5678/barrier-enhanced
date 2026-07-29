@@ -68,6 +68,11 @@ DesktopRetargetDecision decideDesktopRetarget(
 
 bool shouldReturnDesktopMismatch(ReadinessPhase phase);
 
+bool canAdoptRetargetedActiveDesktop(
+    const std::string& expectedDesktopName,
+    const std::string& reportedDesktopName,
+    const std::string& observedDesktopName);
+
 RelaunchDecision observeDesktop(
     RelaunchState& state,
     const std::string& lastDesktopName,
