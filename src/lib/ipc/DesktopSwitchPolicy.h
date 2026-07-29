@@ -73,10 +73,6 @@ bool canAdoptRetargetedActiveDesktop(
     const std::string& reportedDesktopName,
     const std::string& observedDesktopName);
 
-bool shouldRetryFailedActivationAfterDesktopRetarget(
-    const std::string& expectedDesktopName,
-    const std::string& observedDesktopName);
-
 RelaunchDecision observeDesktop(
     RelaunchState& state,
     const std::string& lastDesktopName,

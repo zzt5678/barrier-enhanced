@@ -233,6 +233,19 @@ TEST(MSWindowsWatchdogLaunchTests, failedActivationOnlyDiscardsForProvenSuperses
 }
 
 TEST(MSWindowsWatchdogLaunchTests,
+     ownedActivationFailureRetriesWhileServiceOwnershipRemainsValid)
+{
+    EXPECT_TRUE(MSWindowsWatchdog::shouldRetryOwnedActivationFailure(
+        true, false, true));
+    EXPECT_FALSE(MSWindowsWatchdog::shouldRetryOwnedActivationFailure(
+        false, false, true));
+    EXPECT_FALSE(MSWindowsWatchdog::shouldRetryOwnedActivationFailure(
+        true, true, true));
+    EXPECT_FALSE(MSWindowsWatchdog::shouldRetryOwnedActivationFailure(
+        true, false, false));
+}
+
+TEST(MSWindowsWatchdogLaunchTests,
      unknownDesktopRequiresDiscoveryThenAnExactLaunch)
 {
     const DesktopSwitchPolicy::LaunchTarget discovery =

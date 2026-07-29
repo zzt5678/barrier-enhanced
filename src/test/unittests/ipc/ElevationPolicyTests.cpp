@@ -203,26 +203,6 @@ TEST(DesktopSwitchPolicyTests,
         "Default", "Default", "Default"));
 }
 
-TEST(DesktopSwitchPolicyTests,
-     failedActivationRetriesOnlyAfterIndependentDesktopChange)
-{
-    EXPECT_TRUE(
-        DesktopSwitchPolicy::shouldRetryFailedActivationAfterDesktopRetarget(
-            "Winlogon", "Default"));
-    EXPECT_TRUE(
-        DesktopSwitchPolicy::shouldRetryFailedActivationAfterDesktopRetarget(
-            "Default", "Winlogon"));
-    EXPECT_FALSE(
-        DesktopSwitchPolicy::shouldRetryFailedActivationAfterDesktopRetarget(
-            "Default", "Default"));
-    EXPECT_FALSE(
-        DesktopSwitchPolicy::shouldRetryFailedActivationAfterDesktopRetarget(
-            "Winlogon", ""));
-    EXPECT_FALSE(
-        DesktopSwitchPolicy::shouldRetryFailedActivationAfterDesktopRetarget(
-            "", "Default"));
-}
-
 TEST(DesktopSwitchPolicyTests, desktopRetargetIsBoundedToOneExactRetry)
 {
     EXPECT_EQ(DesktopSwitchPolicy::DesktopRetargetDecision::Retarget,

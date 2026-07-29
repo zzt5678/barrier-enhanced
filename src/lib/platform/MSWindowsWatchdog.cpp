@@ -394,6 +394,15 @@ MSWindowsWatchdog::shouldDiscardFailedActivation(
     return !monitoring || commandEmpty || !ownerMatches;
 }
 
+bool
+MSWindowsWatchdog::shouldRetryOwnedActivationFailure(
+    bool monitoring,
+    bool commandEmpty,
+    bool ownerMatches)
+{
+    return monitoring && !commandEmpty && ownerMatches;
+}
+
 double
 MSWindowsWatchdog::boundedShutdownWaitSeconds(
     double deadlineSeconds,
@@ -1904,22 +1913,24 @@ MSWindowsWatchdog::startProcess()
                     }
                     return false;
                 }
-                const std::string observedDesktopName =
-                    activeDesktopName(false);
-                if (DesktopSwitchPolicy::
-                        shouldRetryFailedActivationAfterDesktopRetarget(
-                            desktopName, observedDesktopName)) {
+                if (shouldRetryOwnedActivationFailure(
+                        activationMonitoring,
+                        activationFailureState.command.empty(),
+                        !ownerReplaced)) {
+                    const std::string observedDesktopName =
+                        activeDesktopName(false);
                     LOG((CLOG_WARN
-                        "discarding activated process %lu after input readiness vanished during desktop retarget expected=%s observed=%s",
+                        "discarding activated process %lu after local input readiness failed while service ownership remained valid expected=%s observed=%s",
                         newProcessInfo.dwProcessId,
                         desktopName.c_str(),
-                        observedDesktopName.c_str()));
+                        observedDesktopName.empty()
+                            ? "<unavailable>"
+                            : observedDesktopName.c_str()));
                     return discardActivatedProcessAndRetry(
-                        "desktop-retargeted process without active readiness could not be discarded");
+                        "owned process without active readiness could not be discarded");
                 }
-                // Current already names B and A has crossed the process fence.
-                // A normal retry could leave durable state and the live input
-                // owner disagreeing, so restart the entire ownership domain.
+                // This is defensive: stop and owner supersession returned
+                // above, while a still-owned failure is retried above.
                 failFastOwnedProcesses(
                     "durable standby replacement failed local data-plane activation or active local input readiness");
             }

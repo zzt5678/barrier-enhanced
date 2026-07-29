@@ -80,6 +80,10 @@ public:
                             bool monitoring,
                             bool commandEmpty,
                             bool ownerMatches);
+    static bool         shouldRetryOwnedActivationFailure(
+                            bool monitoring,
+                            bool commandEmpty,
+                            bool ownerMatches);
     static double       boundedShutdownWaitSeconds(
                             double deadlineSeconds,
                             double nowSeconds,
