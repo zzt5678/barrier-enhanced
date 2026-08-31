@@ -34,9 +34,11 @@
 #include "mt/Lock.h"
 #include "mt/Mutex.h"
 #include "mt/Thread.h"
+#include "mt/ThreadShutdown.h"
 #include "arch/XArch.h"
 #include "base/Log.h"
 #include "base/IEventQueue.h"
+#include "base/Stopwatch.h"
 #include "base/TMethodEventJob.h"
 #include "io/filesystem.h"
 
@@ -91,6 +93,7 @@ OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCurso
 	m_pmMutex(new Mutex),
 	m_pmWatchThread(NULL),
 	m_pmThreadReady(new CondVar<bool>(m_pmMutex, false)),
+	m_pmRunloop(NULL),
 	m_pmRootPort(0),
 	m_activeModifierHotKey(0),
 	m_activeModifierHotKeyMask(0),
@@ -189,20 +192,54 @@ OSXScreen::~OSXScreen()
 	m_events->removeHandler(Event::kSystem, m_events->getSystemTarget());
 
 	if (m_pmWatchThread) {
-		// make sure the thread has setup the runloop.
+		Stopwatch shutdownTimer;
+		const double shutdownDeadline =
+			barrier::kFinalThreadShutdownDeadlineSeconds;
+		bool threadReady = false;
+		CFRunLoopRef readyRunloop = NULL;
+
 		{
 			Lock lock(m_pmMutex);
 			while (!(bool)*m_pmThreadReady) {
-				m_pmThreadReady->wait();
+				if (!m_pmThreadReady->wait(shutdownTimer, shutdownDeadline)) {
+					break;
+				}
+			}
+			threadReady = (bool)*m_pmThreadReady;
+			if (threadReady) {
+				readyRunloop = m_pmRunloop;
 			}
 		}
 
-		// now exit the thread's runloop and wait for it to exit
-		LOG((CLOG_DEBUG "stopping watchSystemPowerThread"));
-		CFRunLoopStop(m_pmRunloop);
-		m_pmWatchThread->wait();
+		if (threadReady && readyRunloop != NULL) {
+			CFRunLoopStop(readyRunloop);
+		}
+
+		if (!m_pmWatchThread->wait(0.0)) {
+			m_pmWatchThread->cancel();
+			m_pmWatchThread->unblockPollSocket();
+			const double elapsed = shutdownTimer.getTime();
+			const double remaining = elapsed < shutdownDeadline ?
+				shutdownDeadline - elapsed : 0.0;
+			barrier::waitForFinalThreadShutdown(
+				"macOS power-monitor thread",
+				remaining,
+				[this](double timeout) {
+					return m_pmWatchThread->wait(timeout);
+				});
+		}
 		delete m_pmWatchThread;
 		m_pmWatchThread = NULL;
+
+		CFRunLoopRef runloop = NULL;
+		{
+			Lock lock(m_pmMutex);
+			runloop = m_pmRunloop;
+			m_pmRunloop = NULL;
+		}
+		if (runloop != NULL) {
+			CFRelease(runloop);
+		}
 	}
 	delete m_pmThreadReady;
 	delete m_pmMutex;
@@ -1625,8 +1662,8 @@ void OSXScreen::watchSystemPowerThread()
 	io_object_t				notifier;
 	IONotificationPortRef	notificationPortRef;
 	CFRunLoopSourceRef		runloopSourceRef = 0;
+	CFRunLoopRef				runloop = CFRunLoopGetCurrent();
 
-	m_pmRunloop = CFRunLoopGetCurrent();
 	// install system power change callback
 	m_pmRootPort = IORegisterForSystemPower(this, &notificationPortRef,
 											powerChangeCallback, &notifier);
@@ -1636,13 +1673,14 @@ void OSXScreen::watchSystemPowerThread()
 	else {
 		runloopSourceRef =
 			IONotificationPortGetRunLoopSource(notificationPortRef);
-		CFRunLoopAddSource(m_pmRunloop, runloopSourceRef,
+		CFRunLoopAddSource(runloop, runloopSourceRef,
 								kCFRunLoopCommonModes);
 	}
 
 	// thread is ready
 	{
 		Lock lock(m_pmMutex);
+		m_pmRunloop = (CFRunLoopRef)CFRetain(runloop);
 		*m_pmThreadReady = true;
 		m_pmThreadReady->signal();
 	}
@@ -1682,15 +1720,17 @@ void OSXScreen::watchSystemPowerThread()
 
 	// cleanup
 	if (notificationPortRef) {
-		CFRunLoopRemoveSource(m_pmRunloop,
+		CFRunLoopRemoveSource(runloop,
 								runloopSourceRef, kCFRunLoopDefaultMode);
 		CFRunLoopSourceInvalidate(runloopSourceRef);
 		CFRelease(runloopSourceRef);
 	}
 
-	Lock lock(m_pmMutex);
 	IODeregisterForSystemPower(&notifier);
-	m_pmRootPort = 0;
+	{
+		Lock lock(m_pmMutex);
+		m_pmRootPort = 0;
+	}
 	LOG((CLOG_DEBUG "stopped watchSystemPowerThread"));
 }
 

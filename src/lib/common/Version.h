@@ -37,3 +37,8 @@ extern const char* kVersion;
 
 // application version
 extern const char* kAppVersion;
+
+// build identity embedded by CMake for deployment diagnostics
+extern const char* kBuildRevision;
+extern const char* kBuildDate;
+extern const char* kBuildId;

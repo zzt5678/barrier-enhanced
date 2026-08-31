@@ -32,7 +32,9 @@
 #        include <time.h>
 #    endif
 #endif
+#include <atomic>
 #include <cerrno>
+#include <unistd.h>
 
 #define SIGWAKEUP SIGUSR1
 
@@ -54,9 +56,10 @@ setSignalSet(sigset_t* sigset)
 class ArchThreadImpl {
 public:
     ArchThreadImpl();
+    ~ArchThreadImpl() noexcept;
 
 public:
-    int                    m_refCount;
+    std::atomic<int>       m_refCount;
     IArchMultithread::ThreadID        m_id;
     pthread_t            m_thread;
     std::function<void()> func_;;
@@ -64,6 +67,7 @@ public:
     bool                m_cancelling;
     bool                m_exited;
     void*                m_networkData;
+    bool                 m_networkDataUnblockPending;
 };
 
 ArchThreadImpl::ArchThreadImpl() :
@@ -72,9 +76,20 @@ ArchThreadImpl::ArchThreadImpl() :
     m_cancel(false),
     m_cancelling(false),
     m_exited(false),
-    m_networkData(NULL)
+    m_networkData(NULL),
+    m_networkDataUnblockPending(false)
 {
     // do nothing
+}
+
+ArchThreadImpl::~ArchThreadImpl() noexcept
+{
+    int* unblockPipe = static_cast<int*>(m_networkData);
+    if (unblockPipe != nullptr) {
+        close(unblockPipe[0]);
+        close(unblockPipe[1]);
+        delete[] unblockPipe;
+    }
 }
 
 
@@ -134,21 +149,51 @@ ArchMultithreadPosix::~ArchMultithreadPosix()
 {
     assert(s_instance != NULL);
 
+    {
+        std::lock_guard<std::mutex> lock(m_threadMutex);
+        erase(m_mainThread);
+    }
+    delete m_mainThread;
+    m_mainThread = nullptr;
     s_instance = NULL;
 }
 
 void
 ArchMultithreadPosix::setNetworkDataForCurrentThread(void* data)
 {
-    std::lock_guard<std::mutex> lock(m_threadMutex);
-    ArchThreadImpl* thread = find(pthread_self());
-    thread->m_networkData = data;
+    bool unblockPending = false;
+    {
+        std::lock_guard<std::mutex> lock(m_threadMutex);
+        ArchThreadImpl* thread = findNoRef(pthread_self());
+        assert(thread != nullptr);
+        assert(thread->m_networkData == nullptr);
+        thread->m_networkData = data;
+        unblockPending = thread->m_networkDataUnblockPending;
+        thread->m_networkDataUnblockPending = false;
+    }
+
+    if (unblockPending && data != nullptr) {
+        const int* unblockPipe = static_cast<const int*>(data);
+        const char dummy = 0;
+        const ssize_t ignored = write(unblockPipe[1], &dummy, 1);
+        (void)ignored;
+    }
 }
 
 void*
 ArchMultithreadPosix::getNetworkDataForThread(ArchThread thread)
 {
     std::lock_guard<std::mutex> lock(m_threadMutex);
+    return thread->m_networkData;
+}
+
+void*
+ArchMultithreadPosix::getNetworkDataForThreadAndMarkUnblock(ArchThread thread)
+{
+    std::lock_guard<std::mutex> lock(m_threadMutex);
+    if (thread->m_networkData == nullptr) {
+        thread->m_networkDataUnblockPending = true;
+    }
     return thread->m_networkData;
 }
 
@@ -378,7 +423,7 @@ ArchMultithreadPosix::closeThread(ArchThread thread)
     assert(thread != NULL);
 
     // decrement ref count and clean up thread if no more references
-    if (--thread->m_refCount == 0) {
+    if (thread->m_refCount.fetch_sub(1) == 1) {
         // detach from thread (unless it's the main thread)
         if (thread->func_) {
             pthread_detach(thread->m_thread);
@@ -631,7 +676,7 @@ ArchMultithreadPosix::refThread(ArchThreadImpl* thread)
 {
     assert(thread != NULL);
     assert(findNoRef(thread->m_thread) != NULL);
-    ++thread->m_refCount;
+    thread->m_refCount.fetch_add(1);
 }
 
 void

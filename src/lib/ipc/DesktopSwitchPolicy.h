@@ -30,6 +30,49 @@ struct RelaunchDecision {
     bool debounced;
 };
 
+enum class LaunchPurpose {
+    Exact,
+    Discovery,
+};
+
+enum class DesktopRetargetDecision {
+    Keep,
+    Retarget,
+    Backoff,
+};
+
+enum class ReadinessPhase {
+    Standby,
+    Active,
+};
+
+struct LaunchTarget {
+    std::string desktopName;
+    bool expectedDesktopKnown;
+    LaunchPurpose purpose;
+};
+
+std::string launchDesktopName(
+    const std::string& observedDesktopName,
+    bool daemonized);
+
+LaunchTarget resolveLaunchTarget(
+    const std::string& observedDesktopName,
+    const std::string& readinessDesktopEvidence,
+    bool daemonized);
+
+DesktopRetargetDecision decideDesktopRetarget(
+    LaunchPurpose launchPurpose,
+    bool readinessDesktopMismatch,
+    bool retargetAlreadyAttempted);
+
+bool shouldReturnDesktopMismatch(ReadinessPhase phase);
+
+bool canAdoptRetargetedActiveDesktop(
+    const std::string& expectedDesktopName,
+    const std::string& reportedDesktopName,
+    const std::string& observedDesktopName);
+
 RelaunchDecision observeDesktop(
     RelaunchState& state,
     const std::string& lastDesktopName,

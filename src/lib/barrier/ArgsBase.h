@@ -38,6 +38,7 @@ public:
     String                m_name;
     bool                m_disableTray;
     bool                m_enableIpc;
+    bool                m_serviceStandby;
     bool                m_enableDragDrop;
     String              m_dropTarget;
     bool                m_gameMode;

@@ -21,6 +21,8 @@
 #include "client/Client.h"
 #include "barrier/FileChunk.h"
 #include "barrier/ClipboardChunk.h"
+#include "barrier/RemoteFileClipboard.h"
+#include "barrier/BulkChannel.h"
 #include "barrier/StreamChunker.h"
 #include "barrier/Clipboard.h"
 #include "barrier/ProtocolUtil.h"
@@ -33,13 +35,59 @@
 #include "base/TMethodEventJob.h"
 #include "base/XBase.h"
 #include "mt/Thread.h"
+#include "mt/ThreadShutdown.h"
 
+#include <algorithm>
 #include <memory>
+#include <cstring>
+#include <utility>
 
 namespace {
 
 const UInt32 kMaxKeepAliveAlarmDeferrals = 8;
 const size_t kSynchronousClipboardSendLimit = 256 * 1024;
+const size_t kMaxFramesPerInputBatch = 64;
+const size_t kMaxBytesPerInputBatch = 256 * 1024;
+const double kMaxSecondsPerInputBatch = 0.002;
+const double kFileTransferReceiveInitialPollSeconds = 0.01;
+const double kFileTransferReceiveMaxPollSeconds = 0.5;
+const double kFileTransferReceivePollDeadlineSeconds = 5.0;
+
+bool isNewerInputSequence(UInt32 candidate, UInt32 current)
+{
+    const UInt32 distance = candidate - current;
+    return distance != 0 && distance < 0x80000000u;
+}
+
+bool isTransactionalFileControlCode(const UInt8* code)
+{
+    return std::memcmp(code, kMsgDFileTransferStart1_12, 4) == 0 ||
+        std::memcmp(code, kMsgDFileTransferStartAck1_12, 4) == 0 ||
+        std::memcmp(code, kMsgDFileTransferCancel1_12, 4) == 0 ||
+        std::memcmp(code, kMsgDFileTransferCancelAck1_12, 4) == 0 ||
+        std::memcmp(code, kMsgDFileTransferCommitAck1_12, 4) == 0;
+}
+
+bool isTransactionalFileBulkCode(const UInt8* code)
+{
+    return std::memcmp(code, kMsgDFileTransferData1_12, 4) == 0 ||
+        std::memcmp(code, kMsgDFileTransferEnd1_12, 4) == 0;
+}
+
+bool sameFileTransferStart(const barrier::FileTransferFrame& lhs,
+                           const barrier::FileTransferFrame& rhs)
+{
+    return lhs.type == rhs.type &&
+        lhs.connectionBinding == rhs.connectionBinding &&
+        lhs.transferId == rhs.transferId &&
+        lhs.totalSize == rhs.totalSize &&
+        lhs.offset == rhs.offset &&
+        lhs.payload == rhs.payload &&
+        lhs.reason == rhs.reason &&
+        lhs.kind == rhs.kind &&
+        lhs.clipboardRevision == rhs.clipboardRevision &&
+        lhs.clipboardSessionId == rhs.clipboardSessionId;
+}
 
 }
 
@@ -47,10 +95,26 @@ const size_t kSynchronousClipboardSendLimit = 256 * 1024;
 // ServerProxy
 //
 
-ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* events) :
+ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* events,
+                         SInt16 protocolMinorVersion) :
     m_client(client),
     m_stream(stream),
     m_seqNum(0),
+    m_hasEnterSequence(false),
+    m_inputActive(false),
+    m_protocolMinorVersion(protocolMinorVersion),
+    m_connectionBinding(),
+    m_preparedEnterSequence(0),
+    m_hasPreparedEnter(false),
+    m_preparedEnterReady(false),
+    m_preparedInputGeneration(0),
+    m_lastInputSequence(0),
+    m_hasInputSequence(false),
+    m_inputFrameAccepted(true),
+    m_inputFrameBroadcast(false),
+    m_inputFrameHasEpoch(false),
+    m_epochPressedKeys(),
+    m_epochPressedButtons(),
     m_compressMouse(false),
     m_compressMouseRelative(false),
     m_xMouse(0),
@@ -64,16 +128,33 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_keepAliveAlarm(0.0),
     m_keepAliveAlarmTimer(NULL),
     m_keepAliveAlarmDeferrals(0),
+    m_keepAliveMissedAlarms(0),
     m_lastKeepAlivePendingInput(false),
     m_lastKeepAliveBufferedOutput(0),
     m_keepAliveActivityTimer(true),
     m_parser(&ServerProxy::parseHandshakeMessage),
     m_events(events),
     m_clipboardSendThread(NULL),
+    m_clipboardBulkChannel(),
+    m_clipboardSendStream(stream),
     m_detachedForDeferredCleanup(false),
     m_clipboardSendId(kClipboardEnd),
     m_clipboardSendSucceeded(false),
-    m_clipboardSendResultAvailable(false)
+    m_clipboardSendResultAvailable(false),
+    m_clipboardSendAttempt(),
+    m_nextClipboardSendAttempt(0),
+    m_latestClipboardSendAttempt(),
+    m_fileTransferReceiver(),
+    m_hasPendingFileTransferStart(false),
+    m_pendingFileTransferStart(),
+    m_fileTransferReceiveBulkChannel(),
+    m_fileTransferReceiveTimer(NULL),
+    m_fileTransferReceiveId(0),
+    m_fileTransferCancelAckPending(false),
+    m_fileTransferReceivePollBudgetId(0),
+    m_fileTransferReceivePollElapsed(0.0),
+    m_fileTransferReceiveNextPollDelay(
+        kFileTransferReceiveInitialPollSeconds)
 {
     assert(m_client != NULL);
     assert(m_stream != NULL);
@@ -103,9 +184,16 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
 
 ServerProxy::~ServerProxy()
 {
+    clearPendingTransactionalFileStart();
+    resetTransactionalFileReceive(true);
     if (!cleanupClipboardSendThread(true) && m_clipboardSendThread != NULL) {
         LOG((CLOG_ERR "waiting for clipboard sender before destroying server proxy"));
-        m_clipboardSendThread->wait();
+        barrier::waitForFinalThreadShutdown(
+            "client clipboard sender",
+            barrier::kFinalThreadShutdownDeadlineSeconds,
+            [this](double timeout) {
+                return m_clipboardSendThread->wait(timeout);
+            });
         delete m_clipboardSendThread;
         m_clipboardSendThread = NULL;
         m_clipboardChunker.reset();
@@ -141,6 +229,7 @@ ServerProxy::setKeepAliveRate(double rate)
 {
     m_keepAliveAlarm = rate * kKeepAlivesUntilDeath;
     m_keepAliveAlarmDeferrals = 0;
+    m_keepAliveMissedAlarms = 0;
     m_lastKeepAlivePendingInput = false;
     m_lastKeepAliveBufferedOutput = 0;
     m_keepAliveActivityTimer.start();
@@ -151,11 +240,19 @@ ServerProxy::setKeepAliveRate(double rate)
 void
 ServerProxy::handleData(const Event&, void*)
 {
-    // handle messages until there are no more.  first read message code.
-    UInt8 code[4];
-    UInt32 n = m_stream->read(code, 4);
     bool receivedMessage = false;
-    while (n != 0) {
+    size_t parsedFrames = 0;
+    size_t parsedBytes = 0;
+    Stopwatch parseTimer;
+
+    while (true) {
+        const UInt32 frameSize = m_stream->getSize();
+        UInt8 code[4];
+        const UInt32 n = m_stream->read(code, 4);
+        if (n == 0) {
+            break;
+        }
+
         // verify we got an entire code
         if (n != 4) {
             LOG((CLOG_ERR "incomplete message from server: %d bytes", n));
@@ -166,6 +263,7 @@ ServerProxy::handleData(const Event&, void*)
 
         // parse message
         LOG((CLOG_DEBUG2 "msg from server: %c%c%c%c", code[0], code[1], code[2], code[3]));
+        Client* const client = m_client;
         try {
             switch ((this->*m_parser)(code)) {
             case kOkay:
@@ -177,6 +275,14 @@ ServerProxy::handleData(const Event&, void*)
                 return;
 
             case kDisconnect:
+                // Some legacy message handlers disconnect synchronously and
+                // delete this proxy before returning kDisconnect.  Use the
+                // stable client pointer captured before parsing, and only
+                // close raw protocol-failure paths that have not already
+                // completed their connection cleanup.
+                if (client->isConnected()) {
+                    client->disconnect("invalid message from server");
+                }
                 return;
             }
         } catch (const XBadClient& e) {
@@ -189,12 +295,24 @@ ServerProxy::handleData(const Event&, void*)
             return;
         }
 
-        // next message
-        n = m_stream->read(code, 4);
+        ++parsedFrames;
+        parsedBytes += frameSize >= 4 ? frameSize : 4;
+        const bool budgetExhausted =
+            parsedFrames >= kMaxFramesPerInputBatch ||
+            parsedBytes >= kMaxBytesPerInputBatch ||
+            parseTimer.getTime() >= kMaxSecondsPerInputBatch;
+        if (budgetExhausted) {
+            if (m_stream->getSize() != 0) {
+                m_events->addEvent(Event(m_events->forIStream().inputReady(),
+                    m_stream->getEventTarget()));
+            }
+            break;
+        }
     }
 
     if (receivedMessage) {
         m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
         m_lastKeepAlivePendingInput = false;
         m_lastKeepAliveBufferedOutput = 0;
         m_keepAliveActivityTimer.reset();
@@ -213,6 +331,18 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
         infoAcknowledgment();
     }
 
+    else if (m_protocolMinorVersion >= 12 &&
+             memcmp(code, kMsgCBulkOffer1_12, 4) == 0) {
+        if (!bulkOffer1_12()) {
+            return kDisconnect;
+        }
+    }
+
+    else if (m_protocolMinorVersion >= 9 && m_protocolMinorVersion < 12 &&
+             memcmp(code, kMsgCBulkOffer, 4) == 0) {
+        bulkOffer();
+    }
+
     else if (memcmp(code, kMsgDSetOptions, 4) == 0) {
         setOptions();
 
@@ -229,6 +359,7 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
         // echo keep alives and reset alarm
         ProtocolUtil::writef(m_stream, kMsgCKeepAlive);
         m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
         resetKeepAliveAlarm();
     }
 
@@ -279,35 +410,83 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
 ServerProxy::EResult
 ServerProxy::parseMessage(const UInt8* code)
 {
-    if (memcmp(code, kMsgDMouseMove, 4) == 0) {
+    if (m_protocolMinorVersion >= 8 &&
+        memcmp(code, kMsgDMouseMove1_8, 4) == 0) {
+        mouseMove1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDMouseRelMove1_8, 4) == 0) {
+        mouseRelativeMove1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDMouseWheel1_8, 4) == 0) {
+        mouseWheel1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDKeyDown1_8, 4) == 0) {
+        keyDown1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDKeyUp1_8, 4) == 0) {
+        keyUp1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDMouseDown1_8, 4) == 0) {
+        mouseDown1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDMouseUp1_8, 4) == 0) {
+        mouseUp1_8();
+    }
+
+    else if (m_protocolMinorVersion >= 8 &&
+             memcmp(code, kMsgDKeyRepeat1_8, 4) == 0) {
+        keyRepeat1_8();
+    }
+
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDMouseMove, 4) == 0) {
         mouseMove();
     }
 
-    else if (memcmp(code, kMsgDMouseRelMove, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDMouseRelMove, 4) == 0) {
         mouseRelativeMove();
     }
 
-    else if (memcmp(code, kMsgDMouseWheel, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDMouseWheel, 4) == 0) {
         mouseWheel();
     }
 
-    else if (memcmp(code, kMsgDKeyDown, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDKeyDown, 4) == 0) {
         keyDown();
     }
 
-    else if (memcmp(code, kMsgDKeyUp, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDKeyUp, 4) == 0) {
         keyUp();
     }
 
-    else if (memcmp(code, kMsgDMouseDown, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDMouseDown, 4) == 0) {
         mouseDown();
     }
 
-    else if (memcmp(code, kMsgDMouseUp, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDMouseUp, 4) == 0) {
         mouseUp();
     }
 
-    else if (memcmp(code, kMsgDKeyRepeat, 4) == 0) {
+    else if (m_protocolMinorVersion < 8 &&
+             memcmp(code, kMsgDKeyRepeat, 4) == 0) {
         keyRepeat();
     }
 
@@ -315,6 +494,7 @@ ServerProxy::parseMessage(const UInt8* code)
         // echo keep alives and reset alarm
         ProtocolUtil::writef(m_stream, kMsgCKeepAlive);
         m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
         resetKeepAliveAlarm();
     }
 
@@ -323,7 +503,24 @@ ServerProxy::parseMessage(const UInt8* code)
     }
 
     else if (memcmp(code, kMsgCEnter, 4) == 0) {
-        enter();
+        if (!enter()) {
+            return kDisconnect;
+        }
+    }
+
+    else if (m_protocolMinorVersion >= 7 &&
+             memcmp(code, kMsgCPrepareEnter, 4) == 0) {
+        prepareEnter();
+    }
+
+    else if (m_protocolMinorVersion >= 7 &&
+             memcmp(code, kMsgCAbortEnter, 4) == 0) {
+        abortEnter();
+    }
+
+    else if (m_protocolMinorVersion >= 11 &&
+             memcmp(code, kMsgCRevokeInput, 4) == 0) {
+        revokeInputLeaseRequest();
     }
 
     else if (memcmp(code, kMsgCLeave, 4) == 0) {
@@ -350,6 +547,18 @@ ServerProxy::parseMessage(const UInt8* code)
         setClipboard();
     }
 
+    else if (m_protocolMinorVersion >= 12 &&
+             memcmp(code, kMsgCBulkOffer1_12, 4) == 0) {
+        if (!bulkOffer1_12()) {
+            return kDisconnect;
+        }
+    }
+
+    else if (m_protocolMinorVersion >= 9 && m_protocolMinorVersion < 12 &&
+             memcmp(code, kMsgCBulkOffer, 4) == 0) {
+        bulkOffer();
+    }
+
     else if (memcmp(code, kMsgCResetOptions, 4) == 0) {
         resetOptions();
     }
@@ -358,11 +567,36 @@ ServerProxy::parseMessage(const UInt8* code)
         setOptions();
     }
 
-    else if (memcmp(code, kMsgDFileTransfer, 4) == 0) {
-        fileChunkReceived();
+    else if (m_protocolMinorVersion >= 12 &&
+             isTransactionalFileControlCode(code)) {
+        const EResult result = transactionalControlFrame(code);
+        if (result != kOkay) {
+            return result;
+        }
+    }
+    else if (m_protocolMinorVersion >= 12 &&
+             isTransactionalFileBulkCode(code)) {
+        LOG((CLOG_WARN
+            "rejecting transactional bulk payload on the control route"));
+        return kDisconnect;
+    }
+    else if (m_protocolMinorVersion < 12 &&
+             memcmp(code, kMsgDFileTransfer, 4) == 0) {
+        if (!discardLegacyFileChunk(m_stream)) {
+            m_client->disconnect("invalid file transfer on control connection");
+            return kDisconnect;
+        }
     }
     else if (memcmp(code, kMsgDDragInfo, 4) == 0) {
-        dragInfoReceived();
+        if (m_protocolMinorVersion < 12) {
+            if (!discardLegacyDragInfo(m_stream)) {
+                m_client->disconnect("invalid drag metadata on control connection");
+                return kDisconnect;
+            }
+        }
+        else {
+            dragInfoReceived();
+        }
     }
 
     else if (memcmp(code, kMsgCClose, 4) == 0) {
@@ -413,6 +647,7 @@ ServerProxy::handleKeepAliveAlarm(const Event&, void*)
         (m_lastKeepAliveBufferedOutput > 0 &&
          bufferedOutput < m_lastKeepAliveBufferedOutput)) {
         m_keepAliveAlarmDeferrals = 0;
+        m_keepAliveMissedAlarms = 0;
     }
     m_lastKeepAlivePendingInput = hasPendingInput;
     m_lastKeepAliveBufferedOutput = bufferedOutput;
@@ -430,6 +665,7 @@ ServerProxy::handleKeepAliveAlarm(const Event&, void*)
         }
 
         ++m_keepAliveAlarmDeferrals;
+        m_keepAliveMissedAlarms = 0;
         LOG((CLOG_WARN
              "server keepalive delayed while stream has pending work; deferring disconnect (%u/%u), "
              "pendingInput=%d bufferedOutput=%u idle=%.3fs",
@@ -444,6 +680,20 @@ ServerProxy::handleKeepAliveAlarm(const Event&, void*)
 
     if (m_keepAliveAlarm > 0.0 &&
         m_keepAliveActivityTimer.getTime() < m_keepAliveAlarm) {
+        m_keepAliveMissedAlarms = 0;
+        resetKeepAliveAlarm();
+        return;
+    }
+
+    static const UInt32 kMaxMissedKeepAlivesBeforeDisconnect = 3;
+    if (m_keepAliveMissedAlarms < kMaxMissedKeepAlivesBeforeDisconnect) {
+        ++m_keepAliveMissedAlarms;
+        LOG((CLOG_WARN
+             "server keepalive missed; probing before disconnect (%u/%u), idle=%.3fs",
+             m_keepAliveMissedAlarms,
+             kMaxMissedKeepAlivesBeforeDisconnect,
+             m_keepAliveActivityTimer.getTime()));
+        keepAlive();
         resetKeepAliveAlarm();
         return;
     }
@@ -492,22 +742,87 @@ ServerProxy::onGrabClipboard(ClipboardID id)
 ServerProxy::ClipboardSendResult
 ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard* clipboard)
 {
+    if (clipboard == NULL) {
+        return kClipboardSendFailed;
+    }
+    if (id == kClipboardClipboard && m_protocolMinorVersion < 12 &&
+        RemoteFileClipboard::containsFileList(*clipboard)) {
+        LOG((CLOG_WARN
+            "not sending file clipboard metadata to a legacy server"));
+        return kClipboardSendFailed;
+    }
+
+    // Do not marshal a potentially large clipboard when the previous sender
+    // cannot yet be reaped. The immutable snapshot overload performs the same
+    // gate before touching its payload.
+    if (!cleanupClipboardSendThread(true)) {
+        LOG((CLOG_WARN
+            "clipboard %d send skipped because previous sender is still stopping",
+            id));
+        return kClipboardSendFailed;
+    }
+
+    const std::shared_ptr<const std::string> data(
+        new std::string(IClipboard::marshall(clipboard)));
+    return onClipboardDataChanged(
+        id, data,
+        id == kClipboardClipboard &&
+            RemoteFileClipboard::containsFileList(*clipboard));
+}
+
+ServerProxy::ClipboardSendResult
+ServerProxy::onClipboardDataChanged(
+    ClipboardID id, const std::shared_ptr<const std::string>& data,
+    bool needsOrderedBulkRoute)
+{
     LOG((CLOG_DEBUG "sending clipboard %d seqnum=%d", id, m_seqNum));
+
+    if (!data) {
+        return kClipboardSendFailed;
+    }
+    if (m_protocolMinorVersion < 12 && needsOrderedBulkRoute) {
+        LOG((CLOG_WARN
+            "not sending ordered file clipboard metadata to a legacy server"));
+        return kClipboardSendFailed;
+    }
 
     if (!cleanupClipboardSendThread(true)) {
         LOG((CLOG_WARN "clipboard %d send skipped because previous sender is still stopping", id));
         return kClipboardSendFailed;
     }
 
-    std::shared_ptr<const std::string> data(
-        new std::string(IClipboard::marshall(clipboard)));
+    const bool requiresBulk =
+        data->size() > kSynchronousClipboardSendLimit || needsOrderedBulkRoute;
+    m_clipboardBulkChannel = requiresBulk ? m_client->acquireBulkChannel() :
+        std::shared_ptr<barrier::BulkChannel>();
+    if (requiresBulk && m_protocolMinorVersion >= 9 &&
+        !m_clipboardBulkChannel) {
+        m_clipboardSendStream = m_stream;
+        LOG((CLOG_WARN
+            "clipboard %d deferred because the required bulk channel is unavailable",
+            id));
+        return kClipboardSendFailed;
+    }
+    m_clipboardSendStream = m_clipboardBulkChannel ?
+        m_clipboardBulkChannel->getStream() : m_stream;
+
+    ++m_nextClipboardSendAttempt;
+    if (m_nextClipboardSendAttempt == 0) {
+        ++m_nextClipboardSendAttempt;
+    }
+    std::shared_ptr<barrier::ClipboardSendAttempt> attempt(
+        new barrier::ClipboardSendAttempt(id, m_nextClipboardSendAttempt));
+    m_latestClipboardSendAttempt[id] = m_nextClipboardSendAttempt;
 
     if (data->size() <= kSynchronousClipboardSendLimit) {
         const bool sent = StreamChunker::sendClipboard(
-            *data, data->size(), id, m_seqNum, m_events, this, m_stream);
+            *data, data->size(), id, m_seqNum, m_events, this,
+            m_clipboardSendStream, m_clipboardBulkChannel, attempt);
         if (!sent) {
             LOG((CLOG_WARN "clipboard %d was not fully queued for sending", id));
         }
+        m_clipboardBulkChannel.reset();
+        m_clipboardSendStream = m_stream;
         return sent ? kClipboardSendQueued : kClipboardSendFailed;
     }
 
@@ -517,6 +832,7 @@ ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard* clipboard)
     m_clipboardSendId = id;
     m_clipboardSendSucceeded = false;
     m_clipboardSendResultAvailable = false;
+    m_clipboardSendAttempt = attempt;
     m_clipboardSendThread = new Thread([this, data, id, sequence, chunker]() {
         sendClipboardThread(data, id, sequence, chunker);
     });
@@ -530,8 +846,11 @@ ServerProxy::sendClipboardThread(const std::shared_ptr<const std::string>& data,
                                  const std::shared_ptr<StreamChunker>& chunker)
 {
     const bool sent = chunker->sendClipboardData(
-            *data, data->size(), id, sequence, m_events, this, m_stream);
-    m_clipboardSendSucceeded = sent;
+            *data, data->size(), id, sequence, m_events, this,
+            m_clipboardSendStream, m_clipboardBulkChannel,
+            m_clipboardSendAttempt);
+    m_clipboardSendSucceeded = sent &&
+        (!m_clipboardSendAttempt || !m_clipboardSendAttempt->failed());
     m_clipboardSendResultAvailable = true;
     if (!sent) {
         LOG((CLOG_WARN "clipboard %d was not fully queued for sending", id));
@@ -554,10 +873,12 @@ ServerProxy::reapClipboardSendResult(ClipboardID id, bool& succeeded)
 
     succeeded = m_clipboardSendResultAvailable &&
         m_clipboardSendId == id &&
-        m_clipboardSendSucceeded;
+        m_clipboardSendSucceeded &&
+        (!m_clipboardSendAttempt || !m_clipboardSendAttempt->failed());
     m_clipboardSendId = kClipboardEnd;
     m_clipboardSendSucceeded = false;
     m_clipboardSendResultAvailable = false;
+    m_clipboardSendAttempt.reset();
     return true;
 }
 
@@ -569,17 +890,12 @@ ServerProxy::cleanupClipboardSendThread(bool cancel)
     }
 
     if (m_clipboardSendThread != NULL) {
-        if (cancel && !m_clipboardSendThread->wait(0.5)) {
-            LOG((CLOG_WARN "clipboard send thread did not stop after interrupt; cancelling"));
-            m_clipboardSendThread->cancel();
-            m_clipboardSendThread->unblockPollSocket();
-            if (!m_clipboardSendThread->wait(2.0)) {
-                LOG((CLOG_ERR "clipboard send thread still running after cancellation; cleanup deferred"));
-                return false;
+        if (!m_clipboardSendThread->wait(0.0)) {
+            if (cancel) {
+                LOG((CLOG_DEBUG "requesting asynchronous clipboard sender cancellation"));
+                m_clipboardSendThread->cancel();
+                m_clipboardSendThread->unblockPollSocket();
             }
-        }
-        else if (!cancel && !m_clipboardSendThread->wait(2.0)) {
-            LOG((CLOG_ERR "clipboard send thread still running; cleanup deferred"));
             return false;
         }
         delete m_clipboardSendThread;
@@ -587,7 +903,69 @@ ServerProxy::cleanupClipboardSendThread(bool cancel)
     }
 
     m_clipboardChunker.reset();
+    m_clipboardSendAttempt.reset();
+    m_clipboardSendId = kClipboardEnd;
+    m_clipboardSendSucceeded = false;
+    m_clipboardSendResultAvailable = false;
+    m_clipboardBulkChannel.reset();
+    m_clipboardSendStream = m_stream;
     return true;
+}
+
+void
+ServerProxy::handleBulkDisconnected(barrier::BulkChannel* channel)
+{
+    if (m_clipboardBulkChannel &&
+        m_clipboardBulkChannel.get() == channel && m_clipboardChunker) {
+        m_clipboardChunker->interruptFile();
+    }
+    if (m_fileTransferReceiveBulkChannel &&
+        m_fileTransferReceiveBulkChannel.get() == channel) {
+        if (m_fileTransferReceiver) {
+            m_fileTransferReceiver->abortActiveTransfer();
+        }
+        resetTransactionalFileReceive(true);
+    }
+}
+
+bool
+ServerProxy::handleBulkChannelReady()
+{
+    if (!m_hasPendingFileTransferStart) {
+        return true;
+    }
+
+    const barrier::FileTransferFrame frame = m_pendingFileTransferStart;
+    clearPendingTransactionalFileStart();
+    const std::shared_ptr<barrier::BulkChannel> channel =
+        m_client->acquireBulkChannel();
+    if (!channel || !channel->isActive()) {
+        const barrier::FileTransferFrame ack =
+            barrier::FileTransferFrame::startAck(
+                m_connectionBinding, frame.transferId,
+                barrier::FileTransferReason::kConnectionLost);
+        return writeTransactionalFileTransferFrame(
+            ack, barrier::FileTransferRole::kPrimary);
+    }
+
+    return processTransactionalFileStart(frame, channel) == kOkay;
+}
+
+bool
+ServerProxy::handleBulkHandshakeFailed()
+{
+    if (!m_hasPendingFileTransferStart) {
+        return true;
+    }
+
+    const UInt32 transferId = m_pendingFileTransferStart.transferId;
+    clearPendingTransactionalFileStart();
+    const barrier::FileTransferFrame ack =
+        barrier::FileTransferFrame::startAck(
+            m_connectionBinding, transferId,
+            barrier::FileTransferReason::kConnectionLost);
+    return writeTransactionalFileTransferFrame(
+        ack, barrier::FileTransferRole::kPrimary);
 }
 
 void
@@ -597,6 +975,8 @@ ServerProxy::detachForDeferredCleanup()
         return;
     }
 
+    clearPendingTransactionalFileStart();
+    resetTransactionalFileReceive(true);
     setKeepAliveRate(-1.0);
     m_events->removeHandler(m_events->forIStream().inputReady(),
                             m_stream->getEventTarget());
@@ -608,6 +988,11 @@ ServerProxy::detachForDeferredCleanup()
 void
 ServerProxy::flushCompressedMouse()
 {
+    if (!m_inputActive) {
+        discardCompressedMouse();
+        return;
+    }
+
     if (m_compressMouse) {
         m_compressMouse = false;
         m_client->mouseMove(m_xMouse, m_yMouse);
@@ -620,9 +1005,33 @@ ServerProxy::flushCompressedMouse()
     }
 }
 
+void
+ServerProxy::discardCompressedMouse()
+{
+    m_compressMouse = false;
+    m_compressMouseRelative = false;
+    m_dxMouse = 0;
+    m_dyMouse = 0;
+}
+
+bool
+ServerProxy::hasActivePointerLease(const char* inputType) const
+{
+    if (m_inputActive) {
+        return true;
+    }
+
+    LOG((CLOG_DEBUG1 "dropping %s outside the active enter sequence", inputType));
+    return false;
+}
+
 bool
 ServerProxy::shouldCompressMouseMoves() const
 {
+    // Callers also require a complete message to be waiting. Coalescing only
+    // after input is already backlogged prevents motion floods from delaying
+    // control messages in normal mode. Immediate-delivery modes already apply
+    // their own pacing and must not lose another set of coordinates here.
     return !m_lowLatencyMode && !m_nestedRemoteMode;
 }
 
@@ -756,7 +1165,7 @@ ServerProxy::translateModifierMask(KeyModifierMask mask) const
     return newMask;
 }
 
-void
+bool
 ServerProxy::enter()
 {
     // parse
@@ -764,18 +1173,181 @@ ServerProxy::enter()
     UInt16 mask;
     UInt32 seqNum;
     ProtocolUtil::readf(m_stream, kMsgCEnter + 4, &x, &y, &seqNum, &mask);
-    LOG((CLOG_DEBUG1 "recv enter, %d,%d %d %04x", x, y, seqNum, mask));
+    LOG((CLOG_DEBUG1 "recv enter, %d,%d %u %04x", x, y, seqNum, mask));
+
+    if (m_hasEnterSequence && !isNewerInputSequence(seqNum, m_seqNum)) {
+        LOG((CLOG_WARN "ignoring stale enter sequence %u; current=%u", seqNum, m_seqNum));
+        return true;
+    }
+
+    if (m_hasPreparedEnter && seqNum != m_preparedEnterSequence) {
+        LOG((CLOG_WARN "ignoring enter sequence %u while prepared sequence %u is pending",
+            seqNum, m_preparedEnterSequence));
+        return true;
+    }
+    if (m_hasPreparedEnter && !m_preparedEnterReady) {
+        LOG((CLOG_WARN "ignoring rejected enter sequence %u", seqNum));
+        return true;
+    }
+    if (m_hasPreparedEnter &&
+        (m_client->inputHandoffGeneration() != m_preparedInputGeneration ||
+         !m_client->canAcceptInputHandoff())) {
+        LOG((CLOG_WARN
+            "rejecting enter sequence %u because the prepared input backend changed",
+            seqNum));
+        m_hasPreparedEnter = false;
+        m_preparedEnterReady = false;
+        m_preparedInputGeneration = 0;
+        ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
+                             static_cast<UInt8>(0));
+        return true;
+    }
+
+    if (m_inputActive) {
+        LOG((CLOG_WARN "replacing active input lease %u with %u", m_seqNum, seqNum));
+        discardCompressedMouse();
+        releaseEpochPressedInput();
+        if (!m_client->leave()) {
+            LOG((CLOG_ERR
+                "input backend could not release active lease %u before enter %u",
+                m_seqNum, seqNum));
+            m_hasPreparedEnter = false;
+            m_preparedEnterReady = false;
+            m_preparedInputGeneration = 0;
+            if (m_protocolMinorVersion >= 7) {
+                ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
+                                     static_cast<UInt8>(0));
+                return true;
+            }
+            m_client->disconnect("input backend could not replace active lease");
+            return false;
+        }
+        m_inputActive = false;
+    }
 
     // discard old compressed mouse motion, if any
-    m_compressMouse         = false;
-    m_compressMouseRelative = false;
-    m_dxMouse               = 0;
-    m_dyMouse               = 0;
+    discardCompressedMouse();
     m_seqNum                = seqNum;
+    m_hasEnterSequence      = true;
     m_ignoreMouse           = false;
+    m_hasPreparedEnter      = false;
+    m_preparedEnterReady    = false;
+    m_preparedInputGeneration = 0;
+    m_lastInputSequence     = 0;
+    m_hasInputSequence      = false;
 
-    // forward
-    m_client->enter(x, y, seqNum, static_cast<KeyModifierMask>(mask), false);
+    // Do not publish the lease until the platform input backend confirms that
+    // it accepted the commit.  A failed Windows desktop command must roll the
+    // server handoff back instead of leaving both peers without the pointer.
+    m_inputActive = m_client->enterInputLease(
+        x, y, seqNum, static_cast<KeyModifierMask>(mask), false);
+    if (!m_inputActive) {
+        LOG((CLOG_ERR "input backend rejected committed enter sequence %u", seqNum));
+        if (m_protocolMinorVersion >= 7) {
+            ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
+                                 static_cast<UInt8>(0));
+        }
+        else {
+            m_client->disconnect("input backend rejected screen enter");
+            return false;
+        }
+    }
+    else {
+        LOG((CLOG_INFO "input backend committed enter sequence %u", seqNum));
+        if (m_protocolMinorVersion >= 10) {
+            ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
+                                 static_cast<UInt8>(1));
+        }
+    }
+    return true;
+}
+
+void
+ServerProxy::prepareEnter()
+{
+    SInt16 x = 0;
+    SInt16 y = 0;
+    UInt16 mask = 0;
+    UInt32 seqNum = 0;
+    ProtocolUtil::readf(m_stream, kMsgCPrepareEnter + 4,
+                        &x, &y, &seqNum, &mask);
+
+    const bool duplicatePrepare =
+        m_hasPreparedEnter && seqNum == m_preparedEnterSequence;
+    const bool sequenceAcceptable = duplicatePrepare ||
+        !m_hasEnterSequence || isNewerInputSequence(seqNum, m_seqNum);
+    const bool ready = !m_inputActive && sequenceAcceptable &&
+        m_client->canAcceptInputHandoff();
+
+    m_preparedEnterSequence = seqNum;
+    m_hasPreparedEnter = true;
+    m_preparedEnterReady = ready;
+    m_preparedInputGeneration = ready ?
+        m_client->inputHandoffGeneration() : 0;
+
+    LOG((CLOG_DEBUG1 "recv prepare enter, %d,%d %u %04x ready=%d",
+        x, y, seqNum, mask, ready ? 1 : 0));
+    ProtocolUtil::writef(m_stream, kMsgDEnterReady, seqNum,
+                         static_cast<UInt8>(ready ? 1 : 0));
+}
+
+void
+ServerProxy::abortEnter()
+{
+    UInt32 seqNum = 0;
+    ProtocolUtil::readf(m_stream, kMsgCAbortEnter + 4, &seqNum);
+    if (m_hasPreparedEnter && seqNum == m_preparedEnterSequence) {
+        LOG((CLOG_DEBUG1 "recv abort prepared enter %u", seqNum));
+        m_hasPreparedEnter = false;
+        m_preparedEnterReady = false;
+        m_preparedInputGeneration = 0;
+    }
+}
+
+void
+ServerProxy::revokeInputLeaseRequest()
+{
+    UInt32 handoffSeqNum = 0;
+    UInt32 inputEpoch = 0;
+    ProtocolUtil::readf(m_stream, kMsgCRevokeInput + 4,
+                        &handoffSeqNum, &inputEpoch);
+
+    bool revoked = false;
+    if (!m_hasEnterSequence || inputEpoch != m_seqNum) {
+        LOG((CLOG_WARN
+            "rejecting stale input lease revoke, handoff=%u epoch=%u active=%u",
+            handoffSeqNum, inputEpoch, m_seqNum));
+    }
+    else if (!m_inputActive) {
+        discardCompressedMouse();
+        revoked = true;
+        LOG((CLOG_DEBUG1
+            "acknowledging already inactive input lease, handoff=%u epoch=%u",
+            handoffSeqNum, inputEpoch));
+    }
+    else {
+        flushCompressedMouse();
+        releaseEpochPressedInput();
+        if (m_client->leave()) {
+            m_inputActive = false;
+            m_hasPreparedEnter = false;
+            m_preparedEnterReady = false;
+            m_preparedInputGeneration = 0;
+            revoked = true;
+            LOG((CLOG_INFO
+                "input backend revoked source lease, handoff=%u epoch=%u",
+                handoffSeqNum, inputEpoch));
+        }
+        else {
+            LOG((CLOG_ERR
+                "input backend rejected source lease revoke, handoff=%u epoch=%u",
+                handoffSeqNum, inputEpoch));
+        }
+    }
+
+    ProtocolUtil::writef(m_stream, kMsgDRevokeInputAck,
+                         handoffSeqNum,
+                         static_cast<UInt8>(revoked ? 1 : 0));
 }
 
 void
@@ -784,21 +1356,46 @@ ServerProxy::leave()
     // parse
     LOG((CLOG_DEBUG1 "recv leave"));
 
+    if (!m_inputActive) {
+        discardCompressedMouse();
+        LOG((CLOG_DEBUG1 "ignoring leave without an active input lease"));
+        return;
+    }
+
     // send last mouse motion
     flushCompressedMouse();
+    releaseEpochPressedInput();
 
-    // forward
-    m_client->leave();
+    // Keep the proxy and client ownership state aligned. COUT has no response,
+    // so a failed platform leave must tear down the connection and let the
+    // supervisor reclaim the input backend instead of silently losing it.
+    if (!m_client->leave()) {
+        LOG((CLOG_ERR
+            "input backend could not release active lease %u; disconnecting",
+            m_seqNum));
+        m_client->disconnect("input backend rejected screen leave");
+        return;
+    }
+    m_inputActive = false;
+    m_hasPreparedEnter = false;
+    m_preparedEnterReady = false;
+    m_preparedInputGeneration = 0;
 }
 
 void
 ServerProxy::setClipboard()
 {
+    setClipboard(m_stream);
+}
+
+void
+ServerProxy::setClipboard(barrier::IStream* stream)
+{
     // parse
     ClipboardID id;
     UInt32 seq;
 
-    int r = ClipboardChunk::assemble(m_stream, m_clipboardReceiveBuffer, id, seq);
+    int r = ClipboardChunk::assemble(stream, m_clipboardReceiveBuffer, id, seq);
 
     if (r == kStart) {
         size_t size = m_clipboardReceiveBuffer.expectedSize;
@@ -807,13 +1404,18 @@ ServerProxy::setClipboard()
     else if (r == kFinish) {
         LOG((CLOG_DEBUG "received clipboard %d size=%d", id, m_clipboardReceiveBuffer.data.size()));
 
-        // forward
-        Clipboard clipboard;
-        clipboard.unmarshall(m_clipboardReceiveBuffer.data, 0);
-        m_client->setClipboard(id, &clipboard);
+        // Transfer ownership of the validated wire buffer. Windows can publish
+        // it on its clipboard worker without parsing or image conversion on
+        // the input/control event thread.
+        std::shared_ptr<String> snapshot(new String());
+        snapshot->swap(m_clipboardReceiveBuffer.data);
         m_clipboardReceiveBuffer.release();
+        if (!m_client->setClipboardData(id, snapshot)) {
+            LOG((CLOG_WARN "clipboard %d snapshot was rejected", id));
+            return;
+        }
 
-        LOG((CLOG_INFO "clipboard was updated"));
+        LOG((CLOG_INFO "clipboard snapshot was queued for publication"));
     }
 }
 
@@ -855,7 +1457,15 @@ ServerProxy::keyDown()
         LOG((CLOG_DEBUG1 "key down translated to id=0x%08x, mask=0x%04x", id2, mask2));
 
     // forward
-    m_client->keyDown(id2, mask2, button);
+    // Keyboard broadcast intentionally targets inactive screens.  The 1.6
+    // protocol has no broadcast marker, so keyboard events cannot use the
+    // pointer lease gate without breaking that feature.
+    if (m_inputFrameAccepted) {
+        m_client->keyDown(id2, mask2, button);
+        if (m_inputFrameHasEpoch && !m_inputFrameBroadcast) {
+            m_epochPressedKeys[button] = PressedKey(id2, mask2);
+        }
+    }
 }
 
 void
@@ -879,7 +1489,9 @@ ServerProxy::keyRepeat()
         LOG((CLOG_DEBUG1 "key repeat translated to id=0x%08x, mask=0x%04x", id2, mask2));
 
     // forward
-    m_client->keyRepeat(id2, mask2, count, button);
+    if (m_inputFrameAccepted) {
+        m_client->keyRepeat(id2, mask2, count, button);
+    }
 }
 
 void
@@ -902,7 +1514,12 @@ ServerProxy::keyUp()
         LOG((CLOG_DEBUG1 "key up translated to id=0x%08x, mask=0x%04x", id2, mask2));
 
     // forward
-    m_client->keyUp(id2, mask2, button);
+    if (m_inputFrameAccepted) {
+        m_client->keyUp(id2, mask2, button);
+        if (m_inputFrameHasEpoch && !m_inputFrameBroadcast) {
+            m_epochPressedKeys.erase(button);
+        }
+    }
 }
 
 void
@@ -917,7 +1534,12 @@ ServerProxy::mouseDown()
     LOG((CLOG_DEBUG1 "recv mouse down id=%d", id));
 
     // forward
-    m_client->mouseDown(static_cast<ButtonID>(id));
+    if (m_inputFrameAccepted && hasActivePointerLease("mouse down")) {
+        m_client->mouseDown(static_cast<ButtonID>(id));
+        if (m_inputFrameHasEpoch) {
+            m_epochPressedButtons.insert(static_cast<ButtonID>(id));
+        }
+    }
 }
 
 void
@@ -932,7 +1554,12 @@ ServerProxy::mouseUp()
     LOG((CLOG_DEBUG1 "recv mouse up id=%d", id));
 
     // forward
-    m_client->mouseUp(static_cast<ButtonID>(id));
+    if (m_inputFrameAccepted && hasActivePointerLease("mouse up")) {
+        m_client->mouseUp(static_cast<ButtonID>(id));
+        if (m_inputFrameHasEpoch) {
+            m_epochPressedButtons.erase(static_cast<ButtonID>(id));
+        }
+    }
 }
 
 void
@@ -945,7 +1572,8 @@ ServerProxy::mouseMove()
 
     // note if we should ignore the move
     clearStaleInfoAckGate();
-    ignore = m_ignoreMouse;
+    ignore = m_ignoreMouse || !m_inputFrameAccepted ||
+        !hasActivePointerLease("mouse move");
 
     // compress mouse motion events if more input follows
     if (!ignore && shouldCompressMouseMoves() &&
@@ -954,7 +1582,7 @@ ServerProxy::mouseMove()
     }
 
     // if compressing then ignore the motion but record it
-    if (m_compressMouse) {
+    if (m_compressMouse && m_inputFrameAccepted) {
         m_compressMouseRelative = false;
         ignore    = true;
         m_xMouse  = x;
@@ -980,7 +1608,8 @@ ServerProxy::mouseRelativeMove()
 
     // note if we should ignore the move
     clearStaleInfoAckGate();
-    ignore = m_ignoreMouse;
+    ignore = m_ignoreMouse || !m_inputFrameAccepted ||
+        !hasActivePointerLease("relative mouse move");
 
     // compress mouse motion events if more input follows
     if (!ignore && shouldCompressMouseMoves() &&
@@ -989,7 +1618,7 @@ ServerProxy::mouseRelativeMove()
     }
 
     // if compressing then ignore the motion but record it
-    if (m_compressMouseRelative) {
+    if (m_compressMouseRelative && m_inputFrameAccepted) {
         ignore     = true;
         m_dxMouse += dx;
         m_dyMouse += dy;
@@ -1014,7 +1643,187 @@ ServerProxy::mouseWheel()
     LOG((CLOG_DEBUG2 "recv mouse wheel %+d,%+d", xDelta, yDelta));
 
     // forward
-    m_client->mouseWheel(xDelta, yDelta);
+    if (m_inputFrameAccepted && hasActivePointerLease("mouse wheel")) {
+        m_client->mouseWheel(xDelta, yDelta);
+    }
+}
+
+bool
+ServerProxy::acceptEpochInput(UInt32 epoch, UInt32 sequence, UInt8 flags,
+                              const char* inputType)
+{
+    if ((flags & ~static_cast<UInt8>(kInputMessageBroadcast)) != 0) {
+        LOG((CLOG_WARN "dropping %s with invalid input flags 0x%02x",
+            inputType, flags));
+        return false;
+    }
+
+    const bool broadcast = (flags & kInputMessageBroadcast) != 0;
+    const bool epochMatches =
+        (m_hasEnterSequence && epoch == m_seqNum) ||
+        (!m_hasEnterSequence && broadcast && epoch == 0);
+    if (!epochMatches) {
+        LOG((CLOG_DEBUG1 "dropping %s for stale input epoch %u; current=%u",
+            inputType, epoch, m_seqNum));
+        return false;
+    }
+    if (!broadcast && !m_inputActive) {
+        LOG((CLOG_DEBUG1 "dropping %s without an active input lease",
+            inputType));
+        return false;
+    }
+    if (m_hasInputSequence &&
+        !isNewerInputSequence(sequence, m_lastInputSequence)) {
+        LOG((CLOG_DEBUG1 "dropping replayed %s sequence %u; current=%u",
+            inputType, sequence, m_lastInputSequence));
+        return false;
+    }
+
+    m_lastInputSequence = sequence;
+    m_hasInputSequence = true;
+    return true;
+}
+
+void
+ServerProxy::dispatchEpochInput(UInt32 epoch, UInt32 sequence, UInt8 flags,
+                                const char* inputType,
+                                InputPayloadHandler handler)
+{
+    const bool previousAccepted = m_inputFrameAccepted;
+    const bool previousBroadcast = m_inputFrameBroadcast;
+    const bool previousHasEpoch = m_inputFrameHasEpoch;
+    m_inputFrameAccepted = acceptEpochInput(epoch, sequence, flags, inputType);
+    m_inputFrameBroadcast =
+        (flags & static_cast<UInt8>(kInputMessageBroadcast)) != 0;
+    m_inputFrameHasEpoch = true;
+    try {
+        (this->*handler)();
+    }
+    catch (...) {
+        m_inputFrameAccepted = previousAccepted;
+        m_inputFrameBroadcast = previousBroadcast;
+        m_inputFrameHasEpoch = previousHasEpoch;
+        throw;
+    }
+    m_inputFrameAccepted = previousAccepted;
+    m_inputFrameBroadcast = previousBroadcast;
+    m_inputFrameHasEpoch = previousHasEpoch;
+}
+
+void
+ServerProxy::releaseEpochPressedInput()
+{
+    if (m_epochPressedKeys.empty() && m_epochPressedButtons.empty()) {
+        return;
+    }
+
+    std::map<KeyButton, PressedKey> keys;
+    std::set<ButtonID> buttons;
+    keys.swap(m_epochPressedKeys);
+    buttons.swap(m_epochPressedButtons);
+
+    LOG((CLOG_DEBUG1 "releasing %lu key(s) and %lu mouse button(s) for input epoch %u",
+        static_cast<unsigned long>(keys.size()),
+        static_cast<unsigned long>(buttons.size()), m_seqNum));
+    for (std::set<ButtonID>::const_iterator i = buttons.begin();
+         i != buttons.end(); ++i) {
+        m_client->mouseUp(*i);
+    }
+    for (std::map<KeyButton, PressedKey>::const_iterator i = keys.begin();
+         i != keys.end(); ++i) {
+        m_client->keyUp(i->second.id, i->second.mask, i->first);
+    }
+}
+
+void
+ServerProxy::revokeInputLease()
+{
+    discardCompressedMouse();
+    releaseEpochPressedInput();
+    m_inputActive = false;
+    m_hasPreparedEnter = false;
+    m_preparedEnterReady = false;
+    m_preparedInputGeneration = 0;
+}
+
+void
+ServerProxy::keyDown1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    UInt8 flags = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i%1i", &epoch, &sequence, &flags);
+    dispatchEpochInput(epoch, sequence, flags, "key down", &ServerProxy::keyDown);
+}
+
+void
+ServerProxy::keyRepeat1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    UInt8 flags = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i%1i", &epoch, &sequence, &flags);
+    dispatchEpochInput(epoch, sequence, flags, "key repeat", &ServerProxy::keyRepeat);
+}
+
+void
+ServerProxy::keyUp1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    UInt8 flags = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i%1i", &epoch, &sequence, &flags);
+    dispatchEpochInput(epoch, sequence, flags, "key up", &ServerProxy::keyUp);
+}
+
+void
+ServerProxy::mouseDown1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i", &epoch, &sequence);
+    dispatchEpochInput(epoch, sequence, kInputMessageNoFlags,
+                       "mouse down", &ServerProxy::mouseDown);
+}
+
+void
+ServerProxy::mouseUp1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i", &epoch, &sequence);
+    dispatchEpochInput(epoch, sequence, kInputMessageNoFlags,
+                       "mouse up", &ServerProxy::mouseUp);
+}
+
+void
+ServerProxy::mouseMove1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i", &epoch, &sequence);
+    dispatchEpochInput(epoch, sequence, kInputMessageNoFlags,
+                       "mouse move", &ServerProxy::mouseMove);
+}
+
+void
+ServerProxy::mouseRelativeMove1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i", &epoch, &sequence);
+    dispatchEpochInput(epoch, sequence, kInputMessageNoFlags,
+                       "relative mouse move", &ServerProxy::mouseRelativeMove);
+}
+
+void
+ServerProxy::mouseWheel1_8()
+{
+    UInt32 epoch = 0;
+    UInt32 sequence = 0;
+    ProtocolUtil::readf(m_stream, "%4i%4i", &epoch, &sequence);
+    dispatchEpochInput(epoch, sequence, kInputMessageNoFlags,
+                       "mouse wheel", &ServerProxy::mouseWheel);
 }
 
 void
@@ -1110,10 +1919,10 @@ ServerProxy::setOptions()
     }
 
     if (m_lowLatencyMode) {
-        LOG((CLOG_NOTE "server requested low latency mode - mouse motion compression disabled"));
+        LOG((CLOG_NOTE "server requested low latency mode - immediate mouse delivery enabled while input is current"));
     }
     if (m_nestedRemoteMode) {
-        LOG((CLOG_NOTE "server requested nested remote mode - favoring immediate mouse delivery"));
+        LOG((CLOG_NOTE "server requested nested remote mode - immediate mouse delivery enabled while input is current"));
     }
 }
 
@@ -1139,23 +1948,731 @@ ServerProxy::infoAcknowledgment()
     m_ignoreMouse = false;
 }
 
-void
+int
 ServerProxy::fileChunkReceived()
 {
+    return fileChunkReceived(m_stream);
+}
+
+int
+ServerProxy::fileChunkReceived(barrier::IStream* stream)
+{
     int result = FileChunk::assemble(
-                    m_stream,
-                    m_client->getReceivedFileData(),
-                    m_client->getExpectedFileSize(),
-                    &m_client->getReceivedFileSpoolPath());
+                    stream,
+                    m_client->getFileReceiveSession());
 
     if (result == kFinish) {
-        m_events->addEvent(Event(m_events->forFile().fileRecieveCompleted(), m_client));
+        FileReceiveSession& session = m_client->getFileReceiveSession();
+        const std::uint64_t generation = session.generation();
+        std::shared_ptr<barrier::BulkChannel> bulkChannel =
+            m_client->acquireBulkChannel();
+        if (bulkChannel && bulkChannel->getStream() == stream) {
+            if (!bulkChannel->pauseInputForCommit(generation) ||
+                !session.installCommitBarrier(
+                    generation,
+                    bulkChannel->makeInputResumeCallback(generation),
+                    bulkChannel->makeInputProgressCallback(generation))) {
+                bulkChannel->resumeInputAfterCommit(generation);
+                LOG((CLOG_ERR
+                    "failed to install bulk file receive commit barrier, generation=%llu",
+                    static_cast<unsigned long long>(generation)));
+                m_client->handleBulkInputPauseFailed(
+                    bulkChannel.get(), generation);
+                return kError;
+            }
+        }
+        FileReceiveCompletionInfo* completionInfo = NULL;
+        try {
+            completionInfo = new FileReceiveCompletionInfo(generation);
+            Event completed(
+                m_events->forFile().fileRecieveCompleted(), m_client);
+            completed.setDataObject(completionInfo);
+            m_events->addEvent(completed);
+            completionInfo = NULL;
+        }
+        catch (...) {
+            delete completionInfo;
+            session.fail();
+            LOG((CLOG_ERR
+                "failed to queue completed file receive, generation=%llu",
+                static_cast<unsigned long long>(generation)));
+            return kError;
+        }
     }
     else if (result == kStart) {
+        FileReceiveSession& session = m_client->getFileReceiveSession();
+        if (stream == m_stream &&
+            session.expectedSize() > FileChunk::kMemoryReceiveLimit) {
+            LOG((CLOG_WARN
+                "discarding legacy file transfer that requires disk spooling; "
+                "bulk transport is required, size=%llu",
+                static_cast<unsigned long long>(session.expectedSize())));
+            session.discardRemaining();
+            return kStart;
+        }
+        m_client->bindFileReceiveClipboardRevision();
         if (m_client->getDragFileList().size() > 0) {
             std::string filename = m_client->getDragFileList().at(0).getFilename();
             LOG((CLOG_DEBUG "start receiving %s", filename.c_str()));
         }
+    }
+    else if (result == kBackpressure) {
+        FileReceiveSession& session = m_client->getFileReceiveSession();
+        const std::uint64_t generation = session.generation();
+        std::shared_ptr<barrier::BulkChannel> bulkChannel =
+            m_client->acquireBulkChannel();
+        if (bulkChannel && bulkChannel->getStream() == stream) {
+            if (!bulkChannel->pauseInputForBackpressure(generation) ||
+                !session.installBackpressureBarrier(
+                    generation,
+                    bulkChannel->makeInputResumeCallback(generation),
+                    bulkChannel->makeInputProgressCallback(generation))) {
+                bulkChannel->resumeInputAfterBackpressure(generation);
+                session.fail();
+                LOG((CLOG_ERR
+                    "failed to install bulk receive backpressure barrier, generation=%llu",
+                    static_cast<unsigned long long>(generation)));
+                return kError;
+            }
+        }
+        else {
+            LOG((CLOG_WARN
+                "discarding flow-controlled legacy file transfer while "
+                "preserving the control connection"));
+            session.discardRemaining();
+        }
+    }
+    return result;
+}
+
+bool
+ServerProxy::discardLegacyFileChunk(barrier::IStream* stream)
+{
+    UInt8 mark = 0;
+    std::string content;
+    if (stream == NULL ||
+        !ProtocolUtil::readf(
+            stream, kMsgDFileTransfer + 4, &mark, &content)) {
+        LOG((CLOG_WARN "invalid legacy file payload from server"));
+        return false;
+    }
+    LOG((CLOG_WARN
+        "ignored legacy file payload from server; protocol 1.12 is required"));
+    return true;
+}
+
+bool
+ServerProxy::discardLegacyDragInfo(barrier::IStream* stream)
+{
+    UInt32 fileCount = 0;
+    std::string content;
+    if (stream == NULL ||
+        !ProtocolUtil::readf(
+            stream, kMsgDDragInfo + 4, &fileCount, &content)) {
+        LOG((CLOG_WARN "invalid legacy drag metadata from server"));
+        return false;
+    }
+    LOG((CLOG_WARN
+        "ignored legacy drag metadata from server; protocol 1.12 is required"));
+    return true;
+}
+
+void
+ServerProxy::bulkOffer()
+{
+    std::string token;
+    if (ProtocolUtil::readf(m_stream, kMsgCBulkOffer + 4, &token) &&
+        m_protocolMinorVersion >= 9 && m_protocolMinorVersion < 12 &&
+        !token.empty()) {
+        m_client->connectBulkChannel(token);
+    }
+}
+
+bool
+ServerProxy::bulkOffer1_12()
+{
+    std::string token;
+    std::string connectionBinding;
+    if (!ProtocolUtil::readf(m_stream, kMsgCBulkOffer1_12 + 4,
+                             &token, &connectionBinding) ||
+        token.empty() || !isValidConnectionBinding(connectionBinding) ||
+        (!m_connectionBinding.empty() &&
+         m_connectionBinding != connectionBinding) ||
+        !m_client->connectBulkChannel(token, connectionBinding)) {
+        return false;
+    }
+    initializeTransactionalFileTransfer(connectionBinding);
+    return true;
+}
+
+void
+ServerProxy::initializeTransactionalFileTransfer(
+    const std::string& connectionBinding)
+{
+    if (!isValidConnectionBinding(connectionBinding)) {
+        clearPendingTransactionalFileStart();
+        resetTransactionalFileReceive(true);
+        m_fileTransferReceiver.reset();
+        m_connectionBinding.clear();
+        return;
+    }
+    if (m_fileTransferReceiver &&
+        m_connectionBinding == connectionBinding) {
+        return;
+    }
+
+    clearPendingTransactionalFileStart();
+    resetTransactionalFileReceive(true);
+    m_connectionBinding = connectionBinding;
+    m_fileTransferReceiver.reset(new barrier::FileTransferReceiver(
+        connectionBinding, barrier::FileTransferRole::kPrimary));
+}
+
+bool
+ServerProxy::writeTransactionalFileTransferFrame(
+    const barrier::FileTransferFrame& frame,
+    barrier::FileTransferRole initiatorRole)
+{
+    if (m_protocolMinorVersion < 12 ||
+        !isValidConnectionBinding(m_connectionBinding) ||
+        frame.connectionBinding != m_connectionBinding) {
+        return false;
+    }
+    try {
+        return barrier::FileTransferProtocol::encode(
+            m_stream, frame, initiatorRole);
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool
+ServerProxy::sendTransactionalFileTransferFrame(
+    const barrier::FileTransferFrame& frame)
+{
+    if (frame.type != barrier::FileTransferFrameType::kStart &&
+        frame.type != barrier::FileTransferFrameType::kCancel) {
+        return false;
+    }
+    return writeTransactionalFileTransferFrame(
+        frame, barrier::FileTransferRole::kSecondary);
+}
+
+ServerProxy::EResult
+ServerProxy::transactionalControlFrame(const UInt8* code)
+{
+    if (m_protocolMinorVersion < 12 || !m_fileTransferReceiver ||
+        !isValidConnectionBinding(m_connectionBinding)) {
+        return kDisconnect;
+    }
+
+    const bool peerInitiated =
+        std::memcmp(code, kMsgDFileTransferStart1_12, 4) == 0 ||
+        std::memcmp(code, kMsgDFileTransferCancel1_12, 4) == 0;
+    barrier::FileTransferFrame frame;
+    if (!barrier::FileTransferProtocol::decode(
+            code, m_stream,
+            peerInitiated ? barrier::FileTransferRole::kPrimary :
+                            barrier::FileTransferRole::kSecondary,
+            m_connectionBinding, frame)) {
+        return kDisconnect;
+    }
+
+    if (!peerInitiated) {
+        return m_client->signalTransactionalFileTransferAck(frame) ?
+            kOkay : kDisconnect;
+    }
+
+    if (frame.type == barrier::FileTransferFrameType::kStart) {
+        if (m_hasPendingFileTransferStart) {
+            if (frame.transferId == m_pendingFileTransferStart.transferId) {
+                return sameFileTransferStart(
+                    frame, m_pendingFileTransferStart) ?
+                        kOkay : kDisconnect;
+            }
+            const barrier::FileTransferFrame ack =
+                barrier::FileTransferFrame::startAck(
+                    m_connectionBinding, frame.transferId,
+                    barrier::FileTransferReason::kBusy);
+            return writeTransactionalFileTransferFrame(
+                ack, barrier::FileTransferRole::kPrimary) ?
+                    kOkay : kDisconnect;
+        }
+
+        std::shared_ptr<barrier::BulkChannel> bulkChannel =
+            m_client->acquireBulkChannel();
+        if (!bulkChannel || !bulkChannel->isActive()) {
+            if (m_client->isBoundBulkHandshakeWaitingForAck(
+                    frame.connectionBinding)) {
+                m_pendingFileTransferStart = frame;
+                m_hasPendingFileTransferStart = true;
+                LOG((CLOG_DEBUG1
+                    "deferring transactional file start until bound bulk handshake completes, transfer=%u",
+                    frame.transferId));
+                return kOkay;
+            }
+            const barrier::FileTransferFrame ack =
+                barrier::FileTransferFrame::startAck(
+                    m_connectionBinding, frame.transferId,
+                    barrier::FileTransferReason::kConnectionLost);
+            return writeTransactionalFileTransferFrame(
+                ack, barrier::FileTransferRole::kPrimary) ?
+                    kOkay : kDisconnect;
+        }
+
+        return processTransactionalFileStart(frame, bulkChannel);
+    }
+
+    if (frame.type == barrier::FileTransferFrameType::kCancel) {
+        if (m_hasPendingFileTransferStart) {
+            if (frame.transferId != m_pendingFileTransferStart.transferId) {
+                return kDisconnect;
+            }
+            clearPendingTransactionalFileStart();
+            const barrier::FileTransferFrame ack =
+                barrier::FileTransferFrame::cancelAck(
+                    m_connectionBinding, frame.transferId,
+                    barrier::FileTransferReason::kNone);
+            return writeTransactionalFileTransferFrame(
+                ack, barrier::FileTransferRole::kPrimary) ?
+                    kOkay : kDisconnect;
+        }
+        return handleTransactionalFileCancel(frame) ?
+            kOkay : kDisconnect;
+    }
+
+    return kDisconnect;
+}
+
+ServerProxy::EResult
+ServerProxy::processTransactionalFileStart(
+    const barrier::FileTransferFrame& frame,
+    const std::shared_ptr<barrier::BulkChannel>& bulkChannel)
+{
+    if (!bulkChannel || !bulkChannel->isActive()) {
+        return kDisconnect;
+    }
+
+    const barrier::FileTransferReceiveResult result =
+        m_fileTransferReceiver->handle(frame);
+    if (result.status ==
+            barrier::FileTransferReceiveStatus::kProtocolError) {
+        return kDisconnect;
+    }
+
+    barrier::FileTransferReason reason = result.reason;
+    if (result.status ==
+            barrier::FileTransferReceiveStatus::kStartAccepted) {
+        reason = m_client->beginTransactionalFileReceive(frame);
+        if (reason == barrier::FileTransferReason::kNone) {
+            m_fileTransferReceiveId = frame.transferId;
+            m_fileTransferReceiveBulkChannel = bulkChannel;
+            m_fileTransferCancelAckPending = false;
+        }
+        else {
+            m_fileTransferReceiver->reset();
+        }
+    }
+    else if (result.status !=
+                 barrier::FileTransferReceiveStatus::kStartRejected) {
+        return kDisconnect;
+    }
+
+    const barrier::FileTransferFrame ack =
+        barrier::FileTransferFrame::startAck(
+            m_connectionBinding, frame.transferId, reason);
+    if (!writeTransactionalFileTransferFrame(
+            ack, barrier::FileTransferRole::kPrimary)) {
+        if (reason == barrier::FileTransferReason::kNone) {
+            resetTransactionalFileReceive(true);
+        }
+        return kDisconnect;
+    }
+    return kOkay;
+}
+
+void
+ServerProxy::clearPendingTransactionalFileStart()
+{
+    m_hasPendingFileTransferStart = false;
+    m_pendingFileTransferStart = barrier::FileTransferFrame();
+}
+
+bool
+ServerProxy::handleTransactionalFileCancel(
+    const barrier::FileTransferFrame& frame)
+{
+    if (!m_fileTransferReceiver) {
+        return false;
+    }
+    const barrier::FileTransferReceiveResult result =
+        m_fileTransferReceiver->handle(frame);
+    if (result.status ==
+            barrier::FileTransferReceiveStatus::kCancelAlreadyApplied) {
+        const barrier::FileTransferFrame ack =
+            barrier::FileTransferFrame::cancelAck(
+                m_connectionBinding, frame.transferId,
+                barrier::FileTransferReason::kNone);
+        return writeTransactionalFileTransferFrame(
+            ack, barrier::FileTransferRole::kPrimary);
+    }
+    if (result.status != barrier::FileTransferReceiveStatus::kCancelled) {
+        resetTransactionalFileReceive(true);
+        return false;
+    }
+
+    cleanupTransactionalFileReceivePoll();
+    resetTransactionalFileReceivePollBudget();
+    m_client->cancelTransactionalFileReceive(frame.transferId);
+    m_fileTransferReceiveBulkChannel.reset();
+    m_fileTransferCancelAckPending = true;
+    if (m_fileTransferReceiver->workerCleanupPending()) {
+        return scheduleTransactionalFileReceivePoll(frame.transferId) ||
+            quarantineTransactionalFileReceive(frame.transferId, true);
+    }
+    m_fileTransferCancelAckPending = false;
+    m_fileTransferReceiveId = 0;
+    resetTransactionalFileReceivePollBudget();
+    const barrier::FileTransferFrame ack =
+        barrier::FileTransferFrame::cancelAck(
+            m_connectionBinding, frame.transferId,
+            barrier::FileTransferReason::kNone);
+    return writeTransactionalFileTransferFrame(
+        ack, barrier::FileTransferRole::kPrimary);
+}
+
+bool
+ServerProxy::handleBulkMessage(const UInt8* code, barrier::IStream* stream)
+{
+    if (m_protocolMinorVersion >= 12 &&
+        isTransactionalFileBulkCode(code)) {
+        return transactionalBulkFrame(code, stream);
+    }
+    if (m_protocolMinorVersion < 12 &&
+        memcmp(code, kMsgDFileTransfer, 4) == 0) {
+        return discardLegacyFileChunk(stream);
+    }
+    if (memcmp(code, kMsgDClipboard, 4) == 0) {
+        setClipboard(stream);
+        return true;
+    }
+    return false;
+}
+
+bool
+ServerProxy::transactionalBulkFrame(
+    const UInt8* code, barrier::IStream* stream)
+{
+    std::shared_ptr<barrier::BulkChannel> currentBulk =
+        m_client->acquireBulkChannel();
+    if (m_protocolMinorVersion < 12 || !m_fileTransferReceiver ||
+        !currentBulk || !currentBulk->isActive() ||
+        currentBulk->getStream() != stream) {
+        return false;
+    }
+
+    barrier::FileTransferFrame frame;
+    if (!barrier::FileTransferProtocol::decode(
+            code, stream, barrier::FileTransferRole::kPrimary,
+            m_connectionBinding, frame)) {
+        resetTransactionalFileReceive(true);
+        return false;
+    }
+    const barrier::FileTransferReceiveResult result =
+        m_fileTransferReceiver->handle(frame);
+    if (result.status ==
+            barrier::FileTransferReceiveStatus::kCancelledPayloadDiscarded) {
+        LOG((CLOG_DEBUG1
+            "discarding queued bulk payload for cancelled transfer %u",
+            frame.transferId));
+        return true;
+    }
+    if (!m_fileTransferReceiver->hasActiveTransfer() ||
+        m_fileTransferReceiveId == 0 ||
+        currentBulk != m_fileTransferReceiveBulkChannel ||
+        frame.transferId != m_fileTransferReceiveId) {
+        resetTransactionalFileReceive(true);
+        return false;
+    }
+
+    switch (result.status) {
+    case barrier::FileTransferReceiveStatus::kDataAccepted:
+        return frame.type == barrier::FileTransferFrameType::kData;
+
+    case barrier::FileTransferReceiveStatus::kBackpressure:
+        if (frame.type != barrier::FileTransferFrameType::kData ||
+            !currentBulk->pauseInputForBackpressure(
+                result.sessionGeneration) ||
+            !m_fileTransferReceiver->installBackpressureBarrier(
+                result.sessionGeneration,
+                currentBulk->makeInputResumeCallback(
+                    result.sessionGeneration),
+                currentBulk->makeInputProgressCallback(
+                    result.sessionGeneration))) {
+            currentBulk->resumeInputAfterBackpressure(
+                result.sessionGeneration);
+            resetTransactionalFileReceive(true);
+            return false;
+        }
+        return true;
+
+    case barrier::FileTransferReceiveStatus::kAwaitingCommit:
+    case barrier::FileTransferReceiveStatus::kReadyToCommit:
+        if (frame.type != barrier::FileTransferFrameType::kEnd ||
+            !currentBulk->pauseInputForCommit(result.sessionGeneration) ||
+            !m_fileTransferReceiver->installCommitBarrier(
+                result.sessionGeneration,
+                currentBulk->makeInputResumeCallback(
+                    result.sessionGeneration),
+                currentBulk->makeInputProgressCallback(
+                    result.sessionGeneration))) {
+            currentBulk->resumeInputAfterCommit(result.sessionGeneration);
+            resetTransactionalFileReceive(true);
+            return false;
+        }
+        if (result.status ==
+                barrier::FileTransferReceiveStatus::kReadyToCommit) {
+            pollTransactionalFileReceive();
+        }
+        else {
+            scheduleTransactionalFileReceivePoll(frame.transferId);
+        }
+        return true;
+
+    case barrier::FileTransferReceiveStatus::kTransferFailed:
+        if (frame.type == barrier::FileTransferFrameType::kEnd) {
+            const UInt32 transferId = m_fileTransferReceiveId;
+            cleanupTransactionalFileReceivePoll();
+            m_fileTransferReceiver->reset();
+            m_client->cancelTransactionalFileReceive(transferId);
+            m_fileTransferReceiveId = 0;
+            m_fileTransferReceiveBulkChannel.reset();
+            const barrier::FileTransferFrame ack =
+                barrier::FileTransferFrame::commitAck(
+                    m_connectionBinding, transferId, result.reason);
+            return writeTransactionalFileTransferFrame(
+                ack, barrier::FileTransferRole::kPrimary);
+        }
+        resetTransactionalFileReceive(true);
+        return false;
+
+    case barrier::FileTransferReceiveStatus::kStartAccepted:
+    case barrier::FileTransferReceiveStatus::kStartRejected:
+    case barrier::FileTransferReceiveStatus::kCancelled:
+    case barrier::FileTransferReceiveStatus::kCancelledPayloadDiscarded:
+    case barrier::FileTransferReceiveStatus::kProtocolError:
+        resetTransactionalFileReceive(true);
+        return false;
+    }
+
+    resetTransactionalFileReceive(true);
+    return false;
+}
+
+void
+ServerProxy::pollTransactionalFileReceive()
+{
+    if (!m_fileTransferReceiver || m_fileTransferReceiveId == 0) {
+        cleanupTransactionalFileReceivePoll();
+        return;
+    }
+
+    const UInt32 transferId = m_fileTransferReceiveId;
+    if (m_fileTransferCancelAckPending) {
+        if (m_fileTransferReceiver->workerCleanupPending()) {
+            if (!scheduleTransactionalFileReceivePoll(transferId) &&
+                !quarantineTransactionalFileReceive(transferId, true)) {
+                LOG((CLOG_WARN
+                    "failed to acknowledge quarantined file cancellation, transfer=%u",
+                    transferId));
+            }
+            return;
+        }
+        cleanupTransactionalFileReceivePoll();
+        m_fileTransferCancelAckPending = false;
+        m_fileTransferReceiveId = 0;
+        resetTransactionalFileReceivePollBudget();
+        const barrier::FileTransferFrame ack =
+            barrier::FileTransferFrame::cancelAck(
+                m_connectionBinding, transferId,
+                barrier::FileTransferReason::kNone);
+        if (!writeTransactionalFileTransferFrame(
+                ack, barrier::FileTransferRole::kPrimary)) {
+            LOG((CLOG_WARN
+                "failed to send transactional file cancel acknowledgment, transfer=%u",
+                transferId));
+        }
+        return;
+    }
+    if (!m_fileTransferReceiver->hasActiveTransfer()) {
+        cleanupTransactionalFileReceivePoll();
+        return;
+    }
+    const barrier::FileTransferReceiveResult result =
+        m_fileTransferReceiver->pollCompletion(transferId);
+    if (result.status ==
+            barrier::FileTransferReceiveStatus::kAwaitingCommit) {
+        if (!scheduleTransactionalFileReceivePoll(transferId) &&
+            !quarantineTransactionalFileReceive(transferId, false)) {
+            LOG((CLOG_WARN
+                "failed to terminate timed-out file receive, transfer=%u",
+                transferId));
+        }
+        return;
+    }
+
+    barrier::FileTransferReason reason = result.reason;
+    if (result.status ==
+            barrier::FileTransferReceiveStatus::kReadyToCommit) {
+        barrier::CompletedFilePayload payload;
+        if (!m_fileTransferReceiver->takeCompleted(
+                transferId, payload)) {
+            reason = barrier::FileTransferReason::kIoError;
+            m_client->cancelTransactionalFileReceive(transferId);
+        }
+        else {
+            reason = m_client->acceptTransactionalFileReceive(
+                transferId, std::move(payload));
+        }
+    }
+    else if (result.status ==
+                 barrier::FileTransferReceiveStatus::kTransferFailed) {
+        m_client->cancelTransactionalFileReceive(transferId);
+    }
+    else {
+        resetTransactionalFileReceive(true);
+        return;
+    }
+
+    cleanupTransactionalFileReceivePoll();
+    m_fileTransferReceiveId = 0;
+    m_fileTransferCancelAckPending = false;
+    m_fileTransferReceiveBulkChannel.reset();
+    resetTransactionalFileReceivePollBudget();
+    const barrier::FileTransferFrame ack =
+        barrier::FileTransferFrame::commitAck(
+            m_connectionBinding, transferId, reason);
+    if (!writeTransactionalFileTransferFrame(
+            ack, barrier::FileTransferRole::kPrimary)) {
+        LOG((CLOG_WARN
+            "failed to send transactional file commit acknowledgment, transfer=%u",
+            transferId));
+    }
+}
+
+bool
+ServerProxy::scheduleTransactionalFileReceivePoll(UInt32 transferId)
+{
+    if (transferId == 0 || transferId != m_fileTransferReceiveId) {
+        return false;
+    }
+    if (m_fileTransferReceiveTimer != NULL) {
+        return m_fileTransferReceivePollBudgetId == transferId;
+    }
+    if (m_fileTransferReceivePollBudgetId != transferId) {
+        resetTransactionalFileReceivePollBudget();
+        m_fileTransferReceivePollBudgetId = transferId;
+    }
+
+    const double remaining = kFileTransferReceivePollDeadlineSeconds -
+        m_fileTransferReceivePollElapsed;
+    if (remaining <= 0.0) {
+        return false;
+    }
+    const double delay = (std::min)(
+        m_fileTransferReceiveNextPollDelay, remaining);
+    m_fileTransferReceiveTimer = m_events->newOneShotTimer(
+        delay, NULL);
+    if (m_fileTransferReceiveTimer == NULL) {
+        LOG((CLOG_ERR
+            "unable to schedule transactional file receive poll, transfer=%u",
+            transferId));
+        return false;
+    }
+    m_fileTransferReceivePollElapsed += delay;
+    m_fileTransferReceiveNextPollDelay = (std::min)(
+        kFileTransferReceiveMaxPollSeconds,
+        m_fileTransferReceiveNextPollDelay * 2.0);
+    m_events->adoptHandler(Event::kTimer, m_fileTransferReceiveTimer,
+        new TMethodEventJob<ServerProxy>(
+            this, &ServerProxy::handleTransactionalFileReceivePoll));
+    return true;
+}
+
+void
+ServerProxy::handleTransactionalFileReceivePoll(const Event&, void*)
+{
+    cleanupTransactionalFileReceivePoll();
+    pollTransactionalFileReceive();
+}
+
+void
+ServerProxy::cleanupTransactionalFileReceivePoll()
+{
+    if (m_fileTransferReceiveTimer != NULL) {
+        m_events->removeHandler(Event::kTimer,
+                                m_fileTransferReceiveTimer);
+        m_events->deleteTimer(m_fileTransferReceiveTimer);
+        m_fileTransferReceiveTimer = NULL;
+    }
+}
+
+void
+ServerProxy::resetTransactionalFileReceivePollBudget()
+{
+    m_fileTransferReceivePollBudgetId = 0;
+    m_fileTransferReceivePollElapsed = 0.0;
+    m_fileTransferReceiveNextPollDelay =
+        kFileTransferReceiveInitialPollSeconds;
+}
+
+bool
+ServerProxy::quarantineTransactionalFileReceive(
+    UInt32 transferId, bool cancelled)
+{
+    cleanupTransactionalFileReceivePoll();
+    if (!m_fileTransferReceiver || transferId == 0 ||
+        transferId != m_fileTransferReceiveId) {
+        return false;
+    }
+
+    LOG((CLOG_WARN
+        "quarantining timed-out transactional file receive cleanup, transfer=%u",
+        transferId));
+    m_client->cancelTransactionalFileReceive(transferId);
+    m_fileTransferReceiver->reset();
+    m_fileTransferReceiver->quarantineRetiredWorkerCleanup();
+    m_fileTransferReceiveId = 0;
+    m_fileTransferCancelAckPending = false;
+    m_fileTransferReceiveBulkChannel.reset();
+    resetTransactionalFileReceivePollBudget();
+
+    const barrier::FileTransferFrame ack = cancelled ?
+        barrier::FileTransferFrame::cancelAck(
+            m_connectionBinding, transferId,
+            barrier::FileTransferReason::kNone) :
+        barrier::FileTransferFrame::commitAck(
+            m_connectionBinding, transferId,
+            barrier::FileTransferReason::kTimeout);
+    return writeTransactionalFileTransferFrame(
+        ack, barrier::FileTransferRole::kPrimary);
+}
+
+void
+ServerProxy::resetTransactionalFileReceive(bool notifyClient)
+{
+    cleanupTransactionalFileReceivePoll();
+    const UInt32 transferId = m_fileTransferReceiveId;
+    if (m_fileTransferReceiver) {
+        m_fileTransferReceiver->reset();
+    }
+    m_fileTransferReceiveId = 0;
+    m_fileTransferCancelAckPending = false;
+    m_fileTransferReceiveBulkChannel.reset();
+    resetTransactionalFileReceivePollBudget();
+    if (notifyClient && transferId != 0) {
+        m_client->cancelTransactionalFileReceive(transferId);
     }
 }
 
@@ -1173,18 +2690,67 @@ ServerProxy::dragInfoReceived()
 void
 ServerProxy::handleClipboardSendingEvent(const Event& event, void*)
 {
-    ClipboardChunk::send(m_stream, event.getData());
+    ClipboardChunk* chunk = static_cast<ClipboardChunk*>(event.getData());
+    handleClipboardSendingChunk(chunk);
+}
+
+void
+ServerProxy::handleClipboardSendingChunk(ClipboardChunk* chunk)
+{
+    if (chunk == NULL) {
+        return;
+    }
+    if (!chunk->isSendRouteActive()) {
+        chunk->failSendAttempt();
+        const std::shared_ptr<barrier::ClipboardSendAttempt> attempt =
+            chunk->getSendAttempt();
+        const ClipboardID id = chunk->getClipboardId();
+        if (attempt && id < kClipboardEnd && attempt->id() == id &&
+            m_latestClipboardSendAttempt[id] == attempt->attemptId()) {
+            m_clipboardSendSucceeded = false;
+            m_client->handleClipboardSendRouteFailure(id);
+        }
+        if (m_clipboardChunker) {
+            m_clipboardChunker->interruptFile();
+        }
+        return;
+    }
+    try {
+        ClipboardChunk::send(chunk->getSendStream(m_stream), chunk);
+    }
+    catch (...) {
+        chunk->failSendAttempt();
+        const std::shared_ptr<barrier::ClipboardSendAttempt> attempt =
+            chunk->getSendAttempt();
+        const ClipboardID id = chunk->getClipboardId();
+        if (attempt && id < kClipboardEnd && attempt->id() == id &&
+            m_latestClipboardSendAttempt[id] == attempt->attemptId()) {
+            m_clipboardSendSucceeded = false;
+            m_client->handleClipboardSendRouteFailure(id);
+        }
+        throw;
+    }
 }
 
 void
 ServerProxy::fileChunkSending(UInt8 mark, char* data, size_t dataSize)
 {
+    if (m_protocolMinorVersion < 12) {
+        LOG((CLOG_WARN
+            "not sending legacy file payload to server"));
+        return;
+    }
     FileChunk::send(m_stream, mark, data, dataSize);
 }
 
 void
 ServerProxy::sendDragInfo(UInt32 fileCount, const char* info, size_t size)
 {
+    if (m_protocolMinorVersion < 12) {
+        LOG((CLOG_WARN
+            "not sending drag metadata to a legacy server"));
+        return;
+    }
     std::string data(info, size);
     ProtocolUtil::writef(m_stream, kMsgDDragInfo, fileCount, &data);
 }

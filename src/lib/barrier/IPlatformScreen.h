@@ -26,6 +26,10 @@
 #include "barrier/IKeyState.h"
 #include "barrier/option_types.h"
 
+#include <cstdint>
+#include <memory>
+#include <string>
+
 class IClipboard;
 
 //! Screen interface
@@ -43,6 +47,33 @@ public:
 
     IPlatformScreen(IEventQueue* events) : IKeyState(events) { }
 
+    // Platforms with an asynchronous clipboard reader can expose its already
+    // validated wire snapshot. The default keeps existing platform behavior.
+    virtual bool getClipboardSnapshot(
+        ClipboardID, std::shared_ptr<const String>*, UInt32*) const
+    {
+        return false;
+    }
+
+    virtual bool setClipboardSnapshot(
+        ClipboardID, const std::shared_ptr<const String>&)
+    {
+        return false;
+    }
+
+    virtual bool setClipboardSnapshot(
+        ClipboardID id, const std::shared_ptr<const String>& data,
+        std::uint64_t publicationId)
+    {
+        (void)publicationId;
+        return setClipboardSnapshot(id, data);
+    }
+
+    virtual bool hasAsyncClipboardPublications() const
+    {
+        return false;
+    }
+
     //! Enable screen
     /*!
     Enable the screen, preparing it to report system and user events.
@@ -50,6 +81,16 @@ public:
     and hiding the cursor.
     */
     virtual void        enable() = 0;
+
+    //! Prepare only the platform input backend before remote handshaking.
+    virtual bool        prepareInputBackend() { return true; }
+
+    //! Probe input-desktop access without installing hooks or capturing input.
+    virtual bool        probeInputBackend(std::string& desktopName) const
+    {
+        desktopName = inputDesktopName();
+        return canEnter();
+    }
 
     //! Disable screen
     /*!
@@ -63,6 +104,18 @@ public:
     Called when the user navigates to this screen.
     */
     virtual void        enter() = 0;
+
+    //! Enter screen and report whether the platform accepted input ownership.
+    /*!
+    Existing platform implementations are assumed to succeed.  Platforms with
+    a fallible input backend override this method so a prepared handoff is not
+    committed before the backend has actually accepted the enter command.
+    */
+    virtual bool        tryEnter()
+    {
+        enter();
+        return true;
+    }
 
     //! Leave screen
     /*!
@@ -86,6 +139,13 @@ public:
     reliably report clipboard ownership changes.
     */
     virtual void        checkClipboards() = 0;
+
+    //! Whether clipboard owner notifications are completed by an isolated
+    //! snapshot worker before clipboardChanged is emitted.
+    virtual bool        hasAsyncClipboardSnapshots() const
+    {
+        return false;
+    }
 
     //! Open screen saver
     /*!
@@ -152,6 +212,12 @@ public:
     */
     virtual bool        canEnter() const { return true; }
 
+    //! Identity of the input backend validated by a prepared handoff.
+    virtual std::uint64_t inputGeneration() const { return 0; }
+
+    //! Platform desktop currently backing input injection.
+    virtual std::string inputDesktopName() const { return std::string(); }
+
     //@}
 
     // IScreen overrides
@@ -177,6 +243,11 @@ public:
     // ISecondaryScreen overrides
     virtual void        fakeMouseButton(ButtonID id, bool press) = 0;
     virtual void        fakeMouseMove(SInt32 x, SInt32 y) = 0;
+    virtual bool        tryFakeMouseMove(SInt32 x, SInt32 y)
+    {
+        fakeMouseMove(x, y);
+        return true;
+    }
     virtual void        fakeMouseRelativeMove(SInt32 dx, SInt32 dy) const = 0;
     virtual void        fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const = 0;
 

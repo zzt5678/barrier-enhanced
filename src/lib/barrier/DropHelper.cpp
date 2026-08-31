@@ -16,6 +16,7 @@
  */
 
 #include "barrier/DropHelper.h"
+#include "barrier/SecureRandom.h"
 #include "barrier/TransferArchive.h"
 
 #include "base/Log.h"
@@ -23,61 +24,115 @@
 #include "mt/Thread.h"
 #include "mt/XThread.h"
 
-#include <ctime>
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <fstream>
-#include <sstream>
 #include <stdexcept>
 #include <system_error>
-#include <thread>
 #include <utility>
 
 namespace {
 
 std::string uniqueToken()
 {
-    std::ostringstream stream;
-    stream << std::hex
-           << static_cast<unsigned long long>(std::time(nullptr))
-           << "-"
-           << static_cast<unsigned long long>(
-               std::hash<std::thread::id>{}(std::this_thread::get_id()))
-           << "-"
-           << static_cast<unsigned long long>(std::rand());
-    return stream.str();
+    std::string token;
+    if (!barrier::SecureRandom::generateHex(16, token)) {
+        throw std::runtime_error("could not generate a secure drop token");
+    }
+    return token;
 }
 
-barrier::fs::path unique_drop_target_path(const barrier::fs::path& destination,
-                                          const String& filename)
+barrier::fs::path reserveStagingDirectory(
+    const barrier::fs::path& destination)
 {
-    barrier::fs::path candidate = destination / barrier::fs::u8path(filename);
-    if (!barrier::fs::exists(candidate)) {
-        return candidate;
-    }
-
-    const auto stem = candidate.stem().u8string();
-    const auto extension = candidate.extension().u8string();
-    for (int index = 1; index < 1000; ++index) {
-        barrier::fs::path next =
-            destination / barrier::fs::u8path(
-                stem + " (" + std::to_string(index) + ")" + extension);
-        if (!barrier::fs::exists(next)) {
-            return next;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const barrier::fs::path candidate =
+            destination /
+            barrier::fs::u8path(".weave-unpack-" + uniqueToken());
+        std::error_code error;
+        if (barrier::fs::create_directory(candidate, error)) {
+            return candidate;
+        }
+        if (error && error != std::make_error_code(std::errc::file_exists)) {
+            throw std::runtime_error(
+                "could not reserve drop staging directory: " +
+                error.message());
         }
     }
 
-    for (int attempt = 0; attempt < 128; ++attempt) {
-        barrier::fs::path next =
-            destination / barrier::fs::u8path(
-                stem + " (" + uniqueToken() + ")" + extension);
-        if (!barrier::fs::exists(next)) {
-            return next;
-        }
+    throw std::runtime_error("could not reserve a unique drop staging directory");
+}
+
+barrier::fs::path dropTargetCandidate(const barrier::fs::path& destination,
+                                      const std::string& filename,
+                                      int index)
+{
+    const barrier::fs::path requested = barrier::fs::u8path(filename);
+    if (index == 0) {
+        return destination / requested;
     }
 
-    throw std::runtime_error("could not allocate unique drop target path");
+    return destination / barrier::fs::u8path(
+        requested.stem().u8string() + " (" + std::to_string(index) + ")" +
+        requested.extension().u8string());
+}
+
+bool commitStagedPathNoReplace(const barrier::fs::path& stagedPath,
+                               const barrier::fs::path& destination,
+                               const std::string& filename,
+                               barrier::fs::path& finalTarget,
+                               std::string& error)
+{
+    finalTarget.clear();
+    error.clear();
+    if (!TransferArchive::isSafePortablePathComponent(filename)) {
+        error = "unsafe drop target filename";
+        return false;
+    }
+
+    try {
+        for (int index = 0; index < 1000; ++index) {
+            const barrier::fs::path candidate =
+                dropTargetCandidate(destination, filename, index);
+            std::error_code commitError;
+            const barrier::RenameNoReplaceResult result =
+                barrier::rename_no_replace(stagedPath, candidate, commitError);
+            if (result == barrier::RenameNoReplaceResult::kSuccess) {
+                finalTarget = candidate;
+                return true;
+            }
+            if (result == barrier::RenameNoReplaceResult::kError) {
+                error = "could not publish drop target: " + commitError.message();
+                return false;
+            }
+        }
+
+        for (int attempt = 0; attempt < 128; ++attempt) {
+            const barrier::fs::path candidate =
+                destination / barrier::fs::u8path(
+                    barrier::fs::u8path(filename).stem().u8string() + " (" +
+                    uniqueToken() + ")" +
+                    barrier::fs::u8path(filename).extension().u8string());
+            std::error_code commitError;
+            const barrier::RenameNoReplaceResult result =
+                barrier::rename_no_replace(stagedPath, candidate, commitError);
+            if (result == barrier::RenameNoReplaceResult::kSuccess) {
+                finalTarget = candidate;
+                return true;
+            }
+            if (result == barrier::RenameNoReplaceResult::kError) {
+                error = "could not publish drop target: " + commitError.message();
+                return false;
+            }
+        }
+    }
+    catch (const std::exception& exception) {
+        error = exception.what();
+        return false;
+    }
+
+    error = "could not allocate unique drop target path";
+    return false;
 }
 
 bool copy_file_payload(const barrier::fs::path& source,
@@ -124,7 +179,7 @@ bool write_memory_payload(std::ofstream& output, const String& data)
     std::size_t offset = 0;
     while (offset < data.size()) {
         Thread::testCancel();
-        const std::size_t count = std::min(kBufferSize, data.size() - offset);
+        const std::size_t count = (std::min)(kBufferSize, data.size() - offset);
         output.write(data.data() + offset, static_cast<std::streamsize>(count));
         if (output.fail()) {
             return false;
@@ -172,6 +227,37 @@ private:
     bool m_active;
 };
 
+bool publishStagingRoot(const barrier::fs::path& stagingRoot,
+                        const barrier::fs::path& destination,
+                        std::vector<String>& droppedPaths,
+                        std::string& error)
+{
+    std::vector<barrier::fs::path> entries;
+    for (const auto& entry : barrier::fs::directory_iterator(stagingRoot)) {
+        entries.push_back(entry.path());
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const barrier::fs::path& left,
+                 const barrier::fs::path& right) {
+                  return left.filename().u8string() <
+                      right.filename().u8string();
+              });
+    for (const barrier::fs::path& entry : entries) {
+        Thread::testCancel();
+        barrier::fs::path finalTarget;
+        if (!commitStagedPathNoReplace(
+                entry, destination, entry.filename().u8string(),
+                finalTarget, error)) {
+            if (!droppedPaths.empty()) {
+                error += "; earlier bundle roots remain published";
+            }
+            return false;
+        }
+        droppedPaths.push_back(finalTarget.u8string());
+    }
+    return true;
+}
+
 }
 
 std::vector<String>
@@ -190,11 +276,10 @@ DropHelper::writeToDir(const String& destination, DragFileList& fileList, String
 
         if (fileList.size() > 1 || fileList.at(0).isDirectory()) {
             std::string error;
-            const barrier::fs::path stagingRoot =
-                dropDirectory / barrier::fs::u8path(".barrier-unpack-" + uniqueToken());
-            barrier::fs::create_directories(stagingRoot);
-            ScopedPathCleanup stagingCleanup(stagingRoot);
             try {
+                const barrier::fs::path stagingRoot =
+                    reserveStagingDirectory(dropDirectory);
+                ScopedPathCleanup stagingCleanup(stagingRoot);
                 if (!TransferArchive::extractPackage(data, stagingRoot, error)) {
                     stagingCleanup.cleanupNow();
                     LOG((CLOG_ERR "drop directory failed: %s", error.c_str()));
@@ -202,12 +287,13 @@ DropHelper::writeToDir(const String& destination, DragFileList& fileList, String
                     return droppedPaths;
                 }
 
-                for (const auto& entry : barrier::fs::directory_iterator(stagingRoot)) {
-                    Thread::testCancel();
-                    const barrier::fs::path finalTarget =
-                        unique_drop_target_path(dropDirectory, entry.path().filename().u8string());
-                    barrier::fs::rename(entry.path(), finalTarget);
-                    droppedPaths.push_back(finalTarget.u8string());
+                if (!publishStagingRoot(
+                        stagingRoot, dropDirectory, droppedPaths, error)) {
+                    stagingCleanup.cleanupNow();
+                    LOG((CLOG_ERR "drop directory publish failed: %s",
+                         error.c_str()));
+                    clearTransferState();
+                    return droppedPaths;
                 }
                 stagingCleanup.cleanupNow();
                 stagingCleanup.dismiss();
@@ -225,12 +311,16 @@ DropHelper::writeToDir(const String& destination, DragFileList& fileList, String
             return droppedPaths;
         }
 
-        const barrier::fs::path dropTarget =
-            unique_drop_target_path(dropDirectory, fileList.at(0).getFilename());
+        const std::string filename = fileList.at(0).getFilename();
+        if (!TransferArchive::isSafePortablePathComponent(filename)) {
+            LOG((CLOG_ERR "drop file rejected unsafe filename"));
+            clearTransferState();
+            return droppedPaths;
+        }
         barrier::fs::path tempTarget;
-        if (!create_drop_temp_file(dropTarget.parent_path(), tempTarget)) {
+        if (!create_drop_temp_file(dropDirectory, tempTarget)) {
             LOG((CLOG_ERR "drop file failed: can not create temporary file in %s",
-                dropTarget.parent_path().u8string().c_str()));
+                dropDirectory.u8string().c_str()));
             clearTransferState();
             return droppedPaths;
         }
@@ -254,7 +344,14 @@ DropHelper::writeToDir(const String& destination, DragFileList& fileList, String
             return droppedPaths;
         }
 
-        barrier::fs::rename(tempTarget, dropTarget);
+        barrier::fs::path dropTarget;
+        std::string publishError;
+        if (!commitStagedPathNoReplace(
+                tempTarget, dropDirectory, filename, dropTarget, publishError)) {
+            LOG((CLOG_ERR "drop file publish failed: %s", publishError.c_str()));
+            clearTransferState();
+            return droppedPaths;
+        }
         tempCleanup.dismiss();
         droppedPaths.push_back(dropTarget.u8string());
 
@@ -294,11 +391,10 @@ DropHelper::writeToDirFromFile(const String& destination,
 
     if (fileList.size() > 1 || fileList.at(0).isDirectory()) {
         std::string error;
-        const barrier::fs::path stagingRoot =
-            dropDirectory / barrier::fs::u8path(".barrier-unpack-" + uniqueToken());
-        barrier::fs::create_directories(stagingRoot);
-        ScopedPathCleanup stagingCleanup(stagingRoot);
         try {
+            const barrier::fs::path stagingRoot =
+                reserveStagingDirectory(dropDirectory);
+            ScopedPathCleanup stagingCleanup(stagingRoot);
             if (!TransferArchive::extractPackageFile(sourcePath, stagingRoot, error)) {
                 stagingCleanup.cleanupNow();
                 LOG((CLOG_ERR "drop directory failed: %s", error.c_str()));
@@ -306,12 +402,13 @@ DropHelper::writeToDirFromFile(const String& destination,
                 return droppedPaths;
             }
 
-            for (const auto& entry : barrier::fs::directory_iterator(stagingRoot)) {
-                Thread::testCancel();
-                const barrier::fs::path finalTarget =
-                    unique_drop_target_path(dropDirectory, entry.path().filename().u8string());
-                barrier::fs::rename(entry.path(), finalTarget);
-                droppedPaths.push_back(finalTarget.u8string());
+            if (!publishStagingRoot(
+                    stagingRoot, dropDirectory, droppedPaths, error)) {
+                stagingCleanup.cleanupNow();
+                LOG((CLOG_ERR "drop directory publish failed: %s",
+                     error.c_str()));
+                clearTransferState();
+                return droppedPaths;
             }
             stagingCleanup.cleanupNow();
             stagingCleanup.dismiss();
@@ -329,12 +426,16 @@ DropHelper::writeToDirFromFile(const String& destination,
         return droppedPaths;
     }
 
-    const barrier::fs::path dropTarget =
-        unique_drop_target_path(dropDirectory, fileList.at(0).getFilename());
+    const std::string filename = fileList.at(0).getFilename();
+    if (!TransferArchive::isSafePortablePathComponent(filename)) {
+        LOG((CLOG_ERR "drop file rejected unsafe filename"));
+        clearTransferState();
+        return droppedPaths;
+    }
     barrier::fs::path tempTarget;
-    if (!create_drop_temp_file(dropTarget.parent_path(), tempTarget)) {
+    if (!create_drop_temp_file(dropDirectory, tempTarget)) {
         LOG((CLOG_ERR "drop file failed: can not create temporary file in %s",
-            dropTarget.parent_path().u8string().c_str()));
+            dropDirectory.u8string().c_str()));
         clearTransferState();
         return droppedPaths;
     }
@@ -346,7 +447,14 @@ DropHelper::writeToDirFromFile(const String& destination,
         return droppedPaths;
     }
 
-    barrier::fs::rename(tempTarget, dropTarget);
+    barrier::fs::path dropTarget;
+    std::string publishError;
+    if (!commitStagedPathNoReplace(
+            tempTarget, dropDirectory, filename, dropTarget, publishError)) {
+        LOG((CLOG_ERR "drop file publish failed: %s", publishError.c_str()));
+        clearTransferState();
+        return droppedPaths;
+    }
     tempCleanup.dismiss();
     droppedPaths.push_back(dropTarget.u8string());
 

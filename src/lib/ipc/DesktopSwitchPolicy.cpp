@@ -25,6 +25,77 @@ RelaunchDecision::RelaunchDecision() :
 {
 }
 
+std::string
+launchDesktopName(const std::string& observedDesktopName, bool daemonized)
+{
+    if (!observedDesktopName.empty()) {
+        return observedDesktopName;
+    }
+    return daemonized ? "Default" : std::string();
+}
+
+LaunchTarget
+resolveLaunchTarget(
+    const std::string& observedDesktopName,
+    const std::string& readinessDesktopEvidence,
+    bool daemonized)
+{
+    LaunchTarget target;
+    target.purpose = LaunchPurpose::Exact;
+    if (!observedDesktopName.empty()) {
+        target.desktopName = observedDesktopName;
+        target.expectedDesktopKnown = true;
+    }
+    else if (!daemonized) {
+        target.desktopName.clear();
+        target.expectedDesktopKnown = false;
+    }
+    else if (!readinessDesktopEvidence.empty()) {
+        target.desktopName = readinessDesktopEvidence;
+        target.expectedDesktopKnown = true;
+    }
+    else {
+        target.desktopName = launchDesktopName(std::string(), true);
+        target.expectedDesktopKnown = false;
+        target.purpose = LaunchPurpose::Discovery;
+    }
+    return target;
+}
+
+DesktopRetargetDecision
+decideDesktopRetarget(
+    LaunchPurpose launchPurpose,
+    bool readinessDesktopMismatch,
+    bool retargetAlreadyAttempted)
+{
+    const bool needsRetarget = launchPurpose == LaunchPurpose::Discovery ||
+        readinessDesktopMismatch;
+    if (!needsRetarget) {
+        return DesktopRetargetDecision::Keep;
+    }
+    return retargetAlreadyAttempted
+        ? DesktopRetargetDecision::Backoff
+        : DesktopRetargetDecision::Retarget;
+}
+
+bool
+shouldReturnDesktopMismatch(ReadinessPhase)
+{
+    return true;
+}
+
+bool
+canAdoptRetargetedActiveDesktop(
+    const std::string& expectedDesktopName,
+    const std::string& reportedDesktopName,
+    const std::string& observedDesktopName)
+{
+    return !expectedDesktopName.empty() &&
+        !reportedDesktopName.empty() &&
+        reportedDesktopName != expectedDesktopName &&
+        reportedDesktopName == observedDesktopName;
+}
+
 RelaunchDecision
 observeDesktop(
     RelaunchState& state,

@@ -20,7 +20,9 @@
 
 #include <QObject>
 #include <QAbstractSocket>
+#include <QString>
 #include <QTimer>
+#include <QtGlobal>
 
 #include "ElevateMode.h"
 
@@ -35,12 +37,14 @@ public:
     IpcClient();
 #if defined(BARRIER_TEST_ENV)
     explicit IpcClient(QTcpSocket* socket);
-    bool waitForBytesWrittenForTest(int timeoutMs);
 #endif
     virtual ~IpcClient();
 
     void sendHello();
     void sendCommand(const QString& command, ElevateMode elevate);
+    quint64 requestServiceStop();
+    bool abandonServiceStopRequest(quint64 requestId);
+    bool flushPendingWrites(int timeoutMs);
     void connectToHost();
     void disconnectFromHost();
 
@@ -50,21 +54,31 @@ public slots:
 private:
     void initializeSocket(QTcpSocket* socket);
     void intToBytes(int value, char* buffer, int size);
+    void writeCommand(const QString& command, ElevateMode elevate);
+    bool writeStopRequest(quint64 requestId);
 
 private slots:
     void connected();
     void error(QAbstractSocket::SocketError error);
     void handleReadLogLine(const QString& text);
+    void handleServiceStopAcknowledged(quint64 requestId,
+                                       quint64 commandGeneration);
 
 signals:
     void readLogLine(const QString& text);
     void infoMessage(const QString& text);
     void errorMessage(const QString& text);
+    void serviceStopAcknowledged(quint64 requestId,
+                                 quint64 commandGeneration);
 
 private:
     QTcpSocket* m_Socket;
     IpcReader* m_Reader;
     bool m_ReaderStarted;
     bool m_Enabled;
+    bool m_HasPendingCommand;
+    QString m_PendingCommand;
+    ElevateMode m_PendingElevate;
     QTimer m_RetryTimer;
+    quint64 m_PendingStopRequestId;
 };

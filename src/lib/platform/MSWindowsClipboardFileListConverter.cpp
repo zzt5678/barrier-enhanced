@@ -12,9 +12,6 @@
 
 namespace {
 
-const size_t kMaxRemoteFileListPaths = 1024;
-const size_t kMaxRemoteFileListUtf8Bytes = 1024 * 1024;
-
 std::wstring wideFromUtf8(const std::string& value)
 {
     if (value.empty()) {
@@ -78,23 +75,19 @@ MSWindowsClipboardFileListConverter::fromIClipboard(const std::string& data) con
         payload.paths.empty()) {
         return NULL;
     }
-    if (payload.paths.size() > kMaxRemoteFileListPaths) {
-        LOG((CLOG_WARN "refusing to publish oversized remote file list to CF_HDROP: %u paths",
-            static_cast<unsigned>(payload.paths.size())));
-        return NULL;
-    }
 
     std::vector<std::wstring> paths;
     size_t charCount = 1;
     size_t utf8Bytes = 0;
     for (size_t i = 0; i < payload.paths.size(); ++i) {
         const std::string utf8Path = payload.paths[i].u8string();
-        utf8Bytes += utf8Path.size();
-        if (utf8Bytes > kMaxRemoteFileListUtf8Bytes) {
-            LOG((CLOG_WARN "refusing to publish oversized remote file list to CF_HDROP: %u bytes",
-                static_cast<unsigned>(utf8Bytes)));
+        std::string validationError;
+        if (!RemoteFileClipboard::validatePathUtf8ForAppend(i, utf8Bytes, utf8Path, &validationError)) {
+            LOG((CLOG_WARN "refusing to publish oversized remote file list to CF_HDROP: %s",
+                validationError.c_str()));
             return NULL;
         }
+        utf8Bytes += utf8Path.size();
 
         const std::wstring widePath = wideFromUtf8(utf8Path);
         if (widePath.empty()) {
@@ -146,7 +139,7 @@ MSWindowsClipboardFileListConverter::toIClipboard(HANDLE data) const
     if (fileCount == 0) {
         return std::string();
     }
-    if (fileCount > kMaxRemoteFileListPaths) {
+    if (fileCount > RemoteFileClipboard::kMaxClipboardPathCount) {
         LOG((CLOG_WARN "refusing to serialize oversized CF_HDROP clipboard list: %u files", fileCount));
         return std::string();
     }
@@ -170,12 +163,16 @@ MSWindowsClipboardFileListConverter::toIClipboard(HANDLE data) const
         widePath.resize(length);
 
         const std::string utf8Path = utf8FromWide(widePath);
-        utf8Bytes += utf8Path.size();
-        if (utf8Bytes > kMaxRemoteFileListUtf8Bytes) {
-            LOG((CLOG_WARN "refusing to serialize oversized CF_HDROP clipboard list: %u bytes",
-                static_cast<unsigned>(utf8Bytes)));
+        std::string validationError;
+        if (!RemoteFileClipboard::validatePathUtf8ForAppend(payload.paths.size(),
+                                                            utf8Bytes,
+                                                            utf8Path,
+                                                            &validationError)) {
+            LOG((CLOG_WARN "refusing to serialize oversized CF_HDROP clipboard list: %s",
+                validationError.c_str()));
             return std::string();
         }
+        utf8Bytes += utf8Path.size();
 
         payload.paths.push_back(barrier::fs::u8path(utf8Path));
     }

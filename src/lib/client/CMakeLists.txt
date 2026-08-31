@@ -23,6 +23,14 @@ endif()
 
 add_library(client STATIC ${sources})
 
+if (MSVC AND BARRIER_BUILD_TESTS)
+    target_compile_definitions(client PRIVATE BARRIER_TEST_ACCESS)
+endif()
+
+if (WIN32)
+    target_link_libraries(client common)
+endif()
+
 if (UNIX)
     target_link_libraries(client synlib io)
 endif()

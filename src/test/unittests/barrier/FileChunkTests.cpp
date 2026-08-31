@@ -1,5 +1,7 @@
 #include "barrier/FileChunk.h"
+#include "barrier/FileTransferProtocol.h"
 #include "barrier/protocol_types.h"
+#include "arch/Arch.h"
 #include "base/Event.h"
 #include "io/IStream.h"
 #include "io/filesystem.h"
@@ -7,8 +9,70 @@
 #include "test/global/gtest.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <fstream>
 #include <vector>
+
+static bool
+waitForReceiveState(FileReceiveSession& session,
+                    FileReceiveSession::State state,
+                    int attempts = 500)
+{
+    for (int i = 0; i < attempts; ++i) {
+        if (session.state() == state) {
+            return true;
+        }
+        ARCH->sleep(0.001);
+    }
+    return session.state() == state;
+}
+
+static barrier::fs::path
+waitForSpoolPath(FileReceiveSession& session, int attempts = 500)
+{
+    barrier::fs::path path;
+    for (int i = 0; i < attempts && path.empty(); ++i) {
+        path = session.spoolPath();
+        if (path.empty()) {
+            ARCH->sleep(0.001);
+        }
+    }
+    return path;
+}
+
+static bool
+waitForPathRemoval(const barrier::fs::path& path, int attempts = 500)
+{
+    for (int i = 0; i < attempts; ++i) {
+        if (!barrier::fs::exists(path)) {
+            return true;
+        }
+        ARCH->sleep(0.001);
+    }
+    return !barrier::fs::exists(path);
+}
+
+static bool
+waitForWorkerCleanup(FileReceiveSession& session, int attempts = 500)
+{
+    for (int i = 0; i < attempts; ++i) {
+        if (!session.workerCleanupPending()) {
+            return true;
+        }
+        ARCH->sleep(0.001);
+    }
+    return !session.workerCleanupPending();
+}
+
+static std::string
+readFileBytes(const barrier::fs::path& path)
+{
+    std::ifstream input;
+    barrier::open_utf8_path(input, path, std::ios::in | std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
+}
 
 class FileChunkTestStream : public barrier::IStream {
 public:
@@ -22,7 +86,7 @@ public:
     UInt32 read(void* buffer, UInt32 n) override
     {
         UInt32 remaining = static_cast<UInt32>(m_data.size() - m_offset);
-        UInt32 count = std::min(n, remaining);
+        UInt32 count = n < remaining ? n : remaining;
         if (count == 0) {
             return 0;
         }
@@ -67,23 +131,22 @@ appendFileChunkMessage(std::vector<UInt8>& data, UInt8 mark, const String& paylo
 TEST(FileChunkTests, assemble_mismatchedEndReleasesReceiveBuffer)
 {
     std::vector<UInt8> data;
-    appendFileChunkMessage(data, kDataStart, "1048576");
+    appendFileChunkMessage(data, kDataStart, "1048577");
     appendFileChunkMessage(data, kDataChunk, String(1024 * 1024, 'x'));
     appendFileChunkMessage(data, kDataEnd, "");
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
+    FileReceiveSession session;
+    const String& received = session.data();
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, received, expectedSize));
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
     EXPECT_GE(received.capacity(), 1024u * 1024u);
     const size_t largeCapacity = received.capacity();
 
-    expectedSize += 1;
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
     EXPECT_LT(received.capacity(), largeCapacity / 2);
-    EXPECT_EQ(0u, expectedSize);
+    EXPECT_EQ(0u, session.expectedSize());
 }
 
 TEST(FileChunkTests, assemble_incompleteEndReleasesReceiveBuffer)
@@ -94,15 +157,15 @@ TEST(FileChunkTests, assemble_incompleteEndReleasesReceiveBuffer)
     appendFileChunkMessage(data, kDataEnd, "");
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
+    FileReceiveSession session;
+    const String& received = session.data();
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, received, expectedSize));
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
     EXPECT_EQ(1024u, received.size());
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
     EXPECT_TRUE(received.empty());
-    EXPECT_EQ(0u, expectedSize);
+    EXPECT_EQ(0u, session.expectedSize());
 }
 
 TEST(FileChunkTests, assemble_cancelReleasesPartialReceiveBuffer)
@@ -113,15 +176,15 @@ TEST(FileChunkTests, assemble_cancelReleasesPartialReceiveBuffer)
     appendFileChunkMessage(data, kDataCancel, "");
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
+    FileReceiveSession session;
+    const String& received = session.data();
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, received, expectedSize));
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
     EXPECT_EQ(1024u, received.size());
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize));
+    EXPECT_EQ(kCancelled, FileChunk::assemble(&stream, session));
     EXPECT_TRUE(received.empty());
-    EXPECT_EQ(0u, expectedSize);
+    EXPECT_EQ(0u, session.expectedSize());
 }
 
 TEST(FileChunkTests, eventDeleteDataDeletesChunkObject)
@@ -133,6 +196,35 @@ TEST(FileChunkTests, eventDeleteDataDeletesChunkObject)
     EXPECT_EQ(chunk, event.getData());
 
     Event::deleteData(event);
+}
+
+TEST(FileChunkTests, transactionalChunkFactoriesRecordOffsetsAndCancelReason)
+{
+    FileChunk* start = FileChunk::start("20", true);
+    FileChunk* data = FileChunk::data(
+        reinterpret_cast<const UInt8*>("abc"), 3, 17);
+    FileChunk* end = FileChunk::end("sha256:digest", 20);
+    FileChunk* cancel = FileChunk::cancel(
+        barrier::FileTransferReason::kTimeout);
+    FileChunk* legacy = FileChunk::data(
+        reinterpret_cast<const UInt8*>("abc"), 3);
+
+    EXPECT_TRUE(start->m_transactional);
+    EXPECT_EQ(17u, data->m_offset);
+    EXPECT_TRUE(data->m_transactional);
+    EXPECT_EQ(20u, end->m_offset);
+    EXPECT_TRUE(end->m_transactional);
+    EXPECT_EQ(barrier::FileTransferReason::kTimeout,
+              cancel->m_transferReason);
+    EXPECT_TRUE(cancel->m_transactional);
+    EXPECT_FALSE(legacy->m_transactional);
+    EXPECT_EQ(0u, legacy->m_offset);
+
+    delete start;
+    delete data;
+    delete end;
+    delete cancel;
+    delete legacy;
 }
 
 TEST(FileChunkTests, releaseReceiveBufferClearsDataCapacityAndExpectedSize)
@@ -155,38 +247,45 @@ TEST(FileChunkTests, assemble_readFailureReleasesReceiveBuffer)
     appendFileChunkMessage(data, kDataChunk, String(1024 * 1024, 'x'));
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
+    FileReceiveSession session;
+    const String& received = session.data();
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, received, expectedSize));
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
     EXPECT_GE(received.capacity(), 1024u * 1024u);
     const size_t largeCapacity = received.capacity();
 
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
     EXPECT_LT(received.capacity(), largeCapacity / 2);
-    EXPECT_EQ(0u, expectedSize);
+    EXPECT_EQ(0u, session.expectedSize());
 }
 
-TEST(FileChunkTests, assemble_newStartDoesNotRetainPreviousPeakCapacity)
+TEST(FileChunkTests, assemble_duplicateStartPreservesMemoryReceiveSession)
 {
     std::vector<UInt8> data;
-    appendFileChunkMessage(data, kDataStart, "1048576");
-    appendFileChunkMessage(data, kDataChunk, String(1024 * 1024, 'x'));
+    appendFileChunkMessage(data, kDataStart, "6");
+    appendFileChunkMessage(data, kDataChunk, "abc");
     appendFileChunkMessage(data, kDataStart, "16");
+    appendFileChunkMessage(data, kDataChunk, "def");
+    appendFileChunkMessage(data, kDataEnd, "");
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
+    FileReceiveSession session;
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_GE(received.capacity(), 1024u * 1024u);
-    const size_t largeCapacity = received.capacity();
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    const std::uint64_t generation = session.generation();
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(16u, expectedSize);
-    EXPECT_LT(received.capacity(), largeCapacity / 2);
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(FileReceiveSession::kReceiving, session.state());
+    EXPECT_EQ(generation, session.generation());
+    EXPECT_EQ(6u, session.expectedSize());
+    EXPECT_EQ(3u, session.receivedSize());
+    EXPECT_EQ("abc", session.data());
+
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ("abcdef", session.data());
 }
 
 TEST(FileChunkTests, assemble_chunkLargerThanExpectedReleasesReceiveBuffer)
@@ -196,13 +295,13 @@ TEST(FileChunkTests, assemble_chunkLargerThanExpectedReleasesReceiveBuffer)
     appendFileChunkMessage(data, kDataChunk, String(1024 * 1024, 'x'));
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
+    FileReceiveSession session;
+    const String& received = session.data();
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize));
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
     EXPECT_LT(received.capacity(), 1024u * 1024u);
-    EXPECT_EQ(0u, expectedSize);
+    EXPECT_EQ(0u, session.expectedSize());
 }
 
 TEST(FileChunkTests, assemble_endAfterReceiveErrorDoesNotFinish)
@@ -213,13 +312,12 @@ TEST(FileChunkTests, assemble_endAfterReceiveErrorDoesNotFinish)
     appendFileChunkMessage(data, kDataEnd, "");
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
+    FileReceiveSession session;
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(0u, expectedSize);
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(0u, session.expectedSize());
 }
 
 TEST(FileChunkTests, assemble_zeroByteTransferCanFinish)
@@ -229,13 +327,84 @@ TEST(FileChunkTests, assemble_zeroByteTransferCanFinish)
     appendFileChunkMessage(data, kDataEnd, "");
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
+    FileReceiveSession session;
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_EQ(kFinish, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_TRUE(received.empty());
-    EXPECT_EQ(0u, expectedSize);
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kFinish, FileChunk::assemble(&stream, session));
+    EXPECT_TRUE(session.data().empty());
+    EXPECT_EQ(0u, session.expectedSize());
+}
+
+TEST(FileChunkTests, assemble_legacyEmptyEndStillFinishes)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "3");
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    appendFileChunkMessage(data, kDataEnd, "");
+    FileChunkTestStream stream(data);
+
+    FileReceiveSession session;
+
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ("abc", session.data());
+}
+
+TEST(FileChunkTests, assemble_matchingSha256EndFinishes)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "3");
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    appendFileChunkMessage(
+        data,
+        kDataEnd,
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    FileChunkTestStream stream(data);
+
+    FileReceiveSession session;
+
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ("abc", session.data());
+}
+
+TEST(FileChunkTests, assemble_mismatchedSha256EndFailsAndClearsPayload)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "3");
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    appendFileChunkMessage(
+        data,
+        kDataEnd,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    FileChunkTestStream stream(data);
+
+    FileReceiveSession session;
+
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_TRUE(session.data().empty());
+    EXPECT_EQ(0u, session.expectedSize());
+}
+
+TEST(FileChunkTests, assemble_malformedSha256EndFailsAndClearsPayload)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "3");
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    appendFileChunkMessage(data, kDataEnd, "sha256:not-a-digest");
+    FileChunkTestStream stream(data);
+
+    FileReceiveSession session;
+
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_TRUE(session.data().empty());
+    EXPECT_EQ(0u, session.expectedSize());
 }
 
 TEST(FileChunkTests, assemble_receiveErrorDoesNotPoisonAnotherReceiveBuffer)
@@ -250,15 +419,13 @@ TEST(FileChunkTests, assemble_receiveErrorDoesNotPoisonAnotherReceiveBuffer)
     appendFileChunkMessage(validData, kDataEnd, "");
     FileChunkTestStream validStream(validData);
 
-    String failingReceived;
-    size_t failingExpectedSize = 0;
-    String validReceived;
-    size_t validExpectedSize = 0;
+    FileReceiveSession failingSession;
+    FileReceiveSession validSession;
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&validStream, validReceived, validExpectedSize));
-    EXPECT_EQ(kStart, FileChunk::assemble(&failingStream, failingReceived, failingExpectedSize));
-    EXPECT_EQ(kError, FileChunk::assemble(&failingStream, failingReceived, failingExpectedSize));
-    EXPECT_EQ(kFinish, FileChunk::assemble(&validStream, validReceived, validExpectedSize));
+    EXPECT_EQ(kStart, FileChunk::assemble(&validStream, validSession));
+    EXPECT_EQ(kStart, FileChunk::assemble(&failingStream, failingSession));
+    EXPECT_EQ(kError, FileChunk::assemble(&failingStream, failingSession));
+    EXPECT_EQ(kFinish, FileChunk::assemble(&validStream, validSession));
 }
 
 TEST(FileChunkTests, assemble_startLargerThanReceiveLimitIsRejected)
@@ -268,12 +435,23 @@ TEST(FileChunkTests, assemble_startLargerThanReceiveLimitIsRejected)
         barrier::string::sizeTypeToString(FileChunk::kMaxReceiveSize + 1));
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
+    FileReceiveSession session;
 
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize));
-    EXPECT_TRUE(received.empty());
-    EXPECT_EQ(0u, expectedSize);
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_TRUE(session.data().empty());
+    EXPECT_EQ(0u, session.expectedSize());
+}
+
+TEST(FileChunkTests, assemble_startSizeWithTrailingBytesIsRejected)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "6trailing");
+    FileChunkTestStream stream(data);
+    FileReceiveSession session;
+
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(FileReceiveSession::kFailed, session.state());
+    EXPECT_EQ(0u, session.expectedSize());
 }
 
 TEST(FileChunkTests, assemble_largeTransferUsesSpoolFileAndKeepsMemoryEmpty)
@@ -284,27 +462,26 @@ TEST(FileChunkTests, assemble_largeTransferUsesSpoolFileAndKeepsMemoryEmpty)
     appendFileChunkMessage(data, kDataChunk, "abc");
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
-    barrier::fs::path spoolPath;
+    FileReceiveSession session;
+    const String& received = session.data();
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize, &spoolPath));
-    EXPECT_EQ(FileChunk::kMemoryReceiveLimit + 1, expectedSize);
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(FileChunk::kMemoryReceiveLimit + 1, session.expectedSize());
+    const barrier::fs::path spoolPath = waitForSpoolPath(session);
     ASSERT_FALSE(spoolPath.empty());
     EXPECT_TRUE(barrier::fs::exists(spoolPath));
     EXPECT_TRUE(received.empty());
 
-    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, received, expectedSize, &spoolPath));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
     EXPECT_TRUE(received.empty());
-    EXPECT_EQ(3u, barrier::fs::file_size(spoolPath));
+    EXPECT_EQ(3u, session.receivedSize());
 
-    const barrier::fs::path savedSpoolPath = spoolPath;
-    FileChunk::releaseReceiveBuffer(received, expectedSize, &spoolPath);
+    FileChunk::releaseReceiveBuffer(session);
 
     EXPECT_TRUE(received.empty());
-    EXPECT_EQ(0u, expectedSize);
-    EXPECT_TRUE(spoolPath.empty());
-    EXPECT_FALSE(barrier::fs::exists(savedSpoolPath));
+    EXPECT_EQ(0u, session.expectedSize());
+    EXPECT_TRUE(session.spoolPath().empty());
+    EXPECT_TRUE(waitForPathRemoval(spoolPath));
 }
 
 TEST(FileChunkTests, assemble_spooledMismatchRemovesSpool)
@@ -316,20 +493,20 @@ TEST(FileChunkTests, assemble_spooledMismatchRemovesSpool)
     appendFileChunkMessage(data, kDataEnd, "");
     FileChunkTestStream stream(data);
 
-    String received;
-    size_t expectedSize = 0;
-    barrier::fs::path spoolPath;
+    FileReceiveSession session;
+    const String& received = session.data();
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize, &spoolPath));
-    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, received, expectedSize, &spoolPath));
-    const barrier::fs::path savedSpoolPath = spoolPath;
-    ASSERT_TRUE(barrier::fs::exists(savedSpoolPath));
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    const barrier::fs::path spoolPath = waitForSpoolPath(session);
+    ASSERT_FALSE(spoolPath.empty());
+    ASSERT_TRUE(barrier::fs::exists(spoolPath));
 
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize, &spoolPath));
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
     EXPECT_TRUE(received.empty());
-    EXPECT_EQ(0u, expectedSize);
-    EXPECT_TRUE(spoolPath.empty());
-    EXPECT_FALSE(barrier::fs::exists(savedSpoolPath));
+    EXPECT_EQ(0u, session.expectedSize());
+    EXPECT_TRUE(session.spoolPath().empty());
+    EXPECT_TRUE(waitForPathRemoval(spoolPath));
 }
 
 TEST(FileChunkTests, assemble_releaseReceiveBufferClearsSpooledReceiveState)
@@ -342,26 +519,276 @@ TEST(FileChunkTests, assemble_releaseReceiveBufferClearsSpooledReceiveState)
     appendFileChunkMessage(data, kDataEnd, "");
     FileChunkTestStream stream(data);
 
-    String received;
+    FileReceiveSession session;
+    const String& received = session.data();
+
+    EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    const barrier::fs::path spoolPath = waitForSpoolPath(session);
+    ASSERT_FALSE(spoolPath.empty());
+    ASSERT_TRUE(barrier::fs::exists(spoolPath));
+
+    FileChunk::releaseReceiveBuffer(session);
+    EXPECT_TRUE(session.spoolPath().empty());
+    EXPECT_TRUE(waitForPathRemoval(spoolPath));
+
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_TRUE(received.empty());
+    EXPECT_EQ(0u, session.expectedSize());
+    EXPECT_TRUE(session.spoolPath().empty());
+
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_TRUE(received.empty());
+    EXPECT_EQ(0u, session.expectedSize());
+    EXPECT_TRUE(session.spoolPath().empty());
+}
+
+TEST(FileChunkTests, receiveSessionKeepsOneSpoolHandleOpenUntilTransferEnds)
+{
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(6, 0, 0));
+    const std::uint64_t generation = session.generation();
+    ASSERT_GT(generation, 0u);
+
+    EXPECT_TRUE(session.append("abc"));
+    EXPECT_TRUE(session.append("def"));
+    EXPECT_EQ(6u, session.receivedSize());
+
+    EXPECT_TRUE(session.finish());
+    EXPECT_TRUE(session.state() == FileReceiveSession::kFinalizing ||
+                session.state() == FileReceiveSession::kComplete);
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+    EXPECT_FALSE(session.isSpoolOpen());
+    EXPECT_TRUE(session.isComplete());
+    EXPECT_EQ(generation, session.generation());
+    EXPECT_EQ(1u, session.spoolOpenCount());
+    EXPECT_EQ(6u, barrier::fs::file_size(session.spoolPath()));
+}
+
+TEST(FileChunkTests, assemble_duplicateStartPreservesFinalizingSpoolSession)
+{
+    FileReceiveSession session;
+    ASSERT_TRUE(session.begin(6, 0, 0));
+    ASSERT_TRUE(session.append("abc"));
+    ASSERT_TRUE(session.append("def"));
+    const std::uint64_t generation = session.generation();
+    ASSERT_TRUE(session.finish());
+    ASSERT_TRUE(session.isFinalizing() || session.isComplete());
+
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "3");
+    FileChunkTestStream stream(data);
+
+    EXPECT_EQ(kError, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(generation, session.generation());
+    EXPECT_EQ(6u, session.expectedSize());
+    EXPECT_EQ(6u, session.receivedSize());
+    EXPECT_TRUE(session.isFinalizing() || session.isComplete());
+
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+    std::string completedData;
     size_t expectedSize = 0;
     barrier::fs::path spoolPath;
+    session.takeCompleted(completedData, expectedSize, spoolPath);
+    ASSERT_EQ(6u, expectedSize);
+    ASSERT_FALSE(spoolPath.empty());
+    EXPECT_EQ("abcdef", readFileBytes(spoolPath));
+    FileChunk::releaseReceiveBuffer(completedData, expectedSize, &spoolPath);
+}
 
-    EXPECT_EQ(kStart, FileChunk::assemble(&stream, received, expectedSize, &spoolPath));
-    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, received, expectedSize, &spoolPath));
-    const barrier::fs::path savedSpoolPath = spoolPath;
-    ASSERT_TRUE(barrier::fs::exists(savedSpoolPath));
+TEST(FileChunkTests, receiveSessionVerifiesSha256BeforeCompletingSpool)
+{
+    FileReceiveSession session;
 
-    FileChunk::releaseReceiveBuffer(received, expectedSize, &spoolPath);
-    EXPECT_TRUE(spoolPath.empty());
-    EXPECT_FALSE(barrier::fs::exists(savedSpoolPath));
+    ASSERT_TRUE(session.begin(6, 0, 0));
+    ASSERT_TRUE(session.append("abc"));
+    ASSERT_TRUE(session.append("def"));
+    ASSERT_TRUE(session.finish(
+        "sha256:bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721"));
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
 
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize, &spoolPath));
-    EXPECT_TRUE(received.empty());
-    EXPECT_EQ(0u, expectedSize);
-    EXPECT_TRUE(spoolPath.empty());
+    EXPECT_EQ(1u, session.spoolOpenCount());
+    EXPECT_EQ("abcdef", readFileBytes(session.spoolPath()));
+}
 
-    EXPECT_EQ(kError, FileChunk::assemble(&stream, received, expectedSize, &spoolPath));
-    EXPECT_TRUE(received.empty());
-    EXPECT_EQ(0u, expectedSize);
-    EXPECT_TRUE(spoolPath.empty());
+TEST(FileChunkTests, receiveSessionRejectsSha256MismatchAndRemovesSpool)
+{
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(6, 0, 0));
+    ASSERT_TRUE(session.append("abc"));
+    ASSERT_TRUE(session.append("def"));
+    const barrier::fs::path spoolPath = waitForSpoolPath(session);
+    ASSERT_FALSE(spoolPath.empty());
+
+    EXPECT_FALSE(session.finish(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    session.fail();
+
+    EXPECT_EQ(FileReceiveSession::kFailed, session.state());
+    EXPECT_TRUE(session.spoolPath().empty());
+    EXPECT_TRUE(waitForPathRemoval(spoolPath));
+}
+
+TEST(FileChunkTests, receiveSessionRejectsChunkLargerThanAsyncQueueBudget)
+{
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(8, 0, 0, 4));
+    EXPECT_FALSE(session.append("12345"));
+
+    session.fail();
+    EXPECT_EQ(FileReceiveSession::kFailed, session.state());
+}
+
+TEST(FileChunkTests, receiveSessionBackpressureResumesAtQueueLowWater)
+{
+    const size_t chunkSize = FileReceiveSession::kMaxAsyncChunkSize;
+    FileReceiveSession session;
+    ASSERT_TRUE(session.begin(chunkSize * 2, 0, 0, chunkSize * 2));
+    const std::uint64_t generation = session.generation();
+
+    EXPECT_EQ(FileReceiveSession::kAppendBackpressure,
+              session.append(std::string(chunkSize, 'a')));
+    std::atomic<bool> firstResume(false);
+    ASSERT_TRUE(session.installBackpressureBarrier(
+        generation, [&firstResume]() { firstResume.store(true); }));
+    for (int attempt = 0; attempt < 500 && !firstResume.load(); ++attempt) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(firstResume.load());
+
+    EXPECT_EQ(FileReceiveSession::kAppendBackpressure,
+              session.append(std::string(chunkSize, 'b')));
+    std::atomic<bool> secondResume(false);
+    ASSERT_TRUE(session.installBackpressureBarrier(
+        generation, [&secondResume]() { secondResume.store(true); }));
+    for (int attempt = 0; attempt < 500 && !secondResume.load(); ++attempt) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(secondResume.load());
+
+    ASSERT_TRUE(session.finish());
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+    EXPECT_EQ(chunkSize * 2, barrier::fs::file_size(session.spoolPath()));
+}
+
+TEST(FileChunkTests, receiveSessionAcceptsProtocolSizedAsyncChunk)
+{
+    const size_t chunkSize = FileReceiveSession::kMaxAsyncChunkSize;
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(chunkSize, 0, 0, chunkSize * 2));
+    EXPECT_NE(FileReceiveSession::kAppendFailed,
+              session.append(std::string(chunkSize, 'a')));
+    ASSERT_TRUE(session.finish());
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+    EXPECT_EQ(chunkSize, barrier::fs::file_size(session.spoolPath()));
+}
+
+TEST(FileChunkTests, receiveSessionDoesNotOverlapRetiredSpoolWorkers)
+{
+    const size_t chunkSize = FileReceiveSession::kMaxAsyncChunkSize;
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(chunkSize, 0, 0, chunkSize * 2));
+    ASSERT_NE(FileReceiveSession::kAppendFailed,
+              session.append(std::string(chunkSize, 'a')));
+    session.reset();
+
+    if (session.workerCleanupPending()) {
+        EXPECT_FALSE(session.begin(1, 0, 0, 1));
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(2);
+    while (session.workerCleanupPending() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_FALSE(session.workerCleanupPending());
+    EXPECT_TRUE(session.begin(1, 0, 0, 1));
+}
+
+TEST(FileChunkTests, discardedControlTransferConsumesFramesUntilEnd)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart, "6");
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    appendFileChunkMessage(data, kDataChunk, "def");
+    appendFileChunkMessage(data, kDataEnd, "");
+    FileChunkTestStream stream(data);
+    FileReceiveSession session;
+
+    ASSERT_EQ(kStart, FileChunk::assemble(&stream, session));
+    ASSERT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    session.discardRemaining();
+
+    EXPECT_EQ(FileReceiveSession::kDiscarding, session.state());
+    EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(kCancelled, FileChunk::assemble(&stream, session));
+    EXPECT_EQ(FileReceiveSession::kIdle, session.state());
+    EXPECT_EQ(0u, session.expectedSize());
+}
+
+TEST(FileChunkTests, receiveSessionGenerationRejectsStaleCompletion)
+{
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(6, 0, 0));
+    const std::uint64_t firstGeneration = session.generation();
+    ASSERT_TRUE(session.append("old"));
+    session.reset();
+    EXPECT_FALSE(session.matchesGeneration(firstGeneration));
+
+    ASSERT_TRUE(waitForWorkerCleanup(session));
+    ASSERT_TRUE(session.begin(3, 0, 0));
+    const std::uint64_t secondGeneration = session.generation();
+    EXPECT_GT(secondGeneration, firstGeneration);
+    EXPECT_FALSE(session.matchesGeneration(firstGeneration));
+    EXPECT_TRUE(session.matchesGeneration(secondGeneration));
+    ASSERT_TRUE(session.append("new"));
+    ASSERT_TRUE(session.finish());
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+    EXPECT_EQ(3u, barrier::fs::file_size(session.spoolPath()));
+}
+
+TEST(FileChunkTests, receiveSessionDestructorRemovesPartialSpool)
+{
+    std::vector<UInt8> data;
+    appendFileChunkMessage(data, kDataStart,
+        barrier::string::sizeTypeToString(FileChunk::kMemoryReceiveLimit + 1));
+    appendFileChunkMessage(data, kDataChunk, "abc");
+    FileChunkTestStream stream(data);
+    barrier::fs::path spoolPath;
+
+    {
+        FileReceiveSession session;
+        EXPECT_EQ(kStart, FileChunk::assemble(&stream, session));
+        EXPECT_EQ(kNotFinish, FileChunk::assemble(&stream, session));
+        spoolPath = waitForSpoolPath(session);
+        ASSERT_FALSE(spoolPath.empty());
+    }
+
+    EXPECT_TRUE(waitForPathRemoval(spoolPath));
+}
+
+TEST(FileChunkTests, receiveSessionCanStartAgainAfterFailure)
+{
+    FileReceiveSession session;
+
+    ASSERT_TRUE(session.begin(6, 0, 0));
+    ASSERT_TRUE(session.append("abc"));
+    const barrier::fs::path abandonedPath = waitForSpoolPath(session);
+    session.fail();
+
+    EXPECT_TRUE(waitForPathRemoval(abandonedPath));
+    ASSERT_TRUE(waitForWorkerCleanup(session));
+    ASSERT_TRUE(session.begin(3, 0, 0));
+    ASSERT_TRUE(session.append("xyz"));
+    ASSERT_TRUE(session.finish());
+    ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
+    EXPECT_EQ(3u, barrier::fs::file_size(session.spoolPath()));
+    EXPECT_EQ(1u, session.spoolOpenCount());
 }

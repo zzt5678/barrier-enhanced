@@ -1,9 +1,9 @@
-Thank you for choosing Barrier!
-https://github.com/debauchee/barrier/
+Thank you for choosing Weave!
+https://github.com/zzt5678/barrier-enhanced
 
-Barrier allows you to share your keyboard and mouse between computers over a network.
+Weave lets you share your keyboard, mouse, and clipboard between trusted computers over a network.
 
-Have fun!
+For support and release information, visit the project website above.
 
 Thanks,
-The Barrier Team
+The Weave Project

@@ -16,6 +16,7 @@
  */
 
 #include "arch/unix/ArchInternetUnix.h"
+#include "common/ProductIdentity.h"
 
 #include "arch/XArch.h"
 #include "common/Version.h"
@@ -75,7 +76,7 @@ std::string CurlFacade::get(const std::string& url)
     curl_easy_setopt(m_curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
 
     std::stringstream userAgent;
-    userAgent << "Barrier ";
+    userAgent << WEAVE_PRODUCT_NAME << " ";
     userAgent << kVersion;
     curl_easy_setopt(m_curl, CURLOPT_USERAGENT, userAgent.str().c_str());
 

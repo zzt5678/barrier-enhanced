@@ -23,6 +23,7 @@
 #include "mt/Lock.h"
 #include "mt/Mutex.h"
 #include "mt/Thread.h"
+#include "mt/ThreadShutdown.h"
 #include "arch/Arch.h"
 #include "arch/XArch.h"
 #include "base/Log.h"
@@ -64,7 +65,12 @@ SocketMultiplexer::~SocketMultiplexer()
 {
     m_thread->cancel();
     m_thread->unblockPollSocket();
-    m_thread->wait();
+    barrier::waitForFinalThreadShutdown(
+        "socket multiplexer service thread",
+        barrier::kFinalThreadShutdownDeadlineSeconds,
+        [this](double timeout) {
+            return m_thread->wait(timeout);
+        });
     delete m_thread;
     delete m_jobsReady;
     delete m_jobListLock;

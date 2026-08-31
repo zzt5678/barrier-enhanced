@@ -36,12 +36,15 @@ public:
 
 signals:
     void readLogLine(const QString& text);
+    void serviceStopAcknowledged(quint64 requestId, quint64 commandGeneration);
 
 private:
     int bytesToInt(const char* buffer, int size);
+    quint64 bytesToUInt64(const char* buffer);
 
 private slots:
     void read();
+    void resetBuffer();
 
 private:
     QTcpSocket* m_Socket;

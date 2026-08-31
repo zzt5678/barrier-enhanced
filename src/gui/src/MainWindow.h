@@ -26,7 +26,6 @@
 #include <QSystemTrayIcon>
 #include <QSettings>
 #include <QProcess>
-#include <QThread>
 #include <QElapsedTimer>
 #include <QTimer>
 
@@ -52,14 +51,12 @@ class QCheckBox;
 class QRadioButton;
 class QTemporaryFile;
 class QMessageBox;
-class QAbstractButton;
+class QResizeEvent;
 
 class LogDialog;
 class QBarrierApplication;
 class SetupWizard;
 class ZeroconfService;
-class DataDownloader;
-class CommandProcess;
 class SslCertificate;
 class ActionBus;
 class WorkflowStore;
@@ -106,6 +103,7 @@ class MainWindow : public QMainWindow, public Ui::MainWindowBase
         QString address();
         QString appPath(const QString& name);
         void open();
+        void activateFromSecondaryInstance();
         VersionChecker& versionChecker() { return m_VersionChecker; }
         QString getScreenName();
         ServerConfig& serverConfig() { return m_ServerConfig; }
@@ -135,7 +133,6 @@ public slots:
         void stopBarrier();
         void logOutput();
         void logError();
-        void bonjourInstallFinished();
         void showLogWindow();
         void showWorkflowHub();
         void showCommandPalette();
@@ -155,7 +152,10 @@ public slots:
         void setIcon(qBarrierState state);
         void setBarrierState(qBarrierState state);
         bool clientArgs(QStringList& args, QString& app);
-        bool serverArgs(QStringList& args, QString& app);
+        bool serverArgs(QStringList& args, QString& app, QString& configForLog);
+#if defined(Q_OS_WIN)
+        bool persistServiceServerConfig(QString& configForLog);
+#endif
         void setStatus(const QString& status);
         void updateFromLogLine(const QString& line);
         void processLogLine(const QString& line);
@@ -166,16 +166,20 @@ public slots:
         void stopDesktop();
         void terminateDuplicateDesktopProcesses(const QString& app);
         void closeEvent(QCloseEvent* event);
+        void resizeEvent(QResizeEvent* event);
         void changeEvent(QEvent* event);
         bool event(QEvent* event);
         void retranslateMenuBar();
+        void retranslateDashboard();
+        void updateDashboardLayout(int windowWidth);
+        void updateControlBarMargins();
 #if defined(Q_OS_WIN)
         bool isServiceRunning(QString name);
 #else
         bool isServiceRunning();
 #endif
         bool isBonjourRunning();
-        void downloadBonjour();
+        void openBonjourInstallationGuide();
         void promptAutoConfig();
         void checkConnected(const QString& line);
         void checkFingerprint(const QString& line);
@@ -207,12 +211,8 @@ public slots:
         QMenu* m_pMenuBarrier;
         QMenu* m_pMenuHelp;
         ZeroconfService* m_pZeroconfService;
-        DataDownloader* m_pDataDownloader;
-        QMessageBox* m_DownloadMessageBox;
-        QAbstractButton* m_pCancelButton;
         QMutex m_UpdateZeroconfMutex;
         bool m_SuppressAutoConfigWarning;
-        CommandProcess* m_BonjourInstall;
         bool m_SuppressEmptyServerWarning;
         qRuningState m_ExpectedRunningState;
         QMutex m_StopDesktopMutex;
@@ -228,9 +228,14 @@ public slots:
         QString m_PendingStdOutLog;
         QString m_PendingStdErrLog;
         QTimer m_RestartTimer;
+        QTimer m_ServiceStopAckTimer;
         QElapsedTimer m_ProcessLifetime;
         int m_UnexpectedExitCount;
         bool m_AllowApplicationQuit;
+        bool m_ExplicitServiceQuitPending;
+        quint64 m_PendingServiceStopRequestId;
+        bool m_WindowGeometryInitialized;
+        bool m_DashboardSingleColumn;
 
         bool m_fingerprint_expanded = false;
 
@@ -238,9 +243,11 @@ private slots:
     void on_m_pCheckBoxAutoConfig_toggled(bool checked);
     void on_m_pComboServerList_currentIndexChanged(QString );
     void on_m_pButtonReload_clicked();
-    void installBonjour();
     void on_m_pCheckBoxEnableDragDrop_clicked(bool checked);
     void on_m_pCheckBoxGameMode_clicked(bool checked);
+    void handleServiceStopAcknowledged(quint64 requestId,
+                                       quint64 commandGeneration);
+    void handleServiceStopTimeout();
 
 };
 

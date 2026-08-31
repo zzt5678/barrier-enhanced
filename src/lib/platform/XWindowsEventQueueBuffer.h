@@ -44,6 +44,8 @@ public:
                         newTimer(double duration, bool oneShot) const;
     virtual void        deleteTimer(EventQueueTimer*) const;
 
+    static int          pollTimeoutForTest(int remaining);
+
 private:
     void                flush();
 

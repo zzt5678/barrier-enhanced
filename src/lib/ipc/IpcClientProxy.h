@@ -19,25 +19,37 @@
 #pragma once
 
 #include "ipc/Ipc.h"
+#include "ipc/IpcPeerAuthentication.h"
 #include "arch/IArchMultithread.h"
 #include "base/EventTypes.h"
 #include "base/Event.h"
+#include "mt/ThreadShutdown.h"
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <condition_variable>
 #include <mutex>
+#include <string>
+#include <vector>
 
 namespace barrier { class IStream; }
 class IpcMessage;
 class IpcCommandMessage;
 class IpcHelloMessage;
+class IpcNodeReadyV2Message;
+class IpcNodeActivatedMessage;
+class IpcStopRequestMessage;
 class IEventQueue;
+class IpcProxyTestAccess;
 
 class IpcClientProxy {
     friend class IpcServer;
+    friend class IpcProxyTestAccess;
 
 public:
-    IpcClientProxy(barrier::IStream& stream, IEventQueue* events);
+    IpcClientProxy(barrier::IStream& stream, IEventQueue* events,
+                   const IpcPeerAuthContext& peerAuth = IpcPeerAuthContext());
     virtual ~IpcClientProxy();
 
 private:
@@ -45,17 +57,45 @@ private:
     bool                tryAddSendRef();
     void                releaseSendRef();
     void                waitForSendRefs();
+    void                waitForSendRefs(
+                            double timeoutSeconds,
+                            const barrier::FinalProcessTerminator& terminator);
     void                handleData(const Event&, void*);
     void                handleDisconnect(const Event&, void*);
     void                handleWriteError(const Event&, void*);
-    IpcHelloMessage*    parseHello();
-    IpcCommandMessage*    parseCommand();
+    IpcMessage*         parseBufferedMessage();
+    IpcHelloMessage*    parseHello(UInt8 type, UInt32 processId);
+    IpcMessage*         parseReady();
+    IpcNodeReadyV2Message* parseReadyV2(
+                            UInt32 processId,
+                            UInt32 sessionId,
+                            std::uint64_t inputGeneration,
+                            UInt8 inputReady,
+                            const std::string& desktopName,
+                            const std::string& buildId,
+                            std::uint64_t queryNonce);
+    IpcNodeActivatedMessage* parseActivated(
+                            UInt32 processId,
+                            std::uint64_t activationNonce);
+    IpcCommandMessage*    parseCommand(const std::string& command,
+                                       UInt8 elevate);
+    IpcStopRequestMessage* parseStopRequest(std::uint64_t requestId);
     void                disconnect();
+    IpcInputReadinessResult inputReadiness(
+                            UInt32 processId,
+                            UInt32 sessionId,
+                            const std::string& desktopName,
+                            const std::string& buildId,
+                            std::uint64_t queryNonce) const;
+    bool                matchesActivation(UInt32 processId,
+                                          std::uint64_t activationNonce) const;
 
 private:
     barrier::IStream&    m_stream;
-    EIpcClientType        m_clientType;
-    UInt32              m_processId;
+    std::atomic<EIpcClientType> m_clientType;
+    std::atomic<UInt32> m_processId;
+    std::atomic<bool>   m_ready;
+    std::atomic<bool>   m_inputReady;
     std::atomic<bool>    m_disconnecting;
     bool                m_deleting;
     UInt32              m_sendRefCount;
@@ -63,5 +103,22 @@ private:
     std::condition_variable m_sendRefCond;
     std::mutex m_readMutex;
     std::mutex m_writeMutex;
+    mutable std::mutex m_readyMutex;
+    UInt32 m_readySessionId;
+    std::uint64_t m_readyInputGeneration;
+    std::string m_readyDesktopName;
+    std::string m_readyBuildId;
+    std::chrono::steady_clock::time_point m_readyReceivedAt;
+    bool m_proofInputReady;
+    UInt32 m_proofSessionId;
+    std::uint64_t m_proofInputGeneration;
+    std::string m_proofDesktopName;
+    std::string m_proofBuildId;
+    std::uint64_t m_proofQueryNonce;
+    std::chrono::steady_clock::time_point m_proofReceivedAt;
+    std::uint64_t m_activationChallengeNonce;
+    std::uint64_t m_activatedNonce;
+    std::vector<UInt8> m_receiveBuffer;
+    IpcPeerAuthContext  m_peerAuth;
     IEventQueue*        m_events;
 };

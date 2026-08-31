@@ -46,10 +46,13 @@ public:
     virtual void        flush();
     virtual void        shutdownInput();
     virtual void        shutdownOutput();
+    virtual void        setInputPaused(bool paused);
     virtual void*        getEventTarget() const;
     virtual bool        isReady() const;
     virtual UInt32        getSize() const;
     virtual UInt32        getBufferedOutputSize() const;
+    virtual std::uint64_t getOutputBytesWritten() const;
+    virtual std::uint64_t getInputBytesReceived() const;
 
     //! Get the stream
     /*!

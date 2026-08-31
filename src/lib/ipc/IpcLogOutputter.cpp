@@ -23,6 +23,7 @@
 #include "ipc/Ipc.h"
 #include "ipc/IpcClientProxy.h"
 #include "mt/Thread.h"
+#include "mt/ThreadShutdown.h"
 #include "arch/Arch.h"
 #include "arch/XArch.h"
 #include "base/Event.h"
@@ -68,7 +69,13 @@ IpcLogOutputter::~IpcLogOutputter()
 
     if (m_bufferThread != nullptr) {
         m_bufferThread->cancel();
-        m_bufferThread->wait();
+        m_bufferThread->unblockPollSocket();
+        barrier::waitForFinalThreadShutdown(
+            "IPC log buffer thread",
+            barrier::kFinalThreadShutdownDeadlineSeconds,
+            [this](double timeout) {
+                return m_bufferThread->wait(timeout);
+            });
         delete m_bufferThread;
     }
 

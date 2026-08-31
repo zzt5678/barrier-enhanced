@@ -42,7 +42,7 @@ void
 TestEventQueue::cleanupQuitTimeout()
 {
     removeHandler(Event::kTimer, m_quitTimeoutTimer);
-    delete m_quitTimeoutTimer;
+    deleteTimer(m_quitTimeoutTimer);
     m_quitTimeoutTimer = nullptr;
 }
 

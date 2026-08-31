@@ -194,11 +194,17 @@ void AppConfig::loadSettings()
         elevateMode = settings().value ("elevateMode",
                                         QVariant(static_cast<int>(defaultElevateMode)));
     }
-    m_ElevateMode = static_cast<ElevateMode>(elevateMode.toInt());
+    const int elevateModeValue = elevateMode.toInt();
+    if (elevateModeValue >= static_cast<int>(ElevateAsNeeded) &&
+        elevateModeValue <= static_cast<int>(ElevateNever)) {
+        m_ElevateMode = static_cast<ElevateMode>(elevateModeValue);
+    }
+    else {
+        m_ElevateMode = defaultElevateMode;
+    }
     m_AutoConfigPrompted = settings().value("autoConfigPrompted", false).toBool();
     m_CryptoEnabled = settings().value("cryptoEnabled", true).toBool();
-    // TODO: set default value of requireClientCertificate to true on Barrier 2.5.0
-    m_RequireClientCertificate = settings().value("requireClientCertificate", false).toBool();
+    m_RequireClientCertificate = settings().value("requireClientCertificate", true).toBool();
     m_AutoHide = settings().value("autoHide", false).toBool();
     m_AutoStart = settings().value("autoStart", false).toBool();
     m_MinimizeToTray = settings().value("minimizeToTray", false).toBool();
@@ -221,7 +227,7 @@ void AppConfig::saveSettings()
     settings().setValue("logLevel", m_LogLevel);
     settings().setValue("logToFile", m_LogToFile);
     settings().setValue("logFilename", m_LogFilename);
-    settings().setValue("wizardLastRun", kWizardVersion);
+    settings().setValue("wizardLastRun", m_WizardLastRun);
     settings().setValue("language", m_Language);
     settings().setValue("startedBefore", m_StartedBefore);
     settings().setValue("autoConfig", m_AutoConfig);

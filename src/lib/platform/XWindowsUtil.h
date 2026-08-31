@@ -24,6 +24,7 @@
 
 #include <X11/Xlib.h>
 
+#include <mutex>
 #include <string>
 
 //! X11 utility functions
@@ -118,7 +119,8 @@ public:
     /*!
     This class sets an X error handler in the c'tor and restores the
     previous error handler in the d'tor.  A lock should only be
-    installed while the display is locked by the thread.
+    installed while the display is locked by the thread. ErrorLock also
+    serializes its process-global X11 handler across threads.
 
     ErrorLock() ignores errors
     ErrorLock(bool* flag) sets *flag to true if any error occurs
@@ -154,7 +156,10 @@ public:
     private:
         typedef int (*XErrorHandler)(Display*, XErrorEvent*);
 
+        static std::recursive_mutex s_processMutex;
+
         Display*        m_display;
+        std::unique_lock<std::recursive_mutex> m_processLock;
         ErrorHandler    m_handler;
         void*            m_userData;
         XErrorHandler    m_oldXHandler;

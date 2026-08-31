@@ -86,6 +86,12 @@ StreamFilter::shutdownOutput()
     getStream()->shutdownOutput();
 }
 
+void
+StreamFilter::setInputPaused(bool paused)
+{
+    getStream()->setInputPaused(paused);
+}
+
 void*
 StreamFilter::getEventTarget() const
 {
@@ -108,6 +114,18 @@ UInt32
 StreamFilter::getBufferedOutputSize() const
 {
     return getStream()->getBufferedOutputSize();
+}
+
+std::uint64_t
+StreamFilter::getOutputBytesWritten() const
+{
+    return getStream()->getOutputBytesWritten();
+}
+
+std::uint64_t
+StreamFilter::getInputBytesReceived() const
+{
+    return getStream()->getInputBytesReceived();
 }
 
 barrier::IStream*

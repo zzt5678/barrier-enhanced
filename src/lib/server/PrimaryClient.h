@@ -38,7 +38,15 @@ public:
     ~PrimaryClient();
 
 #ifdef BARRIER_TEST_ENV
-    PrimaryClient() : BaseClientProxy("") { }
+    PrimaryClient() :
+        BaseClientProxy(""),
+        m_screen(NULL),
+        m_fakeInputCount(0)
+    {
+        for (UInt32 i = 0; i < kClipboardEnd; ++i) {
+            m_clipboardDirty[i] = false;
+        }
+    }
 #endif
 
     //! @name manipulators

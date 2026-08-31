@@ -149,6 +149,11 @@ ArgParser::parseMSWindowsArg(ArgsBase& argsBase, const int& argc, const char* co
     else if (isArg(i, argc, argv, NULL, "--stop-on-desk-switch")) {
         argsBase.m_stopOnDeskSwitch = true;
     }
+    else if (isArg(i, argc, argv, NULL, "--service-standby")) {
+        // Internal watchdog handoff mode. Daemon command validation rejects
+        // this flag from GUI requests and the watchdog appends it locally.
+        argsBase.m_serviceStandby = true;
+    }
     else {
         // option not supported here
         return false;

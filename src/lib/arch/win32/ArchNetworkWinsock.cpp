@@ -61,8 +61,6 @@ static int (PASCAL FAR *WSACleanup_winsock)(void);
 static int (PASCAL FAR *WSAFDIsSet_winsock)(SOCKET, fd_set FAR * fdset);
 static WSAEVENT (PASCAL FAR *WSACreateEvent_winsock)(void);
 static BOOL (PASCAL FAR *WSACloseEvent_winsock)(WSAEVENT);
-static BOOL (PASCAL FAR *WSASetEvent_winsock)(WSAEVENT);
-static BOOL (PASCAL FAR *WSAResetEvent_winsock)(WSAEVENT);
 static int (PASCAL FAR *WSAEventSelect_winsock)(SOCKET, WSAEVENT, long);
 static DWORD (PASCAL FAR *WSAWaitForMultipleEvents_winsock)(DWORD, const WSAEVENT FAR*, BOOL, DWORD, BOOL);
 static int (PASCAL FAR *WSAEnumNetworkEvents_winsock)(SOCKET, WSAEVENT, LPWSANETWORKEVENTS);
@@ -115,11 +113,6 @@ ArchNetworkWinsock::~ArchNetworkWinsock()
     }
     if (m_mutex != NULL) {
         ARCH->closeMutex(m_mutex);
-    }
-
-    EventList::iterator it;
-    for (it = m_unblockEvents.begin(); it != m_unblockEvents.end(); it++) {
-        delete *it;
     }
 }
 
@@ -196,8 +189,6 @@ ArchNetworkWinsock::initModule(HMODULE module)
     setfunc(WSAFDIsSet_winsock, __WSAFDIsSet, int (PASCAL FAR *)(SOCKET, fd_set FAR *));
     setfunc(WSACreateEvent_winsock, WSACreateEvent, WSAEVENT (PASCAL FAR *)(void));
     setfunc(WSACloseEvent_winsock, WSACloseEvent, BOOL (PASCAL FAR *)(WSAEVENT));
-    setfunc(WSASetEvent_winsock, WSASetEvent, BOOL (PASCAL FAR *)(WSAEVENT));
-    setfunc(WSAResetEvent_winsock, WSAResetEvent, BOOL (PASCAL FAR *)(WSAEVENT));
     setfunc(WSAEventSelect_winsock, WSAEventSelect, int (PASCAL FAR *)(SOCKET, WSAEVENT, long));
     setfunc(WSAWaitForMultipleEvents_winsock, WSAWaitForMultipleEvents, DWORD (PASCAL FAR *)(DWORD, const WSAEVENT FAR*, BOOL, DWORD, BOOL));
     setfunc(WSAEnumNetworkEvents_winsock, WSAEnumNetworkEvents, int (PASCAL FAR *)(SOCKET, WSAEVENT, LPWSANETWORKEVENTS));
@@ -445,15 +436,17 @@ ArchNetworkWinsock::pollSocket(PollEntry pe[], int num, double timeout)
     // add the unblock event
     ArchMultithreadWindows* mt = ArchMultithreadWindows::getInstance();
     ArchThread thread     = mt->newCurrentThread();
-    WSAEVENT* unblockEvent = (WSAEVENT*)mt->getNetworkDataForThread(thread);
+    WSAEVENT unblockEvent = static_cast<WSAEVENT>(
+        mt->getNetworkDataForThread(thread));
     ARCH->closeThread(thread);
     if (unblockEvent == NULL) {
-        unblockEvent  = new WSAEVENT;
-        m_unblockEvents.push_back(unblockEvent);
-        *unblockEvent = WSACreateEvent_winsock();
+        unblockEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (unblockEvent == NULL) {
+            throw XArchNetworkSupport("unable to create poll unblock event");
+        }
         mt->setNetworkDataForCurrentThread(unblockEvent);
     }
-    events[n++] = *unblockEvent;
+    events[n++] = unblockEvent;
 
     // prepare timeout
     DWORD t = (timeout < 0.0) ? INFINITE : (DWORD)(1000.0 * timeout);
@@ -466,7 +459,7 @@ ArchNetworkWinsock::pollSocket(PollEntry pe[], int num, double timeout)
     DWORD result = WSAWaitForMultipleEvents_winsock(n, events, FALSE, t, FALSE);
 
     // reset the unblock event
-    WSAResetEvent_winsock(*unblockEvent);
+    ResetEvent(unblockEvent);
 
     // handle results
     if (result == WSA_WAIT_FAILED) {
@@ -545,9 +538,10 @@ ArchNetworkWinsock::unblockPollSocket(ArchThread thread)
 {
     // set the unblock event
     ArchMultithreadWindows* mt = ArchMultithreadWindows::getInstance();
-    WSAEVENT* unblockEvent = (WSAEVENT*)mt->getNetworkDataForThread(thread);
+    WSAEVENT unblockEvent = static_cast<WSAEVENT>(
+        mt->getNetworkDataForThreadAndMarkUnblock(thread));
     if (unblockEvent != NULL) {
-        WSASetEvent_winsock(*unblockEvent);
+        SetEvent(unblockEvent);
     }
 }
 
@@ -560,7 +554,7 @@ ArchNetworkWinsock::readSocket(ArchSocket s, void* buf, size_t len)
     if (n == SOCKET_ERROR) {
         int err = getsockerror_winsock();
         if (err == WSAEINTR || err == WSAEWOULDBLOCK) {
-            return 0;
+            throw XArchNetworkInterrupted(new XArchEvalWinsock(err));
         }
         throwError(err);
     }

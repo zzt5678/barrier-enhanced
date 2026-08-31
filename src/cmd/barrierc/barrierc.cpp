@@ -21,8 +21,11 @@
 #include "base/Log.h"
 #include "base/EventQueue.h"
 
+#include <cstring>
+
 #if WINAPI_MSWINDOWS
 #include "MSWindowsClientTaskBarReceiver.h"
+#include "platform/MSWindowsClipboardBridge.h"
 #elif WINAPI_XWINDOWS
 #include "XWindowsClientTaskBarReceiver.h"
 #elif WINAPI_CARBON
@@ -43,6 +46,15 @@ main(int argc, char** argv)
     arch.init();
 
     Log log;
+#if SYSAPI_WIN32
+    if (argc > 1 && std::strcmp(argv[1], "--clipboard-helper") == 0) {
+        if (argc != 3) {
+            return 2;
+        }
+        return MSWindowsClipboardBridge::runHelper(argv[2]);
+    }
+#endif
+
     EventQueue events;
 
     ClientApp app(&events, createTaskBarReceiver);

@@ -39,6 +39,7 @@ public:
     virtual void        write(const void* buffer, UInt32 n);
     virtual void        writeLowPriority(const void* buffer, UInt32 n);
     virtual void        shutdownInput();
+    virtual void        setInputPaused(bool paused);
     virtual bool        isReady() const;
     virtual UInt32        getSize() const;
     virtual UInt32        getBufferedOutputSize() const;
@@ -59,5 +60,6 @@ private:
     UInt32                m_size;
     StreamBuffer        m_buffer;
     bool                m_inputShutdown;
+    bool                m_inputPaused;
     IEventQueue*        m_events;
 };

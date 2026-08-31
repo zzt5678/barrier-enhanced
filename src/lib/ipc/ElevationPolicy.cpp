@@ -79,4 +79,21 @@ bool shouldAutoElevate(UInt8 mode, const std::string& desktopName)
         desktopName != "Default";
 }
 
+bool shouldElevateDesktopDiscovery(UInt8 mode)
+{
+    return normalizeMode(mode) != IpcCommandMessage::kElevateNever;
+}
+
+bool shouldRelaunchOnDesktopSwitch(UInt8 mode)
+{
+    return normalizeMode(mode) == IpcCommandMessage::kElevateAsNeeded;
+}
+
+bool commandRequiresRelaunch(const std::string& currentCommand, UInt8 currentMode,
+                             const std::string& requestedCommand, UInt8 requestedMode)
+{
+    return currentCommand != requestedCommand ||
+        normalizeMode(currentMode) != normalizeMode(requestedMode);
+}
+
 } // namespace ElevationPolicy

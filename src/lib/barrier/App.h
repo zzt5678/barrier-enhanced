@@ -25,7 +25,9 @@
 #include "base/EventQueue.h"
 #include "net/SocketMultiplexer.h"
 #include "common/common.h"
+#include <cstdint>
 #include <memory>
+#include <string>
 
 #if SYSAPI_WIN32
 #include "barrier/win32/AppUtilWindows.h"
@@ -37,6 +39,7 @@ class IArchTaskBarReceiver;
 class BufferedLogOutputter;
 class ILogOutputter;
 class FileLogOutputter;
+class EventQueueTimer;
 namespace barrier { class Screen; }
 class IEventQueue;
 class SocketMultiplexer;
@@ -104,11 +107,28 @@ public:
 
 private:
     void                handleIpcMessage(const Event&, void*);
+    void                handleIpcConnected(const Event&, void*);
+    void                handleIpcReadinessTimer(const Event&, void*);
+    bool                sendIpcInputReadiness(std::uint64_t queryNonce = 0);
+    void                stopIpcReadinessTimer();
 
 protected:
     void                initIpcClient();
     void                cleanupIpcClient();
     void run_events_loop();
+    bool                waitForServiceActivation(std::uint64_t& activationNonce);
+    bool                sendIpcServiceActivated(std::uint64_t activationNonce);
+    virtual bool        ipcInputReady() const { return true; }
+    virtual std::uint64_t ipcInputGeneration() const { return 0; }
+    virtual std::string ipcInputDesktopName() const { return std::string(); }
+    virtual bool        ipcStandbyInputProbe(
+                            std::uint64_t& inputGeneration,
+                            std::string& desktopName) const
+    {
+        inputGeneration = 0;
+        desktopName.clear();
+        return false;
+    }
 
     IArchTaskBarReceiver* m_taskBarReceiver;
     bool m_suspended;
@@ -121,6 +141,15 @@ private:
     CreateTaskBarReceiverFunc m_createTaskBarReceiver;
     ARCH_APP_UTIL m_appUtil;
     IpcClient*            m_ipcClient;
+    EventQueueTimer*      m_ipcReadinessTimer;
+    bool                  m_hasReportedIpcReadiness;
+    bool                  m_lastIpcInputReady;
+    std::uint64_t         m_lastIpcInputGeneration;
+    std::string           m_lastIpcInputDesktopName;
+    bool                  m_serviceActivationRequested;
+    bool                  m_serviceActivated;
+    bool                  m_ipcShutdownRequested;
+    std::uint64_t         m_serviceActivationNonce;
     std::unique_ptr<SocketMultiplexer> m_socketMultiplexer;
 };
 

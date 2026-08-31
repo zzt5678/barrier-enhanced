@@ -24,3 +24,5 @@ const char*                kIpcMsgHello        = "IHEL%1i%4i";
 const char*                kIpcMsgLogLine        = "ILOG%s";
 const char*                kIpcMsgCommand        = "ICMD%s%1i";
 const char*                kIpcMsgShutdown        = "ISDN";
+const char*                kIpcMsgStopRequest     = "ISRP%4i%4i";
+const char*                kIpcMsgStopAck         = "ISAK%4i%4i%4i%4i";

@@ -18,6 +18,9 @@
 #pragma once
 
 #include "barrier/Chunk.h"
+#include "barrier/FileReceiveSession.h"
+#include "barrier/FileTransferProtocol.h"
+#include "base/Event.h"
 #include "base/String.h"
 #include "common/basic_types.h"
 #include "io/filesystem.h"
@@ -28,23 +31,41 @@ namespace barrier {
 class IStream;
 };
 
+class FileReceiveCompletionInfo : public EventData {
+public:
+    explicit FileReceiveCompletionInfo(std::uint64_t generation) :
+        m_generation(generation)
+    {
+    }
+
+    std::uint64_t m_generation;
+};
+
 class FileChunk : public Chunk {
 public:
     FileChunk(size_t size);
     UInt32 m_transferId;
+    UInt32 m_offset;
+    bool m_transactional;
+    barrier::FileTransferReason m_transferReason;
 
     static const size_t kMaxReceiveSize;
     static const size_t kMemoryReceiveLimit;
 
-    static FileChunk*    start(const String& size);
+    static FileChunk*    start(const String& size, bool transactional = false);
     static FileChunk*    data(const UInt8* data, size_t dataSize);
-    static FileChunk*    end();
+    static FileChunk*    data(
+                            const UInt8* data,
+                            size_t dataSize,
+                            UInt32 offset);
+    static FileChunk*    end(const String& digest = String());
+    static FileChunk*    end(const String& digest, UInt32 finalOffset);
     static FileChunk*    cancel();
+    static FileChunk*    cancel(barrier::FileTransferReason reason);
     static int            assemble(
                             barrier::IStream* stream,
-                            String& dataCached,
-                            size_t& expectedSize,
-                            barrier::fs::path* spoolPath = NULL);
+                            FileReceiveSession& session);
+    static void            releaseReceiveBuffer(FileReceiveSession& session);
     static void            releaseReceiveBuffer(
                             String& dataCached,
                             size_t& expectedSize,

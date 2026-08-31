@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+// Invalid input fails closed as an empty string or a single terminator.
 std::string win_wchar_to_utf8(const WCHAR* utfStr);
 std::vector<WCHAR> utf8_to_win_char(const std::string& str);
 

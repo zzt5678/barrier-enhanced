@@ -22,6 +22,8 @@
 #include "ipc/IpcMessage.h"
 #include "base/TMethodEventJob.h"
 
+#include <memory>
+
 #if SYSAPI_WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -41,6 +43,19 @@ currentProcessId()
 #endif
 }
 
+UInt32
+currentSessionId(UInt32 processId)
+{
+#if SYSAPI_WIN32
+    DWORD sessionId = 0;
+    return ProcessIdToSessionId(processId, &sessionId) ?
+        static_cast<UInt32>(sessionId) : 0;
+#else
+    (void)processId;
+    return 0;
+#endif
+}
+
 }
 
 //
@@ -53,7 +68,10 @@ IpcClient::IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer,
     m_socket(events, socketMultiplexer, IArchNetwork::kINET),
     m_server(nullptr),
     m_events(events),
-    m_clientType(clientType)
+    m_clientType(clientType),
+    m_processId(currentProcessId()),
+    m_sessionId(currentSessionId(m_processId)),
+    m_connectAttempted(false)
 {
     init();
 }
@@ -64,7 +82,10 @@ IpcClient::IpcClient(IEventQueue* events, SocketMultiplexer* socketMultiplexer, 
     m_socket(events, socketMultiplexer, IArchNetwork::kINET),
     m_server(nullptr),
     m_events(events),
-    m_clientType(clientType)
+    m_clientType(clientType),
+    m_processId(currentProcessId()),
+    m_sessionId(currentSessionId(m_processId)),
+    m_connectAttempted(false)
 {
     init();
 }
@@ -77,34 +98,64 @@ IpcClient::init()
 
 IpcClient::~IpcClient()
 {
+    try {
+        disconnect();
+    }
+    catch (...) {
+        // Destructors must not allow cleanup failures to escape.
+    }
 }
 
 void
 IpcClient::connect()
 {
-    m_events->adoptHandler(
-        m_events->forIDataSocket().connected(), m_socket.getEventTarget(),
-        new TMethodEventJob<IpcClient>(
-        this, &IpcClient::handleConnected));
+    if (m_connectAttempted) {
+        return;
+    }
+    m_connectAttempted = true;
 
-    m_socket.connect(m_serverAddress);
-    m_server = new IpcServerProxy(m_socket, m_events);
+    try {
+        std::unique_ptr<IpcServerProxy> server(new IpcServerProxy(m_socket, m_events));
+        std::unique_ptr<IEventJob> messageHandler(
+            new TMethodEventJob<IpcClient>(this, &IpcClient::handleMessageReceived));
 
-    m_events->adoptHandler(
-        m_events->forIpcServerProxy().messageReceived(), m_server,
-        new TMethodEventJob<IpcClient>(
-        this, &IpcClient::handleMessageReceived));
+        m_events->adoptHandler(
+            m_events->forIpcServerProxy().messageReceived(), server.get(),
+            messageHandler.get());
+        messageHandler.release();
+        m_server = server.release();
+
+        std::unique_ptr<IEventJob> connectedHandler(
+            new TMethodEventJob<IpcClient>(this, &IpcClient::handleConnected));
+        m_events->adoptHandler(
+            m_events->forIDataSocket().connected(), m_socket.getEventTarget(),
+            connectedHandler.get());
+        connectedHandler.release();
+
+        m_socket.connect(m_serverAddress);
+    }
+    catch (...) {
+        disconnect();
+        throw;
+    }
 }
 
 void
 IpcClient::disconnect()
 {
-    m_events->removeHandler(m_events->forIDataSocket().connected(), m_socket.getEventTarget());
-    m_events->removeHandler(m_events->forIpcServerProxy().messageReceived(), m_server);
+    m_connectAttempted = true;
+    m_events->removeHandler(
+        m_events->forIDataSocket().connected(), m_socket.getEventTarget());
 
-    m_server->disconnect();
-    delete m_server;
+    IpcServerProxy* server = m_server;
     m_server = nullptr;
+    if (server != nullptr) {
+        m_events->removeHandler(
+            m_events->forIpcServerProxy().messageReceived(), server);
+        delete server;
+    }
+
+    m_socket.close();
 }
 
 void
@@ -120,7 +171,7 @@ IpcClient::handleConnected(const Event&, void*)
     m_events->addEvent(Event(
         m_events->forIpcClient().connected(), this, m_server, Event::kDontFreeData));
 
-    IpcHelloMessage message(m_clientType, currentProcessId());
+    IpcHelloMessage message(m_clientType, m_processId);
     send(message);
 }
 

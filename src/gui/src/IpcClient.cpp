@@ -20,6 +20,8 @@
 #include <QTcpSocket>
 #include <QHostAddress>
 #include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QRandomGenerator>
 #include <iostream>
 #include <QTimer>
 #include "IpcReader.h"
@@ -47,7 +49,10 @@ char normalizeElevateMode(ElevateMode elevate)
 IpcClient::IpcClient() :
 m_ReaderStarted(false),
 m_Enabled(false),
-m_RetryTimer(this)
+m_HasPendingCommand(false),
+m_PendingElevate(ElevateAsNeeded),
+m_RetryTimer(this),
+m_PendingStopRequestId(0)
 {
     initializeSocket(new QTcpSocket(this));
 }
@@ -56,15 +61,14 @@ m_RetryTimer(this)
 IpcClient::IpcClient(QTcpSocket* socket) :
 m_ReaderStarted(false),
 m_Enabled(false),
-m_RetryTimer(this)
+m_HasPendingCommand(false),
+m_PendingElevate(ElevateAsNeeded),
+m_RetryTimer(this),
+m_PendingStopRequestId(0)
 {
     initializeSocket(socket);
 }
 
-bool IpcClient::waitForBytesWrittenForTest(int timeoutMs)
-{
-    return m_Socket->waitForBytesWritten(timeoutMs);
-}
 #endif
 
 IpcClient::~IpcClient()
@@ -81,6 +85,8 @@ void IpcClient::initializeSocket(QTcpSocket* socket)
     m_Reader = new IpcReader(m_Socket);
     m_Reader->setParent(this);
     connect(m_Reader, SIGNAL(readLogLine(const QString&)), this, SLOT(handleReadLogLine(const QString&)));
+    connect(m_Reader, &IpcReader::serviceStopAcknowledged,
+            this, &IpcClient::handleServiceStopAcknowledged);
 
     m_RetryTimer.setSingleShot(true);
     m_RetryTimer.setInterval(1000);
@@ -91,6 +97,15 @@ void IpcClient::connected()
 {
     m_RetryTimer.stop();
     sendHello();
+    if (m_HasPendingCommand) {
+        writeCommand(m_PendingCommand, m_PendingElevate);
+        m_HasPendingCommand = false;
+        m_PendingCommand.clear();
+    }
+    if (m_PendingStopRequestId != 0 &&
+        !writeStopRequest(m_PendingStopRequestId)) {
+        errorMessage("service stop request remains queued after an IPC write failure");
+    }
     infoMessage("connection established");
 }
 
@@ -115,6 +130,8 @@ void IpcClient::connectToHost()
 void IpcClient::disconnectFromHost()
 {
     m_Enabled = false;
+    m_HasPendingCommand = false;
+    m_PendingCommand.clear();
     m_RetryTimer.stop();
     infoMessage("service disconnect");
     m_Reader->stop();
@@ -161,6 +178,97 @@ void IpcClient::sendHello()
 
 void IpcClient::sendCommand(const QString& command, ElevateMode const elevate)
 {
+    if (m_Socket->state() != QAbstractSocket::ConnectedState) {
+        m_PendingCommand = command;
+        m_PendingElevate = elevate;
+        m_HasPendingCommand = true;
+        infoMessage("service command queued until connection is established");
+        return;
+    }
+
+    writeCommand(command, elevate);
+}
+
+quint64 IpcClient::requestServiceStop()
+{
+    if (m_PendingStopRequestId != 0) {
+        if (m_Socket->state() == QAbstractSocket::ConnectedState) {
+            if (!writeStopRequest(m_PendingStopRequestId)) {
+                errorMessage("service stop request remains queued after an IPC write failure");
+            }
+        }
+        else if (m_Enabled) {
+            connectToHost();
+        }
+        return m_PendingStopRequestId;
+    }
+
+    do {
+        m_PendingStopRequestId = QRandomGenerator::system()->generate64();
+    } while (m_PendingStopRequestId == 0);
+
+    if (m_Socket->state() == QAbstractSocket::ConnectedState) {
+        if (!writeStopRequest(m_PendingStopRequestId)) {
+            errorMessage("service stop request remains queued after an IPC write failure");
+        }
+    }
+    else {
+        infoMessage("service stop request queued until connection is established");
+        if (m_Enabled) {
+            connectToHost();
+        }
+    }
+    return m_PendingStopRequestId;
+}
+
+bool IpcClient::abandonServiceStopRequest(quint64 requestId)
+{
+    if (requestId == 0 || requestId != m_PendingStopRequestId) {
+        return false;
+    }
+
+    m_PendingStopRequestId = 0;
+    return true;
+}
+
+bool IpcClient::writeStopRequest(quint64 requestId)
+{
+    if (requestId == 0 ||
+        m_Socket->state() != QAbstractSocket::ConnectedState) {
+        return false;
+    }
+
+    QByteArray frame(kIpcMsgStopRequest, 4);
+    char requestBuf[8];
+    for (int byte = 0; byte < 8; ++byte) {
+        const int shift = 56 - (byte * 8);
+        requestBuf[byte] = static_cast<char>((requestId >> shift) & 0xffu);
+    }
+    frame.append(requestBuf, 8);
+    return m_Socket->write(frame) == frame.size();
+}
+
+bool IpcClient::flushPendingWrites(int timeoutMs)
+{
+    if (m_Socket->state() != QAbstractSocket::ConnectedState) {
+        return false;
+    }
+
+    QElapsedTimer deadline;
+    deadline.start();
+    while (m_Socket->bytesToWrite() > 0) {
+        const int remaining = timeoutMs - static_cast<int>(deadline.elapsed());
+        if (remaining <= 0 ||
+            (!m_Socket->waitForBytesWritten(remaining) &&
+             m_Socket->bytesToWrite() > 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void IpcClient::writeCommand(const QString& command, ElevateMode const elevate)
+{
     QDataStream stream(m_Socket);
 
     stream.writeRawData(kIpcMsgCommand, 4);
@@ -182,6 +290,17 @@ void IpcClient::sendCommand(const QString& command, ElevateMode const elevate)
 void IpcClient::handleReadLogLine(const QString& text)
 {
     readLogLine(text);
+}
+
+void IpcClient::handleServiceStopAcknowledged(
+    quint64 requestId, quint64 commandGeneration)
+{
+    if (requestId == 0 || requestId != m_PendingStopRequestId) {
+        return;
+    }
+
+    m_PendingStopRequestId = 0;
+    serviceStopAcknowledged(requestId, commandGeneration);
 }
 
 // TODO: qt must have a built in way of converting int to bytes.

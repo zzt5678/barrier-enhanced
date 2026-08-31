@@ -73,6 +73,11 @@ public:
     */
     String                marshall() const;
 
+    //! Inspect a validated marshalled clipboard without allocating formats.
+    static bool         marshalledHasFormat(const String& data,
+                            IClipboard::EFormat format);
+    static bool         isValidMarshalled(const String& data);
+
     //@}
 
     // IClipboard overrides

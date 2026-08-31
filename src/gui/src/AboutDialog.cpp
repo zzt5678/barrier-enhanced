@@ -17,6 +17,7 @@
  */
 
 #include "AboutDialog.h"
+#include "common/Version.h"
 
 #include <QtCore>
 #include <QtGui>
@@ -28,17 +29,15 @@ AboutDialog::AboutDialog(QWidget* parent, const QString& barrierApp) :
 	setupUi(this);
 
 	m_versionChecker.setApp(barrierApp);
-	QString version = m_versionChecker.getVersion();
-	version = version + '-' + BARRIER_VERSION_STAGE;
-#ifdef BARRIER_REVISION
-    version +=  '-';
-    version += BARRIER_REVISION;
-#endif
-	m_pLabelBarrierVersion->setText(version);
+	const QString dataPlaneVersion = m_versionChecker.getVersion();
+	m_pLabelBarrierVersion->setText(QString::fromLatin1(kBuildId));
+	m_pLabelBarrierVersion->setToolTip(
+		tr("Data process version: %1").arg(dataPlaneVersion));
 
-	QString buildDateString = QString::fromLocal8Bit(__DATE__).simplified();
-	QDate buildDate = QLocale("en_US").toDate(buildDateString, "MMM d yyyy");
-	m_pLabelBuildDate->setText(QLocale().toString(buildDate, QLocale::LongFormat));
+	const QString buildDateText = QString::fromLatin1(kBuildDate);
+	const QDate buildDate = QDate::fromString(buildDateText, "yyyyMMdd");
+	m_pLabelBuildDate->setText(buildDate.isValid() ?
+		QLocale().toString(buildDate, QLocale::LongFormat) : buildDateText);
 
 	// change default size based on os
 #if defined(Q_OS_MAC)

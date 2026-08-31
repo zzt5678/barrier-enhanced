@@ -53,6 +53,36 @@ if (NOT DEFINED BARRIER_REVISION)
                 OUTPUT_VARIABLE BARRIER_REVISION
                 OUTPUT_STRIP_TRAILING_WHITESPACE
             )
+
+            execute_process (
+                COMMAND git rev-parse --git-path HEAD
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                OUTPUT_VARIABLE BARRIER_GIT_HEAD_PATH
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+            )
+            execute_process (
+                COMMAND git symbolic-ref -q HEAD
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                OUTPUT_VARIABLE BARRIER_GIT_HEAD_REF
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE BARRIER_GIT_HEAD_REF_RESULT
+            )
+            if (BARRIER_GIT_HEAD_PATH)
+                get_filename_component (BARRIER_GIT_HEAD_PATH "${BARRIER_GIT_HEAD_PATH}" ABSOLUTE
+                    BASE_DIR "${CMAKE_SOURCE_DIR}")
+                set_property (DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${BARRIER_GIT_HEAD_PATH}")
+            endif()
+            if (BARRIER_GIT_HEAD_REF_RESULT EQUAL 0 AND BARRIER_GIT_HEAD_REF)
+                execute_process (
+                    COMMAND git rev-parse --git-path ${BARRIER_GIT_HEAD_REF}
+                    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                    OUTPUT_VARIABLE BARRIER_GIT_REF_PATH
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                )
+                get_filename_component (BARRIER_GIT_REF_PATH "${BARRIER_GIT_REF_PATH}" ABSOLUTE
+                    BASE_DIR "${CMAKE_SOURCE_DIR}")
+                set_property (DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${BARRIER_GIT_REF_PATH}")
+            endif()
         endif()
     endif()
 endif()
@@ -80,7 +110,12 @@ else()
 endif()
 
 set (BARRIER_VERSION "${BARRIER_VERSION_MAJOR}.${BARRIER_VERSION_MINOR}.${BARRIER_VERSION_PATCH}-${BARRIER_VERSION_STAGE}")
-set (BARRIER_VERSION_STRING "${BARRIER_VERSION}-${BARRIER_VERSION_TAG}")
+if (BARRIER_VERSION_STAGE STREQUAL "snapshot")
+    set (BARRIER_VERSION_STRING
+         "${BARRIER_VERSION_MAJOR}.${BARRIER_VERSION_MINOR}.${BARRIER_VERSION_PATCH}-${BARRIER_VERSION_TAG}")
+else()
+    set (BARRIER_VERSION_STRING "${BARRIER_VERSION}")
+endif()
 message (STATUS "Full Barrier version string is '" ${BARRIER_VERSION_STRING} "'")
 
 add_definitions (-DBARRIER_VERSION="${BARRIER_VERSION}")

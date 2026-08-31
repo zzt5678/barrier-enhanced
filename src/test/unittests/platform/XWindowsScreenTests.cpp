@@ -2,6 +2,177 @@
 
 #include "platform/XWindowsScreen.h"
 
+TEST(XWindowsScreenTests, externalSelectionOwnerChange_acceptsExternalSetOwner)
+{
+	EXPECT_TRUE(XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+		100, 100, 0, 0, 0x200, 0x100));
+}
+
+TEST(XWindowsScreenTests, externalSelectionOwnerChange_rejectsSelfAndNoOwner)
+{
+	EXPECT_FALSE(XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+		100, 100, 0, 0, 0x100, 0x100));
+	EXPECT_FALSE(XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+		100, 100, 0, 0, None, 0x100));
+}
+
+TEST(XWindowsScreenTests, externalSelectionOwnerChange_rejectsOtherEvents)
+{
+	EXPECT_FALSE(XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+		101, 100, 0, 0, 0x200, 0x100));
+	EXPECT_FALSE(XWindowsScreen::isExternalSelectionOwnerChangeForTest(
+		100, 100, 1, 0, 0x200, 0x100));
+}
+
+TEST(XWindowsScreenTests, clipboardCheckWithoutXFixesResnapshotsSameExternalOwner)
+{
+	EXPECT_TRUE(XWindowsScreen::shouldObserveClipboardOnCheckForTest(
+		false, 0x200, 0x200, 0x100));
+}
+
+TEST(XWindowsScreenTests, clipboardCheckWithXFixesSkipsSameExternalOwner)
+{
+	EXPECT_FALSE(XWindowsScreen::shouldObserveClipboardOnCheckForTest(
+		true, 0x200, 0x200, 0x100));
+}
+
+TEST(XWindowsScreenTests, clipboardCheckObservesOwnerChangesWithXFixes)
+{
+	EXPECT_TRUE(XWindowsScreen::shouldObserveClipboardOnCheckForTest(
+		true, 0x300, 0x200, 0x100));
+	EXPECT_TRUE(XWindowsScreen::shouldObserveClipboardOnCheckForTest(
+		true, None, 0x200, 0x100));
+}
+
+TEST(XWindowsScreenTests, primaryLeaveGrabTimeoutForTest_lowLatencyFailsFast)
+{
+	EXPECT_LT(XWindowsScreen::primaryLeaveGrabTimeoutForTest(true), 0.1);
+}
+
+TEST(XWindowsScreenTests, primaryLeaveGrabTimeoutForTest_normalModeKeepsRecoveryWindow)
+{
+	EXPECT_GE(XWindowsScreen::primaryLeaveGrabTimeoutForTest(false), 1.0);
+}
+
+TEST(XWindowsScreenTests, primaryLeaveGrabRetrySleepForTest_lowLatencyKeepsQuickRetryCadence)
+{
+	EXPECT_LT(XWindowsScreen::primaryLeaveGrabRetrySleepForTest(true),
+		XWindowsScreen::primaryLeaveGrabTimeoutForTest(true));
+}
+
+TEST(XWindowsScreenTests, coreMotionIsIgnoredWhenXi2OwnsPointerMotion)
+{
+	EXPECT_FALSE(
+		XWindowsScreen::shouldProcessCoreMotionForTest(
+			true, false, true, true));
+}
+
+TEST(XWindowsScreenTests, coreMotionIsProcessedForPrimaryXi2Fallback)
+{
+	EXPECT_TRUE(
+		XWindowsScreen::shouldProcessCoreMotionForTest(
+			true, false, false, false));
+}
+
+TEST(XWindowsScreenTests, coreMotionIsProcessedUntilXi2RawMotionTakesOwnership)
+{
+	EXPECT_TRUE(
+		XWindowsScreen::shouldProcessCoreMotionForTest(
+			true, false, true, false));
+}
+
+TEST(XWindowsScreenTests, coreMotionIsIgnoredOnPrimaryWhileXi2IsSelected)
+{
+	EXPECT_FALSE(
+		XWindowsScreen::shouldProcessCoreMotionForTest(
+			true, true, true, false));
+}
+
+TEST(XWindowsScreenTests, coreMotionIsIgnoredForSecondaryScreen)
+{
+	EXPECT_FALSE(
+		XWindowsScreen::shouldProcessCoreMotionForTest(
+			false, false, false, false));
+}
+
+#ifdef HAVE_XI2
+TEST(XWindowsScreenTests, xInputCookieUsableForTest_rejectsNullEventData)
+{
+	XGenericEventCookie cookie = {};
+	cookie.type = GenericEvent;
+	cookie.extension = 23;
+	cookie.data = NULL;
+
+	EXPECT_FALSE(XWindowsScreen::xInputCookieUsableForTest(cookie, 23));
+}
+
+TEST(XWindowsScreenTests, xInputCookieUsableForTest_rejectsUnrelatedEvents)
+{
+	int eventData = 0;
+	XGenericEventCookie cookie = {};
+	cookie.type = ButtonPress;
+	cookie.extension = 23;
+	cookie.data = &eventData;
+	EXPECT_FALSE(XWindowsScreen::xInputCookieUsableForTest(cookie, 23));
+
+	cookie.type = GenericEvent;
+	cookie.extension = 24;
+	EXPECT_FALSE(XWindowsScreen::xInputCookieUsableForTest(cookie, 23));
+}
+
+TEST(XWindowsScreenTests, xInputCookieUsableForTest_acceptsMatchingCookieWithData)
+{
+	int eventData = 0;
+	XGenericEventCookie cookie = {};
+	cookie.type = GenericEvent;
+	cookie.extension = 23;
+	cookie.data = &eventData;
+
+	EXPECT_TRUE(XWindowsScreen::xInputCookieUsableForTest(cookie, 23));
+}
+
+TEST(XWindowsScreenTests, xInputEventPayload_rawMotionNeedsCookieData)
+{
+	EXPECT_TRUE(
+		XWindowsScreen::xInputEventNeedsPayloadForTest(XI_RawMotion));
+	EXPECT_TRUE(
+		XWindowsScreen::xInputEventNeedsPayloadForTest(XI_RawButtonPress));
+	EXPECT_TRUE(
+		XWindowsScreen::xInputEventNeedsPayloadForTest(XI_RawButtonRelease));
+}
+
+TEST(XWindowsScreenTests, xInputRawMotionDeltas_readsPackedPointerAxes)
+{
+	unsigned char mask[XIMaskLen(3)] = {};
+	XISetMask(mask, 0);
+	XISetMask(mask, 2);
+	double values[] = { 1.25, 9.0 };
+	XIRawEvent event = {};
+	event.valuators.mask_len = sizeof(mask);
+	event.valuators.mask = mask;
+	event.valuators.values = values;
+	double dx = 0.0;
+	double dy = 0.0;
+
+	EXPECT_TRUE(
+		XWindowsScreen::xInputRawMotionDeltasForTest(event, dx, dy));
+	EXPECT_DOUBLE_EQ(1.25, dx);
+	EXPECT_DOUBLE_EQ(0.0, dy);
+}
+
+TEST(XWindowsScreenTests, xInputRawMotionDeltas_rejectsMissingPayload)
+{
+	XIRawEvent event = {};
+	double dx = 1.0;
+	double dy = 1.0;
+
+	EXPECT_FALSE(
+		XWindowsScreen::xInputRawMotionDeltasForTest(event, dx, dy));
+	EXPECT_DOUBLE_EQ(0.0, dx);
+	EXPECT_DOUBLE_EQ(0.0, dy);
+}
+#endif
+
 TEST(XWindowsScreenTests, clampPointToRectForTest_insideRect_keepsPoint)
 {
 	SInt32 x = 5200;
@@ -107,4 +278,38 @@ TEST(XWindowsScreenTests, adjustPointToVisibleAreaNearAnchorForTest_closedAnchor
 		areas, 100, 1200, x, y));
 	EXPECT_EQ(5120, x);
 	EXPECT_EQ(900, y);
+}
+
+TEST(XWindowsScreenTests, visibleAreaTopologiesEqualForTest_ignoresOutputOrder)
+{
+	XWindowsScreen::VisibleAreas first;
+	first.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1080, true));
+	first.push_back(XWindowsScreen::VisibleArea(1920, 0, 2560, 1440, false));
+	XWindowsScreen::VisibleAreas second;
+	second.push_back(XWindowsScreen::VisibleArea(1920, 0, 2560, 1440, false));
+	second.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1080, true));
+
+	EXPECT_TRUE(XWindowsScreen::visibleAreaTopologiesEqualForTest(first, second));
+}
+
+TEST(XWindowsScreenTests, visibleAreaTopologiesEqualForTest_detectsPrimaryOutputChange)
+{
+	XWindowsScreen::VisibleAreas first;
+	first.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1080, true));
+	first.push_back(XWindowsScreen::VisibleArea(1920, 0, 1920, 1080, false));
+	XWindowsScreen::VisibleAreas second;
+	second.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1080, false));
+	second.push_back(XWindowsScreen::VisibleArea(1920, 0, 1920, 1080, true));
+
+	EXPECT_FALSE(XWindowsScreen::visibleAreaTopologiesEqualForTest(first, second));
+}
+
+TEST(XWindowsScreenTests, visibleAreaTopologiesEqualForTest_detectsGeometryChange)
+{
+	XWindowsScreen::VisibleAreas first;
+	first.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1080, true));
+	XWindowsScreen::VisibleAreas second;
+	second.push_back(XWindowsScreen::VisibleArea(0, 0, 1920, 1200, true));
+
+	EXPECT_FALSE(XWindowsScreen::visibleAreaTopologiesEqualForTest(first, second));
 }

@@ -21,8 +21,18 @@
 #include "common/win32/encoding_utilities.h"
 #include <windows.h>
 #else
+#include <cerrno>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)
+#endif
+#elif defined(__APPLE__)
+#include <stdio.h>
+#endif
 #endif
 #include <chrono>
 #include <fstream>
@@ -75,21 +85,31 @@ std::FILE* fopen_utf8_path(const fs::path& path, const std::string& mode)
 }
 
 bool create_secure_temp_file(const std::string& prefix, const std::string& suffix,
-                             fs::path& path)
+                             fs::path& path) noexcept
 {
     path.clear();
 
-    return create_secure_temp_file_in_directory(
-        fs::temp_directory_path(), prefix, suffix, path);
+    try {
+        std::error_code error;
+        const fs::path directory = fs::temp_directory_path(error);
+        return !error && !directory.empty() &&
+            create_secure_temp_file_in_directory(
+                directory, prefix, suffix, path);
+    }
+    catch (...) {
+        path.clear();
+        return false;
+    }
 }
 
 bool create_secure_temp_file_in_directory(const fs::path& directory,
                                           const std::string& prefix,
                                           const std::string& suffix,
-                                          fs::path& path)
+                                          fs::path& path) noexcept
 {
     path.clear();
 
+    try {
 #if SYSAPI_WIN32
     if (directory.empty()) {
         return false;
@@ -163,6 +183,86 @@ bool create_secure_temp_file_in_directory(const fs::path& directory,
     path = fs::path(buffer.data());
     return true;
 #endif
+    }
+    catch (...) {
+        path.clear();
+        return false;
+    }
+}
+
+RenameNoReplaceResult rename_no_replace(const fs::path& source,
+                                        const fs::path& target,
+                                        std::error_code& error) noexcept
+{
+    error.clear();
+    try {
+#if SYSAPI_WIN32
+        if (MoveFileExW(source.native().c_str(), target.native().c_str(),
+                        MOVEFILE_WRITE_THROUGH) != FALSE) {
+            return RenameNoReplaceResult::kSuccess;
+        }
+        const DWORD code = GetLastError();
+        if (code == ERROR_FILE_EXISTS || code == ERROR_ALREADY_EXISTS) {
+            return RenameNoReplaceResult::kTargetExists;
+        }
+        error = std::error_code(static_cast<int>(code), std::system_category());
+        return RenameNoReplaceResult::kError;
+#elif defined(__linux__)
+        if (::syscall(SYS_renameat2, AT_FDCWD, source.native().c_str(),
+                      AT_FDCWD, target.native().c_str(),
+                      RENAME_NOREPLACE) == 0) {
+            return RenameNoReplaceResult::kSuccess;
+        }
+        if (errno == EEXIST || errno == ENOTEMPTY) {
+            return RenameNoReplaceResult::kTargetExists;
+        }
+        error = std::error_code(errno, std::generic_category());
+        return RenameNoReplaceResult::kError;
+#elif defined(__APPLE__)
+        if (::renamex_np(source.native().c_str(), target.native().c_str(),
+                         RENAME_EXCL) == 0) {
+            return RenameNoReplaceResult::kSuccess;
+        }
+        if (errno == EEXIST || errno == ENOTEMPTY) {
+            return RenameNoReplaceResult::kTargetExists;
+        }
+        error = std::error_code(errno, std::generic_category());
+        return RenameNoReplaceResult::kError;
+#else
+        // A hard link gives regular files an atomic, no-replace fallback.
+        // Directory publication fails closed on platforms without such a
+        // primitive instead of using POSIX rename's overwrite semantics.
+        std::error_code statusError;
+        if (!fs::is_regular_file(source, statusError) || statusError) {
+            error = std::make_error_code(std::errc::operation_not_supported);
+            return RenameNoReplaceResult::kError;
+        }
+        fs::create_hard_link(source, target, error);
+        if (error == std::errc::file_exists) {
+            error.clear();
+            return RenameNoReplaceResult::kTargetExists;
+        }
+        if (error) {
+            return RenameNoReplaceResult::kError;
+        }
+        std::error_code removeError;
+        if (!fs::remove(source, removeError) || removeError) {
+            std::error_code rollbackError;
+            fs::remove(target, rollbackError);
+            error = removeError ? removeError :
+                std::make_error_code(std::errc::io_error);
+            return RenameNoReplaceResult::kError;
+        }
+        return RenameNoReplaceResult::kSuccess;
+#endif
+    }
+    catch (const std::system_error& exception) {
+        error = exception.code();
+    }
+    catch (...) {
+        error = std::make_error_code(std::errc::io_error);
+    }
+    return RenameNoReplaceResult::kError;
 }
 
 } // namespace barrier

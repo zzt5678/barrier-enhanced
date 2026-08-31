@@ -26,6 +26,9 @@
 #include "barrier/option_types.h"
 #include "base/String.h"
 
+#include <cstdint>
+#include <memory>
+
 class IClipboard;
 class IPlatformScreen;
 class IEventQueue;
@@ -43,7 +46,18 @@ public:
     virtual ~Screen();
 
 #ifdef BARRIER_TEST_ENV
-    Screen() : m_mock(true) { }
+    Screen() :
+        m_screen(nullptr),
+        m_isPrimary(false),
+        m_enabled(false),
+        m_entered(false),
+        m_screenSaverSync(false),
+        m_halfDuplex(0),
+        m_fakeInput(false),
+        m_events(nullptr),
+        m_mock(true),
+        m_enableDragDrop(false)
+    { }
 #endif
 
     //! @name manipulators
@@ -57,6 +71,12 @@ public:
     */
     virtual void        enable();
 
+    //! Prepare the platform input backend without enabling clipboard/network state.
+    bool                prepareInputBackend();
+
+    //! Probe platform input access without activating hooks or cursor capture.
+    bool                probeInputBackend(std::string& desktopName) const;
+
     //! Deactivate screen
     /*!
     Undoes the operations in activate() and events are no longer
@@ -69,7 +89,7 @@ public:
     Called when the user navigates to this screen.  \p toggleMask has the
     toggle keys that should be turned on on the secondary screen.
     */
-    void                enter(KeyModifierMask toggleMask);
+    bool                enter(KeyModifierMask toggleMask);
 
     //! Leave screen
     /*!
@@ -99,6 +119,16 @@ public:
     soon after an enter().
     */
     void                setClipboard(ClipboardID, const IClipboard*);
+    virtual bool        setClipboardChecked(
+                            ClipboardID, const IClipboard*);
+    virtual bool        setClipboardSnapshot(
+                            ClipboardID,
+                            const std::shared_ptr<const String>& data);
+    virtual bool        setClipboardSnapshot(
+                            ClipboardID,
+                            const std::shared_ptr<const String>& data,
+                            std::uint64_t publicationId);
+    virtual bool        hasAsyncClipboardPublications() const;
 
     //! Grab clipboard
     /*!
@@ -159,6 +189,7 @@ public:
     screen position \c xAbs,yAbs.
     */
     void                mouseMove(SInt32 xAbs, SInt32 yAbs);
+    bool                tryMouseMove(SInt32 xAbs, SInt32 yAbs);
 
     //! Notify of mouse motion
     /*!
@@ -252,6 +283,12 @@ public:
     //! Test if the platform can safely enter this screen now.
     bool                canEnter() const;
 
+    //! Return the current platform input backend generation.
+    std::uint64_t       inputGeneration() const;
+
+    //! Return the platform desktop currently backing input injection.
+    std::string         inputDesktopName() const;
+
     //! Get jump zone size
     /*!
     Return the jump zone size, the size of the regions on the edges of
@@ -303,6 +340,10 @@ public:
     // IScreen overrides
     virtual void*        getEventTarget() const;
     virtual bool        getClipboard(ClipboardID id, IClipboard*) const;
+    virtual bool        getClipboardSnapshot(
+                            ClipboardID id,
+                            std::shared_ptr<const String>* data,
+                            UInt32* snapshotTime) const;
     virtual void        getShape(SInt32& x, SInt32& y,
                             SInt32& width, SInt32& height) const;
     virtual void        getCursorPos(SInt32& x, SInt32& y) const;

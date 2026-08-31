@@ -43,4 +43,5 @@ public:
     MOCK_CONST_METHOD0(isReady, bool());
     MOCK_CONST_METHOD0(getSize, UInt32());
     MOCK_CONST_METHOD0(getBufferedOutputSize, UInt32());
+    MOCK_CONST_METHOD0(getInputBytesReceived, std::uint64_t());
 };

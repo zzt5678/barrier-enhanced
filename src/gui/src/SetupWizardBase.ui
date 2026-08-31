@@ -318,7 +318,7 @@ p, li { white-space: pre-wrap; }
     <item>
      <widget class="QLabel" name="m_pPermissionHint">
       <property name="text">
-       <string>On macOS, Weave can trigger the Accessibility prompt automatically. On Windows, keep Elevate set to As Needed. On Linux, X11 works best; Wayland remains limited.</string>
+       <string>On macOS, Weave can trigger the Accessibility prompt automatically. On Windows, keep Elevate set to Always. On Linux, X11 works best; Wayland remains limited.</string>
       </property>
       <property name="wordWrap">
        <bool>true</bool>

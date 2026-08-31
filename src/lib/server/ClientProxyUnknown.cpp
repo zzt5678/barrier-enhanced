@@ -26,6 +26,12 @@
 #include "server/ClientProxy1_4.h"
 #include "server/ClientProxy1_5.h"
 #include "server/ClientProxy1_6.h"
+#include "server/ClientProxy1_7.h"
+#include "server/ClientProxy1_8.h"
+#include "server/ClientProxy1_9.h"
+#include "server/ClientProxy1_10.h"
+#include "server/ClientProxy1_11.h"
+#include "server/ClientProxy1_12.h"
 #include "barrier/protocol_types.h"
 #include "barrier/ProtocolUtil.h"
 #include "barrier/XBarrier.h"
@@ -43,6 +49,10 @@ ClientProxyUnknown::ClientProxyUnknown(barrier::IStream* stream, double timeout,
     m_stream(stream),
     m_proxy(NULL),
     m_ready(false),
+    m_handshakeKind(kHandshakeNone),
+    m_bulkName(),
+    m_bulkToken(),
+    m_bulkConnectionBinding(),
     m_server(server),
     m_events(events)
 {
@@ -71,7 +81,7 @@ ClientProxyUnknown::~ClientProxyUnknown()
 ClientProxy*
 ClientProxyUnknown::orphanClientProxy()
 {
-    if (m_ready) {
+    if (m_ready && m_handshakeKind == kHandshakeControl) {
         removeHandlers();
         ClientProxy* proxy = m_proxy;
         m_proxy = NULL;
@@ -81,6 +91,22 @@ ClientProxyUnknown::orphanClientProxy()
     else {
         return NULL;
     }
+}
+
+barrier::IStream*
+ClientProxyUnknown::orphanBulkStream(std::string& name, std::string& token,
+                                    std::string& connectionBinding)
+{
+    if (!m_ready || m_handshakeKind != kHandshakeBulk) {
+        return NULL;
+    }
+    removeHandlers();
+    name = m_bulkName;
+    token = m_bulkToken;
+    connectionBinding = m_bulkConnectionBinding;
+    barrier::IStream* stream = m_stream;
+    m_stream = NULL;
+    return stream;
 }
 
 void
@@ -97,6 +123,7 @@ ClientProxyUnknown::sendFailure()
     delete m_proxy;
     m_proxy = NULL;
     m_ready = false;
+    m_handshakeKind = kHandshakeNone;
     removeHandlers();
     removeTimer();
     m_events->addEvent(Event(m_events->forClientProxyUnknown().failure(), this));
@@ -191,17 +218,57 @@ ClientProxyUnknown::handleData(const Event&, void*)
             throw XBadClient();
         }
 
-        // parse the reply to hello
-        SInt16 major, minor;
-        if (!ProtocolUtil::readf(m_stream, kMsgHelloBack,
-                                    &major, &minor, &name)) {
+        UInt8 code[4];
+        if (m_stream->read(code, 4) != 4) {
             throw XBadClient();
         }
 
-        // disallow invalid version numbers
-        if (major <= 0 || minor < 0) {
+        // Parse either a normal control hello or a typed bulk hello. Reading
+        // the discriminator first prevents WBUL from ever creating a screen.
+        SInt16 major, minor;
+        if (memcmp(code, kMsgHelloBulkBack1_12, 4) == 0) {
+            std::string token;
+            std::string connectionBinding;
+            if (!ProtocolUtil::readf(m_stream, kMsgHelloBulkBack1_12 + 4,
+                                     &major, &minor, &name, &token,
+                                     &connectionBinding) ||
+                name.empty() || token.empty() || token.size() > 256 ||
+                major != kProtocolMajorVersion || minor < 12 ||
+                !isValidConnectionBinding(connectionBinding)) {
+                throw XBadClient();
+            }
+            removeHandlers();
+            m_handshakeKind = kHandshakeBulk;
+            m_bulkName = name;
+            m_bulkToken = token;
+            m_bulkConnectionBinding = connectionBinding;
+            LOG((CLOG_DEBUG1
+                "received connection-bound bulk hello for client \"%s\"",
+                name.c_str()));
+            sendSuccess();
+            return;
+        }
+
+        if (memcmp(code, kMsgHelloBulkBack, 4) == 0) {
+            throw XBadClient();
+        }
+
+        if (memcmp(code, kMsgHelloBack, 4) != 0 ||
+            !ProtocolUtil::readf(m_stream, kMsgHelloBack + 4,
+                                 &major, &minor, &name)) {
+            throw XBadClient();
+        }
+
+        // Transactional input ownership and bulk isolation are mandatory.
+        if (major != kProtocolMajorVersion ||
+            minor < kProtocolMinimumMinorVersion) {
             throw XIncompatibleClient(major, minor);
         }
+
+        const SInt16 negotiatedMinor = minor < kProtocolMinorVersion ?
+            minor : kProtocolMinorVersion;
+
+        m_handshakeKind = kHandshakeControl;
 
         // remove stream event handlers.  the proxy we're about to create
         // may install its own handlers and we don't want to accidentally
@@ -209,8 +276,8 @@ ClientProxyUnknown::handleData(const Event&, void*)
         removeHandlers();
 
         // create client proxy for highest version supported by the client
-        if (major == 1) {
-            switch (minor) {
+        if (major == kProtocolMajorVersion) {
+            switch (negotiatedMinor) {
             case 0:
                 m_proxy = new ClientProxy1_0(name, m_stream, m_events);
                 break;
@@ -238,6 +305,30 @@ ClientProxyUnknown::handleData(const Event&, void*)
             case 6:
                 m_proxy = new ClientProxy1_6(name, m_stream, m_server, m_events);
                 break;
+
+            case 7:
+                m_proxy = new ClientProxy1_7(name, m_stream, m_server, m_events);
+                break;
+
+            case 8:
+                m_proxy = new ClientProxy1_8(name, m_stream, m_server, m_events);
+                break;
+
+            case 9:
+                m_proxy = new ClientProxy1_9(name, m_stream, m_server, m_events);
+                break;
+
+            case 10:
+                m_proxy = new ClientProxy1_10(name, m_stream, m_server, m_events);
+                break;
+
+            case 11:
+                m_proxy = new ClientProxy1_11(name, m_stream, m_server, m_events);
+                break;
+
+            case 12:
+                m_proxy = new ClientProxy1_12(name, m_stream, m_server, m_events);
+                break;
             }
         }
 
@@ -247,7 +338,10 @@ ClientProxyUnknown::handleData(const Event&, void*)
         }
 
         // the proxy is created and now proxy now owns the stream
-        LOG((CLOG_DEBUG1 "created proxy for client \"%s\" version %d.%d", name.c_str(), major, minor));
+        LOG((CLOG_DEBUG1
+             "created proxy for client \"%s\" version %d.%d (peer %d.%d)",
+             name.c_str(), kProtocolMajorVersion, negotiatedMinor,
+             major, minor));
         m_stream = NULL;
 
         // wait until the proxy signals that it's ready or has disconnected
@@ -256,7 +350,8 @@ ClientProxyUnknown::handleData(const Event&, void*)
     }
     catch (XIncompatibleClient& e) {
         // client is incompatible
-        LOG((CLOG_WARN "client \"%s\" has incompatible version %d.%d)", name.c_str(), e.getMajor(), e.getMinor()));
+        LOG((CLOG_WARN "client \"%s\" has incompatible version %d.%d",
+             name.c_str(), e.getMajor(), e.getMinor()));
         ProtocolUtil::writef(m_stream,
                             kMsgEIncompatible,
                             kProtocolMajorVersion, kProtocolMinorVersion);
@@ -288,9 +383,10 @@ ClientProxyUnknown::handleTimeout(const Event&, void*)
 }
 
 void
-ClientProxyUnknown::handleDisconnect(const Event&, void*)
+ClientProxyUnknown::handleDisconnect(const Event& event, void*)
 {
-    LOG((CLOG_NOTE "new client disconnected"));
+    LOG((CLOG_NOTE "new client handshake failed: %s",
+         m_events->getTypeName(event.getType())));
     sendFailure();
 }
 

@@ -21,7 +21,9 @@
 #include "ipc/Ipc.h"
 #include "ipc/IpcClientProxy.h"
 #include "ipc/IpcMessage.h"
+#include "ipc/IpcPeerAuthentication.h"
 #include "net/IDataSocket.h"
+#include "net/TCPSocket.h"
 #include "io/IStream.h"
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
@@ -35,6 +37,7 @@
 //
 
 IpcServer::IpcServer(IEventQueue* events, SocketMultiplexer* socketMultiplexer) :
+    m_peerAuthenticator(&IpcPeerAuthenticator::authenticate),
     m_mock(false),
     m_events(events),
     m_socketMultiplexer(socketMultiplexer),
@@ -45,12 +48,27 @@ IpcServer::IpcServer(IEventQueue* events, SocketMultiplexer* socketMultiplexer) 
 }
 
 IpcServer::IpcServer(IEventQueue* events, SocketMultiplexer* socketMultiplexer, int port) :
+    m_peerAuthenticator(&IpcPeerAuthenticator::authenticate),
     m_mock(false),
     m_events(events),
     m_socketMultiplexer(socketMultiplexer),
     m_address(NetworkAddress(IPC_HOST, port))
 {
     init();
+}
+
+IpcServer::IpcServer(IEventQueue* events,
+                     SocketMultiplexer* socketMultiplexer, int port,
+                     PeerAuthenticator peerAuthenticator) :
+    IpcServer(events, socketMultiplexer, port)
+{
+    m_peerAuthenticator = peerAuthenticator;
+}
+
+IpcServer::PeerAuthenticator
+IpcServer::testPeerAuthenticator() const
+{
+    return m_peerAuthenticator;
 }
 
 void
@@ -106,10 +124,25 @@ IpcServer::handleClientConnecting(const Event&, void*)
 
     LOG((CLOG_DEBUG "accepted ipc client connection"));
 
+    TCPSocket* tcpSocket = dynamic_cast<TCPSocket*>(stream);
+    const IpcPeerAuthContext peerAuth =
+        tcpSocket != nullptr && m_peerAuthenticator != nullptr
+        ? m_peerAuthenticator(*tcpSocket)
+        : IpcPeerAuthContext::rejected(
+            tcpSocket == nullptr
+                ? "accepted IPC transport is not a TCP socket"
+                : "IPC peer authenticator is unavailable");
+    if (!peerAuth.permitsConnection()) {
+        LOG((CLOG_WARN "rejecting local ipc connection: %s",
+             peerAuth.rejectionReason().c_str()));
+        delete stream;
+        return;
+    }
+
     IpcClientProxy* proxy = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_clientsMutex);
-        proxy = new IpcClientProxy(*stream, m_events);
+        proxy = new IpcClientProxy(*stream, m_events, peerAuth);
         m_clients.push_back(proxy);
     }
 
@@ -173,13 +206,161 @@ IpcServer::hasClients(EIpcClientType clientType) const
     for (it = m_clients.begin(); it != m_clients.end(); it++) {
         // at least one client is alive and type matches, there are clients.
         IpcClientProxy* p = *it;
-        if (!p->m_disconnecting && p->m_clientType == clientType) {
+        if (!p->m_disconnecting && p->m_clientType.load() == clientType) {
             return true;
         }
     }
 
     // all clients must be disconnecting, no active clients.
     return false;
+}
+
+bool
+IpcServer::hasClientProcess(EIpcClientType clientType, UInt32 processId) const
+{
+    if (processId == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (ClientList::const_iterator it = m_clients.begin(); it != m_clients.end(); ++it) {
+        IpcClientProxy* proxy = *it;
+        if (!proxy->m_disconnecting &&
+            proxy->m_clientType.load() == clientType &&
+            proxy->m_processId.load() == processId) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool
+IpcServer::hasReadyClientProcess(EIpcClientType clientType, UInt32 processId) const
+{
+    if (processId == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (ClientList::const_iterator it = m_clients.begin(); it != m_clients.end(); ++it) {
+        IpcClientProxy* proxy = *it;
+        if (!proxy->m_disconnecting.load() && proxy->m_ready.load() &&
+            proxy->m_clientType.load() == clientType &&
+            proxy->m_processId.load() == processId) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+IpcInputReadinessResult
+IpcServer::inputReadiness(EIpcClientType clientType,
+                          UInt32 processId, UInt32 sessionId,
+                          const std::string& desktopName,
+                          const std::string& buildId,
+                          std::uint64_t queryNonce) const
+{
+    IpcInputReadinessResult result;
+    if (processId == 0 || clientType != kIpcClientNode) {
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (ClientList::const_iterator it = m_clients.begin(); it != m_clients.end(); ++it) {
+        const IpcInputReadinessResult candidate = (*it)->inputReadiness(
+            processId, sessionId, desktopName, buildId, queryNonce);
+        if (candidate.match == IpcInputReadinessMatch::Exact) {
+            return candidate;
+        }
+        if (candidate.match == IpcInputReadinessMatch::DesktopMismatch) {
+            result = candidate;
+        }
+    }
+
+    return result;
+}
+
+IpcInputReadinessResult
+IpcServer::inputReadinessProof(EIpcClientType clientType,
+                               UInt32 processId, UInt32 sessionId,
+                               const std::string& desktopName,
+                               const std::string& buildId,
+                               std::uint64_t queryNonce) const
+{
+    if (queryNonce == 0) {
+        return IpcInputReadinessResult();
+    }
+    return inputReadiness(
+        clientType, processId, sessionId, desktopName, buildId, queryNonce);
+}
+
+bool
+IpcServer::hasInputReadyClientProcess(EIpcClientType clientType,
+                                      UInt32 processId, UInt32 sessionId,
+                                      const std::string& desktopName,
+                                      const std::string& buildId,
+                                      std::uint64_t queryNonce,
+                                      bool requireDesktopMatch,
+                                      std::string* reportedDesktopName) const
+{
+    if (reportedDesktopName != nullptr) {
+        reportedDesktopName->clear();
+    }
+    const IpcInputReadinessResult result = inputReadiness(
+        clientType, processId, sessionId, desktopName, buildId, queryNonce);
+    const bool accepted = result.match == IpcInputReadinessMatch::Exact ||
+        (!requireDesktopMatch &&
+         result.match == IpcInputReadinessMatch::DesktopMismatch);
+    if (accepted && reportedDesktopName != nullptr) {
+        *reportedDesktopName = result.desktopName;
+    }
+    return accepted;
+}
+
+bool
+IpcServer::hasActivatedClientProcess(UInt32 processId,
+                                     std::uint64_t activationNonce) const
+{
+    if (processId == 0 || activationNonce == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (ClientList::const_iterator it = m_clients.begin();
+         it != m_clients.end(); ++it) {
+        if ((*it)->matchesActivation(processId, activationNonce)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void
+IpcServer::sendWithAcquiredRefs(
+    const IpcMessage& message,
+    const std::vector<IpcClientProxy*>& recipients)
+{
+    try {
+        for (std::vector<IpcClientProxy*>::const_iterator it = recipients.begin();
+             it != recipients.end(); ++it) {
+            (*it)->send(message);
+        }
+    }
+    catch (...) {
+        for (std::vector<IpcClientProxy*>::const_iterator it = recipients.begin();
+             it != recipients.end(); ++it) {
+            (*it)->releaseSendRef();
+        }
+        throw;
+    }
+
+    for (std::vector<IpcClientProxy*>::const_iterator it = recipients.begin();
+         it != recipients.end(); ++it) {
+        (*it)->releaseSendRef();
+    }
 }
 
 void
@@ -193,24 +374,14 @@ IpcServer::send(const IpcMessage& message, EIpcClientType filterType)
         ClientList::iterator it;
         for (it = m_clients.begin(); it != m_clients.end(); it++) {
             IpcClientProxy* proxy = *it;
-            if (proxy->m_clientType == filterType && proxy->tryAddSendRef()) {
+            if (proxy->m_clientType.load() == filterType &&
+                proxy->tryAddSendRef()) {
                 recipients.push_back(proxy);
             }
         }
     }
 
-    std::vector<IpcClientProxy*>::iterator it;
-    for (it = recipients.begin(); it != recipients.end(); it++) {
-        IpcClientProxy* proxy = *it;
-        try {
-            proxy->send(message);
-        }
-        catch (...) {
-            proxy->releaseSendRef();
-            throw;
-        }
-        proxy->releaseSendRef();
-    }
+    sendWithAcquiredRefs(message, recipients);
 }
 
 bool
@@ -229,26 +400,27 @@ IpcServer::sendToProcess(const IpcMessage& message, EIpcClientType filterType,
         ClientList::iterator it;
         for (it = m_clients.begin(); it != m_clients.end(); it++) {
             IpcClientProxy* proxy = *it;
-            if (proxy->m_clientType == filterType &&
-                proxy->m_processId == processId &&
+            if (proxy->m_clientType.load() == filterType &&
+                proxy->m_processId.load() == processId &&
                 proxy->tryAddSendRef()) {
                 recipients.push_back(proxy);
             }
         }
     }
 
-    std::vector<IpcClientProxy*>::iterator it;
-    for (it = recipients.begin(); it != recipients.end(); it++) {
-        IpcClientProxy* proxy = *it;
-        try {
-            proxy->send(message);
-        }
-        catch (...) {
-            proxy->releaseSendRef();
-            throw;
-        }
-        proxy->releaseSendRef();
-    }
+    sendWithAcquiredRefs(message, recipients);
 
     return !recipients.empty();
+}
+
+bool
+IpcServer::sendActivateToProcess(UInt32 processId,
+                                 std::uint64_t activationNonce)
+{
+    if (processId == 0 || activationNonce == 0) {
+        return false;
+    }
+
+    IpcActivateNodeMessage activate(activationNonce);
+    return sendToProcess(activate, kIpcClientNode, processId);
 }

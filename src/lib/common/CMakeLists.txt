@@ -34,7 +34,10 @@ endif()
 
 add_library(common STATIC ${sources})
 
+if (WIN32)
+    target_link_libraries(common Wtsapi32)
+endif()
+
 if (HAVE_GETPWUID_R)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DHAVE_GETPWUID_R=1")
 endif()
-

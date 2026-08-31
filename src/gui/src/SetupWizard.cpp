@@ -18,6 +18,7 @@
 #include "SetupWizard.h"
 #include "MainWindow.h"
 #include "QBarrierApplication.h"
+#include "common/ProductIdentity.h"
 #include "QUtility.h"
 #include "AppConfig.h"
 #include "DisplayIsValid.h"
@@ -217,7 +218,7 @@ QString SetupWizard::permissionDetailText() const
     }
     return tr("Weave needs Accessibility access to capture and inject input. Click the button below and macOS will open the authorization prompt for you.");
 #elif defined(Q_OS_WIN)
-    return tr("Windows works best with Elevate set to As Needed. Weave will prompt for UAC when the desktop context changes, so no separate permissions page is required.");
+    return tr("Windows works best with Elevate set to Always so Weave can keep input working across UAC and desktop switching.");
 #elif defined(WINAPI_XWINDOWS)
     if (QGuiApplication::platformName() == QStringLiteral("wayland")) {
         return tr("This session is running on Wayland. Clipboard and discovery may work, but full input control is limited. Use an X11 session for the smoothest setup.");
@@ -238,7 +239,7 @@ void SetupWizard::triggerPermissionAction()
     CFRelease(options);
 #elif defined(WINAPI_XWINDOWS)
     if (QGuiApplication::platformName() == QStringLiteral("wayland")) {
-        QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/debauchee/barrier/wiki/FAQ")));
+        QDesktopServices::openUrl(QUrl(QString::fromLatin1(WEAVE_PROJECT_URL)));
     }
 #endif
 }

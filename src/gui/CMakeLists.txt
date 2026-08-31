@@ -10,15 +10,23 @@ set (CMAKE_INCLUDE_CURRENT_DIR ON)
 set(GUI_COMMON_SOURCE_FILES
     src/Action.cpp
     src/CommandLine.cpp
+    src/ElidingLabel.cpp
+    src/GuiInstanceCoordinator.cpp
     src/Hotkey.cpp
     src/KeySequence.cpp
+    src/ServerLaunchProfile.cpp
+    src/WindowLifecyclePolicy.cpp
 )
 
 set(GUI_COMMON_HEADER_FILES
     src/Action.h
     src/CommandLine.h
+    src/ElidingLabel.h
+    src/GuiInstanceCoordinator.h
     src/Hotkey.h
     src/KeySequence.h
+    src/ServerLaunchProfile.h
+    src/WindowLifecyclePolicy.h
 )
 
 set(GUI_SOURCE_FILES
@@ -31,7 +39,6 @@ set(GUI_SOURCE_FILES
     src/BaseConfig.cpp
     src/CommandProcess.cpp
     src/CommandPaletteDialog.cpp
-    src/DataDownloader.cpp
     src/DisplayIsValid.cpp
     src/FingerprintAcceptDialog.cpp
     src/HotkeyDialog.cpp
@@ -75,7 +82,6 @@ set(GUI_HEADER_FILES
     src/BaseConfig.h
     src/CommandProcess.h
     src/CommandPaletteDialog.h
-    src/DataDownloader.h
     src/DisplayIsValid.h
     src/ElevateMode.h
     src/HotkeyDialog.h
@@ -147,6 +153,19 @@ target_compile_definitions (barrier PRIVATE -DBARRIER_VERSION_STAGE="${BARRIER_V
 target_compile_definitions (barrier PRIVATE -DBARRIER_REVISION="${BARRIER_REVISION}")
 set_target_properties(barrier PROPERTIES OUTPUT_NAME weave)
 
+if (BARRIER_BUILD_TESTS)
+    add_test(NAME weave_gui_build_identity
+        COMMAND $<TARGET_FILE:barrier> --version)
+    set_tests_properties(weave_gui_build_identity PROPERTIES
+        PASS_REGULAR_EXPRESSION
+            "Weave ${BARRIER_VERSION}\\+${BARRIER_REVISION}\\.${BARRIER_BUILD_DATE}"
+        TIMEOUT 5)
+    if (UNIX AND NOT APPLE)
+        set_tests_properties(weave_gui_build_identity PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    endif()
+endif()
+
 if (WIN32)
     file(TO_CMAKE_PATH "$ENV{BONJOUR_SDK_HOME}" BONJOUR_SDK_HOME)
     string(STRIP "${BONJOUR_SDK_HOME}" BONJOUR_SDK_HOME)
@@ -167,17 +186,40 @@ if (WIN32)
         set(WINDEPLOYQT_EXECUTABLE "${QT_BIN_DIR}/windeployqt.exe")
     endif()
 
+    set(OPENSSL_RUNTIME_ROOT_HINT "${OPENSSL_ROOT_DIR}")
+    if (NOT OPENSSL_RUNTIME_ROOT_HINT AND OPENSSL_INCLUDE_DIR)
+        get_filename_component(
+            OPENSSL_RUNTIME_ROOT_HINT "${OPENSSL_INCLUDE_DIR}" DIRECTORY)
+    endif()
+
     add_custom_command(
         TARGET barrier POST_BUILD
         COMMAND "${CMAKE_COMMAND}"
             -DWINDEPLOYQT_EXECUTABLE=${WINDEPLOYQT_EXECUTABLE}
             -DQT_BIN_DIR=${QT_BIN_DIR}
-            -DOPENSSL_ROOT_HINT=${OPENSSL_ROOT_DIR}
+            -DOPENSSL_ROOT_HINT=${OPENSSL_RUNTIME_ROOT_HINT}
+            -DBUILD_CONFIGURATION=$<CONFIG>
             -DOUTPUT_DIR=$<TARGET_FILE_DIR:barrier>
             -DTARGET_FILE=$<TARGET_FILE:barrier>
             -P "${CMAKE_CURRENT_LIST_DIR}/DeployWindowsGui.cmake"
         VERBATIM
     )
+
+    if (BARRIER_BUILD_INSTALLER)
+        add_custom_target(weave_windows_release_stage ALL
+            COMMAND "${CMAKE_COMMAND}"
+                -DWINDEPLOYQT_EXECUTABLE=${WINDEPLOYQT_EXECUTABLE}
+                -DQT_BIN_DIR=${QT_BIN_DIR}
+                -DOPENSSL_ROOT_HINT=${OPENSSL_RUNTIME_ROOT_HINT}
+                -DBUILD_CONFIGURATION=$<CONFIG>
+                -DOUTPUT_DIR=$<TARGET_FILE_DIR:barrier>
+                -DSTAGING_DIR=${CMAKE_BINARY_DIR}/windows-release/$<CONFIG>
+                -DSTAGING_REQUIRED=TRUE
+                -DTARGET_FILE=$<TARGET_FILE:barrier>
+                -P "${CMAKE_CURRENT_LIST_DIR}/DeployWindowsGui.cmake"
+            DEPENDS barrier barriers barrierc barrierd
+            VERBATIM)
+    endif()
 elseif (APPLE)
     find_library(APPSERVICES_LIB ApplicationServices)
     target_link_libraries(barrier ${APPSERVICES_LIB})
@@ -205,13 +247,23 @@ if (BARRIER_BUILD_TESTS)
         test/HotkeyTests.cpp
         test/IpcReaderTests.cpp
         test/AppConfigTests.cpp
+        test/ElidingLabelTests.cpp
+        test/SettingsDialogTests.cpp
+        test/GuiInstanceCoordinatorTests.cpp
+        test/ServerLaunchProfileTests.cpp
+        test/WindowLifecyclePolicyTests.cpp
+        test/WorkflowStoreTests.cpp
         test/main.cpp
         src/AppConfig.cpp
         src/ActionBus.cpp
+        src/BarrierLocale.cpp
         src/Ipc.cpp
         src/IpcClient.cpp
         src/IpcReader.cpp
+        src/SettingsDialog.cpp
         src/WorkflowStore.cpp
+        src/SettingsDialogBase.ui
+        res/Barrier.qrc
     )
 
     add_executable(guiunittests

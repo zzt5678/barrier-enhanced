@@ -21,6 +21,8 @@
 #include "base/Event.h"
 #include "base/EventTypes.h"
 
+#include <string>
+
 class ClientProxy;
 class EventQueueTimer;
 namespace barrier { class IStream; }
@@ -43,8 +45,17 @@ public:
     */
     ClientProxy*        orphanClientProxy();
 
+    //! Orphan a successfully authenticated bulk stream.
+    barrier::IStream*   orphanBulkStream(std::string& name,
+                                         std::string& token,
+                                         std::string& connectionBinding);
+
     //! Get the stream
     barrier::IStream*    getStream() { return m_stream; }
+
+#ifdef BARRIER_TEST_ENV
+    void handleDataForTest() { handleData(Event(), NULL); }
+#endif
 
     //@}
 
@@ -66,6 +77,11 @@ private:
     EventQueueTimer*    m_timer;
     ClientProxy*        m_proxy;
     bool                m_ready;
+    enum HandshakeKind { kHandshakeNone, kHandshakeControl, kHandshakeBulk };
+    HandshakeKind       m_handshakeKind;
+    std::string         m_bulkName;
+    std::string         m_bulkToken;
+    std::string         m_bulkConnectionBinding;
     Server*                m_server;
     IEventQueue*        m_events;
 };

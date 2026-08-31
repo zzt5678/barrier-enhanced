@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-server="_build/bin/weaves"
-client="_build/bin/weavec"
+build_dir="${BUILD_DIR:-build}"
+server="${WEAVES_BIN:-${build_dir}/bin/weaves}"
+client="${WEAVEC_BIN:-${build_dir}/bin/weavec}"
 display="${DISPLAY:-:0}"
 port="24837"
 cycles="300"
@@ -21,8 +22,8 @@ Repeatedly connects and terminates a Weave client while keeping one server
 alive, then fails if server RSS, FD count, or thread count grows past limits.
 
 Options:
-  --server <path>              Server executable (default: _build/bin/weaves)
-  --client <path>              Client executable (default: _build/bin/weavec)
+  --server <path>              Server executable (default: build/bin/weaves, or $BUILD_DIR/bin/weaves)
+  --client <path>              Client executable (default: build/bin/weavec, or $BUILD_DIR/bin/weavec)
   --display <display>          X display for both processes (default: $DISPLAY or :0)
   --port <port>                Test listen port (default: 24837)
   --cycles <n>                 Reconnect cycles (default: 300)

@@ -152,7 +152,9 @@ PrimaryClient::disable()
 void
 PrimaryClient::refreshKeyState()
 {
-    m_screen->refreshKeyState();
+    if (m_screen != NULL) {
+        m_screen->refreshKeyState();
+    }
 }
 
 void
@@ -163,7 +165,10 @@ PrimaryClient::enter(SInt32 xAbs, SInt32 yAbs,
     if (!screensaver) {
         m_screen->warpCursor(xAbs, yAbs);
     }
-    m_screen->enter(mask);
+    if (!m_screen->enter(mask)) {
+        LOG((CLOG_ERR "primary platform rejected screen enter sequence %u",
+            seqNum));
+    }
 }
 
 bool

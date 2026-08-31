@@ -118,6 +118,9 @@
 /* Define to 1 if you have the <X11/extensions/XInput2.h> header file. */
 #cmakedefine HAVE_XI2 ${HAVE_XI2}
 
+/* Define to 1 if XFixes selection notifications are available. */
+#cmakedefine HAVE_XFIXES ${HAVE_XFIXES}
+
 /* Define this if the XKB extension is available. */
 #cmakedefine HAVE_XKB_EXTENSION ${HAVE_XKB_EXTENSION}
 

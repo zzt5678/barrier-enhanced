@@ -16,22 +16,32 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define TRAY_RETRY_COUNT 5
-#define TRAY_RETRY_WAIT 2000
-
 #include "QBarrierApplication.h"
 #include "MainWindow.h"
 #include "AppConfig.h"
 #include "SetupWizard.h"
 #include "DisplayIsValid.h"
+#include "GuiInstanceCoordinator.h"
+#include "common/Version.h"
+#include "barrier/protocol_types.h"
 
 #include <QtCore>
 #include <QtGui>
 #include <QSettings>
 #include <QMessageBox>
-#include <QLockFile>
 #include <QDir>
 #include <QFileInfo>
+#include <QSocketNotifier>
+
+#include <cstdio>
+#include <cstring>
+
+#if defined(Q_OS_UNIX)
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #if defined(Q_OS_MAC)
 #include <Carbon/Carbon.h>
@@ -41,22 +51,62 @@
 #include <cstdlib>
 #endif
 
-class QThreadImpl : public QThread
-{
-public:
-	static void msleep(unsigned long msecs)
-	{
-		QThread::msleep(msecs);
-	}
-};
-
-int waitForTray();
-
 #if defined(Q_OS_MAC)
 bool checkMacAssistiveDevices();
 #endif
 
 namespace {
+
+#if defined(Q_OS_UNIX)
+int signalWriteFd = -1;
+
+void forwardUnixSignal(int)
+{
+    const int savedErrno = errno;
+    const char byte = 1;
+    if (signalWriteFd >= 0) {
+        const ssize_t result = ::write(signalWriteFd, &byte, sizeof(byte));
+        (void)result;
+    }
+    errno = savedErrno;
+}
+
+void installUnixSignalHandlers(QCoreApplication& app)
+{
+    int signalPipe[2];
+    if (::pipe(signalPipe) != 0) {
+        return;
+    }
+
+    for (const int fd : signalPipe) {
+        ::fcntl(fd, F_SETFD, ::fcntl(fd, F_GETFD) | FD_CLOEXEC);
+    }
+    ::fcntl(signalPipe[1], F_SETFL, ::fcntl(signalPipe[1], F_GETFL) | O_NONBLOCK);
+    signalWriteFd = signalPipe[1];
+
+    const int readFd = signalPipe[0];
+    auto* notifier = new QSocketNotifier(readFd, QSocketNotifier::Read, &app);
+    QObject::connect(
+        notifier,
+        &QSocketNotifier::activated,
+        &app,
+        [&app, notifier, readFd]() {
+            notifier->setEnabled(false);
+            char byte;
+            const ssize_t result = ::read(readFd, &byte, sizeof(byte));
+            (void)result;
+            app.quit();
+        });
+
+    struct sigaction action;
+    std::memset(&action, 0, sizeof(action));
+    action.sa_handler = forwardUnixSignal;
+    ::sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    ::sigaction(SIGTERM, &action, nullptr);
+    ::sigaction(SIGINT, &action, nullptr);
+}
+#endif
 
 void cleanupStartupArtifacts()
 {
@@ -77,6 +127,16 @@ void cleanupStartupArtifacts()
 
 int main(int argc, char* argv[])
 {
+    for (int index = 1; index < argc; ++index) {
+        if (std::strcmp(argv[index], "--version") == 0) {
+            std::printf("Weave %s\n", kBuildId);
+            std::printf("Protocol version %d.%d\n",
+                        static_cast<int>(kProtocolMajorVersion),
+                        static_cast<int>(kProtocolMinorVersion));
+            return 0;
+        }
+    }
+
 #ifdef WINAPI_XWINDOWS
     // QApplication's constructor will call a fscking abort() if
     // DISPLAY is bad. Let's check it first and handle it gracefully
@@ -93,6 +153,7 @@ int main(int argc, char* argv[])
 	QCoreApplication::setOrganizationName("Weave");
 	QCoreApplication::setOrganizationDomain("github.com");
 	QCoreApplication::setApplicationName("Weave");
+	QCoreApplication::setApplicationVersion(QString::fromLatin1(kBuildId));
 
 	// Enable High DPI scaling for modern displays
 	QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
@@ -100,21 +161,20 @@ int main(int argc, char* argv[])
 
 	QBarrierApplication app(argc, argv);
 
-	// Single instance lock - prevent multiple barrier GUI instances
-	// This fixes the tray icon duplication issue when restarting barrier
-	QLockFile lockFile(QDir::temp().absoluteFilePath("weave-gui.lock"));
-	lockFile.setStaleLockTime(30000);
-    bool locked = false;
-    for (int attempt = 0; attempt < 20 && !locked; ++attempt) {
-        locked = lockFile.tryLock(100);
-        if (!locked) {
-            QThreadImpl::msleep(100);
-        }
-    }
-	if (!locked) {
-		QMessageBox::warning(nullptr, "Weave",
-			"Weave is already running.\n\n"
-			"If you need to restart, please quit the existing instance first.");
+#if defined(Q_OS_UNIX)
+    installUnixSignalHandlers(app);
+#endif
+
+	GuiInstanceCoordinator instanceCoordinator(
+		GuiInstanceCoordinator::defaultLockPath(),
+		GuiInstanceCoordinator::defaultServerName());
+	const GuiInstanceCoordinator::StartResult instanceResult =
+		instanceCoordinator.start();
+	if (instanceResult == GuiInstanceCoordinator::StartResult::ExistingActivated) {
+		return 0;
+	}
+	if (instanceResult != GuiInstanceCoordinator::StartResult::Primary) {
+		fprintf(stderr, "Unable to start or activate the Weave GUI.\n");
 		return 1;
 	}
 
@@ -140,8 +200,6 @@ int main(int argc, char* argv[])
 	}
 #endif
 
-	int trayAvailable = waitForTray();
-
 	QApplication::setQuitOnLastWindowClosed(false);
 
     if (QGuiApplication::platformName() == "wayland") {
@@ -152,13 +210,6 @@ int main(int argc, char* argv[])
 
 	QSettings settings;
 	AppConfig appConfig (&settings);
-
-	if (appConfig.getAutoHide() && !trayAvailable)
-	{
-		// force auto hide to false - otherwise there is no way to get the GUI back
-		fprintf(stdout, "System tray not available, force disabling auto hide!\n");
-		appConfig.setAutoHide(false);
-	}
 
 	app.switchTranslator(appConfig.language());
 
@@ -174,30 +225,18 @@ int main(int argc, char* argv[])
 		mainWindow.open();
 	}
 
+	instanceCoordinator.setActivationHandler([&mainWindow, &setupWizard]() {
+		if (setupWizard.isVisible()) {
+			setupWizard.showNormal();
+			setupWizard.raise();
+			setupWizard.activateWindow();
+		}
+		else {
+			mainWindow.activateFromSecondaryInstance();
+		}
+	});
+
 	return app.exec();
-}
-
-int waitForTray()
-{
-	// on linux, the system tray may not be available immediately after logging in,
-	// so keep retrying but give up after a short time.
-	int trayAttempts = 0;
-	while (true)
-	{
-		if (QSystemTrayIcon::isSystemTrayAvailable())
-		{
-			break;
-		}
-
-		if (++trayAttempts > TRAY_RETRY_COUNT)
-		{
-			fprintf(stdout, "System tray is unavailable.\n");
-			return false;
-		}
-
-		QThreadImpl::msleep(TRAY_RETRY_WAIT);
-	}
-	return true;
 }
 
 #if defined(Q_OS_MAC)

@@ -101,6 +101,9 @@ EventQueue::~EventQueue()
     ARCH->setSignalHandler(Arch::kINTERRUPT, NULL, NULL);
     ARCH->setSignalHandler(Arch::kTERMINATE, NULL, NULL);
 
+    HandlerTable handlers;
+    Timers timers;
+
     {
         std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -110,6 +113,25 @@ EventQueue::~EventQueue()
         m_events.clear();
         m_oldEventIDs.clear();
 
+        handlers.swap(m_handlers);
+        timers.swap(m_timers);
+        while (!m_timerQueue.empty()) {
+            m_timerQueue.pop();
+        }
+    }
+
+    for (HandlerTable::iterator target = handlers.begin();
+         target != handlers.end(); ++target) {
+        TypeHandlerTable& typeHandlers = target->second;
+        for (TypeHandlerTable::iterator type = typeHandlers.begin();
+             type != typeHandlers.end(); ++type) {
+            delete type->second;
+        }
+    }
+
+    for (Timers::iterator timer = timers.begin();
+         timer != timers.end(); ++timer) {
+        m_buffer->deleteTimer(*timer);
     }
 
     {
@@ -123,6 +145,27 @@ EventQueue::~EventQueue()
     delete m_buffer;
     delete m_readyCondVar;
     delete m_readyMutex;
+
+    delete m_typesForClient;
+    delete m_typesForIStream;
+    delete m_typesForIpcClient;
+    delete m_typesForIpcClientProxy;
+    delete m_typesForIpcServer;
+    delete m_typesForIpcServerProxy;
+    delete m_typesForIDataSocket;
+    delete m_typesForIListenSocket;
+    delete m_typesForISocket;
+    delete m_typesForOSXScreen;
+    delete m_typesForClientListener;
+    delete m_typesForClientProxy;
+    delete m_typesForClientProxyUnknown;
+    delete m_typesForServer;
+    delete m_typesForServerApp;
+    delete m_typesForIKeyState;
+    delete m_typesForIPrimaryScreen;
+    delete m_typesForIScreen;
+    delete m_typesForClipboard;
+    delete m_typesForFile;
 }
 
 void
@@ -239,6 +282,14 @@ retry:
         event = Event(Event::kQuit);
         return false;
     }
+
+    // Platform event sources can remain continuously ready under high-rate
+    // input. Check timers before consuming another buffered event so periodic
+    // work such as connection keepalives cannot be starved indefinitely.
+    if (hasTimerExpired(event)) {
+        return true;
+    }
+
     // if no events are waiting then handle timers and then wait
     while (m_buffer->isEmpty()) {
         // handle timers first

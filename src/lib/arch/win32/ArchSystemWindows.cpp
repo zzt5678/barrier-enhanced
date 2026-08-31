@@ -19,6 +19,7 @@
 #include "arch/win32/ArchSystemWindows.h"
 #include "arch/win32/ArchMiscWindows.h"
 #include "arch/win32/XArchWindows.h"
+#include "common/ProductIdentity.h"
 
 #include "tchar.h"
 #include <string>
@@ -27,10 +28,32 @@
 #include <psapi.h>
 
 static const char* s_settingsKeyNames[] = {
-    _T("SOFTWARE"),
-    _T("Barrier"),
+    WEAVE_SETTINGS_REGISTRY_ROOT,
+    WEAVE_SETTINGS_REGISTRY_SUBKEY,
     NULL
 };
+
+namespace {
+
+class ScopedRegistryKey {
+public:
+    explicit ScopedRegistryKey(HKEY key) : m_key(key) { }
+    ~ScopedRegistryKey()
+    {
+        if (m_key != NULL) {
+            ArchMiscWindows::closeKey(m_key);
+        }
+    }
+
+    HKEY get() const { return m_key; }
+
+private:
+    ScopedRegistryKey(const ScopedRegistryKey&);
+    ScopedRegistryKey& operator=(const ScopedRegistryKey&);
+    HKEY m_key;
+};
+
+} // namespace
 
 //
 // ArchSystemWindows
@@ -62,9 +85,11 @@ ArchSystemWindows::getOSName() const
     if (key == NULL) {
         return osName;
     }
+    ScopedRegistryKey registryKey(key);
 
-    std::string productName = ArchMiscWindows::readValueString(key, "ProductName");
-    if (osName.empty()) {
+    std::string productName = ArchMiscWindows::readValueString(
+        registryKey.get(), "ProductName");
+    if (productName.empty()) {
         return osName;
     }
 
@@ -94,8 +119,10 @@ ArchSystemWindows::setting(const std::string& valueName) const
     HKEY key = ArchMiscWindows::openKey(HKEY_LOCAL_MACHINE, s_settingsKeyNames);
     if (key == NULL)
         return "";
+    ScopedRegistryKey registryKey(key);
 
-    return ArchMiscWindows::readValueString(key, valueName.c_str());
+    return ArchMiscWindows::readValueStringUtf8(
+        registryKey.get(), valueName.c_str());
 }
 
 void
@@ -104,7 +131,9 @@ ArchSystemWindows::setting(const std::string& valueName, const std::string& valu
     HKEY key = ArchMiscWindows::addKey(HKEY_LOCAL_MACHINE, s_settingsKeyNames);
     if (key == NULL)
         throw XArch(std::string("could not access registry key: ") + valueName);
-    ArchMiscWindows::setValue(key, valueName.c_str(), valueString.c_str());
+    ScopedRegistryKey registryKey(key);
+    ArchMiscWindows::setValueUtf8(
+        registryKey.get(), valueName.c_str(), valueString);
 }
 
 bool

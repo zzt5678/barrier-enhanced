@@ -2,13 +2,20 @@
 
 #include "server/ClientProxy.h"
 #include "server/ClientProxy1_6.h"
+#include "server/ClientProxy1_12.h"
 #include "server/Config.h"
 #include "barrier/Clipboard.h"
+#include "barrier/BulkChannel.h"
 #include "barrier/FileChunk.h"
+#include "barrier/FileTransferProtocol.h"
+#include "barrier/FileTransferReceiver.h"
+#include "barrier/FileTransferSendState.h"
 #include "barrier/IPlatformScreen.h"
 #include "barrier/RemoteFileClipboard.h"
+#include "barrier/StreamChunker.h"
 #include "arch/Arch.h"
 #include "base/IEventJob.h"
+#include "base/Stopwatch.h"
 #include "io/filesystem.h"
 #include "mt/Thread.h"
 #include "mt/XThread.h"
@@ -33,17 +40,24 @@ bool testServerPrepareTransferSource(const char* filename,
                                      barrier::fs::path& tempPackagePath,
                                      std::string& error);
 
-#define private public
 #include "server/Server.h"
-#undef private
 
 using ::testing::_;
+using ::testing::AnyNumber;
+using ::testing::DoubleEq;
 using ::testing::Invoke;
 using ::testing::NiceMock;
 using ::testing::Return;
 using ::testing::ReturnRef;
 
 namespace {
+
+constexpr const char* kLocalFileSessionId =
+    "00000000000000000000000000000051";
+constexpr const char* kMaterializedFileSessionId =
+    "00000000000000000000000000000052";
+constexpr const char* kImageFileSessionId =
+    "00000000000000000000000000000053";
 
 std::string invalidTransferPackageData()
 {
@@ -66,6 +80,7 @@ public:
         enterSeqNum(0),
         enterMask(0),
         enterForScreensaver(true),
+        leaveCount(0),
         mouseMoveCount(0),
         mouseMoveX(0),
         mouseMoveY(0),
@@ -123,7 +138,11 @@ public:
         enterMask = mask;
         enterForScreensaver = forScreensaver;
     }
-    bool leave() override { return true; }
+    bool leave() override
+    {
+        ++leaveCount;
+        return true;
+    }
     void setClipboard(ClipboardID id, const IClipboard* clipboard) override
     {
         ++setClipboardCount;
@@ -181,6 +200,7 @@ public:
     UInt32 enterSeqNum;
     KeyModifierMask enterMask;
     bool enterForScreensaver;
+    UInt32 leaveCount;
     UInt32 mouseMoveCount;
     SInt32 mouseMoveX;
     SInt32 mouseMoveY;
@@ -201,6 +221,211 @@ public:
     std::vector<ClipboardID> setClipboardIds;
     Clipboard lastSetClipboard;
 };
+
+class TransactionalRecordingClient : public RecordingClient
+{
+public:
+    explicit TransactionalRecordingClient(const std::string& name,
+                                           bool commitAckSupported = false) :
+        RecordingClient(name),
+        commitAckSupported(commitAckSupported),
+        prepareCount(0),
+        abortCount(0),
+        preparedX(0),
+        preparedY(0),
+        preparedSeqNum(0),
+        preparedMask(0),
+        abortedSeqNum(0)
+    {
+    }
+
+    bool supportsInputHandoff() const override { return true; }
+    bool supportsInputHandoffCommitAck() const override
+    {
+        return commitAckSupported;
+    }
+    void prepareEnter(SInt32 x, SInt32 y, UInt32 seqNum,
+                      KeyModifierMask mask) override
+    {
+        ++prepareCount;
+        preparedX = x;
+        preparedY = y;
+        preparedSeqNum = seqNum;
+        preparedMask = mask;
+    }
+    void abortEnter(UInt32 seqNum) override
+    {
+        ++abortCount;
+        abortedSeqNum = seqNum;
+    }
+
+    bool commitAckSupported;
+    UInt32 prepareCount;
+    UInt32 abortCount;
+    SInt32 preparedX;
+    SInt32 preparedY;
+    UInt32 preparedSeqNum;
+    KeyModifierMask preparedMask;
+    UInt32 abortedSeqNum;
+};
+
+class RevocableRecordingClient : public TransactionalRecordingClient
+{
+public:
+    explicit RevocableRecordingClient(const std::string& name,
+                                       bool commitAckSupported = true) :
+        TransactionalRecordingClient(name, commitAckSupported),
+        revokeCount(0),
+        revokeHandoffSeqNum(0),
+        revokeInputEpoch(0),
+        inputEpoch(0)
+    {
+    }
+
+    bool supportsInputLeaseRevokeAck() const override { return true; }
+    UInt32 getInputEpoch() const override { return inputEpoch; }
+    void enter(SInt32 xAbs, SInt32 yAbs, UInt32 seqNum,
+               KeyModifierMask mask, bool forScreensaver) override
+    {
+        inputEpoch = seqNum;
+        TransactionalRecordingClient::enter(
+            xAbs, yAbs, seqNum, mask, forScreensaver);
+    }
+    void requestInputLeaseRevoke(UInt32 handoffSeqNum,
+                                 UInt32 inputEpoch) override
+    {
+        ++revokeCount;
+        revokeHandoffSeqNum = handoffSeqNum;
+        revokeInputEpoch = inputEpoch;
+    }
+
+    UInt32 revokeCount;
+    UInt32 revokeHandoffSeqNum;
+    UInt32 revokeInputEpoch;
+    UInt32 inputEpoch;
+};
+
+class BulkRecordingClient : public RecordingClient
+{
+public:
+    explicit BulkRecordingClient(const std::string& name) :
+        RecordingClient(name),
+        attachAllowed(true),
+        attachCount(0)
+    {
+    }
+
+    bool supportsBulkChannel() const override { return true; }
+    void offerBulkChannel(const std::string& token) override
+    {
+        offeredToken = token;
+    }
+    bool attachBulkChannel(barrier::IStream* stream) override
+    {
+        ++attachCount;
+        if (!attachAllowed) {
+            return false;
+        }
+        delete stream;
+        return true;
+    }
+
+    bool attachAllowed;
+    UInt32 attachCount;
+    std::string offeredToken;
+};
+
+class BoundBulkRecordingClient : public BulkRecordingClient
+{
+public:
+    explicit BoundBulkRecordingClient(const std::string& name) :
+        BulkRecordingClient(name),
+        connectionBinding("00112233445566778899aabbccddeeff")
+    {
+    }
+
+    bool supportsTransactionalFileTransfer() const override { return true; }
+    std::string getConnectionBinding() const override
+    {
+        return connectionBinding;
+    }
+
+    std::string connectionBinding;
+};
+
+class RoutedBoundBulkRecordingClient : public BoundBulkRecordingClient
+{
+public:
+    explicit RoutedBoundBulkRecordingClient(const std::string& name) :
+        BoundBulkRecordingClient(name),
+        bulkRoute()
+    {
+    }
+
+    std::shared_ptr<barrier::BulkChannel> acquireBulkChannel() const override
+    {
+        return bulkRoute && bulkRoute->isActive() ? bulkRoute :
+            std::shared_ptr<barrier::BulkChannel>();
+    }
+
+    std::shared_ptr<barrier::BulkChannel> bulkRoute;
+};
+
+class NoopBulkHandler : public barrier::IBulkChannelHandler
+{
+public:
+    bool handleBulkMessage(const UInt8*, barrier::IStream*) override
+    {
+        return true;
+    }
+    void handleBulkDisconnected(barrier::BulkChannel*, std::uint64_t) override { }
+};
+
+class Protocol112RecordingClient : public ClientProxy1_12
+{
+public:
+    Protocol112RecordingClient(const std::string& name,
+                               barrier::IStream* stream,
+                               Server* server,
+                               IEventQueue* events) :
+        ClientProxy1_12(name, stream, server, events),
+        setClipboardCount(0)
+    {
+    }
+
+    void setClipboard(ClipboardID, const IClipboard*) override
+    {
+        ++setClipboardCount;
+    }
+
+    UInt32 setClipboardCount;
+};
+
+void attachTestBulkRoute(RoutedBoundBulkRecordingClient& client,
+                         MockEventQueue& events,
+                         IStreamEvents& streamEvents,
+                         NoopBulkHandler& handler)
+{
+    streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    ON_CALL(*stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    client.bulkRoute = std::make_shared<barrier::BulkChannel>(
+        stream, &handler, &events);
+}
+
+void attachTestBulkRoute(ClientProxy1_12& client,
+                         MockEventQueue& events,
+                         IStreamEvents& streamEvents)
+{
+    streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    ON_CALL(*stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    ASSERT_TRUE(client.attachBulkChannel(stream));
+}
 
 class DeferringClientProxy16 : public ClientProxy1_6
 {
@@ -279,9 +504,13 @@ public:
 class EnterablePrimaryClient : public PrimaryClient
 {
 public:
-    explicit EnterablePrimaryClient(barrier::Screen* screen = NULL) :
-        PrimaryClient("primary", screen),
-        enterCount(0),
+	explicit EnterablePrimaryClient(barrier::Screen* screen = NULL) :
+		PrimaryClient("primary", screen),
+		shapeX(0),
+		shapeY(0),
+		shapeW(1024),
+		shapeH(768),
+		enterCount(0),
         enterX(0),
         enterY(0),
         enterSeqNum(0),
@@ -306,12 +535,12 @@ public:
         enterMask = mask;
         enterForScreensaver = forScreensaver;
     }
-    void getShape(SInt32& x, SInt32& y, SInt32& width, SInt32& height) const override
-    {
-        x = 0;
-        y = 0;
-        width = 1024;
-        height = 768;
+	void getShape(SInt32& x, SInt32& y, SInt32& width, SInt32& height) const override
+	{
+		x = shapeX;
+		y = shapeY;
+		width = shapeW;
+		height = shapeH;
     }
     void getCursorPos(SInt32& x, SInt32& y) const override
     {
@@ -319,7 +548,11 @@ public:
         y = 100;
     }
 
-    UInt32 enterCount;
+	SInt32 shapeX;
+	SInt32 shapeY;
+	SInt32 shapeW;
+	SInt32 shapeH;
+	UInt32 enterCount;
     SInt32 enterX;
     SInt32 enterY;
     UInt32 enterSeqNum;
@@ -327,11 +560,68 @@ public:
     bool enterForScreensaver;
 };
 
+class LeavingFailsPrimaryClient : public EnterablePrimaryClient
+{
+public:
+    explicit LeavingFailsPrimaryClient(barrier::Screen* screen) :
+        EnterablePrimaryClient(screen),
+        mouseMoveCount(0),
+        mouseMoveX(0),
+        mouseMoveY(0)
+    {
+    }
+
+    bool leave() override { return false; }
+    void mouseMove(SInt32 x, SInt32 y) override
+    {
+        ++mouseMoveCount;
+        mouseMoveX = x;
+        mouseMoveY = y;
+    }
+
+    UInt32 mouseMoveCount;
+    SInt32 mouseMoveX;
+    SInt32 mouseMoveY;
+};
+
+class LeaveFailsOncePrimaryClient : public LeavingFailsPrimaryClient
+{
+public:
+    explicit LeaveFailsOncePrimaryClient(barrier::Screen* screen) :
+        LeavingFailsPrimaryClient(screen),
+        leaveCount(0)
+    {
+    }
+
+    bool leave() override
+    {
+        ++leaveCount;
+        return leaveCount > 1;
+    }
+
+    UInt32 leaveCount;
+};
+
+class InvalidCursorPrimaryClient : public EnterablePrimaryClient
+{
+public:
+    explicit InvalidCursorPrimaryClient(barrier::Screen* screen) :
+        EnterablePrimaryClient(screen)
+    {
+    }
+
+    void getCursorPos(SInt32& x, SInt32& y) const override
+    {
+        x = -1;
+        y = -1;
+    }
+};
+
 class ClipboardPrimaryClient : public PrimaryClient
 {
 public:
-    ClipboardPrimaryClient() :
-        PrimaryClient("primary", NULL),
+    explicit ClipboardPrimaryClient(barrier::Screen* screen = NULL) :
+        PrimaryClient("primary", screen),
         clipboardAvailable(false),
         getClipboardCount(0),
         clipboardDirtyCount(0),
@@ -372,7 +662,9 @@ class DragPlatformScreen : public IPlatformScreen
 public:
     DragPlatformScreen() :
         IPlatformScreen(NULL),
-        draggingStarted(false)
+        draggingStarted(false),
+        asyncClipboardSnapshots(false),
+        acceptClipboardSet(true)
     {
     }
 
@@ -380,8 +672,15 @@ public:
     void disable() override { }
     void enter() override { }
     bool leave() override { return true; }
-    bool setClipboard(ClipboardID, const IClipboard*) override { return true; }
+    bool setClipboard(ClipboardID, const IClipboard*) override
+    {
+        return acceptClipboardSet;
+    }
     void checkClipboards() override { }
+    bool hasAsyncClipboardSnapshots() const override
+    {
+        return asyncClipboardSnapshots;
+    }
     void openScreensaver(bool) override { }
     void closeScreensaver() override { }
     void screensaver(bool) override { }
@@ -444,8 +743,43 @@ public:
     void handleSystemEvent(const Event&, void*) override { }
 
     bool draggingStarted;
+    bool asyncClipboardSnapshots;
+    bool acceptClipboardSet;
     String draggingFilename;
     String dropTarget;
+};
+
+class AsyncClipboardPublicationScreen : public MockScreen
+{
+public:
+    AsyncClipboardPublicationScreen() :
+        publicationCount(0),
+        publicationId(0),
+        acceptPublication(true)
+    {
+    }
+
+    bool setClipboardSnapshot(
+        ClipboardID id, const std::shared_ptr<const String>& data,
+        std::uint64_t idForPublication) override
+    {
+        ++publicationCount;
+        clipboardId = id;
+        snapshot = data;
+        publicationId = idForPublication;
+        return acceptPublication && data != NULL;
+    }
+
+    bool hasAsyncClipboardPublications() const override
+    {
+        return true;
+    }
+
+    UInt32 publicationCount;
+    ClipboardID clipboardId;
+    std::shared_ptr<const String> snapshot;
+    std::uint64_t publicationId;
+    bool acceptPublication;
 };
 
 class AnchoringPlatformScreen : public DragPlatformScreen
@@ -518,7 +852,7 @@ void setEventTypeDefaults(MockEventQueue& events,
 }
 
 void initializeServer(Server& server, Config& config, PrimaryClient& primary,
-                      MockEventQueue& events, RecordingClient& active)
+                      MockEventQueue& events, BaseClientProxy& active)
 {
     server.m_config = &config;
     server.m_primaryClient = &primary;
@@ -526,15 +860,9 @@ void initializeServer(Server& server, Config& config, PrimaryClient& primary,
     server.m_active = &active;
     server.m_activeSaver = NULL;
     server.m_switchScreen = NULL;
-    server.m_recentSwitchGuardActive = false;
-    server.m_recentSwitchGuardLogged = false;
-    server.m_recentSwitchFromName.clear();
-    server.m_recentSwitchToName.clear();
-    server.m_recentSwitchReverseDir = kNoDirection;
-    server.m_recentSwitchEntryX = 0;
-    server.m_recentSwitchEntryY = 0;
     server.m_primaryReturnAnchorActive = false;
     server.m_primaryReturnAnchorClientName.clear();
+    server.m_primaryReturnAnchorDir = kNoDirection;
     server.m_primaryReturnAnchorX = 0;
     server.m_primaryReturnAnchorY = 0;
     server.m_switchWaitDelay = 0.0;
@@ -550,9 +878,7 @@ void initializeServer(Server& server, Config& config, PrimaryClient& primary,
     server.m_y = 654;
     server.m_enableClipboard = false;
     server.m_lockedToScreen = false;
-    server.m_expectedFileSize = 0;
-    server.m_receivedFileData.clear();
-    server.m_receivedFileSpoolPath.clear();
+    server.m_fileReceiveSession.reset();
     server.m_sendFileThread = NULL;
     server.m_writeToDropDirThread = NULL;
     server.m_args = ServerArgs();
@@ -564,7 +890,7 @@ Clipboard makeSourcePathsClipboard(const barrier::fs::path& path)
 {
     RemoteFileClipboard::Data payload;
     payload.mode = RemoteFileClipboard::Mode::SourcePaths;
-    payload.sessionId = "local-file-list";
+    payload.sessionId = kLocalFileSessionId;
     payload.paths.push_back(path);
 
     Clipboard clipboard;
@@ -579,7 +905,7 @@ Clipboard makeMaterializedPathsClipboard(const barrier::fs::path& path)
 {
     RemoteFileClipboard::Data payload;
     payload.mode = RemoteFileClipboard::Mode::MaterializedPaths;
-    payload.sessionId = "remote-ready-session";
+    payload.sessionId = kMaterializedFileSessionId;
     payload.paths.push_back(path);
 
     Clipboard clipboard;
@@ -594,7 +920,7 @@ Clipboard makeImageClipboardWithSourcePathMetadata(const barrier::fs::path& path
 {
     RemoteFileClipboard::Data payload;
     payload.mode = RemoteFileClipboard::Mode::SourcePaths;
-    payload.sessionId = "local-image-file-list";
+    payload.sessionId = kImageFileSessionId;
     payload.paths.push_back(path);
 
     Clipboard clipboard;
@@ -619,6 +945,1471 @@ Clipboard makeTextClipboard(const std::string& text)
 
 }
 
+TEST(ServerReconnectTests, bulkBindingRejectsWrongNameAndConsumedTokenReplay)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    BulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    server.renewBulkChannel(&client);
+    ASSERT_EQ(64u, client.offeredToken.size());
+    ASSERT_EQ(1u, server.m_pendingBulkBindings.size());
+
+    barrier::IStream* wrongName = new NiceMock<MockStream>();
+    EXPECT_FALSE(server.attachBulkStream("primary", client.offeredToken, wrongName));
+    delete wrongName;
+    EXPECT_EQ(0u, client.attachCount);
+
+    EXPECT_TRUE(server.attachBulkStream(
+        "client", client.offeredToken, new NiceMock<MockStream>()));
+    EXPECT_EQ(1u, client.attachCount);
+    EXPECT_TRUE(server.m_pendingBulkBindings.empty());
+
+    barrier::IStream* replay = new NiceMock<MockStream>();
+    EXPECT_FALSE(server.attachBulkStream("client", client.offeredToken, replay));
+    delete replay;
+    EXPECT_EQ(1u, client.attachCount);
+}
+
+TEST(ServerReconnectTests, failedExactBulkAttachStillConsumesToken)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    BulkRecordingClient client("client");
+    client.attachAllowed = false;
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    server.renewBulkChannel(&client);
+    const std::string token = client.offeredToken;
+    barrier::IStream* rejected = new NiceMock<MockStream>();
+    EXPECT_FALSE(server.attachBulkStream("client", token, rejected));
+    delete rejected;
+    EXPECT_EQ(1u, client.attachCount);
+    ASSERT_EQ(1u, server.m_pendingBulkBindings.size());
+    EXPECT_NE(token, client.offeredToken);
+    EXPECT_EQ(64u, client.offeredToken.size());
+
+    barrier::IStream* replay = new NiceMock<MockStream>();
+    EXPECT_FALSE(server.attachBulkStream("client", token, replay));
+    delete replay;
+    EXPECT_EQ(1u, client.attachCount);
+}
+
+TEST(ServerReconnectTests, protocol112BulkTokenIsBoundToControlConnection)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    BoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    server.renewBulkChannel(&client);
+    const std::string token = client.offeredToken;
+    ASSERT_EQ(64u, token.size());
+    ASSERT_EQ(1u, server.m_pendingBulkBindings.size());
+    EXPECT_EQ(token, server.m_pendingBulkBindings.begin()->second.token);
+    EXPECT_EQ(client.connectionBinding,
+              server.m_pendingBulkBindings.begin()->second.connectionBinding);
+
+    barrier::IStream* missingBinding = new NiceMock<MockStream>();
+    EXPECT_FALSE(server.attachBulkStream(
+        "client", token, std::string(), missingBinding));
+    delete missingBinding;
+    EXPECT_EQ(0u, client.attachCount);
+
+    barrier::IStream* wrongBinding = new NiceMock<MockStream>();
+    EXPECT_FALSE(server.attachBulkStream(
+        "client", token, "ffeeddccbbaa99887766554433221100",
+        wrongBinding));
+    delete wrongBinding;
+    EXPECT_EQ(0u, client.attachCount);
+
+    EXPECT_TRUE(server.attachBulkStream(
+        "client", token, client.connectionBinding,
+        new NiceMock<MockStream>()));
+    EXPECT_EQ(1u, client.attachCount);
+    EXPECT_TRUE(server.m_pendingBulkBindings.empty());
+
+    barrier::IStream* replay = new NiceMock<MockStream>();
+    EXPECT_FALSE(server.attachBulkStream(
+        "client", token, client.connectionBinding, replay));
+    delete replay;
+    EXPECT_EQ(1u, client.attachCount);
+}
+
+TEST(ServerReconnectTests, protocol19FileRequestsAreRejectedWithoutQueuingLegacyTransfer)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    BulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_FALSE(client.supportsTransactionalFileTransfer());
+
+    server.sendFileToClient(
+        "/tmp/weave-legacy-manual-file-must-not-be-opened");
+    EXPECT_EQ(nullptr, server.m_sendFileThread);
+    EXPECT_EQ(0u, server.m_sendFileTransferId);
+    EXPECT_EQ(nullptr, server.m_pendingManualFileSendTarget);
+    EXPECT_TRUE(server.m_pendingManualFileSendPath.empty());
+
+    const std::vector<barrier::fs::path> paths(
+        1, barrier::fs::u8path("/tmp/clipboard.txt"));
+    server.m_clipboardRevision.advance();
+    server.sendClipboardSelectionToClient(
+        &client, paths, kLocalFileSessionId, server.m_clipboardRevision);
+    EXPECT_TRUE(server.m_pendingFileClipboardPrefetchPaths.empty());
+    EXPECT_EQ(nullptr, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_EQ(nullptr, server.m_sendFileThread);
+    EXPECT_EQ(0u, server.m_sendFileTransferId);
+}
+
+TEST(ServerReconnectTests, consecutiveManualFileRequestDoesNotCancelActiveTransfer)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    std::atomic<bool> releaseSender(false);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    server.m_sendFileTarget = &client;
+    server.m_sendFileChunker = chunker;
+    server.m_sendFileTransferId = 17;
+    server.m_sendFileStarted = true;
+    server.m_sendFileThread = new Thread([&releaseSender]() {
+        while (!releaseSender.load()) {
+            ARCH->sleep(0.001);
+        }
+    });
+
+    Thread* const activeThread = server.m_sendFileThread;
+    server.sendFileToClient("/tmp/second-manual.txt");
+
+    EXPECT_EQ(activeThread, server.m_sendFileThread);
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_EQ(17u, server.m_sendFileTransferId);
+    EXPECT_FALSE(chunker->testShouldInterrupt());
+    EXPECT_EQ(NULL, server.m_pendingManualFileSendTarget);
+    EXPECT_TRUE(server.m_pendingManualFileSendPath.empty());
+
+    releaseSender.store(true);
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(false); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(false));
+}
+
+TEST(ServerReconnectTests, manualFilePreflightFailureDoesNotBlockNextRequest)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+
+    NiceMock<MockPrimaryClient> primary;
+    NoopBulkHandler bulkHandler;
+    RoutedBoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    attachTestBulkRoute(client, events, streamEvents, bulkHandler);
+
+    const barrier::fs::path missingPath =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-missing-manual-source.txt");
+    const barrier::fs::path validPath =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-valid-manual-source.txt");
+    std::error_code ec;
+    barrier::fs::remove(missingPath, ec);
+    barrier::fs::remove(validPath, ec);
+    {
+        std::ofstream validFile(
+            validPath.u8string().c_str(),
+            std::ios::out | std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(validFile.is_open());
+        validFile << "next request";
+    }
+
+    server.sendFileToClient(missingPath.u8string());
+    const UInt32 failedTransferId = server.m_sendFileTransferId;
+    ASSERT_NE(nullptr, server.m_sendFileThread);
+    for (int i = 0; i < 200 && !server.m_sendFileThread->wait(0.0); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(server.m_sendFileThread->wait(0.0));
+    EXPECT_TRUE(server.m_sendFilePreflightFailed.load());
+
+    server.sendFileToClient(validPath.u8string());
+
+    EXPECT_GT(server.m_sendFileTransferId, failedTransferId);
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_NE(nullptr, server.m_sendFileThread);
+    EXPECT_FALSE(server.m_sendFilePreflightFailed.load());
+
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(true));
+    barrier::fs::remove(validPath, ec);
+}
+
+TEST(ServerReconnectTests, manualFilePreflightFailureQueuesIdleCompletion)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    const Event::Type keepAliveType = fileEvents.keepAlive();
+
+    NiceMock<MockPrimaryClient> primary;
+    NoopBulkHandler bulkHandler;
+    RoutedBoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    attachTestBulkRoute(client, events, streamEvents, bulkHandler);
+
+    const barrier::fs::path missingPath =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-missing-idle-manual-source.txt");
+    std::error_code ec;
+    barrier::fs::remove(missingPath, ec);
+
+    std::atomic<bool> completionQueued(false);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke(
+        [&completionQueued, keepAliveType, &server](const Event& event) {
+            EXPECT_EQ(keepAliveType, event.getType());
+            EXPECT_EQ(&server, event.getTarget());
+            completionQueued.store(true);
+        }));
+
+    server.sendFileToClient(missingPath.u8string());
+    ASSERT_NE(nullptr, server.m_sendFileThread);
+    for (int i = 0; i < 200 && !server.m_sendFileThread->wait(0.0); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(server.m_sendFileThread->wait(0.0));
+    EXPECT_TRUE(completionQueued.load());
+    EXPECT_TRUE(server.m_sendFilePreflightFailed.load());
+
+    server.serviceSendFileCompletion();
+    EXPECT_EQ(nullptr, server.m_sendFileThread);
+    EXPECT_EQ(nullptr, server.m_sendFileTarget);
+    EXPECT_FALSE(server.m_sendFileTransactionState);
+    EXPECT_FALSE(server.m_sendFilePreflightFailed.load());
+}
+
+TEST(ServerReconnectTests, transactionalManualFilePreflightFailureQueuesIdleCompletion)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    const Event::Type keepAliveType = fileEvents.keepAlive();
+
+    NiceMock<MockPrimaryClient> primary;
+    BoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    const barrier::fs::path missingPath =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-missing-transactional-manual-source.txt");
+    std::error_code ec;
+    barrier::fs::remove(missingPath, ec);
+
+    std::atomic<bool> completionQueued(false);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke(
+        [&completionQueued, keepAliveType, &server](const Event& event) {
+            EXPECT_EQ(keepAliveType, event.getType());
+            EXPECT_EQ(&server, event.getTarget());
+            completionQueued.store(true);
+        }));
+
+    server.startManualFileSend(
+        &client, missingPath.u8string(), std::shared_ptr<barrier::BulkChannel>());
+    ASSERT_NE(nullptr, server.m_sendFileThread);
+    ASSERT_TRUE(server.m_sendFileTransactionState);
+    for (int i = 0; i < 200 && !server.m_sendFileThread->wait(0.0); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(server.m_sendFileThread->wait(0.0));
+    EXPECT_TRUE(completionQueued.load());
+    EXPECT_TRUE(server.m_sendFilePreflightFailed.load());
+    EXPECT_EQ(barrier::FileTransferReason::kIoError,
+              server.m_sendFileTransactionState->result());
+
+    server.serviceSendFileCompletion();
+    EXPECT_EQ(nullptr, server.m_sendFileThread);
+    EXPECT_EQ(nullptr, server.m_sendFileTarget);
+    EXPECT_FALSE(server.m_sendFileTransactionState);
+    EXPECT_FALSE(server.m_sendFilePreflightFailed.load());
+}
+
+TEST(ServerReconnectTests, protocol112ManualSendDeclaresManualIdentity)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+
+    NiceMock<MockPrimaryClient> primary;
+    BoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    const barrier::fs::path missingPath =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-missing-manual-identity.txt");
+    std::error_code ec;
+    barrier::fs::remove(missingPath, ec);
+
+    server.startManualFileSend(
+        &client, missingPath.u8string(), std::shared_ptr<barrier::BulkChannel>());
+
+    std::shared_ptr<barrier::FileTransferSendState> state =
+        server.m_sendFileTransactionState;
+    ASSERT_TRUE(state);
+    EXPECT_EQ(barrier::FileTransferKind::kManual, state->kind());
+    EXPECT_EQ(0u, state->clipboardRevision());
+    EXPECT_TRUE(state->clipboardSessionId().empty());
+
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(true));
+}
+
+TEST(ServerReconnectTests, manualPreflightCompletionBeforeWorkerExitArmsReaper)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    const Event::Type keepAliveType = fileEvents.keepAlive();
+    EventQueueTimer* reapTimer = reinterpret_cast<EventQueueTimer*>(21);
+    EXPECT_CALL(events, newOneShotTimer(DoubleEq(0.01), nullptr))
+        .WillOnce(Return(reapTimer));
+    EXPECT_CALL(events, deleteTimer(reapTimer)).Times(1);
+
+    NiceMock<MockPrimaryClient> primary;
+    NoopBulkHandler bulkHandler;
+    RoutedBoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    attachTestBulkRoute(client, events, streamEvents, bulkHandler);
+
+    const barrier::fs::path missingPath =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-missing-early-manual-source.txt");
+    std::error_code ec;
+    barrier::fs::remove(missingPath, ec);
+
+    std::atomic<bool> completionServiced(false);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke(
+        [&completionServiced, keepAliveType, &server](const Event& event) {
+            EXPECT_EQ(keepAliveType, event.getType());
+            EXPECT_EQ(&server, event.getTarget());
+            server.serviceSendFileCompletion();
+            EXPECT_NE(nullptr, server.m_sendFileThread);
+            completionServiced.store(true);
+        }));
+
+    server.sendFileToClient(missingPath.u8string());
+    ASSERT_NE(nullptr, server.m_sendFileThread);
+    for (int i = 0; i < 200 && !completionServiced.load(); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(completionServiced.load());
+    EXPECT_TRUE(server.testHasSendFileReapTimer());
+    for (int i = 0; i < 200 && !server.m_sendFileThread->wait(0.0); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(server.m_sendFileThread->wait(0.0));
+
+    server.testHandleSendFileReap();
+
+    EXPECT_EQ(nullptr, server.m_sendFileThread);
+    EXPECT_EQ(nullptr, server.m_sendFileTarget);
+    EXPECT_FALSE(server.testHasSendFileReapTimer());
+    EXPECT_FALSE(server.m_sendFilePreflightFailed.load());
+}
+
+TEST(ServerReconnectTests, legacyClipboardPreflightCompletionBeforeWorkerExitArmsReaper)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    const Event::Type keepAliveType = fileEvents.keepAlive();
+    EventQueueTimer* reapTimer = reinterpret_cast<EventQueueTimer*>(22);
+    EXPECT_CALL(events, newOneShotTimer(DoubleEq(0.01), nullptr))
+        .WillOnce(Return(reapTimer));
+    EXPECT_CALL(events, deleteTimer(reapTimer)).Times(1);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    const barrier::fs::path missingPath =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-missing-early-clipboard-source.txt");
+    std::error_code ec;
+    barrier::fs::remove(missingPath, ec);
+    const std::vector<barrier::fs::path> sourcePaths(1, missingPath);
+    const std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    const UInt32 transferId = 31;
+    server.m_sendFileTarget = &client;
+    server.m_sendFileTransferId = transferId;
+    server.m_sendFileChunker = chunker;
+    server.m_sendFileIsClipboardPrefetch = true;
+
+    std::atomic<bool> completionServiced(false);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke(
+        [&completionServiced, keepAliveType, &server](const Event& event) {
+            EXPECT_EQ(keepAliveType, event.getType());
+            EXPECT_EQ(&server, event.getTarget());
+            server.serviceSendFileCompletion();
+            EXPECT_NE(nullptr, server.m_sendFileThread);
+            completionServiced.store(true);
+        }));
+
+    server.m_sendFileThread = new Thread(
+        [&server, &client, sourcePaths, chunker, transferId]() {
+            server.send_clipboard_file_thread(
+                client.getStream(), sourcePaths, chunker, transferId,
+                std::shared_ptr<barrier::FileTransferSendState>());
+        });
+    for (int i = 0; i < 200 && !completionServiced.load(); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(completionServiced.load());
+    EXPECT_TRUE(server.testHasSendFileReapTimer());
+    for (int i = 0; i < 200 && !server.m_sendFileThread->wait(0.0); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(server.m_sendFileThread->wait(0.0));
+
+    server.testHandleSendFileReap();
+
+    EXPECT_EQ(nullptr, server.m_sendFileThread);
+    EXPECT_EQ(nullptr, server.m_sendFileTarget);
+    EXPECT_FALSE(server.testHasSendFileReapTimer());
+    EXPECT_FALSE(server.m_sendFilePreflightFailed.load());
+}
+
+TEST(ServerReconnectTests, pendingBulkFileRequestIsRejectedIfRouteBecomesOwned)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    server.m_pendingManualFileSendTarget = &client;
+    server.m_pendingManualFileSendPath = "/tmp/pending-manual.txt";
+    server.m_sendFileTarget = &client;
+    server.m_sendFileTransferId = 23;
+    server.m_sendFileStarted = true;
+
+    server.startPendingManualFileSend();
+
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_EQ(23u, server.m_sendFileTransferId);
+    EXPECT_EQ(NULL, server.m_pendingManualFileSendTarget);
+    EXPECT_TRUE(server.m_pendingManualFileSendPath.empty());
+}
+
+TEST(ServerReconnectTests, transactionalDataUsesPinnedTargetBulkWhenActiveChanges)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("target");
+    config.addScreen("other");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+
+    Server server;
+    NiceMock<MockStream>* controlStream = new NiceMock<MockStream>();
+    ON_CALL(*controlStream, getEventTarget()).WillByDefault(Return(controlStream));
+    ON_CALL(*controlStream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    ClientProxy1_12 target("target", controlStream, &server, &events);
+    RecordingClient other("other");
+    ClipboardPrimaryClient primary;
+    initializeServer(server, config, primary, events, target);
+    server.m_clients.insert(std::make_pair(other.getName(), &other));
+    server.m_clientSet.insert(&other);
+    server.m_active = &other;
+
+    NiceMock<MockStream>* bulkStream = new NiceMock<MockStream>();
+    ON_CALL(*bulkStream, getEventTarget()).WillByDefault(Return(bulkStream));
+    ON_CALL(*bulkStream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    ASSERT_TRUE(target.attachBulkChannel(bulkStream));
+    std::shared_ptr<barrier::BulkChannel> bulkRoute =
+        target.acquireBulkChannel();
+    ASSERT_TRUE(bulkRoute);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 41);
+    std::shared_ptr<barrier::FileTransferSendState> state(
+        new barrier::FileTransferSendState(transferId));
+    ASSERT_TRUE(state->markStartQueued(3));
+    ASSERT_TRUE(state->signalStartAck(
+        transferId, barrier::FileTransferReason::kNone));
+    ASSERT_TRUE(state->markDataQueued(0, 3));
+    server.m_sendFileBulkChannel = bulkRoute;
+    server.m_sendFileTarget = &target;
+    server.m_sendFileTransferId = transferId;
+    server.m_sendFileTransactionState = state;
+
+    EXPECT_CALL(*controlStream, write(_, _)).Times(0);
+    EXPECT_CALL(*bulkStream, write(_, _)).Times(1);
+    FileChunk* chunk = FileChunk::data(
+        reinterpret_cast<const UInt8*>("abc"), 3, 0);
+    chunk->m_transferId = transferId;
+    server.onFileChunkSending(chunk);
+
+    EXPECT_EQ(0u, other.fileChunkCount);
+
+    delete chunk;
+    server.m_sendFileBulkChannel.reset();
+    server.m_sendFileTransactionState.reset();
+    server.m_sendFileTarget = NULL;
+    target.detachBulkChannel();
+}
+
+TEST(ServerReconnectTests, bulkDisconnectInterruptsPinnedFileSenderWithoutControlFallback)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    NiceMock<MockStream>* bulkStream = new NiceMock<MockStream>();
+    ON_CALL(*bulkStream, getEventTarget()).WillByDefault(Return(bulkStream));
+    ON_CALL(*bulkStream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    EXPECT_CALL(*bulkStream, writeLowPriority(_, _)).Times(0);
+
+    NoopBulkHandler handler;
+    std::shared_ptr<barrier::BulkChannel> channel =
+        std::make_shared<barrier::BulkChannel>(bulkStream, &handler, &events);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    server.m_sendFileBulkChannel = channel;
+    server.m_sendFileTarget = &client;
+    server.m_sendFileChunker = chunker;
+    server.m_sendFileTransferId = 42;
+
+    channel->close();
+    server.handleBulkDisconnected(&client, channel.get());
+
+    FileChunk* chunk = FileChunk::data(
+        reinterpret_cast<const UInt8*>("payload"), 7);
+    chunk->m_transferId = 42;
+    server.onFileChunkSending(chunk);
+
+    EXPECT_TRUE(chunker->testShouldInterrupt());
+    EXPECT_EQ(0u, client.fileChunkCount);
+
+    delete chunk;
+    server.m_sendFileTarget = NULL;
+    server.m_sendFileChunker.reset();
+    server.m_sendFileBulkChannel.reset();
+}
+
+TEST(ServerReconnectTests, transactionalAckMustMatchSourceBindingAndTransfer)
+{
+    Server server;
+    BoundBulkRecordingClient source("source");
+    BoundBulkRecordingClient other("other");
+    other.connectionBinding = "ffeeddccbbaa99887766554433221100";
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 7);
+    std::shared_ptr<barrier::FileTransferSendState> state(
+        new barrier::FileTransferSendState(transferId));
+    ASSERT_TRUE(state->markStartQueued(3));
+    server.m_sendFileTarget = &source;
+    server.m_sendFileTransferId = transferId;
+    server.m_sendFileTransactionState = state;
+
+    EXPECT_TRUE(server.handleTransactionalFileAck(
+        &other, barrier::FileTransferFrame::startAck(
+            other.connectionBinding, transferId,
+            barrier::FileTransferReason::kNone)));
+    EXPECT_TRUE(server.handleTransactionalFileAck(
+        &source, barrier::FileTransferFrame::startAck(
+            source.connectionBinding, transferId + 1,
+            barrier::FileTransferReason::kNone)));
+    EXPECT_FALSE(server.handleTransactionalFileAck(
+        &source, barrier::FileTransferFrame::startAck(
+            other.connectionBinding, transferId,
+            barrier::FileTransferReason::kNone)));
+
+    EXPECT_TRUE(server.handleTransactionalFileAck(
+        &source, barrier::FileTransferFrame::startAck(
+            source.connectionBinding, transferId,
+            barrier::FileTransferReason::kNone)));
+    EXPECT_EQ(barrier::FileTransferReason::kNone,
+              state->waitForStartAck());
+
+    EXPECT_TRUE(server.handleTransactionalFileAck(
+        &source, barrier::FileTransferFrame::startAck(
+            source.connectionBinding, transferId,
+            barrier::FileTransferReason::kNone)));
+}
+
+TEST(ServerReconnectTests, queuedTransactionalCancelIsNotRetiredBeforeFrameDispatch)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    BoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 15);
+    std::shared_ptr<barrier::FileTransferSendState> state(
+        new barrier::FileTransferSendState(transferId));
+    ASSERT_TRUE(state->markStartQueued(1));
+    ASSERT_TRUE(state->signalStartAck(
+        transferId, barrier::FileTransferReason::kNone));
+    ASSERT_TRUE(state->markCancelQueued(
+        barrier::FileTransferReason::kCancelled));
+
+    server.m_sendFileTarget = &client;
+    server.m_sendFileTransferId = transferId;
+    server.m_sendFileTransactionState = state;
+    server.m_sendFileStarted = true;
+    server.m_sendFileCompletionPending = false;
+    server.m_sendFileThread = new Thread([]() { });
+    for (int i = 0; i < 200 && !server.m_sendFileThread->wait(0.0); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(server.m_sendFileThread->wait(0.0));
+
+    server.handleFileKeepAliveEvent(Event(), NULL);
+
+    EXPECT_EQ(NULL, server.m_sendFileThread);
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_EQ(state, server.m_sendFileTransactionState);
+
+    server.m_sendFileTarget = NULL;
+    server.m_sendFileTransactionState.reset();
+    server.m_sendFileCompletionPending = false;
+    server.m_sendFileStarted = false;
+}
+
+TEST(ServerReconnectTests, cancelAckPollsBulkDrainThenStartsNextSend)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    IStreamEvents streamEvents;
+    FileEvents fileEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    streamEvents.setEvents(&events);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    EventQueueTimer* drainTimer = reinterpret_cast<EventQueueTimer*>(23);
+    EXPECT_CALL(events, newOneShotTimer(DoubleEq(0.01), nullptr))
+        .WillOnce(Return(drainTimer));
+    EXPECT_CALL(events, deleteTimer(drainTimer)).Times(1);
+
+    NiceMock<MockPrimaryClient> primary;
+    RoutedBoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    UInt32 bufferedOutput = 4096;
+    NiceMock<MockStream>* bulkStream = new NiceMock<MockStream>();
+    ON_CALL(*bulkStream, getEventTarget()).WillByDefault(Return(bulkStream));
+    ON_CALL(*bulkStream, getBufferedOutputSize()).WillByDefault(Invoke(
+        [&bufferedOutput]() { return bufferedOutput; }));
+    NoopBulkHandler bulkHandler;
+    client.bulkRoute = std::make_shared<barrier::BulkChannel>(
+        bulkStream, &bulkHandler, &events);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 32);
+    std::shared_ptr<barrier::FileTransferSendState> state(
+        new barrier::FileTransferSendState(transferId));
+    ASSERT_TRUE(state->markStartQueued(4096));
+    ASSERT_TRUE(state->signalStartAck(
+        transferId, barrier::FileTransferReason::kNone));
+    ASSERT_TRUE(state->markDataQueued(0, 4096));
+    ASSERT_TRUE(state->markCancelQueued(
+        barrier::FileTransferReason::kCancelled));
+    server.m_sendFileTarget = &client;
+    server.m_sendFileTransferId = transferId;
+    server.m_sendFileTransactionState = state;
+    server.m_sendFileBulkChannel = client.bulkRoute;
+    server.m_sendFileStarted = true;
+    server.m_sendFileCompletionPending = true;
+    server.m_sendFileCancelAckPending = true;
+
+    const barrier::fs::path nextPath =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-after-cancel-drain.txt");
+    std::error_code ec;
+    barrier::fs::remove(nextPath, ec);
+    {
+        std::ofstream nextFile(
+            nextPath.u8string().c_str(),
+            std::ios::out | std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(nextFile.is_open());
+        nextFile << "next transfer";
+    }
+    server.m_pendingManualFileSendTarget = &client;
+    server.m_pendingManualFileSendPath = nextPath.u8string();
+
+    EXPECT_TRUE(server.handleTransactionalFileAck(
+        &client, barrier::FileTransferFrame::cancelAck(
+            client.connectionBinding, transferId,
+            barrier::FileTransferReason::kNone)));
+
+    EXPECT_TRUE(state->cancelAcknowledged());
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_EQ(state, server.m_sendFileTransactionState);
+    EXPECT_TRUE(server.testHasSendFileReapTimer());
+    EXPECT_EQ(&client, server.m_pendingManualFileSendTarget);
+
+    bufferedOutput = 0;
+    server.testHandleSendFileReap();
+
+    EXPECT_FALSE(server.testHasSendFileReapTimer());
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_GT(server.m_sendFileTransferId, transferId);
+    EXPECT_TRUE(server.m_sendFileTransactionState);
+    EXPECT_NE(state, server.m_sendFileTransactionState);
+    EXPECT_NE(nullptr, server.m_sendFileThread);
+    EXPECT_EQ(nullptr, server.m_pendingManualFileSendTarget);
+
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(true));
+    barrier::fs::remove(nextPath, ec);
+    client.bulkRoute.reset();
+}
+
+TEST(ServerReconnectTests, stalledBulkDrainTimeoutRetiresWithoutWaitingForControlOutput)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+
+    NiceMock<MockPrimaryClient> primary;
+    RoutedBoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    NiceMock<MockStream>* controlStream =
+        static_cast<NiceMock<MockStream>*>(client.getStream());
+    ON_CALL(*controlStream, getBufferedOutputSize())
+        .WillByDefault(Return(2048u));
+    NiceMock<MockStream>* bulkStream = new NiceMock<MockStream>();
+    ON_CALL(*bulkStream, getEventTarget()).WillByDefault(Return(bulkStream));
+    ON_CALL(*bulkStream, getBufferedOutputSize())
+        .WillByDefault(Return(4096u));
+    NoopBulkHandler bulkHandler;
+    client.bulkRoute = std::make_shared<barrier::BulkChannel>(
+        bulkStream, &bulkHandler, &events);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 33);
+    std::shared_ptr<barrier::FileTransferSendState> state(
+        new barrier::FileTransferSendState(transferId));
+    ASSERT_TRUE(state->markStartQueued(4096));
+    ASSERT_TRUE(state->signalStartAck(
+        transferId, barrier::FileTransferReason::kNone));
+    ASSERT_TRUE(state->markDataQueued(0, 4096));
+    ASSERT_TRUE(state->markCancelQueued(
+        barrier::FileTransferReason::kCancelled));
+    ASSERT_TRUE(state->signalCancelAck(
+        transferId, barrier::FileTransferReason::kNone));
+    server.m_sendFileTarget = &client;
+    server.m_sendFileTransferId = transferId;
+    server.m_sendFileTransactionState = state;
+    server.m_sendFileBulkChannel = client.bulkRoute;
+    server.m_sendFileStarted = true;
+    server.m_sendFileCompletionPending = true;
+    server.m_sendFileOutputDrainTransferId = transferId;
+    server.m_sendFileOutputDrainDeadline = ARCH->time() - 1.0;
+
+    server.serviceSendFileCompletion();
+
+    EXPECT_EQ(nullptr, server.m_sendFileTarget);
+    EXPECT_FALSE(server.m_sendFileTransactionState);
+    EXPECT_FALSE(server.m_sendFileBulkChannel);
+    EXPECT_FALSE(client.bulkRoute->isActive());
+    EXPECT_FALSE(client.offeredToken.empty());
+    client.bulkRoute.reset();
+}
+
+TEST(ServerReconnectTests, activePackagingDoesNotEnterSenderReapPolling)
+{
+    Server server;
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 16);
+    std::shared_ptr<barrier::FileTransferSendState> state(
+        new barrier::FileTransferSendState(transferId));
+    server.m_sendFileTransactionState = state;
+    server.m_sendFileStarted = false;
+    server.m_sendFileCompletionPending = false;
+
+    EXPECT_FALSE(server.testCompletedSendFileMayRetire());
+    ASSERT_TRUE(state->fail(barrier::FileTransferReason::kIoError));
+    EXPECT_TRUE(server.testCompletedSendFileMayRetire());
+
+    server.m_sendFileTransactionState.reset();
+}
+
+TEST(ServerReconnectTests, terminalAckArmsReaperUntilSenderThreadExits)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    EventQueueTimer* reapTimer = reinterpret_cast<EventQueueTimer*>(10);
+    EXPECT_CALL(events, newOneShotTimer(DoubleEq(0.01), nullptr))
+        .WillOnce(Return(reapTimer));
+    EXPECT_CALL(events, deleteTimer(reapTimer)).Times(1);
+
+    NiceMock<MockPrimaryClient> primary;
+    BoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 16);
+    std::shared_ptr<barrier::FileTransferSendState> state(
+        new barrier::FileTransferSendState(transferId));
+    ASSERT_TRUE(state->markStartQueued(1));
+    ASSERT_TRUE(state->signalStartAck(
+        transferId, barrier::FileTransferReason::kNone));
+    ASSERT_TRUE(state->markDataQueued(0, 1));
+    ASSERT_TRUE(state->markEndQueued(1));
+    server.m_sendFileTarget = &client;
+    server.m_sendFileTransferId = transferId;
+    server.m_sendFileTransactionState = state;
+    server.m_sendFileStarted = true;
+    server.m_sendFileCompletionPending = true;
+
+    std::atomic<bool> releaseSender(false);
+    Thread* sender = new Thread([&releaseSender]() {
+        while (!releaseSender.load()) {
+            ARCH->sleep(0.001);
+        }
+    });
+    server.m_sendFileThread = sender;
+
+    EXPECT_TRUE(server.handleTransactionalFileAck(
+        &client, barrier::FileTransferFrame::commitAck(
+            client.connectionBinding, transferId,
+            barrier::FileTransferReason::kNone)));
+
+    EXPECT_TRUE(state->committed());
+    EXPECT_EQ(sender, server.m_sendFileThread);
+    EXPECT_TRUE(server.testHasSendFileReapTimer());
+    EXPECT_EQ(state, server.m_sendFileTransactionState);
+
+    releaseSender.store(true);
+    for (int i = 0; i < 200 && !sender->wait(0.0); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(sender->wait(0.0));
+    server.testHandleSendFileReap();
+
+    EXPECT_EQ(NULL, server.m_sendFileThread);
+    EXPECT_FALSE(server.testHasSendFileReapTimer());
+    EXPECT_FALSE(server.m_sendFileTransactionState);
+    EXPECT_EQ(NULL, server.m_sendFileTarget);
+}
+
+TEST(ServerReconnectTests, transactionalClipboardReceiveJoinsMetadataAtCommit)
+{
+    Server server;
+    BoundBulkRecordingClient source("source");
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kSecondary, 9);
+    const barrier::FileTransferFrame start = barrier::FileTransferFrame::start(
+        source.connectionBinding, transferId, 7,
+        barrier::FileTransferKind::kClipboard, 41, kLocalFileSessionId);
+
+    Server::TransactionalFileReceiveContext context;
+    ASSERT_EQ(barrier::FileTransferReason::kNone,
+              server.prepareTransactionalFileReceive(&source, start, context));
+    EXPECT_EQ(barrier::FileTransferKind::kClipboard, context.kind);
+    EXPECT_EQ(41u, context.senderClipboardRevision);
+    EXPECT_EQ(kLocalFileSessionId, context.clipboardSessionId);
+
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = kLocalFileSessionId;
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+    server.m_remoteFileClipboardOriginBinding = source.connectionBinding;
+
+    std::atomic<bool> releaseWriter(false);
+    server.m_writeToDropDirThread = new Thread([&releaseWriter]() {
+        while (!releaseWriter.load()) {
+            ARCH->sleep(0.001);
+            Thread::testCancel();
+        }
+    });
+    barrier::CompletedFilePayload payload;
+    payload.data = "payload";
+    payload.expectedSize = payload.data.size();
+    EXPECT_EQ(barrier::FileTransferReason::kNone,
+              server.acceptTransactionalFileReceive(
+                  context, std::move(payload)));
+    ASSERT_EQ(1u, server.m_pendingDropDirTransfers.size());
+    EXPECT_EQ(barrier::FileTransferKind::kClipboard,
+              server.m_pendingDropDirTransfers.back()->kind);
+    EXPECT_EQ(kLocalFileSessionId,
+              server.m_pendingDropDirTransfers.back()->remoteFileClipboardSession);
+    EXPECT_EQ("source",
+              server.m_pendingDropDirTransfers.back()->remoteFileClipboardOrigin);
+    EXPECT_EQ(server.m_clipboardRevision,
+              server.m_pendingDropDirTransfers.back()->clipboardRevision);
+
+    server.releasePendingDropDirTransfers();
+    releaseWriter.store(true);
+    for (int i = 0; i < 500 && server.testHasWriteToDropDirThread(); ++i) {
+        ARCH->sleep(0.001);
+        server.testCleanupWriteToDropDirThread();
+    }
+    EXPECT_FALSE(server.testHasWriteToDropDirThread());
+}
+
+TEST(ServerReconnectTests, transactionalClipboardReceiveRejectsMissingOrSupersededMetadata)
+{
+    Server server;
+    BoundBulkRecordingClient source("source");
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kSecondary, 10);
+    const barrier::FileTransferFrame start = barrier::FileTransferFrame::start(
+        source.connectionBinding, transferId, 7,
+        barrier::FileTransferKind::kClipboard, 42, kLocalFileSessionId);
+    Server::TransactionalFileReceiveContext context;
+    ASSERT_EQ(barrier::FileTransferReason::kNone,
+              server.prepareTransactionalFileReceive(&source, start, context));
+
+    barrier::CompletedFilePayload missingMetadata;
+    missingMetadata.data = "payload";
+    missingMetadata.expectedSize = missingMetadata.data.size();
+    EXPECT_EQ(barrier::FileTransferReason::kRejected,
+              server.acceptTransactionalFileReceive(
+                  context, std::move(missingMetadata)));
+    EXPECT_TRUE(server.m_pendingDropDirTransfers.empty());
+
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = kLocalFileSessionId;
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+    server.m_remoteFileClipboardOriginBinding = source.connectionBinding;
+    server.supersedeFileClipboard("newer text clipboard");
+
+    barrier::CompletedFilePayload superseded;
+    superseded.data = "payload";
+    superseded.expectedSize = superseded.data.size();
+    EXPECT_EQ(barrier::FileTransferReason::kRejected,
+              server.acceptTransactionalFileReceive(
+                  context, std::move(superseded)));
+    EXPECT_TRUE(server.m_pendingDropDirTransfers.empty());
+}
+
+TEST(ServerReconnectTests, transactionalClipboardReceiveRejectsDifferentOriginBinding)
+{
+    Server server;
+    BoundBulkRecordingClient source("source");
+    BoundBulkRecordingClient other("other");
+    other.connectionBinding = "ffeeddccbbaa99887766554433221100";
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kSecondary, 11);
+    const barrier::FileTransferFrame start = barrier::FileTransferFrame::start(
+        source.connectionBinding, transferId, 7,
+        barrier::FileTransferKind::kClipboard, 43, kLocalFileSessionId);
+    Server::TransactionalFileReceiveContext context;
+    ASSERT_EQ(barrier::FileTransferReason::kNone,
+              server.prepareTransactionalFileReceive(&source, start, context));
+
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = kLocalFileSessionId;
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+    server.m_remoteFileClipboardOriginBinding = other.connectionBinding;
+
+    barrier::CompletedFilePayload payload;
+    payload.data = "payload";
+    payload.expectedSize = payload.data.size();
+    EXPECT_EQ(barrier::FileTransferReason::kRejected,
+              server.acceptTransactionalFileReceive(
+                  context, std::move(payload)));
+    EXPECT_TRUE(server.m_pendingDropDirTransfers.empty());
+}
+
+TEST(ServerReconnectTests, transactionalManualAndDragDoNotInheritClipboardIdentity)
+{
+    Server server;
+    BoundBulkRecordingClient source("source");
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = kLocalFileSessionId;
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+    server.m_remoteFileClipboardOriginBinding = source.connectionBinding;
+
+    DragInformation entry;
+    String draggedFilename("dragged.txt");
+    entry.setFilename(draggedFilename);
+    server.m_transactionalDragFileLists[&source].push_back(entry);
+
+    Server::TransactionalFileReceiveContext manualContext;
+    const barrier::FileTransferFrame manualStart =
+        barrier::FileTransferFrame::start(
+            source.connectionBinding,
+            barrier::FileTransferProtocol::makeTransferId(
+                barrier::FileTransferRole::kSecondary, 12), 7,
+            barrier::FileTransferKind::kManual);
+    ASSERT_EQ(barrier::FileTransferReason::kNone,
+              server.prepareTransactionalFileReceive(
+                  &source, manualStart, manualContext));
+    EXPECT_EQ(barrier::FileTransferKind::kManual, manualContext.kind);
+    EXPECT_TRUE(manualContext.clipboardSessionId.empty());
+    EXPECT_TRUE(manualContext.dragFileList.empty());
+    ASSERT_EQ(1u, server.m_transactionalDragFileLists[&source].size());
+
+    Server::TransactionalFileReceiveContext dragContext;
+    const barrier::FileTransferFrame dragStart =
+        barrier::FileTransferFrame::start(
+            source.connectionBinding,
+            barrier::FileTransferProtocol::makeTransferId(
+                barrier::FileTransferRole::kSecondary, 13), 7,
+            barrier::FileTransferKind::kDrag);
+    ASSERT_EQ(barrier::FileTransferReason::kNone,
+              server.prepareTransactionalFileReceive(
+                  &source, dragStart, dragContext));
+    EXPECT_EQ(barrier::FileTransferKind::kDrag, dragContext.kind);
+    EXPECT_TRUE(dragContext.clipboardSessionId.empty());
+    ASSERT_EQ(1u, dragContext.dragFileList.size());
+    EXPECT_EQ(0u, server.m_transactionalDragFileLists.count(&source));
+}
+
+TEST(ServerReconnectTests, transactionalBulkDisconnectWakesSenderWaiter)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+    EXPECT_CALL(events, adoptHandler(_, _, _)).Times(AnyNumber());
+    EXPECT_CALL(events, removeHandler(_, _)).Times(AnyNumber());
+
+    BoundBulkRecordingClient source("source");
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    ON_CALL(*stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    NoopBulkHandler handler;
+    std::shared_ptr<barrier::BulkChannel> channel(
+        new barrier::BulkChannel(stream, &handler, &events));
+    const UInt32 transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kPrimary, 8);
+    std::shared_ptr<barrier::FileTransferSendState> state(
+        new barrier::FileTransferSendState(transferId));
+    ASSERT_TRUE(state->markStartQueued(3));
+
+    Server server;
+    server.m_sendFileTarget = &source;
+    server.m_sendFileBulkChannel = channel;
+    server.m_sendFileTransactionState = state;
+    server.handleBulkDisconnected(&source, channel.get());
+
+    EXPECT_EQ(barrier::FileTransferReason::kConnectionLost,
+              state->waitForStartAck());
+    channel->close();
+}
+
+TEST(ServerReconnectTests, transactionalReceiveQueueFullReturnsBusy)
+{
+    Server server;
+    BoundBulkRecordingClient source("source");
+    std::atomic<bool> releaseWriter(false);
+    server.m_writeToDropDirThread = new Thread([&releaseWriter]() {
+        while (!releaseWriter.load()) {
+            ARCH->sleep(0.001);
+            Thread::testCancel();
+        }
+    });
+    for (int i = 0; i < 4; ++i) {
+        server.testQueueDropDirTransfer("queued");
+    }
+    ASSERT_EQ(4u, server.testPendingDropDirTransferCount());
+
+    Server::TransactionalFileReceiveContext context;
+    context.source = &source;
+    context.transferId = barrier::FileTransferProtocol::makeTransferId(
+        barrier::FileTransferRole::kSecondary, 9);
+    context.connectionBinding = source.connectionBinding;
+    barrier::CompletedFilePayload payload;
+    payload.data = "fifth";
+    payload.expectedSize = payload.data.size();
+    EXPECT_EQ(barrier::FileTransferReason::kBusy,
+              server.acceptTransactionalFileReceive(
+                  context, std::move(payload)));
+    EXPECT_EQ(4u, server.testPendingDropDirTransferCount());
+
+    server.releasePendingDropDirTransfers();
+    releaseWriter.store(true);
+    for (int i = 0; i < 500 && server.testHasWriteToDropDirThread(); ++i) {
+        ARCH->sleep(0.001);
+        server.testCleanupWriteToDropDirThread();
+    }
+    EXPECT_FALSE(server.testHasWriteToDropDirThread());
+}
+
+TEST(ServerReconnectTests, failedBulkInputPauseReleasesReceiveGeneration)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    FileReceiveSession& session = server.getFileReceiveSession();
+    ASSERT_TRUE(session.begin(4, FileChunk::kMemoryReceiveLimit, 64));
+    server.bindFileReceiveClipboardRevision(&client, NULL);
+    const std::uint64_t failedGeneration = session.generation();
+
+    server.handleBulkInputPauseFailed(&client, NULL, failedGeneration);
+
+    EXPECT_EQ(FileReceiveSession::kIdle, session.state());
+    EXPECT_FALSE(session.matchesGeneration(failedGeneration));
+    EXPECT_EQ(NULL, server.m_fileReceiveSource);
+    EXPECT_EQ(NULL, server.m_fileReceiveBulkChannel);
+    EXPECT_TRUE(session.begin(4, FileChunk::kMemoryReceiveLimit, 64));
+}
+
+TEST(ServerReconnectTests, completedBulkInputPauseFailureReleasesReceiveGeneration)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    FileReceiveSession& session = server.getFileReceiveSession();
+    ASSERT_TRUE(session.begin(0, FileChunk::kMemoryReceiveLimit, 64));
+    ASSERT_TRUE(session.finish());
+    ASSERT_EQ(FileReceiveSession::kComplete, session.state());
+    server.bindFileReceiveClipboardRevision(&client, NULL);
+    const std::uint64_t failedGeneration = session.generation();
+
+    server.handleBulkDisconnected(&client, NULL, failedGeneration);
+
+    EXPECT_EQ(FileReceiveSession::kIdle, session.state());
+    EXPECT_FALSE(session.matchesGeneration(failedGeneration));
+    EXPECT_TRUE(session.begin(4, FileChunk::kMemoryReceiveLimit, 64));
+}
+
+TEST(ServerReconnectTests, failedBulkCommitBarrierRenewsChannelAndReceiveSession)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+
+    ClipboardPrimaryClient primary;
+    BulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    ON_CALL(*stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    NoopBulkHandler handler;
+    std::shared_ptr<barrier::BulkChannel> channel =
+        std::make_shared<barrier::BulkChannel>(stream, &handler, &events);
+
+    FileReceiveSession& session = server.getFileReceiveSession();
+    ASSERT_TRUE(session.begin(0, FileChunk::kMemoryReceiveLimit, 64));
+    ASSERT_TRUE(session.finish());
+    ASSERT_EQ(FileReceiveSession::kComplete, session.state());
+    server.bindFileReceiveClipboardRevision(&client, channel.get());
+
+    server.completeFileReceiveRoute(&client, channel.get());
+
+    EXPECT_FALSE(channel->isActive());
+    EXPECT_EQ(FileReceiveSession::kIdle, session.state());
+    EXPECT_TRUE(session.begin(4, FileChunk::kMemoryReceiveLimit, 64));
+    EXPECT_EQ(64u, client.offeredToken.size());
+    EXPECT_EQ(1u, server.m_pendingBulkBindings.size());
+}
+
+TEST(ServerReconnectTests, staleBulkInputPauseFailureDoesNotResetNewReceive)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+
+    FileReceiveSession& session = server.getFileReceiveSession();
+    ASSERT_TRUE(session.begin(3, FileChunk::kMemoryReceiveLimit, 64));
+    const std::uint64_t staleGeneration = session.generation();
+    session.reset();
+    ASSERT_TRUE(session.begin(4, FileChunk::kMemoryReceiveLimit, 64));
+    const std::uint64_t currentGeneration = session.generation();
+
+    server.handleBulkDisconnected(&client, NULL, staleGeneration);
+
+    EXPECT_TRUE(session.matchesGeneration(currentGeneration));
+    EXPECT_EQ(FileReceiveSession::kReceiving, session.state());
+    EXPECT_EQ(4u, session.expectedSize());
+}
+
+TEST(ServerReconnectTests, defaultMockConfigHasNoLockToScreenAction)
+{
+    NiceMock<MockConfig> config;
+
+    EXPECT_FALSE(config.hasLockToScreenAction());
+}
+
 TEST(ServerReconnectTests, constructorInitializesTransferAndCursorState)
 {
     TestEventQueue events;
@@ -636,12 +2427,134 @@ TEST(ServerReconnectTests, constructorInitializesTransferAndCursorState)
     Server server(config, &primary, &screen, &events, args);
     server.m_mock = true;
 
-    EXPECT_TRUE(server.isReceivedFileSizeValid());
-    EXPECT_EQ(0u, server.m_expectedFileSize);
-    EXPECT_TRUE(server.m_receivedFileData.empty());
-    EXPECT_TRUE(server.m_receivedFileSpoolPath.empty());
+    EXPECT_FALSE(server.isReceivedFileSizeValid());
+    EXPECT_EQ(0u, server.m_fileReceiveSession.expectedSize());
+    EXPECT_TRUE(server.m_fileReceiveSession.data().empty());
+    EXPECT_TRUE(server.m_fileReceiveSession.spoolPath().empty());
     EXPECT_EQ(0, server.m_x);
     EXPECT_EQ(0, server.m_y);
+}
+
+TEST(ServerReconnectTests,
+     asyncMaterializedClipboardQueueWaitsForPlatformCommit)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient active("client");
+    AsyncClipboardPublicationScreen screen;
+    Server server;
+    initializeServer(server, config, primary, events, active);
+    server.m_screen = &screen;
+
+    std::vector<std::string> paths(1, "/tmp/materialized.txt");
+    server.testSetFileClipboardSessions(
+        kMaterializedFileSessionId, kMaterializedFileSessionId, paths);
+    server.testPublishMaterializedFileClipboard();
+
+    ASSERT_NE(0u, screen.publicationId);
+    EXPECT_EQ(screen.publicationId,
+              server.testPendingClipboardPublicationId());
+    EXPECT_EQ(kMaterializedFileSessionId,
+              server.testRemoteFileClipboardSession());
+    EXPECT_FALSE(server.testMaterializedClipboardCommitted());
+
+    server.testHandleClipboardPublished(
+        screen.publicationId,
+        IScreen::ClipboardPublicationResult::Succeeded);
+
+    EXPECT_EQ(0u, server.testPendingClipboardPublicationId());
+    EXPECT_TRUE(server.testRemoteFileClipboardSession().empty());
+    EXPECT_TRUE(server.testMaterializedClipboardCommitted());
+}
+
+TEST(ServerReconnectTests,
+     failedOrStaleAsyncMaterializedClipboardDoesNotCommit)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient active("client");
+    AsyncClipboardPublicationScreen screen;
+    Server server;
+    initializeServer(server, config, primary, events, active);
+    server.m_screen = &screen;
+
+    std::vector<std::string> paths(1, "/tmp/materialized.txt");
+    server.testSetFileClipboardSessions(
+        kMaterializedFileSessionId, kMaterializedFileSessionId, paths);
+    server.testPublishMaterializedFileClipboard();
+    const std::uint64_t failedId = screen.publicationId;
+    ASSERT_NE(0u, failedId);
+
+    server.testHandleClipboardPublished(
+        failedId, IScreen::ClipboardPublicationResult::Failed);
+    EXPECT_EQ(kMaterializedFileSessionId,
+              server.testRemoteFileClipboardSession());
+    EXPECT_FALSE(server.testMaterializedClipboardCommitted());
+
+    server.testPublishMaterializedFileClipboard();
+    const std::uint64_t staleId = screen.publicationId;
+    ASSERT_NE(failedId, staleId);
+    server.testSupersedeFileClipboard("new local revision");
+    server.testHandleClipboardPublished(
+        staleId, IScreen::ClipboardPublicationResult::Succeeded);
+
+    EXPECT_FALSE(server.testMaterializedClipboardCommitted());
+}
+
+TEST(ServerReconnectTests,
+     failedSynchronousMaterializedClipboardRetainsPendingSession)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient active("client");
+    DragPlatformScreen* platform = new DragPlatformScreen();
+    platform->acceptClipboardSet = false;
+    barrier::Screen screen(platform, &events);
+    Server server;
+    initializeServer(server, config, primary, events, active);
+    server.m_screen = &screen;
+
+    std::vector<std::string> paths(1, "/tmp/materialized.txt");
+    server.testSetFileClipboardSessions(
+        kMaterializedFileSessionId, kMaterializedFileSessionId, paths);
+    server.testPublishMaterializedFileClipboard();
+
+    EXPECT_EQ(kMaterializedFileSessionId,
+              server.testRemoteFileClipboardSession());
+    EXPECT_FALSE(server.testMaterializedClipboardCommitted());
 }
 
 TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotPublishForeignSourcePaths)
@@ -678,7 +2591,7 @@ TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotPublishForeignSourcePa
                         kClipboardClipboard));
 }
 
-TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotPrefetchPrimarySourcePaths)
+TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotOverwriteCurrentOwner)
 {
     Config config;
     config.addScreen("primary");
@@ -689,12 +2602,48 @@ TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotPrefetchPrimarySourceP
     IScreenEvents screenEvents;
     ClipboardEvents clipboardEvents;
     ServerEvents serverEvents;
-    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
 
     ClipboardPrimaryClient primary;
     RecordingClient client("client");
     Server server;
     initializeServer(server, config, primary, events, client);
+    server.m_enableClipboard = true;
+    server.m_active = &client;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboard = makeTextClipboard("stale cached clipboard");
+
+    server.replayClipboardsToActive();
+
+    EXPECT_EQ(client.setClipboardIds.end(),
+              std::find(client.setClipboardIds.begin(),
+                        client.setClipboardIds.end(),
+                        kClipboardClipboard));
+}
+
+TEST(ServerReconnectTests, replayClipboardsToActivePrefetchesPrimarySourcePaths)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    NoopBulkHandler bulkHandler;
+    RoutedBoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    attachTestBulkRoute(client, events, streamEvents, bulkHandler);
     server.m_clients.insert(std::make_pair(primary.getName(), &primary));
     server.m_clientSet.insert(&primary);
     server.m_enableClipboard = true;
@@ -706,13 +2655,332 @@ TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotPrefetchPrimarySourceP
 
     server.replayClipboardsToActive();
 
-    EXPECT_EQ(client.setClipboardIds.end(),
+    EXPECT_NE(client.setClipboardIds.end(),
               std::find(client.setClipboardIds.begin(),
                         client.setClipboardIds.end(),
                         kClipboardClipboard));
     EXPECT_EQ(0u, client.fileChunkCount);
+    EXPECT_TRUE(server.m_sendFileThread != NULL);
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(true));
+}
+
+TEST(ServerReconnectTests, replayClipboardsToActiveDoesNotWaitForExistingFileSender)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    NoopBulkHandler bulkHandler;
+    RoutedBoundBulkRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    attachTestBulkRoute(client, events, streamEvents, bulkHandler);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &client;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = primary.getName();
+    clipboard.m_clipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/primary-file.txt"));
+
+    std::atomic<bool> releaseSender(false);
+    std::atomic<bool> senderCancelled(false);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    server.m_sendFileTarget = &client;
+    server.m_sendFileChunker = chunker;
+    server.m_sendFileThread = new Thread([&releaseSender, &senderCancelled]() {
+        try {
+            while (!releaseSender.load()) {
+                ARCH->sleep(0.01);
+                Thread::testCancel();
+            }
+        }
+        catch (XThread&) {
+            senderCancelled.store(true);
+        }
+    });
+
+    Stopwatch elapsed;
+    server.replayClipboardsToActive();
+
+    EXPECT_LT(elapsed.getTime(), 0.5);
+    EXPECT_FALSE(senderCancelled.load());
+    EXPECT_FALSE(chunker->testShouldInterrupt());
+    EXPECT_TRUE(server.m_sendFileThread != NULL);
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_EQ(std::vector<barrier::fs::path>(
+                  1, barrier::fs::u8path("/tmp/primary-file.txt")),
+              server.m_pendingFileClipboardPrefetchPaths);
+    EXPECT_EQ(&client, server.m_pendingFileClipboardPrefetchTarget);
+
+    releaseSender.store(true);
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(false); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(false));
+}
+
+TEST(ServerReconnectTests, newestFileClipboardSupersedesActivePrefetchWithoutWaiting)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+
+    Server server;
+    ClipboardPrimaryClient primary;
+    NiceMock<MockStream>* controlStream = new NiceMock<MockStream>();
+    ON_CALL(*controlStream, getEventTarget()).WillByDefault(Return(controlStream));
+    ON_CALL(*controlStream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    Protocol112RecordingClient client(
+        "client", controlStream, &server, &events);
+    initializeServer(server, config, primary, events, client);
+    attachTestBulkRoute(client, events, streamEvents);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &client;
+    server.m_clipboardRevision.advance();
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = primary.getName();
+    clipboard.m_clipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/first.txt"));
+
+    const UInt32 oldTransferId =
+        barrier::FileTransferProtocol::makeTransferId(
+            barrier::FileTransferRole::kPrimary, 17);
+    std::shared_ptr<barrier::FileTransferSendState> oldState(
+        new barrier::FileTransferSendState(
+            oldTransferId, barrier::FileTransferKind::kClipboard,
+            server.m_clipboardRevision.sequence(), kLocalFileSessionId));
+    ASSERT_TRUE(oldState->markStartQueued(0));
+    ASSERT_TRUE(oldState->signalStartAck(
+        oldTransferId, barrier::FileTransferReason::kNone));
+
+    std::atomic<bool> releaseSender(false);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    server.m_sendFileTarget = &client;
+    server.m_sendFileChunker = chunker;
+    server.m_sendFileTransferId = oldTransferId;
+    server.m_sendFileTransactionState = oldState;
+    server.m_sendFileBulkChannel = client.acquireBulkChannel();
+    server.m_sendFileStarted = true;
+    server.m_sendFileIsClipboardPrefetch = true;
+    server.m_sendFileThread = new Thread([&releaseSender]() {
+        while (!releaseSender.load()) {
+            ARCH->sleep(0.01);
+            Thread::testCancel();
+        }
+    });
+
+    server.replayClipboardsToActive();
+    clipboard.m_clipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/latest.txt"));
+    Stopwatch elapsed;
+    server.replayClipboardsToActive();
+
+    EXPECT_LT(elapsed.getTime(), 0.5);
+    EXPECT_TRUE(chunker->testShouldInterrupt());
+    EXPECT_EQ(&client, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_EQ(std::vector<barrier::fs::path>(
+              1, barrier::fs::u8path("/tmp/latest.txt")),
+              server.m_pendingFileClipboardPrefetchPaths);
+
+    // Model the sender observing StreamChunker's interrupt and emitting the
+    // protocol 1.12 cancellation frame for the active transaction.
+    oldState->interrupt();
+    ASSERT_TRUE(oldState->markCancelQueued(
+        barrier::FileTransferReason::kCancelled));
+    FileChunk* cancel = FileChunk::cancel(
+        barrier::FileTransferReason::kCancelled);
+    cancel->m_transferId = oldTransferId;
+    server.onFileChunkSending(cancel);
+    delete cancel;
+
+    ASSERT_TRUE(server.m_sendFileCompletionPending);
+    ASSERT_TRUE(server.m_sendFileCancelAckPending);
+    releaseSender.store(true);
+    for (int i = 0; i < 200 && server.m_sendFileThread != NULL; ++i) {
+        server.handleFileKeepAliveEvent(Event(), NULL);
+        ARCH->sleep(0.001);
+    }
+
+    // Worker exit is not a commit boundary: the old route remains pinned until
+    // the peer acknowledges the transactional Cancel.
     EXPECT_EQ(NULL, server.m_sendFileThread);
-    EXPECT_EQ(NULL, server.m_sendFileTarget);
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_FALSE(server.m_pendingFileClipboardPrefetchPaths.empty());
+    EXPECT_EQ(oldState, server.m_sendFileTransactionState);
+
+    ASSERT_TRUE(server.handleTransactionalFileAck(
+        &client, barrier::FileTransferFrame::cancelAck(
+            client.getConnectionBinding(), oldTransferId,
+            barrier::FileTransferReason::kNone)));
+
+    EXPECT_TRUE(server.m_pendingFileClipboardPrefetchPaths.empty());
+    EXPECT_EQ(NULL, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_EQ(&client, server.m_sendFileTarget);
+    EXPECT_EQ(barrier::FileTransferProtocol::makeTransferId(
+                  barrier::FileTransferRole::kPrimary, 18),
+              server.m_sendFileTransferId);
+    EXPECT_NE(oldState, server.m_sendFileTransactionState);
+    EXPECT_TRUE(server.m_sendFileThread != NULL);
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(true));
+}
+
+TEST(ServerReconnectTests, newerTextClipboardCancelsPendingFilePrefetch)
+{
+    Server server;
+    RecordingClient client("client");
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    server.m_sendFileTarget = &client;
+    server.m_sendFileChunker = chunker;
+    server.m_sendFileIsClipboardPrefetch = true;
+    server.m_pendingFileClipboardPrefetchTarget = &client;
+    server.m_pendingFileClipboardPrefetchPaths.push_back(
+        barrier::fs::u8path("/tmp/stale.txt"));
+    server.m_pendingFileClipboardPrefetchSession = kLocalFileSessionId;
+    server.m_clipboardRevision.advance();
+    server.m_pendingFileClipboardPrefetchRevision = server.m_clipboardRevision;
+
+    server.supersedeFileClipboard("test text clipboard");
+
+    EXPECT_EQ(NULL, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_TRUE(server.m_pendingFileClipboardPrefetchPaths.empty());
+    EXPECT_TRUE(server.m_pendingFileClipboardPrefetchSession.empty());
+    EXPECT_FALSE(server.m_pendingFileClipboardPrefetchRevision.valid());
+    EXPECT_TRUE(chunker->testShouldInterrupt());
+
+    server.m_sendFileTarget = NULL;
+    server.m_sendFileChunker.reset();
+    server.m_sendFileIsClipboardPrefetch = false;
+}
+
+TEST(ServerReconnectTests, pendingPrefetchWaitsForTransactionalCommitAck)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+
+    Server server;
+    NiceMock<MockPrimaryClient> primary;
+    NiceMock<MockStream>* controlStream = new NiceMock<MockStream>();
+    ON_CALL(*controlStream, getEventTarget()).WillByDefault(Return(controlStream));
+    ON_CALL(*controlStream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    Protocol112RecordingClient client(
+        "client", controlStream, &server, &events);
+    initializeServer(server, config, primary, events, client);
+    attachTestBulkRoute(client, events, streamEvents);
+    server.m_clipboardRevision.advance();
+
+    const UInt32 oldTransferId =
+        barrier::FileTransferProtocol::makeTransferId(
+            barrier::FileTransferRole::kPrimary, 29);
+    std::shared_ptr<barrier::FileTransferSendState> oldState(
+        new barrier::FileTransferSendState(
+            oldTransferId, barrier::FileTransferKind::kClipboard,
+            server.m_clipboardRevision.sequence(), kLocalFileSessionId));
+    ASSERT_TRUE(oldState->markStartQueued(0));
+    ASSERT_TRUE(oldState->signalStartAck(
+        oldTransferId, barrier::FileTransferReason::kNone));
+    ASSERT_TRUE(oldState->markEndQueued(0));
+
+    std::atomic<bool> commitWaitReturned(false);
+    std::atomic<UInt32> commitResult(
+        static_cast<UInt32>(barrier::FileTransferReason::kProtocolError));
+    server.m_sendFileTarget = &client;
+    server.m_sendFileTransferId = oldTransferId;
+    server.m_sendFileTransactionState = oldState;
+    server.m_sendFileBulkChannel = client.acquireBulkChannel();
+    server.m_sendFileIsClipboardPrefetch = true;
+    server.m_sendFileStarted = true;
+    server.m_sendFileCompletionPending = false;
+    server.m_sendFileThread = new Thread(
+        [&commitWaitReturned, &commitResult, oldState]() {
+            commitResult.store(static_cast<UInt32>(
+                oldState->waitForCommitAck()));
+            commitWaitReturned.store(true);
+        });
+    server.m_pendingFileClipboardPrefetchTarget = &client;
+    const std::vector<barrier::fs::path> latest(
+        1, barrier::fs::u8path("/tmp/latest.txt"));
+    server.m_pendingFileClipboardPrefetchPaths = latest;
+    server.m_pendingFileClipboardPrefetchSession = kLocalFileSessionId;
+    server.m_pendingFileClipboardPrefetchRevision = server.m_clipboardRevision;
+
+    server.handleFileKeepAliveEvent(Event(), NULL);
+
+    EXPECT_EQ(latest, server.m_pendingFileClipboardPrefetchPaths);
+    EXPECT_EQ(&client, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_EQ(oldTransferId, server.m_sendFileTransferId);
+    EXPECT_NE(nullptr, server.m_sendFileThread);
+    EXPECT_FALSE(commitWaitReturned.load());
+
+    ASSERT_TRUE(server.handleTransactionalFileAck(
+        &client, barrier::FileTransferFrame::commitAck(
+            client.getConnectionBinding(), oldTransferId,
+            barrier::FileTransferReason::kNone)));
+    for (int i = 0; i < 200 &&
+            server.m_sendFileTransferId == oldTransferId; ++i) {
+        server.handleFileKeepAliveEvent(Event(), NULL);
+        ARCH->sleep(0.001);
+    }
+
+    EXPECT_TRUE(commitWaitReturned.load());
+    EXPECT_EQ(static_cast<UInt32>(barrier::FileTransferReason::kNone),
+              commitResult.load());
+    EXPECT_TRUE(server.m_pendingFileClipboardPrefetchPaths.empty());
+    EXPECT_EQ(NULL, server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_EQ(barrier::FileTransferProtocol::makeTransferId(
+                  barrier::FileTransferRole::kPrimary, 30),
+              server.m_sendFileTransferId);
+    EXPECT_NE(oldState, server.m_sendFileTransactionState);
+    EXPECT_TRUE(server.m_sendFileThread != NULL);
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(true));
 }
 
 TEST(ServerReconnectTests, sendDragInfoUsesSynchronousPathAndClearsState)
@@ -728,7 +2996,7 @@ TEST(ServerReconnectTests, sendDragInfoUsesSynchronousPathAndClearsState)
     setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
 
     NiceMock<MockPrimaryClient> primary;
-    RecordingClient target("target");
+    BoundBulkRecordingClient target("target");
     Server server;
     initializeServer(server, config, primary, events, target);
 
@@ -761,6 +3029,43 @@ TEST(ServerReconnectTests, sendDragInfoUsesSynchronousPathAndClearsState)
     barrier::fs::remove(secondPath);
 }
 
+TEST(ServerReconnectTests, legacyTargetDoesNotReceiveDragMetadata)
+{
+    Config config;
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient target("target");
+    Server server;
+    initializeServer(server, config, primary, events, target);
+
+    const barrier::fs::path path = barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-legacy-drag-info.txt");
+    {
+        std::ofstream file(path.u8string().c_str(),
+                           std::ios::out | std::ios::trunc);
+        file << "legacy";
+    }
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    platformScreen->draggingFilename = path.u8string() + "\n";
+    barrier::Screen screen(platformScreen, &events);
+    server.m_screen = &screen;
+
+    server.sendDragInfo(&target);
+
+    EXPECT_EQ(0u, target.dragInfoCount);
+    EXPECT_TRUE(server.m_dragFileList.empty());
+    barrier::fs::remove(path);
+}
+
 TEST(ServerReconnectTests, primaryDragAtEdgeSendsDragInfoAndSwitchesToTarget)
 {
     Config config;
@@ -776,7 +3081,7 @@ TEST(ServerReconnectTests, primaryDragAtEdgeSendsDragInfoAndSwitchesToTarget)
     setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
 
     EnterablePrimaryClient primary;
-    RecordingClient target("target");
+    BoundBulkRecordingClient target("target");
     Server server;
     initializeServer(server, config, primary, events, target);
     server.m_active = &primary;
@@ -828,41 +3133,102 @@ TEST(ServerReconnectTests, completedTransferSnapshotOwnsSpoolBeforeNextReceive)
     Server server;
     initializeServer(server, config, primary, events, active);
 
-    const barrier::fs::path spoolPath =
-        barrier::fs::temp_directory_path() / barrier::fs::u8path("weave-server-snapshot.part");
-    barrier::fs::remove(spoolPath);
-    {
-        std::ofstream file(spoolPath.u8string().c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        file << "payload";
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = "session-1";
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+    ASSERT_TRUE(server.m_fileReceiveSession.begin(7, 0, 0));
+    server.bindFileReceiveClipboardRevision();
+    ASSERT_TRUE(server.m_fileReceiveSession.append("payload"));
+    ASSERT_TRUE(server.m_fileReceiveSession.finish());
+    for (int i = 0; i < 500 && !server.m_fileReceiveSession.isComplete(); ++i) {
+        ARCH->sleep(0.001);
     }
+    ASSERT_TRUE(server.m_fileReceiveSession.isComplete());
+    const barrier::fs::path spoolPath = server.m_fileReceiveSession.spoolPath();
 
     DragInformation entry;
     String filename("payload.txt");
     entry.setFilename(filename);
 
-    server.m_expectedFileSize = 7;
-    server.m_receivedFileData = "memory-copy";
-    server.m_receivedFileSpoolPath = spoolPath;
     server.m_fakeDragFileList.push_back(entry);
-    server.m_remoteFileClipboardSession = "session-1";
 
     auto transfer = server.testTakeCompletedFileTransfer();
 
-    EXPECT_EQ(0u, server.m_expectedFileSize);
-    EXPECT_TRUE(server.m_receivedFileData.empty());
-    EXPECT_TRUE(server.m_receivedFileSpoolPath.empty());
+    EXPECT_EQ(0u, server.m_fileReceiveSession.expectedSize());
+    EXPECT_TRUE(server.m_fileReceiveSession.data().empty());
+    EXPECT_TRUE(server.m_fileReceiveSession.spoolPath().empty());
     EXPECT_TRUE(server.m_fakeDragFileList.empty());
     EXPECT_TRUE(barrier::fs::exists(spoolPath));
 
     ASSERT_TRUE(transfer);
     EXPECT_EQ(7u, transfer->expectedSize);
-    EXPECT_EQ("memory-copy", transfer->data);
+    EXPECT_TRUE(transfer->data.empty());
     EXPECT_EQ(spoolPath, transfer->spoolPath);
     EXPECT_EQ(1u, transfer->dragFileList.size());
     EXPECT_EQ("session-1", transfer->remoteFileClipboardSession);
 
     FileChunk::releaseReceiveBuffer(transfer->data, transfer->expectedSize, &transfer->spoolPath);
     EXPECT_FALSE(barrier::fs::exists(spoolPath));
+}
+
+TEST(ServerReconnectTests, completedTransferKeepsClipboardRevisionBoundAtStart)
+{
+    Config config;
+    config.addScreen("primary");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient active("primary");
+    Server server;
+    initializeServer(server, config, primary, events, active);
+
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = "session-a";
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+    const barrier::ClipboardRevision revisionA = server.m_clipboardRevision;
+
+    ASSERT_TRUE(server.m_fileReceiveSession.begin(7, 1024, 1024));
+    server.bindFileReceiveClipboardRevision();
+    ASSERT_TRUE(server.m_fileReceiveSession.append("payload"));
+    ASSERT_TRUE(server.m_fileReceiveSession.finish());
+
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = "session-b";
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+
+    std::shared_ptr<Server::CompletedFileTransfer> transfer =
+        server.testTakeCompletedFileTransfer();
+
+    ASSERT_TRUE(transfer);
+    EXPECT_EQ("session-a", transfer->remoteFileClipboardSession);
+    EXPECT_EQ(revisionA, transfer->clipboardRevision);
+    EXPECT_NE(server.m_clipboardRevision, transfer->clipboardRevision);
+    EXPECT_EQ("session-b", server.m_remoteFileClipboardSession);
+}
+
+TEST(ServerReconnectTests, firstFileTransferGetsValidClipboardRevision)
+{
+    Server server;
+
+    ASSERT_FALSE(server.m_clipboardRevision.valid());
+    ASSERT_TRUE(server.m_fileReceiveSession.begin(7, 1024, 1024));
+    server.bindFileReceiveClipboardRevision();
+    ASSERT_TRUE(server.m_fileReceiveSession.append("payload"));
+    ASSERT_TRUE(server.m_fileReceiveSession.finish());
+
+    std::shared_ptr<Server::CompletedFileTransfer> transfer =
+        server.testTakeCompletedFileTransfer();
+
+    ASSERT_TRUE(transfer);
+    EXPECT_TRUE(transfer->clipboardRevision.valid());
+    EXPECT_EQ(server.m_clipboardRevision, transfer->clipboardRevision);
 }
 
 TEST(ServerReconnectTests, fileReceiveCompleteDoesNotBlockOnBusyDropDirWriter)
@@ -900,24 +3266,32 @@ TEST(ServerReconnectTests, fileReceiveCompleteDoesNotBlockOnBusyDropDirWriter)
         }
     }));
 
-    server.m_expectedFileSize = 4;
-    server.m_receivedFileData = "data";
+    ASSERT_TRUE(server.m_fileReceiveSession.begin(4, FileChunk::kMemoryReceiveLimit, 64));
+    ASSERT_TRUE(server.m_fileReceiveSession.append("data"));
+    ASSERT_TRUE(server.m_fileReceiveSession.finish());
 
-    server.onFileRecieveCompleted();
+    server.onFileRecieveCompleted(server.m_fileReceiveSession.generation());
 
     EXPECT_FALSE(writerCancelled.load());
     EXPECT_TRUE(server.testHasWriteToDropDirThread());
     EXPECT_EQ(1u, server.testPendingDropDirTransferCount());
-    EXPECT_EQ(0u, server.m_expectedFileSize);
-    EXPECT_TRUE(server.m_receivedFileData.empty());
-    EXPECT_TRUE(server.m_receivedFileSpoolPath.empty());
+    EXPECT_EQ(0u, server.m_fileReceiveSession.expectedSize());
+    EXPECT_TRUE(server.m_fileReceiveSession.data().empty());
+    EXPECT_TRUE(server.m_fileReceiveSession.spoolPath().empty());
 
     releaseWriter.store(true);
-    EXPECT_TRUE(server.testCleanupWriteToDropDirThread());
+    for (int i = 0; i < 200 && server.testHasWriteToDropDirThread(); ++i) {
+        server.testCleanupWriteToDropDirThread();
+        ARCH->sleep(0.001);
+    }
+    ASSERT_FALSE(server.testHasWriteToDropDirThread());
     server.testDrainDropDirTransferQueue();
     EXPECT_EQ(0u, server.testPendingDropDirTransferCount());
     EXPECT_TRUE(server.testHasWriteToDropDirThread());
-    EXPECT_TRUE(server.testCleanupWriteToDropDirThread());
+    for (int i = 0; i < 200 && server.testHasWriteToDropDirThread(); ++i) {
+        server.testCleanupWriteToDropDirThread();
+        ARCH->sleep(0.001);
+    }
     EXPECT_FALSE(server.testHasWriteToDropDirThread());
 }
 
@@ -962,24 +3336,55 @@ TEST(ServerReconnectTests, clientDisconnectReleasesPartialReceiveSpool)
     Server server;
     initializeServer(server, config, primary, events, active);
 
-    const barrier::fs::path spoolPath =
-        barrier::fs::temp_directory_path() / barrier::fs::u8path("weave-server-disconnect-spool.part");
-    barrier::fs::remove(spoolPath);
-    {
-        std::ofstream file(spoolPath.u8string().c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        file << "partial";
-    }
+    RecordingClient* source = new RecordingClient("client");
+    ASSERT_TRUE(server.m_fileReceiveSession.begin(1024, 0, 0));
+    ASSERT_TRUE(server.m_fileReceiveSession.append("partial"));
+    server.bindFileReceiveClipboardRevision(source, NULL);
+    const barrier::fs::path spoolPath = server.m_fileReceiveSession.spoolPath();
 
-    server.m_expectedFileSize = 1024;
-    server.m_receivedFileData = "stale";
-    server.m_receivedFileSpoolPath = spoolPath;
+    server.handleClientDisconnected(Event(), source);
 
-    server.handleClientDisconnected(Event(), new RecordingClient("client"));
-
-    EXPECT_EQ(0u, server.m_expectedFileSize);
-    EXPECT_TRUE(server.m_receivedFileData.empty());
-    EXPECT_TRUE(server.m_receivedFileSpoolPath.empty());
+    EXPECT_EQ(0u, server.m_fileReceiveSession.expectedSize());
+    EXPECT_TRUE(server.m_fileReceiveSession.data().empty());
+    EXPECT_TRUE(server.m_fileReceiveSession.spoolPath().empty());
     EXPECT_FALSE(barrier::fs::exists(spoolPath));
+}
+
+TEST(ServerReconnectTests, oldClientRemovalClearsInputHandoffHandler)
+{
+    Config config;
+    config.addScreen("primary");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+    Event::Type nextType = Event::kLast;
+    ON_CALL(events, registerTypeOnce(_, _)).WillByDefault(
+        Invoke([&nextType](Event::Type& type, const char*) {
+            if (type == Event::kUnknown) {
+                type = nextType++;
+            }
+            return type;
+        }));
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient active("primary");
+    RecordingClient oldClient("old-client");
+    Server server;
+    initializeServer(server, config, primary, events, active);
+    EventQueueTimer* timer = reinterpret_cast<EventQueueTimer*>(1);
+    server.m_oldClients.insert(std::make_pair(&oldClient, timer));
+
+    EXPECT_CALL(events, removeHandler(_, _)).Times(AnyNumber());
+    EXPECT_CALL(events, removeHandler(
+        clientProxyEvents.inputHandoffReady(), &oldClient)).Times(1);
+
+    server.removeOldClient(&oldClient);
+
+    EXPECT_TRUE(server.m_oldClients.empty());
 }
 
 TEST(ServerReconnectTests, cleanupSendFileThreadReleasesAllDeferredClients)
@@ -1202,7 +3607,7 @@ TEST(ServerReconnectTests, fileKeepAliveDoesNotDeleteDeferredSendTargetUntilComp
     delete chunk;
 }
 
-TEST(ServerReconnectTests, fileKeepAliveKeepsConnectedTargetUntilCompletionChunk)
+TEST(ServerReconnectTests, connectedLegacyTargetIsRetainedUntilTerminalChunkIsRejected)
 {
     Config config;
     config.addScreen("primary");
@@ -1240,9 +3645,10 @@ TEST(ServerReconnectTests, fileKeepAliveKeepsConnectedTargetUntilCompletionChunk
     FileChunk* chunk = FileChunk::end();
     server.onFileChunkSending(chunk);
 
-    EXPECT_EQ(1u, client->fileChunkCount);
-    EXPECT_EQ(kDataEnd, client->lastFileChunkMark);
+    EXPECT_EQ(0u, client->fileChunkCount);
+    EXPECT_EQ(0u, client->lastFileChunkMark);
     EXPECT_EQ(NULL, server.m_sendFileTarget);
+    EXPECT_FALSE(server.m_sendFilePreflightFailed.load());
 
     delete chunk;
 
@@ -1291,12 +3697,83 @@ TEST(ServerReconnectTests, activeClientDisconnectEntersPrimaryAndClearsPendingSw
     EXPECT_EQ(&primary, server.m_active);
     EXPECT_EQ(NULL, server.m_switchScreen);
     EXPECT_EQ(1u, primary.enterCount);
-    EXPECT_EQ(512, primary.enterX);
-    EXPECT_EQ(384, primary.enterY);
+    EXPECT_EQ(100, primary.enterX);
+    EXPECT_EQ(100, primary.enterY);
     EXPECT_EQ(7u, primary.enterSeqNum);
     EXPECT_EQ(0u, primary.enterMask);
     EXPECT_FALSE(primary.enterForScreensaver);
     EXPECT_EQ(1u, screenSwitchedCount);
+}
+
+TEST(ServerReconnectTests, activeClientDisconnectRecoversNearRememberedPhysicalEdge)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient* client = new RecordingClient("client");
+    Server server;
+    initializeServer(server, config, primary, events, *client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.rememberPrimaryReturnAnchor(client, 0, 137, kLeft);
+
+    server.handleClientDisconnected(Event(), client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(16, primary.enterX);
+    EXPECT_EQ(137, primary.enterY);
+}
+
+TEST(ServerReconnectTests, activeClientDisconnectUsesCenterOnlyAfterInvalidLocalPoint)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    InvalidCursorPrimaryClient primary(&screen);
+    RecordingClient* client = new RecordingClient("client");
+    Server server;
+    initializeServer(server, config, primary, events, *client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+
+    server.handleClientDisconnected(Event(), client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(512, primary.enterX);
+    EXPECT_EQ(384, primary.enterY);
 }
 
 TEST(ServerReconnectTests, activeClientDisconnectDoesNotEnterUnavailablePrimary)
@@ -1386,9 +3863,47 @@ TEST(ServerReconnectTests, activeClientShapeChangedToUnusableRecoversToPrimary)
     EXPECT_EQ(&primary, server.m_active);
     EXPECT_EQ(NULL, server.m_switchScreen);
     EXPECT_EQ(1u, primary.enterCount);
-    EXPECT_EQ(512, primary.enterX);
-    EXPECT_EQ(384, primary.enterY);
+	EXPECT_EQ(100, primary.enterX);
+	EXPECT_EQ(100, primary.enterY);
     EXPECT_EQ(1u, screenSwitchedCount);
+}
+
+TEST(ServerReconnectTests, activeClientShapeRecoveryUsesRememberedPhysicalEdge)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.rememberPrimaryReturnAnchor(&client, 0, 137, kLeft);
+
+    client.shapeW = 0;
+    client.shapeH = 0;
+    server.handleShapeChanged(Event(), &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(16, primary.enterX);
+    EXPECT_EQ(137, primary.enterY);
 }
 
 TEST(ServerReconnectTests, adoptClient_replacesActiveSameNameClient_entersNewClient)
@@ -1402,6 +3917,19 @@ TEST(ServerReconnectTests, adoptClient_replacesActiveSameNameClient_entersNewCli
     ClipboardEvents clipboardEvents;
     ServerEvents serverEvents;
     setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    bool connectedEventOwnsData = false;
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&connectedEventOwnsData](const Event& event) {
+            if (event.getDataObject() != NULL) {
+                const Server::ScreenConnectedInfo* info =
+                    static_cast<const Server::ScreenConnectedInfo*>(event.getDataObject());
+                connectedEventOwnsData = true;
+                EXPECT_EQ(event.getData(), event.getDataObject());
+                EXPECT_EQ("client", info->m_screen);
+            }
+            Event::deleteData(event);
+        }));
 
     NiceMock<MockPrimaryClient> primary;
     ON_CALL(primary, getToggleMask()).WillByDefault(Return(KeyModifierCapsLock));
@@ -1421,6 +3949,158 @@ TEST(ServerReconnectTests, adoptClient_replacesActiveSameNameClient_entersNewCli
     EXPECT_EQ(8u, newClient.enterSeqNum);
     EXPECT_EQ(KeyModifierCapsLock, newClient.enterMask);
     EXPECT_FALSE(newClient.enterForScreensaver);
+    EXPECT_TRUE(connectedEventOwnsData);
+}
+
+TEST(ServerReconnectTests, modernActiveReplacementWaitsForSourceLeaseRevoke)
+{
+    Config config;
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    NiceMock<MockPrimaryClient> primary;
+    ON_CALL(primary, getToggleMask()).WillByDefault(Return(0));
+    ON_CALL(primary, getEventTarget()).WillByDefault(Return(&primary));
+
+    RevocableRecordingClient oldClient("client");
+    RecordingClient newClient("client");
+    Server server;
+    initializeServer(server, config, primary, events, oldClient);
+    oldClient.inputEpoch = 41;
+    server.m_seqNum = 41;
+
+    server.adoptClient(&newClient);
+
+    EXPECT_EQ(&oldClient, server.m_active);
+    EXPECT_EQ(1u, oldClient.revokeCount);
+    EXPECT_EQ(41u, oldClient.revokeInputEpoch);
+    EXPECT_EQ(0u, newClient.enterCount);
+
+    BaseClientProxy::InputHandoffReadyInfo revoked(
+        oldClient.revokeHandoffSeqNum, true);
+    Event revokedEvent(Event::kUnknown, &oldClient, &revoked,
+                       Event::kDontFreeData);
+    server.handleInputHandoffReady(revokedEvent, &oldClient);
+
+    EXPECT_EQ(&newClient, server.m_active);
+    EXPECT_EQ(1u, newClient.enterCount);
+    EXPECT_EQ(0u, oldClient.leaveCount);
+}
+
+TEST(ServerReconnectTests, modernActiveReplacementTimeoutFencesBeforeNewEnter)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RevocableRecordingClient* oldClient =
+        new RevocableRecordingClient("client");
+    RecordingClient newClient("client");
+    Server server;
+    initializeServer(server, config, primary, events, *oldClient);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    oldClient->inputEpoch = 51;
+    server.m_seqNum = 51;
+
+    server.adoptClient(&newClient);
+    ASSERT_EQ(0u, newClient.enterCount);
+
+    server.handleActiveClientReplacementTimeout(Event(), NULL);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(0u, newClient.enterCount);
+    EXPECT_EQ(0u, server.m_clientSet.count(oldClient));
+    EXPECT_EQ(&newClient, server.m_activeReplacementTarget);
+
+    server.handleClientDisconnected(Event(), oldClient);
+
+    EXPECT_EQ(&newClient, server.m_active);
+    EXPECT_EQ(1u, newClient.enterCount);
+    EXPECT_EQ(NULL, server.m_activeReplacementSource);
+    EXPECT_EQ(NULL, server.m_activeReplacementTarget);
+}
+
+TEST(ServerReconnectTests, activeClientReentryRejectionRestoresPrimaryLease)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient oldClient("client");
+    TransactionalRecordingClient newClient("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, oldClient);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.rememberPrimaryReturnAnchor(&oldClient, 0, 137, kLeft);
+
+    server.adoptClient(&newClient);
+
+    ASSERT_EQ(&newClient, server.m_active);
+    ASSERT_EQ(1u, newClient.enterCount);
+    ASSERT_TRUE(server.m_inputHandoffCommitted);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    ASSERT_TRUE(server.m_inputHandoffTimer != NULL);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&newClient, server.m_inputHandoffTarget);
+    EXPECT_EQ(newClient.enterSeqNum, server.m_inputHandoffSeqNum);
+
+    BaseClientProxy::InputHandoffReadyInfo rejected(
+        newClient.enterSeqNum, false);
+    Event rejectedEvent(Event::kUnknown, &newClient, &rejected,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(rejectedEvent, &newClient);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(16, primary.enterX);
+    EXPECT_EQ(137, primary.enterY);
 }
 
 TEST(ServerReconnectTests, adoptClientReplacingSameNameInterruptsOldSendTarget)
@@ -1538,8 +4218,74 @@ TEST(ServerReconnectTests, secondaryMotion_repeatedEdgePressureKeepsCursorInside
     EXPECT_LT(server.m_x, client.shapeX + client.shapeW);
     EXPECT_EQ(100, server.m_y);
     EXPECT_EQ(NULL, server.m_switchScreen);
+    server.flushPendingMouseMove();
     EXPECT_EQ(server.m_x, client.mouseMoveX);
     EXPECT_EQ(server.m_y, client.mouseMoveY);
+}
+
+TEST(ServerReconnectTests, secondaryMotion_coalescesBurstAndFlushesBeforeMouseButton)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_x = 100;
+    server.m_y = 100;
+
+    server.onMouseMoveSecondary(1, 0);
+    server.onMouseMoveSecondary(1, 0);
+
+    EXPECT_EQ(1u, client.mouseMoveCount);
+
+    server.onMouseDown(1);
+
+    EXPECT_EQ(2u, client.mouseMoveCount);
+    EXPECT_EQ(102, client.mouseMoveX);
+    EXPECT_EQ(100, client.mouseMoveY);
+}
+
+TEST(ServerReconnectTests, secondaryMotion_timerFlushesLatestBurstPosition)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_x = 100;
+    server.m_y = 100;
+
+    server.onMouseMoveSecondary(1, 0);
+    server.onMouseMoveSecondary(2, 0);
+    ASSERT_EQ(1u, client.mouseMoveCount);
+
+    server.handleMouseMoveFlush(Event(), NULL);
+
+    EXPECT_EQ(2u, client.mouseMoveCount);
+    EXPECT_EQ(103, client.mouseMoveX);
+    EXPECT_EQ(100, client.mouseMoveY);
+    EXPECT_EQ(NULL, server.m_mouseMoveTimer);
+    EXPECT_FALSE(server.m_pendingMouseMove);
 }
 
 TEST(ServerReconnectTests, avoidJumpZoneIgnoresConfiguredButUnavailableNeighbor)
@@ -1641,7 +4387,7 @@ TEST(ServerReconnectTests, avoidJumpZoneInsetsSecondaryScreenAwayFromReverseEdge
     EXPECT_EQ(100, y);
 }
 
-TEST(ServerReconnectTests, recentReverseSwitchGuardKeepsClientActiveUntilMovedInward)
+TEST(ServerReconnectTests, firstLeftReverseMotionAfterEntryReturnsImmediately)
 {
     Config config;
     config.addScreen("primary");
@@ -1674,29 +4420,283 @@ TEST(ServerReconnectTests, recentReverseSwitchGuardKeepsClientActiveUntilMovedIn
     EXPECT_EQ(&client, server.m_active);
     EXPECT_EQ(16, client.enterX);
     EXPECT_EQ(100, client.enterY);
-    EXPECT_TRUE(server.m_recentSwitchGuardActive);
-    EXPECT_EQ("primary", server.m_recentSwitchFromName);
-    EXPECT_EQ("client", server.m_recentSwitchToName);
-    EXPECT_EQ(kLeft, server.m_recentSwitchReverseDir);
-    EXPECT_EQ(16, server.m_recentSwitchEntryX);
-    EXPECT_EQ(100, server.m_recentSwitchEntryY);
-
-    server.onMouseMoveSecondary(-40, 0);
-    EXPECT_EQ(&client, server.m_active);
-    EXPECT_EQ(0, server.m_x);
-    EXPECT_EQ(1u, client.enterCount);
-    EXPECT_EQ(0u, primary.enterCount);
-
-    server.onMouseMoveSecondary(160, 0);
-    EXPECT_EQ(&client, server.m_active);
-    EXPECT_GE(server.m_x, 96);
-
-    server.onMouseMoveSecondary(-300, 0);
+    server.onMouseMoveSecondary(-17, 0);
     EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.enterCount);
     EXPECT_EQ(1u, primary.enterCount);
     EXPECT_GE(primary.enterX, 0);
     EXPECT_LT(primary.enterX, 1024);
     EXPECT_EQ(100, primary.enterY);
+}
+
+TEST(ServerReconnectTests, firstRightReverseMotionAfterEntryReturnsImmediately)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1;
+    server.m_y = 100;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 100));
+    ASSERT_EQ(&client, server.m_active);
+    server.onMouseMoveSecondary(17, 0);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 100));
+    ASSERT_EQ(&client, server.m_active);
+
+    server.onMouseMoveSecondary(256, 0);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(2u, primary.enterCount);
+}
+
+TEST(ServerReconnectTests, repeatedRoundTripReturnsAtOriginalPrimaryEdge)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1;
+    server.m_y = 100;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 100));
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_EQ(1u, client.enterCount);
+
+	// Move inward to confirm the first entry, then cross back with a large
+	// relative-motion overshoot. The source-space overshoot must not strand the
+	// pointer in the middle of an aggregate primary desktop.
+    server.onMouseMoveSecondary(-160, 0);
+    ASSERT_EQ(&client, server.m_active);
+    server.onMouseMoveSecondary(660, 0);
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(1u, primary.enterCount);
+	ASSERT_EQ(16, primary.enterX);
+
+    EXPECT_TRUE(server.onMouseMovePrimary(0, 100));
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(2u, client.enterCount);
+}
+
+TEST(ServerReconnectTests, nearEdgePrimaryReturnAllowsImmediateIntentionalRecross)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1;
+    server.m_y = 100;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 100));
+    ASSERT_EQ(&client, server.m_active);
+    server.onMouseMoveSecondary(-160, 0);
+    ASSERT_EQ(&client, server.m_active);
+    server.onMouseMoveSecondary(177, 0);
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(16, primary.enterX);
+    EXPECT_TRUE(server.onMouseMovePrimary(0, 100));
+    EXPECT_EQ(&client, server.m_active);
+}
+
+TEST(ServerReconnectTests, repeatedEdgeRoundTripsRemainUsable)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1;
+    server.m_y = 100;
+
+    for (UInt32 round = 0; round < 100; ++round) {
+        ASSERT_TRUE(server.onMouseMovePrimary(0, 100)) << "round " << round;
+        ASSERT_EQ(&client, server.m_active) << "round " << round;
+
+        server.onMouseMoveSecondary(-160, 0);
+        server.onMouseMoveSecondary(177, 0);
+
+        ASSERT_EQ(&primary, server.m_active) << "round " << round;
+        ASSERT_EQ(16, primary.enterX) << "round " << round;
+    }
+
+    EXPECT_EQ(100u, client.enterCount);
+    EXPECT_EQ(100u, primary.enterCount);
+}
+
+TEST(ServerReconnectTests, primaryReturnOvershootStaysAtOriginalExitEdge)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f, "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f, "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient client("client");
+
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 0;
+    server.m_y = 100;
+
+    ASSERT_TRUE(server.switchScreen(&client, 1022, 100, false, kLeft));
+    ASSERT_EQ(&client, server.m_active);
+
+    // A large relative delta from the client can map to the opposite side of
+    // the aggregate primary desktop. Return to the edge that was actually
+    // used to leave instead of stranding the pointer across two monitors.
+    ASSERT_TRUE(server.switchScreen(&primary, 1022, 100, false, kRight));
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(16, primary.enterX);
+
+    EXPECT_TRUE(server.onMouseMovePrimary(0, 100));
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(2u, client.enterCount);
+}
+
+TEST(ServerReconnectTests, primaryReturnOvershootUsesPhysicalEdgeOnWideAggregateDesktop)
+{
+	Config config;
+	config.addScreen("primary");
+	config.addScreen("client");
+	ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+		"client", 0.0f, 1.0f));
+	ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+		"primary", 0.0f, 1.0f));
+
+	NiceMock<MockEventQueue> events;
+	ClientProxyEvents clientProxyEvents;
+	IScreenEvents screenEvents;
+	ClipboardEvents clipboardEvents;
+	ServerEvents serverEvents;
+	setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+		clipboardEvents, serverEvents);
+
+	AnchoringPlatformScreen* platformScreen = new AnchoringPlatformScreen();
+	platformScreen->areas.push_back(
+		AnchoringPlatformScreen::Area(0, 0, 5120, 2880));
+	platformScreen->areas.push_back(
+		AnchoringPlatformScreen::Area(5120, 0, 5120, 2880));
+	barrier::Screen screen(platformScreen, &events);
+	EnterablePrimaryClient primary(&screen);
+	primary.shapeW = 10240;
+	primary.shapeH = 2880;
+	RecordingClient client("client");
+	client.shapeW = 2560;
+	client.shapeH = 1440;
+
+	Server server;
+	initializeServer(server, config, primary, events, client);
+	server.m_screen = &screen;
+	server.m_active = &primary;
+	server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+	server.m_clientSet.insert(&primary);
+	server.m_x = 0;
+	server.m_y = 720;
+
+	ASSERT_TRUE(server.switchScreen(&client, 2542, 720, false, kLeft));
+	ASSERT_TRUE(server.switchScreen(&primary, 2542, 720, false, kRight));
+
+	EXPECT_EQ(&primary, server.m_active);
+	EXPECT_EQ(16, primary.enterX);
+	EXPECT_EQ(720, primary.enterY);
 }
 
 TEST(ServerReconnectTests, primaryReturnUsesLastPrimaryOutputAnchor)
@@ -1737,7 +4737,7 @@ TEST(ServerReconnectTests, primaryReturnUsesLastPrimaryOutputAnchor)
     EXPECT_EQ(100, primary.enterY);
 }
 
-TEST(ServerReconnectTests, delayedSwitchArmsRecentReverseSwitchGuard)
+TEST(ServerReconnectTests, delayedSwitchAllowsImmediateReverseMotion)
 {
     Config config;
     config.addScreen("primary");
@@ -1773,30 +4773,9 @@ TEST(ServerReconnectTests, delayedSwitchArmsRecentReverseSwitchGuard)
     server.handleSwitchWaitTimeout(Event(Event::kUnknown), NULL);
 
     EXPECT_EQ(&client, server.m_active);
-    EXPECT_TRUE(server.m_recentSwitchGuardActive);
-    EXPECT_EQ("primary", server.m_recentSwitchFromName);
-    EXPECT_EQ("client", server.m_recentSwitchToName);
-    EXPECT_EQ(kLeft, server.m_recentSwitchReverseDir);
-    EXPECT_EQ(16, server.m_recentSwitchEntryX);
-    EXPECT_EQ(100, server.m_recentSwitchEntryY);
-
-    server.onMouseMoveSecondary(-40, 0);
-    EXPECT_EQ(&client, server.m_active);
-    EXPECT_EQ(0, server.m_x);
-    EXPECT_EQ(1u, client.enterCount);
-    EXPECT_EQ(0u, primary.enterCount);
-
-    ARCH->sleep(0.3);
-    server.onMouseMoveSecondary(-40, 0);
-    EXPECT_EQ(&client, server.m_active);
-    EXPECT_EQ(0u, primary.enterCount);
-
-    server.onMouseMoveSecondary(160, 0);
-    EXPECT_EQ(&client, server.m_active);
-    EXPECT_GE(server.m_x, 96);
-
-    server.onMouseMoveSecondary(-300, 0);
+    server.onMouseMoveSecondary(-17, 0);
     EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.enterCount);
     EXPECT_EQ(1u, primary.enterCount);
     EXPECT_GE(primary.enterX, 0);
     EXPECT_LT(primary.enterX, 1024);
@@ -1845,11 +4824,11 @@ TEST(ServerReconnectTests, secondaryMotion_reanchorsActiveClientWhenLeaveFails)
     EXPECT_EQ(0u, other.enterCount);
 }
 
-TEST(ServerReconnectTests, fileChunkSendingUsesTransferTargetWhenActiveChanges)
+TEST(ServerReconnectTests, transactionalSwitchKeepsSourceLeaseUntilTargetReady)
 {
     Config config;
-    config.addScreen("target");
-    config.addScreen("other");
+    config.addScreen("primary");
+    config.addScreen("client");
 
     NiceMock<MockEventQueue> events;
     ClientProxyEvents clientProxyEvents;
@@ -1858,27 +4837,2031 @@ TEST(ServerReconnectTests, fileChunkSendingUsesTransferTargetWhenActiveChanges)
     ServerEvents serverEvents;
     setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
 
-    NiceMock<MockPrimaryClient> primary;
-    RecordingClient target("target");
-    RecordingClient other("other");
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client");
     Server server;
-    initializeServer(server, config, primary, events, target);
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_TRUE(server.m_inputHandoffPending);
+    EXPECT_EQ(1u, client.prepareCount);
+    EXPECT_EQ(0u, client.enterCount);
+    EXPECT_EQ(0, client.preparedX);
+    EXPECT_EQ(137, client.preparedY);
+
+    BaseClientProxy::InputHandoffReadyInfo ready(client.preparedSeqNum, true);
+    Event readyEvent(Event::kUnknown, &client, &ready, Event::kDontFreeData);
+    server.handleInputHandoffReady(readyEvent, &client);
+
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_EQ(client.preparedSeqNum, client.enterSeqNum);
+
+    server.handleInputHandoffReady(readyEvent, &client);
+
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(1u, client.enterCount);
+}
+
+TEST(ServerReconnectTests, repeatedSameEdgeMotionKeepsPreparedHandoff)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
+    const UInt32 preparedSeqNum = client.preparedSeqNum;
+    EventQueueTimer* const pendingTimer = server.m_inputHandoffTimer;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 140));
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_TRUE(server.m_inputHandoffPending);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&client, server.m_inputHandoffTarget);
+    EXPECT_EQ(preparedSeqNum, server.m_inputHandoffSeqNum);
+    EXPECT_EQ(pendingTimer, server.m_inputHandoffTimer);
+    EXPECT_EQ(1u, client.prepareCount);
+    EXPECT_EQ(0u, client.abortCount);
+    EXPECT_EQ(137, client.preparedY);
+    EXPECT_EQ(NULL, server.m_switchScreen);
+    EXPECT_EQ(kNoDirection, server.m_switchDir);
+
+    BaseClientProxy::InputHandoffReadyInfo ready(preparedSeqNum, true);
+    Event readyEvent(Event::kUnknown, &client, &ready, Event::kDontFreeData);
+    server.handleInputHandoffReady(readyEvent, &client);
+
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_EQ(preparedSeqNum, client.enterSeqNum);
+    EXPECT_EQ(0u, client.abortCount);
+    EXPECT_TRUE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&client, server.m_inputHandoffTarget);
+}
+
+TEST(ServerReconnectTests, nearEdgeBounceKeepsPreparedHandoffUntilPointerClearlyLeaves)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
+    ASSERT_TRUE(server.m_inputHandoffPending);
+    const UInt32 preparedSeqNum = server.m_inputHandoffSeqNum;
+    EventQueueTimer* const pendingTimer = server.m_inputHandoffTimer;
+
+    EXPECT_FALSE(server.onMouseMovePrimary(16, 137));
+
+    EXPECT_TRUE(server.m_inputHandoffPending);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&client, server.m_inputHandoffTarget);
+    EXPECT_EQ(preparedSeqNum, server.m_inputHandoffSeqNum);
+    EXPECT_EQ(pendingTimer, server.m_inputHandoffTimer);
+    EXPECT_EQ(1u, client.prepareCount);
+    EXPECT_EQ(0u, client.abortCount);
+
+    EXPECT_FALSE(server.onMouseMovePrimary(64, 137));
+
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_EQ(1u, client.abortCount);
+    EXPECT_EQ(preparedSeqNum, client.abortedSeqNum);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+}
+
+TEST(ServerReconnectTests, committedHandoffWaitsForMatchingPositiveAck)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    config.addScreen("other");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    TransactionalRecordingClient other("other", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
     server.m_clients.insert(std::make_pair(other.getName(), &other));
     server.m_clientSet.insert(&other);
-    server.m_active = &other;
-    server.setFileTransferForTest(&target, 7);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
 
-    FileChunk* chunk = FileChunk::data(reinterpret_cast<const UInt8*>("abc"), 3);
-    chunk->m_transferId = 7;
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    const UInt32 seqNum = client.preparedSeqNum;
+    BaseClientProxy::InputHandoffReadyInfo prepared(seqNum, true);
+    Event preparedEvent(Event::kUnknown, &client, &prepared,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(preparedEvent, &client);
 
-    server.onFileChunkSending(chunk);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitted);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    ASSERT_TRUE(server.m_inputHandoffTimer != NULL);
 
-    EXPECT_EQ(1u, target.fileChunkCount);
-    EXPECT_EQ(0u, other.fileChunkCount);
-    EXPECT_EQ(kDataChunk, target.lastFileChunkMark);
-    EXPECT_EQ(3u, target.lastFileChunkSize);
+    BaseClientProxy::InputHandoffReadyInfo stale(seqNum - 1, true);
+    Event staleEvent(Event::kUnknown, &client, &stale, Event::kDontFreeData);
+    server.handleInputHandoffReady(staleEvent, &client);
+    EXPECT_TRUE(server.m_inputHandoffCommitAckPending);
 
-    delete chunk;
+    BaseClientProxy::InputHandoffReadyInfo wrongPeer(seqNum, true);
+    Event wrongPeerEvent(Event::kUnknown, &other, &wrongPeer,
+                         Event::kDontFreeData);
+    server.handleInputHandoffReady(wrongPeerEvent, &other);
+    EXPECT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    BaseClientProxy::InputHandoffReadyInfo committed(seqNum, true);
+    Event committedEvent(Event::kUnknown, &client, &committed,
+                         Event::kDontFreeData);
+    server.handleInputHandoffReady(committedEvent, &client);
+
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+    EXPECT_EQ(0u, client.abortCount);
+}
+
+TEST(ServerReconnectTests, remoteSourceMustAcknowledgeRevokeBeforePrimaryEnter)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RevocableRecordingClient source("source");
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &source;
+    server.m_seqNum = 41;
+    source.inputEpoch = 41;
+    server.m_x = 500;
+    server.m_y = 250;
+
+    ASSERT_TRUE(server.switchScreen(&primary, 100, 200, false,
+                                    kNoDirection));
+
+    ASSERT_TRUE(server.m_inputHandoffPending);
+    ASSERT_TRUE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_EQ(&source, server.m_active);
+    EXPECT_EQ(1u, source.revokeCount);
+    EXPECT_EQ(server.m_inputHandoffSeqNum, source.revokeHandoffSeqNum);
+    EXPECT_EQ(41u, source.revokeInputEpoch);
+    EXPECT_EQ(0u, source.leaveCount);
+    EXPECT_EQ(0u, primary.enterCount);
+
+    BaseClientProxy::InputHandoffReadyInfo stale(
+        source.revokeHandoffSeqNum - 1, true);
+    Event staleEvent(Event::kUnknown, &source, &stale,
+                     Event::kDontFreeData);
+    server.handleInputHandoffReady(staleEvent, &source);
+    EXPECT_EQ(&source, server.m_active);
+    EXPECT_TRUE(server.m_inputHandoffSourceRevokePending);
+
+    BaseClientProxy::InputHandoffReadyInfo revoked(
+        source.revokeHandoffSeqNum, true);
+    Event revokedEvent(Event::kUnknown, &source, &revoked,
+                       Event::kDontFreeData);
+    server.handleInputHandoffReady(revokedEvent, &source);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(0u, source.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_FALSE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+}
+
+TEST(ServerReconnectTests, remoteTargetWaitsForPreparedSourceRevokeAck)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RevocableRecordingClient source("source");
+    TransactionalRecordingClient target("target", true);
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(target.getName(), &target));
+    server.m_clientSet.insert(&target);
+    server.m_active = &source;
+    server.m_seqNum = 71;
+    source.inputEpoch = 71;
+    server.m_x = 500;
+    server.m_y = 250;
+
+    ASSERT_TRUE(server.switchScreen(&target, 30, 40, false, kRight));
+    ASSERT_EQ(1u, target.prepareCount);
+    ASSERT_EQ(0u, source.revokeCount);
+    ASSERT_EQ(0u, target.enterCount);
+
+    BaseClientProxy::InputHandoffReadyInfo targetReady(
+        target.preparedSeqNum, true);
+    Event targetReadyEvent(Event::kUnknown, &target, &targetReady,
+                           Event::kDontFreeData);
+    server.handleInputHandoffReady(targetReadyEvent, &target);
+
+    ASSERT_TRUE(server.m_inputHandoffPending);
+    ASSERT_TRUE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_EQ(1u, source.revokeCount);
+    EXPECT_EQ(71u, source.revokeInputEpoch);
+    EXPECT_EQ(0u, source.leaveCount);
+    EXPECT_EQ(0u, target.enterCount);
+
+    server.noSwitch(512, 250);
+    EXPECT_TRUE(server.m_inputHandoffPending);
+    EXPECT_TRUE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_EQ(0u, target.abortCount);
+
+    BaseClientProxy::InputHandoffReadyInfo sourceRevoked(
+        source.revokeHandoffSeqNum, true);
+    Event sourceRevokedEvent(Event::kUnknown, &source, &sourceRevoked,
+                             Event::kDontFreeData);
+    server.handleInputHandoffReady(sourceRevokedEvent, &source);
+
+    EXPECT_EQ(&target, server.m_active);
+    EXPECT_EQ(0u, source.leaveCount);
+    EXPECT_EQ(1u, target.enterCount);
+    EXPECT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    BaseClientProxy::InputHandoffReadyInfo targetCommitted(
+        target.enterSeqNum, true);
+    Event targetCommittedEvent(Event::kUnknown, &target, &targetCommitted,
+                               Event::kDontFreeData);
+    server.handleInputHandoffReady(targetCommittedEvent, &target);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+}
+
+TEST(ServerReconnectTests, rejectedSourceRevokeKeepsSourceLeaseAndAbortsTarget)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RevocableRecordingClient source("source");
+    TransactionalRecordingClient target("target", true);
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(target.getName(), &target));
+    server.m_clientSet.insert(&target);
+    server.m_active = &source;
+    server.m_seqNum = 91;
+    source.inputEpoch = 91;
+
+    ASSERT_TRUE(server.switchScreen(&target, 30, 40, false, kRight));
+    BaseClientProxy::InputHandoffReadyInfo targetReady(
+        target.preparedSeqNum, true);
+    Event targetReadyEvent(Event::kUnknown, &target, &targetReady,
+                           Event::kDontFreeData);
+    server.handleInputHandoffReady(targetReadyEvent, &target);
+    ASSERT_TRUE(server.m_inputHandoffSourceRevokePending);
+
+    BaseClientProxy::InputHandoffReadyInfo rejected(
+        source.revokeHandoffSeqNum, false);
+    Event rejectedEvent(Event::kUnknown, &source, &rejected,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(rejectedEvent, &source);
+
+    EXPECT_EQ(&source, server.m_active);
+    EXPECT_EQ(0u, source.leaveCount);
+    EXPECT_EQ(0u, target.enterCount);
+    EXPECT_EQ(1u, target.abortCount);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_FALSE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+}
+
+TEST(ServerReconnectTests, canceledPrepareDoesNotAdvanceSourceLeaseEpoch)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RevocableRecordingClient source("source");
+    TransactionalRecordingClient target("target", true);
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(target.getName(), &target));
+    server.m_clientSet.insert(&target);
+    server.m_active = &source;
+    server.m_seqNum = 41;
+    source.inputEpoch = 41;
+    server.m_x = 1023;
+    server.m_y = 250;
+
+    ASSERT_TRUE(server.switchScreen(&target, 0, 250, false, kRight));
+    ASSERT_EQ(42u, target.preparedSeqNum);
+    server.noSwitch(512, 250);
+    ASSERT_FALSE(server.m_inputHandoffPending);
+    ASSERT_EQ(1u, target.abortCount);
+
+    ASSERT_TRUE(server.switchScreen(&target, 0, 250, false, kRight));
+    ASSERT_EQ(43u, target.preparedSeqNum);
+    BaseClientProxy::InputHandoffReadyInfo ready(
+        target.preparedSeqNum, true);
+    Event readyEvent(Event::kUnknown, &target, &ready,
+                     Event::kDontFreeData);
+    server.handleInputHandoffReady(readyEvent, &target);
+
+    ASSERT_TRUE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_EQ(41u, source.revokeInputEpoch);
+    EXPECT_EQ(43u, source.revokeHandoffSeqNum);
+    EXPECT_EQ(&source, server.m_active);
+}
+
+TEST(ServerReconnectTests, targetDisconnectAfterRevokeRedirectsLeaseToPrimary)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RevocableRecordingClient source("source");
+    TransactionalRecordingClient target("target", true);
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(target.getName(), &target));
+    server.m_clientSet.insert(&target);
+    server.m_active = &source;
+    server.m_seqNum = 51;
+    source.inputEpoch = 51;
+    server.m_x = 500;
+    server.m_y = 250;
+
+    ASSERT_TRUE(server.switchScreen(&target, 0, 250, false, kRight));
+    BaseClientProxy::InputHandoffReadyInfo ready(
+        target.preparedSeqNum, true);
+    Event readyEvent(Event::kUnknown, &target, &ready,
+                     Event::kDontFreeData);
+    server.handleInputHandoffReady(readyEvent, &target);
+    ASSERT_TRUE(server.m_inputHandoffSourceRevokePending);
+
+    ASSERT_TRUE(server.removeClient(&target));
+    EXPECT_TRUE(server.m_inputHandoffPending);
+    EXPECT_TRUE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_EQ(&primary, server.m_inputHandoffTarget);
+    EXPECT_EQ(&source, server.m_active);
+
+    BaseClientProxy::InputHandoffReadyInfo revoked(
+        source.revokeHandoffSeqNum, true);
+    Event revokedEvent(Event::kUnknown, &source, &revoked,
+                       Event::kDontFreeData);
+    server.handleInputHandoffReady(revokedEvent, &source);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(0u, source.leaveCount);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_FALSE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+}
+
+TEST(ServerReconnectTests, screensaverActivationPreservesFlagThroughSourceRevoke)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RevocableRecordingClient source("source");
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &source;
+    server.m_seqNum = 61;
+    source.inputEpoch = 61;
+    primary.enterForScreensaver = false;
+
+    server.onScreensaver(true);
+
+    ASSERT_TRUE(server.m_inputHandoffSourceRevokePending);
+    ASSERT_EQ(0u, primary.enterCount);
+    ASSERT_EQ(&source, server.m_activeSaver);
+
+    BaseClientProxy::InputHandoffReadyInfo revoked(
+        source.revokeHandoffSeqNum, true);
+    Event revokedEvent(Event::kUnknown, &source, &revoked,
+                       Event::kDontFreeData);
+    server.handleInputHandoffReady(revokedEvent, &source);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_TRUE(primary.enterForScreensaver);
+    EXPECT_EQ(&source, server.m_activeSaver);
+}
+
+TEST(ServerReconnectTests, sourceRevokeTimeoutFencesSourceWithoutGrantingTarget)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RevocableRecordingClient source("source");
+    TransactionalRecordingClient target("target", true);
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(target.getName(), &target));
+    server.m_clientSet.insert(&target);
+    server.m_active = &source;
+    server.m_seqNum = 81;
+    source.inputEpoch = 81;
+
+    ASSERT_TRUE(server.switchScreen(&target, 0, 250, false, kRight));
+    BaseClientProxy::InputHandoffReadyInfo ready(
+        target.preparedSeqNum, true);
+    Event readyEvent(Event::kUnknown, &target, &ready,
+                     Event::kDontFreeData);
+    server.handleInputHandoffReady(readyEvent, &target);
+    ASSERT_TRUE(server.m_inputHandoffSourceRevokePending);
+
+    server.handleInputHandoffTimeout(Event(), NULL);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(0u, target.enterCount);
+    EXPECT_EQ(1u, target.abortCount);
+    EXPECT_EQ(0u, server.m_clientSet.count(&source));
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_FALSE(server.m_inputHandoffSourceRevokePending);
+}
+
+TEST(ServerReconnectTests, handoffTimersBoundEdgeWaitAndCoverWindowsCommitBudget)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    std::vector<double> timerIntervals;
+    EXPECT_CALL(events, newOneShotTimer(_, _))
+        .WillRepeatedly(Invoke([&timerIntervals](double interval, void*) {
+            timerIntervals.push_back(interval);
+            return reinterpret_cast<EventQueueTimer*>(1);
+        }));
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    BaseClientProxy::InputHandoffReadyInfo prepared(
+        client.preparedSeqNum, true);
+    Event preparedEvent(Event::kUnknown, &client, &prepared,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(preparedEvent, &client);
+
+    ASSERT_EQ(2u, timerIntervals.size());
+    EXPECT_GT(timerIntervals[0], 0.0);
+    EXPECT_LE(timerIntervals[0], 0.5);
+    EXPECT_GE(timerIntervals[1], 1.5);
+    EXPECT_LE(timerIntervals[1], 2.0);
+}
+
+TEST(ServerReconnectTests, committedHandoffAckTimeoutRollsBackToSource)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    const UInt32 seqNum = client.preparedSeqNum;
+    BaseClientProxy::InputHandoffReadyInfo prepared(seqNum, true);
+    Event preparedEvent(Event::kUnknown, &client, &prepared,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(preparedEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    server.handleInputHandoffTimeout(Event(), NULL);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(0u, client.abortCount);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+
+    BaseClientProxy::InputHandoffReadyInfo lateAck(seqNum, true);
+    Event lateAckEvent(Event::kUnknown, &client, &lateAck,
+                       Event::kDontFreeData);
+    server.handleInputHandoffReady(lateAckEvent, &client);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_EQ(1u, client.leaveCount);
+}
+
+TEST(ServerReconnectTests, directRemoteSwitchWaitsForMatchingCommitAck)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 777;
+    server.m_y = 321;
+
+    ASSERT_TRUE(server.switchScreen(&client, 30, 40, false,
+                                    kNoDirection));
+
+    ASSERT_EQ(&client, server.m_active);
+    EXPECT_EQ(0u, client.prepareCount);
+    ASSERT_EQ(1u, client.enterCount);
+    EXPECT_TRUE(server.m_inputHandoffCommitted);
+    EXPECT_TRUE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&client, server.m_inputHandoffTarget);
+    EXPECT_EQ(client.enterSeqNum, server.m_inputHandoffSeqNum);
+    EXPECT_EQ(777, server.m_inputHandoffSourceX);
+    EXPECT_EQ(321, server.m_inputHandoffSourceY);
+
+    BaseClientProxy::InputHandoffReadyInfo stale(
+        client.enterSeqNum - 1, true);
+    Event staleEvent(Event::kUnknown, &client, &stale,
+                     Event::kDontFreeData);
+    server.handleInputHandoffReady(staleEvent, &client);
+    EXPECT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    BaseClientProxy::InputHandoffReadyInfo committed(
+        client.enterSeqNum, true);
+    Event committedEvent(Event::kUnknown, &client, &committed,
+                         Event::kDontFreeData);
+    server.handleInputHandoffReady(committedEvent, &client);
+
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+}
+
+TEST(ServerReconnectTests, directLegacyRemoteFailureRollsBackWithoutAckTimer)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", false);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+
+    ASSERT_TRUE(server.switchScreen(&client, 30, 40, false,
+                                    kNoDirection));
+
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(0u, client.prepareCount);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_TRUE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&client, server.m_inputHandoffTarget);
+
+    BaseClientProxy::InputHandoffReadyInfo rejected(
+        client.enterSeqNum, false);
+    Event rejectedEvent(Event::kUnknown, &client, &rejected,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(rejectedEvent, &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+}
+
+TEST(ServerReconnectTests, legacyTargetRejectsAfterSourceDisconnectReturnsPrimary)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient source("source");
+    TransactionalRecordingClient target("target", false);
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(target.getName(), &target));
+    server.m_clientSet.insert(&target);
+    server.m_active = &source;
+
+    ASSERT_TRUE(server.switchScreen(&target, 30, 40, false,
+                                    kNoDirection));
+    const UInt32 seqNum = target.enterSeqNum;
+    ASSERT_TRUE(server.m_inputHandoffCommitted);
+    ASSERT_FALSE(server.m_inputHandoffCommitAckPending);
+
+    ASSERT_TRUE(server.removeClient(&source));
+    ASSERT_TRUE(server.m_inputHandoffCommitted);
+    ASSERT_EQ(NULL, server.m_inputHandoffSource);
+    ASSERT_EQ(&target, server.m_inputHandoffTarget);
+
+    BaseClientProxy::InputHandoffReadyInfo rejected(seqNum, false);
+    Event rejectedEvent(Event::kUnknown, &target, &rejected,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(rejectedEvent, &target);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, target.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+}
+
+TEST(ServerReconnectTests, directRemoteCommitRejectionRollsBackToPrimary)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 700;
+    server.m_y = 300;
+
+    ASSERT_TRUE(server.switchScreen(&client, 30, 40, false,
+                                    kNoDirection));
+    const UInt32 seqNum = client.enterSeqNum;
+    BaseClientProxy::InputHandoffReadyInfo rejected(seqNum, false);
+    Event rejectedEvent(Event::kUnknown, &client, &rejected,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(rejectedEvent, &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(700, primary.enterX);
+    EXPECT_EQ(300, primary.enterY);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+}
+
+TEST(ServerReconnectTests, directRemoteCommitTimeoutRollsBackAndIgnoresLateAck)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 701;
+    server.m_y = 301;
+
+    ASSERT_TRUE(server.switchScreen(&client, 30, 40, false,
+                                    kNoDirection));
+    const UInt32 seqNum = client.enterSeqNum;
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    server.handleInputHandoffTimeout(Event(), NULL);
+
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(1u, client.leaveCount);
+    ASSERT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+
+    BaseClientProxy::InputHandoffReadyInfo late(seqNum, true);
+    Event lateEvent(Event::kUnknown, &client, &late,
+                    Event::kDontFreeData);
+    server.handleInputHandoffReady(lateEvent, &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_EQ(1u, client.leaveCount);
+}
+
+TEST(ServerReconnectTests, directRemoteToRemoteRollbackRequiresSourceAck)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient source("source", true);
+    TransactionalRecordingClient target("target", true);
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(target.getName(), &target));
+    server.m_clientSet.insert(&target);
+    server.m_active = &source;
+    server.m_x = 500;
+    server.m_y = 250;
+
+    ASSERT_TRUE(server.switchScreen(&target, 30, 40, false,
+                                    kNoDirection));
+    const UInt32 targetSeqNum = target.enterSeqNum;
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    ASSERT_EQ(&source, server.m_inputHandoffSource);
+
+    BaseClientProxy::InputHandoffReadyInfo targetRejected(
+        targetSeqNum, false);
+    Event targetRejectedEvent(Event::kUnknown, &target, &targetRejected,
+                              Event::kDontFreeData);
+    server.handleInputHandoffReady(targetRejectedEvent, &target);
+
+    ASSERT_EQ(&source, server.m_active);
+    ASSERT_EQ(1u, source.enterCount);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(&primary, server.m_inputHandoffSource);
+    EXPECT_EQ(&source, server.m_inputHandoffTarget);
+    EXPECT_EQ(source.enterSeqNum, server.m_inputHandoffSeqNum);
+
+    BaseClientProxy::InputHandoffReadyInfo sourceCommitted(
+        source.enterSeqNum, true);
+    Event sourceCommittedEvent(Event::kUnknown, &source, &sourceCommitted,
+                               Event::kDontFreeData);
+    server.handleInputHandoffReady(sourceCommittedEvent, &source);
+
+    EXPECT_EQ(&source, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(0u, primary.enterCount);
+}
+
+TEST(ServerReconnectTests, rejectedRemoteRollbackDoesNotBounceToBadTarget)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient source("source", true);
+    TransactionalRecordingClient target("target", true);
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(target.getName(), &target));
+    server.m_clientSet.insert(&target);
+    server.m_active = &source;
+    server.m_x = 500;
+    server.m_y = 250;
+
+    ASSERT_TRUE(server.switchScreen(&target, 30, 40, false,
+                                    kNoDirection));
+    BaseClientProxy::InputHandoffReadyInfo targetRejected(
+        target.enterSeqNum, false);
+    Event targetRejectedEvent(Event::kUnknown, &target, &targetRejected,
+                              Event::kDontFreeData);
+    server.handleInputHandoffReady(targetRejectedEvent, &target);
+    ASSERT_EQ(&source, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    BaseClientProxy::InputHandoffReadyInfo sourceRejected(
+        source.enterSeqNum, false);
+    Event sourceRejectedEvent(Event::kUnknown, &source, &sourceRejected,
+                              Event::kDontFreeData);
+    server.handleInputHandoffReady(sourceRejectedEvent, &source);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, target.enterCount);
+    EXPECT_EQ(1u, source.enterCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(1u, target.leaveCount);
+    EXPECT_EQ(2u, source.leaveCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+}
+
+TEST(ServerReconnectTests, switchBackToSourceDuringCommitWaitRollsBackImmediately)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    const UInt32 seqNum = client.preparedSeqNum;
+    BaseClientProxy::InputHandoffReadyInfo prepared(seqNum, true);
+    Event preparedEvent(Event::kUnknown, &client, &prepared,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(preparedEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    EXPECT_TRUE(server.switchScreen(&primary, 1007, 137, false,
+                                    kNoDirection));
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+}
+
+TEST(ServerReconnectTests, largeReverseMotionReturnsPrimaryDuringCommitAckWait)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
+    const UInt32 seqNum = client.preparedSeqNum;
+    BaseClientProxy::InputHandoffReadyInfo prepared(seqNum, true);
+    Event preparedEvent(Event::kUnknown, &client, &prepared,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(preparedEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    // A deliberate return must not wait for the commit acknowledgment or a
+    // second motion event. This is the live path that previously stranded the
+    // hidden primary cursor at its center warp.
+    server.onMouseMoveSecondary(256, 0);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+
+    BaseClientProxy::InputHandoffReadyInfo lateAck(seqNum, true);
+    Event lateAckEvent(Event::kUnknown, &client, &lateAck,
+                       Event::kDontFreeData);
+    server.handleInputHandoffReady(lateAckEvent, &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+}
+
+TEST(ServerReconnectTests, staleCommitAckCannotBreakImmediateSecondHandoff)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
+    const UInt32 firstSeqNum = client.preparedSeqNum;
+    BaseClientProxy::InputHandoffReadyInfo firstReady(firstSeqNum, true);
+    Event firstReadyEvent(Event::kUnknown, &client, &firstReady,
+                          Event::kDontFreeData);
+    server.handleInputHandoffReady(firstReadyEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    server.onMouseMoveSecondary(-160, 0);
+    ASSERT_EQ(&client, server.m_active);
+    server.onMouseMoveSecondary(177, 0);
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(16, primary.enterX);
+    ASSERT_FALSE(server.m_inputHandoffPending);
+    ASSERT_FALSE(server.m_inputHandoffCommitted);
+    ASSERT_FALSE(server.m_inputHandoffCommitAckPending);
+    ASSERT_EQ(NULL, server.m_inputHandoffTimer);
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
+    const UInt32 secondSeqNum = client.preparedSeqNum;
+    ASSERT_NE(firstSeqNum, secondSeqNum);
+    ASSERT_TRUE(server.m_inputHandoffPending);
+    ASSERT_EQ(&primary, server.m_active);
+
+    BaseClientProxy::InputHandoffReadyInfo staleAck(firstSeqNum, true);
+    Event staleAckEvent(Event::kUnknown, &client, &staleAck,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(staleAckEvent, &client);
+    ASSERT_TRUE(server.m_inputHandoffPending);
+    ASSERT_EQ(secondSeqNum, server.m_inputHandoffSeqNum);
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(1u, client.enterCount);
+
+    BaseClientProxy::InputHandoffReadyInfo secondReady(secondSeqNum, true);
+    Event secondReadyEvent(Event::kUnknown, &client, &secondReady,
+                           Event::kDontFreeData);
+    server.handleInputHandoffReady(secondReadyEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    BaseClientProxy::InputHandoffReadyInfo staleReject(firstSeqNum, false);
+    Event staleRejectEvent(Event::kUnknown, &client, &staleReject,
+                           Event::kDontFreeData);
+    server.handleInputHandoffReady(staleRejectEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    ASSERT_EQ(secondSeqNum, server.m_inputHandoffSeqNum);
+
+    server.handleInputHandoffReady(secondReadyEvent, &client);
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(2u, client.prepareCount);
+    EXPECT_EQ(2u, client.enterCount);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+    EXPECT_EQ(0u, client.abortCount);
+}
+
+TEST(ServerReconnectTests, switchToThirdScreenDuringCommitWaitRollsBackAndRejectsThird)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    config.addScreen("other");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    TransactionalRecordingClient other("other", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(other.getName(), &other));
+    server.m_clientSet.insert(&other);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    BaseClientProxy::InputHandoffReadyInfo prepared(
+        client.preparedSeqNum, true);
+    Event preparedEvent(Event::kUnknown, &client, &prepared,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(preparedEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    EXPECT_FALSE(server.switchScreen(&other, 0, 137, false, kRight));
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(0u, other.prepareCount);
+    EXPECT_EQ(0u, other.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+}
+
+TEST(ServerReconnectTests, targetDisconnectDuringCommitWaitReturnsPrimaryLease)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    BaseClientProxy::InputHandoffReadyInfo prepared(
+        client.preparedSeqNum, true);
+    Event preparedEvent(Event::kUnknown, &client, &prepared,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(preparedEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    server.removeActiveClient(&client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+    EXPECT_EQ(0u, server.m_clientSet.count(&client));
+}
+
+TEST(ServerReconnectTests, sourceDisconnectDuringCommitWaitTimeoutReturnsPrimaryLease)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    RecordingClient source("source");
+    TransactionalRecordingClient target("target", true);
+    Server server;
+    initializeServer(server, config, primary, events, source);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(target.getName(), &target));
+    server.m_clientSet.insert(&target);
+    server.m_active = &source;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&target, 0, 137, false, kRight));
+    BaseClientProxy::InputHandoffReadyInfo prepared(
+        target.preparedSeqNum, true);
+    Event preparedEvent(Event::kUnknown, &target, &prepared,
+                        Event::kDontFreeData);
+    server.handleInputHandoffReady(preparedEvent, &target);
+    ASSERT_EQ(&target, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    ASSERT_EQ(&source, server.m_inputHandoffSource);
+
+    ASSERT_TRUE(server.removeClient(&source));
+    EXPECT_EQ(NULL, server.m_inputHandoffSource);
+    EXPECT_TRUE(server.m_inputHandoffCommitAckPending);
+
+    server.handleInputHandoffTimeout(Event(), NULL);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, target.leaveCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+    EXPECT_EQ(NULL, server.m_inputHandoffTarget);
+}
+
+TEST(ServerReconnectTests, rejectedTransactionalSwitchKeepsSourceAndIgnoresLateReady)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    const UInt32 preparedSeqNum = client.preparedSeqNum;
+
+    BaseClientProxy::InputHandoffReadyInfo rejected(preparedSeqNum, false);
+    Event rejectedEvent(Event::kUnknown, &client, &rejected, Event::kDontFreeData);
+    server.handleInputHandoffReady(rejectedEvent, &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_EQ(1u, client.abortCount);
+    EXPECT_EQ(0u, client.enterCount);
+
+    BaseClientProxy::InputHandoffReadyInfo lateReady(preparedSeqNum, true);
+    Event lateReadyEvent(Event::kUnknown, &client, &lateReady, Event::kDontFreeData);
+    server.handleInputHandoffReady(lateReadyEvent, &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(0u, client.enterCount);
+}
+
+TEST(ServerReconnectTests, commitRejectionRollsBackToSourceLease)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client", true);
+    RecordingClient unavailable("unavailable");
+    unavailable.shapeW = 0;
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_clients.insert(std::make_pair(unavailable.getName(), &unavailable));
+    server.m_clientSet.insert(&unavailable);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    const UInt32 preparedSeqNum = client.preparedSeqNum;
+
+    BaseClientProxy::InputHandoffReadyInfo ready(preparedSeqNum, true);
+    Event readyEvent(Event::kUnknown, &client, &ready, Event::kDontFreeData);
+    server.handleInputHandoffReady(readyEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+
+    // A failed unrelated switch does not prove that the committed target
+    // accepted its lease, so the source rollback record must remain intact.
+    ASSERT_FALSE(server.switchScreen(&unavailable, 0, 0, false, kNoDirection));
+
+    BaseClientProxy::InputHandoffReadyInfo rejected(preparedSeqNum, false);
+    Event rejectedEvent(Event::kUnknown, &client, &rejected, Event::kDontFreeData);
+    server.handleInputHandoffReady(rejectedEvent, &client);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(0u, client.abortCount);
+    EXPECT_EQ(1u, client.leaveCount);
+    EXPECT_FALSE(server.m_inputHandoffCommitted);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+    EXPECT_EQ(NULL, server.m_inputHandoffTimer);
+}
+
+TEST(ServerReconnectTests, transactionalSwitchTimeoutKeepsSourceAndAbortsTarget)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    server.handleInputHandoffTimeout(Event(), NULL);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_EQ(1u, client.abortCount);
+    EXPECT_EQ(client.preparedSeqNum, client.abortedSeqNum);
+    EXPECT_EQ(0u, client.enterCount);
+    EXPECT_LT(server.m_x, 1023);
+}
+
+TEST(ServerReconnectTests, transactionalTargetDisconnectKeepsAndReanchorsSource)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    ASSERT_TRUE(server.removeClient(&client));
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_EQ(0u, client.abortCount);
+    EXPECT_EQ(0u, client.enterCount);
+    EXPECT_LT(server.m_x, 1023);
+}
+
+TEST(ServerReconnectTests, leavingSwitchEdgeCancelsPreparedHandoff)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    TransactionalRecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 137, false, kRight));
+    server.noSwitch(512, 137);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_EQ(1u, client.abortCount);
+    EXPECT_EQ(0u, client.enterCount);
+}
+
+TEST(ServerReconnectTests, failedPrimaryLeaveRecoversNearAttemptedRightEdge)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    LeavingFailsPrimaryClient primary(&screen);
+
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    EXPECT_FALSE(server.switchScreen(&client, 0, 137, false, kRight));
+
+    EXPECT_EQ(1u, primary.mouseMoveCount);
+    EXPECT_EQ(1007, primary.mouseMoveX);
+    EXPECT_EQ(137, primary.mouseMoveY);
+    EXPECT_EQ(primary.mouseMoveX, server.m_x);
+    EXPECT_EQ(primary.mouseMoveY, server.m_y);
+    EXPECT_EQ(&primary, server.m_active);
+}
+
+TEST(ServerReconnectTests, failedEdgeGateSuppressesOneSyntheticEventThenRetries)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kRight, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    LeaveFailsOncePrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_active = &primary;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_x = 1023;
+    server.m_y = 137;
+
+    EXPECT_FALSE(server.onMouseMovePrimary(1023, 137));
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_EQ(1u, primary.leaveCount);
+    ASSERT_TRUE(server.m_primaryLeaveFailedRecently);
+    ASSERT_EQ(kRight, server.m_primaryLeaveFailureDir);
+
+    // Continued pressure at the same edge is the synthetic loop this gate is
+    // meant to absorb. It must not issue another leave immediately.
+    EXPECT_FALSE(server.onMouseMovePrimary(1023, 137));
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.leaveCount);
+    EXPECT_FALSE(server.m_primaryLeaveFailedRecently);
+    EXPECT_EQ(kNoDirection, server.m_primaryLeaveFailureDir);
+
+    // The failed warp's one stale edge event has been consumed. Continued
+    // physical pressure can retry without first moving inward.
+    EXPECT_TRUE(server.onMouseMovePrimary(1023, 137));
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(2u, primary.leaveCount);
+    EXPECT_EQ(1u, client.enterCount);
+}
+
+TEST(ServerReconnectTests, switchScreenDoesNotReadPrimaryClipboardDuringDeferredSync)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    ClipboardPrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_enableClipboard = true;
+    server.m_x = 1023;
+    server.m_y = 100;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = primary.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_pendingClipboardFetch = true;
+    clipboard.m_clipboard = makeTextClipboard("last committed clipboard");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+    primary.sourceClipboard = makeTextClipboard("clipboard read must be deferred");
+    primary.clipboardAvailable = true;
+
+    EXPECT_TRUE(server.switchScreen(&client, 0, 100, false, kRight));
+
+    EXPECT_EQ(0u, primary.getClipboardCount);
+    EXPECT_EQ(0u, client.setClipboardCount);
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_TRUE(server.m_clipboardSyncTimer != NULL);
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+
+    server.handleClipboardSync(Event(), NULL);
+
+    EXPECT_EQ(0u, primary.getClipboardCount);
+    EXPECT_GT(client.setClipboardCount, 0u);
+
+    ASSERT_TRUE(screen.enter(0));
+}
+
+TEST(ServerReconnectTests, asyncPrimaryClipboardGrabNeverSchedulesProviderRead)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    platformScreen->asyncClipboardSnapshots = true;
+    barrier::Screen screen(platformScreen, &events);
+    ClipboardPrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_enableClipboard = true;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboard = makeTextClipboard("stale clipboard");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+    primary.sourceClipboard = makeTextClipboard("fresh clipboard");
+    primary.clipboardAvailable = true;
+
+    IScreen::ClipboardInfo eventInfo;
+    eventInfo.m_id = kClipboardClipboard;
+    eventInfo.m_sequenceNumber = 10;
+    server.handleClipboardGrabbed(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &primary);
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+    EXPECT_EQ(NULL, server.m_clipboardSyncTimer);
+    EXPECT_EQ(0u, primary.getClipboardCount);
+
+    ASSERT_TRUE(server.switchScreen(&client, 0, 100, false, kRight));
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+    EXPECT_EQ(0u, primary.getClipboardCount);
+
+    // The platform emits this only after its isolated worker has populated
+    // getClipboard's in-memory snapshot cache.
+    server.handleClipboardChanged(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &primary);
+    EXPECT_EQ(1u, primary.getClipboardCount);
+
+    server.handleClipboardSync(Event(), NULL);
+
+    EXPECT_EQ(1u, primary.getClipboardCount);
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    EXPECT_NE(client.setClipboardIds.end(),
+              std::find(client.setClipboardIds.begin(),
+                        client.setClipboardIds.end(), kClipboardClipboard));
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("fresh clipboard", clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
+
+    ASSERT_TRUE(screen.enter(0));
+}
+
+TEST(ServerReconnectTests, asyncPrimaryFallbackWaitsForSnapshotReadyEvent)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    platformScreen->asyncClipboardSnapshots = true;
+    barrier::Screen screen(platformScreen, &events);
+    ClipboardPrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clients.insert(std::make_pair(client.getName(), &client));
+    server.m_clientSet.insert(&primary);
+    server.m_clientSet.insert(&client);
+    server.m_active = &primary;
+    server.m_enableClipboard = true;
+
+    Server::ClipboardInfo& clipboard =
+        server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_pendingClipboardFetch = false;
+    clipboard.m_clipboard = makeTextClipboard("last committed clipboard");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+    primary.sourceClipboard = makeTextClipboard("worker snapshot not announced");
+    primary.clipboardAvailable = true;
+
+    EXPECT_TRUE(screen.isOnScreen());
+    server.fetchPendingPrimaryClipboards();
+    EXPECT_TRUE(screen.isOnScreen());
+
+    EXPECT_EQ(0u, primary.getClipboardCount);
+    EXPECT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("last committed clipboard",
+              clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
+
+}
+
+TEST(ServerReconnectTests, supersededAsyncClipboardChangedDoesNotRetryOnEventQueue)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    platformScreen->asyncClipboardSnapshots = true;
+    barrier::Screen screen(platformScreen, &events);
+    ClipboardPrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_enableClipboard = true;
+    primary.clipboardAvailable = false;
+
+    IScreen::ClipboardInfo eventInfo;
+    eventInfo.m_id = kClipboardClipboard;
+    eventInfo.m_sequenceNumber = 10;
+    server.handleClipboardGrabbed(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &primary);
+    server.handleClipboardChanged(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &primary);
+
+    EXPECT_EQ(1u, primary.getClipboardCount);
+    EXPECT_TRUE(
+        server.m_clipboards[kClipboardClipboard].m_pendingClipboardFetch);
+    EXPECT_EQ(NULL, server.m_clipboardSyncTimer);
+}
+
+TEST(ServerReconnectTests, staleClipboardCompletionFromPreviousOwnerIsRejected)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+
+    Server::ClipboardInfo& clipboard =
+        server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_clipboard = makeTextClipboard("current owner data");
+    primary.sourceClipboard = makeTextClipboard("stale primary data");
+    primary.clipboardAvailable = true;
+
+    EXPECT_FALSE(server.onClipboardChanged(
+        &primary, kClipboardClipboard, 10));
+    EXPECT_EQ(0u, primary.getClipboardCount);
+    EXPECT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("current owner data",
+              clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
 }
 
 TEST(ServerReconnectTests, staleFileChunkAfterReconnectDoesNotWriteToNewTarget)
@@ -1909,7 +6892,7 @@ TEST(ServerReconnectTests, staleFileChunkAfterReconnectDoesNotWriteToNewTarget)
     delete chunk;
 }
 
-TEST(ServerReconnectTests, generationlessFileChunkStillWritesOnGenerationlessTransfer)
+TEST(ServerReconnectTests, generationlessLegacyFileChunkIsRejected)
 {
     Config config;
     config.addScreen("target");
@@ -1926,14 +6909,20 @@ TEST(ServerReconnectTests, generationlessFileChunkStillWritesOnGenerationlessTra
     Server server;
     initializeServer(server, config, primary, events, target);
     server.setFileTransferForTest(&target, 0);
+    std::shared_ptr<StreamChunker> chunker(new StreamChunker());
+    server.m_sendFileChunker = chunker;
 
     FileChunk* chunk = FileChunk::data(reinterpret_cast<const UInt8*>("abc"), 3);
 
     server.onFileChunkSending(chunk);
 
-    EXPECT_EQ(1u, target.fileChunkCount);
-    EXPECT_EQ(kDataChunk, target.lastFileChunkMark);
-    EXPECT_EQ(3u, target.lastFileChunkSize);
+    EXPECT_EQ(0u, target.fileChunkCount);
+    EXPECT_EQ(0u, target.lastFileChunkMark);
+    EXPECT_EQ(0u, target.lastFileChunkSize);
+    EXPECT_TRUE(chunker->testShouldInterrupt());
+    EXPECT_EQ(NULL, server.m_sendFileTarget);
+    EXPECT_FALSE(server.m_sendFileCompletionPending);
+    EXPECT_FALSE(server.m_sendFilePreflightFailed.load());
 
     delete chunk;
 }
@@ -1973,7 +6962,7 @@ TEST(ServerReconnectTests, fileChunkSendingDropsChunkWhenTransferTargetDisconnec
     delete chunk;
 }
 
-TEST(ServerReconnectTests, onClipboardChangedBlocksLocalFileListWithoutDirtyingOtherClients)
+TEST(ServerReconnectTests, onClipboardChangedCachesLocalFileListForActiveReplay)
 {
     Config config;
     config.addScreen("primary");
@@ -1996,24 +6985,26 @@ TEST(ServerReconnectTests, onClipboardChangedBlocksLocalFileListWithoutDirtyingO
     server.m_active = &client;
     server.m_remoteFileClipboardSession = "stale-session";
     server.m_readyFileClipboardSession = "ready-session";
-    server.m_readyFileClipboardPaths.push_back(barrier::fs::u8path("/tmp/stale"));
+    server.m_readyFileClipboardPaths.push_back(
+        barrier::fs::u8path("/tmp/stale").u8string());
 
     Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
     clipboard.m_clipboardOwner = primary.getName();
     clipboard.m_clipboardSeqNum = 10;
-    clipboard.m_pendingPrimaryFetch = true;
+    clipboard.m_pendingClipboardFetch = true;
     primary.sourceClipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/local-file.txt"));
     primary.clipboardAvailable = true;
 
     server.onClipboardChanged(&primary, kClipboardClipboard, 10);
 
-    EXPECT_FALSE(clipboard.m_pendingPrimaryFetch);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
     EXPECT_TRUE(server.m_remoteFileClipboardSession.empty());
     EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
     EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
-    EXPECT_EQ(0u, client.clipboardDirtyCount);
+    EXPECT_EQ(1u, client.clipboardDirtyCount);
+    EXPECT_TRUE(client.lastClipboardDirty);
     EXPECT_EQ(0u, client.setClipboardCount);
-    EXPECT_EQ(0u, primary.clipboardDirtyCount);
+    EXPECT_EQ(1u, primary.clipboardDirtyCount);
     EXPECT_EQ(0u, primary.setClipboardCount);
 
 	RemoteFileClipboard::Data remoteFileClipboard;
@@ -2024,7 +7015,7 @@ TEST(ServerReconnectTests, onClipboardChangedBlocksLocalFileListWithoutDirtyingO
 	EXPECT_EQ("/tmp/local-file.txt", remoteFileClipboard.paths[0].u8string());
 }
 
-TEST(ServerReconnectTests, handleClipboardGrabbedDefersReadAndDoesNotPreGrabOtherScreens)
+TEST(ServerReconnectTests, handlePrimaryClipboardGrabSchedulesSnapshotOutsideInputHandoff)
 {
     Config config;
     config.addScreen("primary");
@@ -2047,8 +7038,9 @@ TEST(ServerReconnectTests, handleClipboardGrabbedDefersReadAndDoesNotPreGrabOthe
     server.m_active = &client;
     server.m_remoteFileClipboardSession = "stale-session";
     server.m_readyFileClipboardSession = "ready-session";
-    server.m_readyFileClipboardPaths.push_back(barrier::fs::u8path("/tmp/stale"));
-    primary.sourceClipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/local-file.txt"));
+    server.m_readyFileClipboardPaths.push_back(
+        barrier::fs::u8path("/tmp/stale").u8string());
+    primary.sourceClipboard = makeTextClipboard("fresh local clipboard");
     primary.clipboardAvailable = true;
 
     IScreen::ClipboardInfo eventInfo;
@@ -2061,12 +7053,32 @@ TEST(ServerReconnectTests, handleClipboardGrabbedDefersReadAndDoesNotPreGrabOthe
     Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
     EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
     EXPECT_EQ(10u, clipboard.m_clipboardSeqNum);
-    EXPECT_TRUE(clipboard.m_pendingPrimaryFetch);
+    EXPECT_TRUE(clipboard.m_pendingClipboardFetch);
+    EXPECT_TRUE(server.m_clipboardSyncTimer != NULL);
+    EXPECT_TRUE(server.m_clipboardFetchPending);
     EXPECT_EQ(0u, primary.getClipboardCount);
     EXPECT_EQ(0u, client.grabClipboardCount);
     EXPECT_EQ(0u, client.clipboardDirtyCount);
     EXPECT_EQ(0u, client.setClipboardCount);
     EXPECT_EQ(0u, primary.clipboardDirtyCount);
+
+    server.handleClipboardSync(Event(), NULL);
+
+    EXPECT_EQ(NULL, server.m_clipboardSyncTimer);
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    EXPECT_EQ(1u, primary.getClipboardCount);
+    EXPECT_EQ(1u, client.clipboardDirtyCount);
+    EXPECT_TRUE(client.lastClipboardDirty);
+    EXPECT_GT(client.setClipboardCount, 0u);
+    EXPECT_NE(client.setClipboardIds.end(),
+              std::find(client.setClipboardIds.begin(),
+                        client.setClipboardIds.end(), kClipboardClipboard));
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("fresh local clipboard",
+              clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
 }
 
 TEST(ServerReconnectTests, handleClipboardGrabbedOnActivePrimaryDefersReadAndBroadcast)
@@ -2103,13 +7115,229 @@ TEST(ServerReconnectTests, handleClipboardGrabbedOnActivePrimaryDefersReadAndBro
     Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
     EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
     EXPECT_EQ(10u, clipboard.m_clipboardSeqNum);
-    EXPECT_TRUE(clipboard.m_pendingPrimaryFetch);
+    EXPECT_TRUE(clipboard.m_pendingClipboardFetch);
+    EXPECT_TRUE(server.m_clipboardSyncTimer != NULL);
+    EXPECT_TRUE(server.m_clipboardFetchPending);
     EXPECT_EQ(0u, primary.getClipboardCount);
     EXPECT_EQ(0u, primary.clipboardDirtyCount);
     EXPECT_EQ(0u, primary.setClipboardCount);
     EXPECT_EQ(0u, client.grabClipboardCount);
     EXPECT_EQ(0u, client.clipboardDirtyCount);
     EXPECT_EQ(0u, client.setClipboardCount);
+}
+
+TEST(ServerReconnectTests, remoteClipboardGrabDoesNotSchedulePrimarySnapshot)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    IScreen::ClipboardInfo eventInfo;
+    eventInfo.m_id = kClipboardClipboard;
+    eventInfo.m_sequenceNumber = 10;
+    server.handleClipboardGrabbed(
+        Event(Event::kUnknown, NULL, &eventInfo, Event::kDontFreeData),
+        &client);
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    EXPECT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    EXPECT_TRUE(clipboard.m_pendingClipboardFetch);
+    EXPECT_EQ(NULL, server.m_clipboardSyncTimer);
+    EXPECT_FALSE(server.m_clipboardFetchPending);
+    EXPECT_EQ(0u, primary.getClipboardCount);
+}
+
+TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsCapturesTextWithoutGrabEvent)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clients.insert(std::make_pair(client.getName(), &client));
+    server.m_clientSet.insert(&primary);
+    server.m_clientSet.insert(&client);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_pendingClipboardFetch = false;
+    clipboard.m_clipboard = makeTextClipboard("stale remote text");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+    primary.sourceClipboard = makeTextClipboard("fresh primary text");
+    primary.clipboardAvailable = true;
+
+    server.fetchPendingPrimaryClipboards();
+
+    EXPECT_EQ(1u, primary.getClipboardCount);
+    EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("fresh primary text", clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
+    EXPECT_EQ(1u, client.clipboardDirtyCount);
+    EXPECT_TRUE(client.lastClipboardDirty);
+}
+
+TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsDoesNotSupersedePendingRemoteGrab)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clients.insert(std::make_pair(client.getName(), &client));
+    server.m_clientSet.insert(&primary);
+    server.m_clientSet.insert(&client);
+    server.m_enableClipboard = true;
+    server.m_active = &client;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboardSeqNum = 11;
+    clipboard.m_pendingClipboardFetch = true;
+    clipboard.m_clipboard = makeTextClipboard("last committed clipboard");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+    primary.sourceClipboard = makeTextClipboard("stale primary clipboard");
+    primary.clipboardAvailable = true;
+
+    server.fetchPendingPrimaryClipboards();
+
+    EXPECT_EQ(0u, primary.getClipboardCount);
+    EXPECT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    EXPECT_TRUE(clipboard.m_pendingClipboardFetch);
+    EXPECT_EQ(0u, client.clipboardDirtyCount);
+    EXPECT_EQ(0u, client.setClipboardCount);
+}
+
+TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsPreservesRemoteOwnerForEmptyFallback)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clients.insert(std::make_pair(client.getName(), &client));
+    server.m_clientSet.insert(&primary);
+    server.m_clientSet.insert(&client);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_pendingClipboardFetch = false;
+    clipboard.m_clipboard = makeTextClipboard("last synchronized text");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+    primary.sourceClipboard = Clipboard();
+    primary.clipboardAvailable = true;
+
+    server.fetchPendingPrimaryClipboards();
+
+    EXPECT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("last synchronized text", clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
+    EXPECT_EQ(0u, client.clipboardDirtyCount);
+}
+
+TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsDoesNotEchoMaterializedRemoteFile)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    const barrier::fs::path cachedPath =
+        barrier::fs::u8path("/tmp/clipboard-cache/remote-copy.txt");
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = client.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_pendingClipboardFetch = false;
+    clipboard.m_clipboard = makeSourcePathsClipboard(cachedPath);
+    Clipboard materializedClipboard = makeMaterializedPathsClipboard(cachedPath);
+    clipboard.m_clipboardData.set(materializedClipboard.marshall());
+    primary.sourceClipboard = makeSourcePathsClipboard(cachedPath);
+    primary.clipboardAvailable = true;
+    server.m_readyFileClipboardSession = kMaterializedFileSessionId;
+    server.m_readyFileClipboardPaths.push_back(cachedPath.u8string());
+
+    server.fetchPendingPrimaryClipboards();
+
+    EXPECT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    EXPECT_EQ(0u, client.clipboardDirtyCount);
+    EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
+    EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
 }
 
 TEST(ServerReconnectTests, onClipboardChangedForwardsTextAfterBlockingLocalFileList)
@@ -2135,41 +7363,47 @@ TEST(ServerReconnectTests, onClipboardChangedForwardsTextAfterBlockingLocalFileL
     server.m_active = &client;
     server.m_remoteFileClipboardSession = "stale-session";
     server.m_readyFileClipboardSession = "ready-session";
-    server.m_readyFileClipboardPaths.push_back(barrier::fs::u8path("/tmp/stale"));
+    server.m_readyFileClipboardPaths.push_back(
+        barrier::fs::u8path("/tmp/stale").u8string());
 
     Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
     clipboard.m_clipboardOwner = primary.getName();
     clipboard.m_clipboardSeqNum = 10;
-    clipboard.m_pendingPrimaryFetch = true;
+    clipboard.m_pendingClipboardFetch = true;
     primary.sourceClipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/local-file.txt"));
     primary.clipboardAvailable = true;
 
     server.onClipboardChanged(&primary, kClipboardClipboard, 10);
 
-    EXPECT_FALSE(clipboard.m_pendingPrimaryFetch);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
     EXPECT_TRUE(server.m_remoteFileClipboardSession.empty());
     EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
     EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
-    EXPECT_EQ(0u, client.clipboardDirtyCount);
+    EXPECT_EQ(1u, client.clipboardDirtyCount);
+    EXPECT_TRUE(client.lastClipboardDirty);
     EXPECT_EQ(0u, client.setClipboardCount);
 
-    clipboard.m_pendingPrimaryFetch = true;
+    clipboard.m_pendingClipboardFetch = true;
     primary.sourceClipboard = makeTextClipboard("plain text after local file copy");
 
     server.onClipboardChanged(&primary, kClipboardClipboard, 11);
 
-    EXPECT_FALSE(clipboard.m_pendingPrimaryFetch);
-    EXPECT_EQ(1u, client.clipboardDirtyCount);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    EXPECT_EQ(2u, client.clipboardDirtyCount);
     EXPECT_TRUE(client.lastClipboardDirty);
     EXPECT_EQ(1u, client.setClipboardCount);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
     ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
     EXPECT_EQ("plain text after local file copy", clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
+    ASSERT_TRUE(client.lastSetClipboard.open(0));
     ASSERT_TRUE(client.lastSetClipboard.has(IClipboard::kText));
     EXPECT_EQ("plain text after local file copy", client.lastSetClipboard.get(IClipboard::kText));
     EXPECT_FALSE(client.lastSetClipboard.has(IClipboard::kFileList));
+    client.lastSetClipboard.close();
 }
 
-TEST(ServerReconnectTests, onClipboardChangedForwardsMaterializedFileList)
+TEST(ServerReconnectTests, onClipboardChangedRejectsUntrustedMaterializedFileList)
 {
     Config config;
     config.addScreen("primary");
@@ -2194,25 +7428,200 @@ TEST(ServerReconnectTests, onClipboardChangedForwardsMaterializedFileList)
     Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
     clipboard.m_clipboardOwner = primary.getName();
     clipboard.m_clipboardSeqNum = 10;
-    clipboard.m_pendingPrimaryFetch = true;
+    clipboard.m_pendingClipboardFetch = true;
     primary.sourceClipboard = makeMaterializedPathsClipboard(
         barrier::fs::u8path("/tmp/weave-cache/remote-file.txt"));
     primary.clipboardAvailable = true;
 
-    server.onClipboardChanged(&primary, kClipboardClipboard, 10);
+    Clipboard previousClipboard = makeTextClipboard("previous safe clipboard");
+    clipboard.m_clipboardData.set(previousClipboard.marshall());
 
-    EXPECT_FALSE(clipboard.m_pendingPrimaryFetch);
-    EXPECT_EQ(1u, client.clipboardDirtyCount);
-    EXPECT_TRUE(client.lastClipboardDirty);
-    EXPECT_EQ(1u, client.setClipboardCount);
-    EXPECT_EQ(1u, primary.clipboardDirtyCount);
+    EXPECT_FALSE(server.onClipboardChanged(
+        &primary, kClipboardClipboard, 10));
+
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    EXPECT_EQ(0u, client.clipboardDirtyCount);
+    EXPECT_FALSE(client.lastClipboardDirty);
+    EXPECT_EQ(0u, client.setClipboardCount);
+    EXPECT_EQ(0u, primary.clipboardDirtyCount);
     EXPECT_EQ(0u, primary.setClipboardCount);
+    EXPECT_TRUE(clipboard.m_clipboardData.matches(previousClipboard.marshall()));
+}
 
-    RemoteFileClipboard::Data remoteFileClipboard;
+TEST(ServerReconnectTests, legacyRemoteSourcePathsClipboardIsRejected)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("legacy");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient legacy("legacy");
+    Server server;
+    initializeServer(server, config, primary, events, legacy);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    Server::ClipboardInfo& clipboard =
+        server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = legacy.getName();
+    clipboard.m_clipboardSeqNum = 10;
+    clipboard.m_pendingClipboardFetch = true;
+    clipboard.m_previousClipboardOwner = primary.getName();
+    clipboard.m_previousClipboardSeqNum = 9;
+    clipboard.m_hasClipboardRollback = true;
+    clipboard.m_clipboard = makeTextClipboard("last safe clipboard");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+    legacy.sourceClipboard = makeSourcePathsClipboard(
+        barrier::fs::u8path("C:/legacy-remote.txt"));
+    legacy.clipboardAvailable = true;
+
+    EXPECT_FALSE(server.onClipboardChanged(
+        &legacy, kClipboardClipboard, 10));
+
+    EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    EXPECT_TRUE(server.m_remoteFileClipboardSession.empty());
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("last safe clipboard",
+              clipboard.m_clipboard.get(IClipboard::kText));
+    EXPECT_FALSE(clipboard.m_clipboard.has(IClipboard::kFileList));
+    clipboard.m_clipboard.close();
+}
+
+TEST(ServerReconnectTests, trustedMaterializedFileEchoCommitsReadyPathsForReplay)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("source");
+    config.addScreen("target");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient source("source");
+    RecordingClient target("target");
+    Server server;
+    initializeServer(server, config, primary, events, target);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clients.insert(std::make_pair(source.getName(), &source));
+    server.m_clientSet.insert(&primary);
+    server.m_clientSet.insert(&source);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    const barrier::fs::path staleSourcePath =
+        barrier::fs::u8path("/remote/source/original.txt");
+    const barrier::fs::path readyPath =
+        barrier::fs::u8path("/tmp/weave-cache/materialized.txt");
+    Server::ClipboardInfo& clipboard =
+        server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = primary.getName();
+    clipboard.m_clipboardSeqNum = 11;
+    clipboard.m_pendingClipboardFetch = true;
+    clipboard.m_previousClipboardOwner = source.getName();
+    clipboard.m_previousClipboardSeqNum = 10;
+    clipboard.m_hasClipboardRollback = true;
+    clipboard.m_clipboard = makeSourcePathsClipboard(staleSourcePath);
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+
+    server.m_clipboardRevision.advance();
+    server.m_readyFileClipboardSession = kMaterializedFileSessionId;
+    server.m_readyFileClipboardPaths.push_back(readyPath.u8string());
+    server.m_readyFileClipboardRevision = server.m_clipboardRevision;
+    primary.sourceClipboard = makeMaterializedPathsClipboard(readyPath);
+    primary.clipboardAvailable = true;
+
+    ASSERT_TRUE(server.onClipboardChanged(
+        &primary, kClipboardClipboard, clipboard.m_clipboardSeqNum));
+    EXPECT_EQ(source.getName(), clipboard.m_clipboardOwner);
+    EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
+
+    server.m_active = &target;
+    server.m_clipboards[kClipboardSelection].m_clipboardOwner =
+        target.getName();
+    server.replayClipboardsToActive();
+
+    ASSERT_EQ(1u, target.setClipboardCount);
+    RemoteFileClipboard::Data replayed;
     ASSERT_TRUE(RemoteFileClipboard::readFromClipboard(
-        clipboard.m_clipboard, remoteFileClipboard));
-    EXPECT_EQ(RemoteFileClipboard::Mode::MaterializedPaths, remoteFileClipboard.mode);
-    EXPECT_EQ("remote-ready-session", remoteFileClipboard.sessionId);
+        target.lastSetClipboard, replayed));
+    EXPECT_EQ(RemoteFileClipboard::Mode::MaterializedPaths, replayed.mode);
+    ASSERT_EQ(1u, replayed.paths.size());
+    EXPECT_EQ(readyPath, replayed.paths.front());
+}
+
+TEST(ServerReconnectTests, invalidRemoteClipboardRollsBackPendingGrab)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clients.insert(std::make_pair(client.getName(), &client));
+    server.m_clientSet.insert(&primary);
+    server.m_clientSet.insert(&client);
+    server.m_enableClipboard = true;
+    server.m_active = &primary;
+
+    Server::ClipboardInfo& clipboard =
+        server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = primary.getName();
+    clipboard.m_clipboardSeqNum = 5;
+    clipboard.m_clipboard = makeTextClipboard("last committed clipboard");
+    clipboard.m_clipboardData.set(clipboard.m_clipboard.marshall());
+
+    IScreen::ClipboardInfo grab;
+    grab.m_id = kClipboardClipboard;
+    grab.m_sequenceNumber = 10;
+    server.handleClipboardGrabbed(
+        Event(Event::kUnknown, NULL, &grab, Event::kDontFreeData), &client);
+    ASSERT_EQ(client.getName(), clipboard.m_clipboardOwner);
+    ASSERT_TRUE(clipboard.m_pendingClipboardFetch);
+
+    client.sourceClipboard = makeMaterializedPathsClipboard(
+        barrier::fs::u8path("/tmp/untrusted-cache/remote-file.txt"));
+    client.clipboardAvailable = true;
+
+    EXPECT_FALSE(server.onClipboardChanged(
+        &client, kClipboardClipboard, 10));
+
+    EXPECT_EQ(primary.getName(), clipboard.m_clipboardOwner);
+    EXPECT_EQ(5u, clipboard.m_clipboardSeqNum);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
+    ASSERT_TRUE(clipboard.m_clipboard.has(IClipboard::kText));
+    EXPECT_EQ("last committed clipboard",
+              clipboard.m_clipboard.get(IClipboard::kText));
+    clipboard.m_clipboard.close();
 }
 
 TEST(ServerReconnectTests, onClipboardChangedStripsImageFileListMetadataBeforeForwarding)
@@ -2240,23 +7649,27 @@ TEST(ServerReconnectTests, onClipboardChangedStripsImageFileListMetadataBeforeFo
     Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
     clipboard.m_clipboardOwner = primary.getName();
     clipboard.m_clipboardSeqNum = 10;
-    clipboard.m_pendingPrimaryFetch = true;
+    clipboard.m_pendingClipboardFetch = true;
     primary.sourceClipboard = makeImageClipboardWithSourcePathMetadata(
         barrier::fs::u8path("/tmp/image-copy.png"));
     primary.clipboardAvailable = true;
 
     server.onClipboardChanged(&primary, kClipboardClipboard, 10);
 
-    EXPECT_FALSE(clipboard.m_pendingPrimaryFetch);
+    EXPECT_FALSE(clipboard.m_pendingClipboardFetch);
     EXPECT_EQ(1u, client.clipboardDirtyCount);
     EXPECT_TRUE(client.lastClipboardDirty);
     EXPECT_EQ(1u, client.setClipboardCount);
+    ASSERT_TRUE(clipboard.m_clipboard.open(0));
     EXPECT_TRUE(clipboard.m_clipboard.has(IClipboard::kPNG));
     EXPECT_FALSE(clipboard.m_clipboard.has(IClipboard::kFileList));
     EXPECT_FALSE(clipboard.m_clipboard.has(IClipboard::kText));
+    clipboard.m_clipboard.close();
+    ASSERT_TRUE(client.lastSetClipboard.open(0));
     ASSERT_TRUE(client.lastSetClipboard.has(IClipboard::kPNG));
     EXPECT_FALSE(client.lastSetClipboard.has(IClipboard::kFileList));
     EXPECT_FALSE(client.lastSetClipboard.has(IClipboard::kText));
+    client.lastSetClipboard.close();
 }
 
 TEST(ServerReconnectTests, delayedSwitchReanchorsActiveWhenPrimaryCannotBeEntered)
@@ -2317,24 +7730,59 @@ TEST(ServerReconnectTests, invalidFileCompletionReleasesReceiveState)
     Server server;
     initializeServer(server, config, primary, events, client);
 
-    const barrier::fs::path spoolPath =
-        barrier::fs::temp_directory_path() / barrier::fs::u8path("weave-server-invalid-complete.part");
-    barrier::fs::remove(spoolPath);
-    {
-        std::ofstream file(spoolPath.u8string().c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        file << "partial";
-    }
+    ASSERT_TRUE(server.getFileReceiveSession().begin(1024, 0, 0));
+    ASSERT_TRUE(server.getFileReceiveSession().append("partial"));
+    const barrier::fs::path spoolPath = server.getFileReceiveSession().spoolPath();
 
-    server.getExpectedFileSize() = 1024;
-    server.getReceivedFileData() = "stale";
-    server.getReceivedFileSpoolPath() = spoolPath;
+    server.onFileRecieveCompleted(
+        server.getFileReceiveSession().generation());
 
-    server.onFileRecieveCompleted();
-
-    EXPECT_EQ(0u, server.getExpectedFileSize());
-    EXPECT_TRUE(server.getReceivedFileData().empty());
-    EXPECT_TRUE(server.getReceivedFileSpoolPath().empty());
+    EXPECT_EQ(0u, server.getFileReceiveSession().expectedSize());
+    EXPECT_TRUE(server.getFileReceiveSession().data().empty());
+    EXPECT_TRUE(server.getFileReceiveSession().spoolPath().empty());
     EXPECT_FALSE(barrier::fs::exists(spoolPath));
+}
+
+TEST(ServerReconnectTests, staleFileCompletionDoesNotResetNewReceive)
+{
+    Config config;
+    config.addScreen("primary");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient active("primary");
+    Server server;
+    initializeServer(server, config, primary, events, active);
+
+    ASSERT_TRUE(server.getFileReceiveSession().begin(3, 1024, 1024));
+    const std::uint64_t staleGeneration =
+        server.getFileReceiveSession().generation();
+    ASSERT_TRUE(server.getFileReceiveSession().append("old"));
+    ASSERT_TRUE(server.getFileReceiveSession().finish());
+
+    std::string completedData;
+    size_t completedSize = 0;
+    barrier::fs::path completedSpool;
+    server.getFileReceiveSession().takeCompleted(
+        completedData, completedSize, completedSpool);
+    ASSERT_EQ("old", completedData);
+    ASSERT_EQ(3u, completedSize);
+    ASSERT_TRUE(server.getFileReceiveSession().begin(4, 1024, 1024));
+    const std::uint64_t currentGeneration =
+        server.getFileReceiveSession().generation();
+    server.onFileRecieveCompleted(staleGeneration);
+
+    EXPECT_GT(currentGeneration, staleGeneration);
+    EXPECT_TRUE(server.getFileReceiveSession().matchesGeneration(currentGeneration));
+    EXPECT_EQ(FileReceiveSession::kReceiving,
+              server.getFileReceiveSession().state());
+    EXPECT_EQ(4u, server.getFileReceiveSession().expectedSize());
 }
 
 TEST(ServerReconnectTests, singleFileTransferRejectsSymlinkSource)
@@ -2404,6 +7852,67 @@ TEST(ServerReconnectTests, invalidRemoteClipboardPackageDoesNotPublishReadyClipb
     EXPECT_EQ(0u, readyEvents);
 }
 
+TEST(ServerReconnectTests, manualAndDragDropsPreserveClipboardWhileWritingFiles)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    FileEvents fileEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+
+    UInt32 publishRequests = 0;
+    ON_CALL(events, addEvent(_))
+        .WillByDefault(Invoke([&publishRequests](const Event& event) {
+            if (event.getDataObject() != NULL) {
+                Server::FileClipboardReadyInfo* info =
+                    static_cast<Server::FileClipboardReadyInfo*>(
+                        event.getDataObject());
+                if (info->m_publishClipboard) {
+                    ++publishRequests;
+                }
+            }
+            Event::deleteData(event);
+        }));
+
+    NiceMock<MockPrimaryClient> primary;
+    RecordingClient active("primary");
+    Server server;
+    initializeServer(server, config, primary, events, active);
+    const barrier::fs::path root =
+        barrier::fs::temp_directory_path() /
+        barrier::fs::u8path("weave-server-transfer-kind-clipboard-test");
+    barrier::fs::remove_all(root);
+    barrier::fs::create_directories(root);
+
+    server.testWriteDroppedFileTransfer(
+        barrier::FileTransferKind::kManual, root.u8string(),
+        "manual.txt", "manual payload");
+    server.testWriteDroppedFileTransfer(
+        barrier::FileTransferKind::kDrag, root.u8string(),
+        "drag.txt", "drag payload");
+
+    EXPECT_EQ(0u, publishRequests);
+    EXPECT_TRUE(barrier::fs::exists(root / "manual.txt"));
+    EXPECT_TRUE(barrier::fs::exists(root / "drag.txt"));
+
+    server.testWriteDroppedFileTransfer(
+        barrier::FileTransferKind::kClipboard, root.u8string(),
+        "clipboard.txt", "clipboard payload");
+
+    EXPECT_EQ(1u, publishRequests);
+    EXPECT_TRUE(barrier::fs::exists(root / "clipboard.txt"));
+    barrier::fs::remove_all(root);
+}
+
 TEST(ServerReconnectTests, staleFileClipboardReadyDoesNotReplacePendingSession)
 {
     Config config;
@@ -2434,19 +7943,99 @@ TEST(ServerReconnectTests, staleFileClipboardReadyDoesNotReplacePendingSession)
     server.m_readyFileClipboardSession = "ready-session";
     server.m_readyFileClipboardPaths.push_back("/tmp/current-ready.txt");
 
-    Server::FileClipboardReadyInfo* info = new Server::FileClipboardReadyInfo();
-    info->m_sessionId = "stale-session";
-    info->m_paths.push_back("/tmp/stale-ready.txt");
-    info->m_publishClipboard = false;
-    Event event(Event::kUnknown, &server, info);
-    event.setDataObject(info);
+    Server::FileClipboardReadyInfo info;
+    info.m_sessionId = "stale-session";
+    info.m_paths.push_back("/tmp/stale-ready.txt");
+    info.m_publishClipboard = false;
+    Event event(Event::kUnknown, &server, &info, Event::kDontFreeData);
 
     server.handleFileClipboardReadyEvent(event, NULL);
-    Event::deleteData(event);
 
     EXPECT_EQ("current-session", server.m_remoteFileClipboardSession);
     EXPECT_EQ("ready-session", server.m_readyFileClipboardSession);
     ASSERT_EQ(1u, server.m_readyFileClipboardPaths.size());
     EXPECT_EQ("/tmp/current-ready.txt", server.m_readyFileClipboardPaths[0]);
     EXPECT_EQ(0u, publishedEvents);
+}
+
+TEST(ServerReconnectTests, primaryClipboardGrabSupersedesPendingRemoteFileClipboard)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_clipboardRevision.advance();
+    server.m_remoteFileClipboardSession = "remote-file-a";
+    server.m_remoteFileClipboardRevision = server.m_clipboardRevision;
+
+    IScreen::ClipboardInfo grabbed;
+    grabbed.m_id = kClipboardClipboard;
+    grabbed.m_sequenceNumber = 11;
+    server.handleClipboardGrabbed(
+        Event(Event::kUnknown, NULL, &grabbed, Event::kDontFreeData),
+        &primary);
+
+    Server::FileClipboardReadyInfo ready;
+    ready.m_sessionId = "remote-file-a";
+    ready.m_paths.push_back("/tmp/materialized-a.txt");
+    Event readyEvent(Event::kUnknown, &server, &ready, Event::kDontFreeData);
+    server.handleFileClipboardReadyEvent(readyEvent, NULL);
+
+    EXPECT_TRUE(server.m_remoteFileClipboardSession.empty());
+    EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
+    EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
+    EXPECT_EQ(0u, primary.setClipboardCount);
+}
+
+TEST(ServerReconnectTests, newerClipboardRevisionRejectsOlderFileCompletion)
+{
+    Config config;
+    config.addScreen("primary");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents,
+                         serverEvents);
+
+    ClipboardPrimaryClient primary;
+    RecordingClient active("primary");
+    Server server;
+    initializeServer(server, config, primary, events, active);
+
+    server.m_clipboardRevision.advance();
+    const barrier::ClipboardRevision fileRevision = server.m_clipboardRevision;
+    server.m_remoteFileClipboardSession = "remote-file-a";
+    server.m_remoteFileClipboardRevision = fileRevision;
+
+    server.supersedeFileClipboard("newer text clipboard");
+
+    Server::FileClipboardReadyInfo ready;
+    ready.m_sessionId = "remote-file-a";
+    ready.m_paths.push_back("/tmp/materialized-a.txt");
+    ready.m_revision = fileRevision;
+    Event readyEvent(Event::kUnknown, &server, &ready, Event::kDontFreeData);
+    server.handleFileClipboardReadyEvent(readyEvent, NULL);
+
+    EXPECT_NE(fileRevision, server.m_clipboardRevision);
+    EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
+    EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
+    EXPECT_EQ(0u, primary.setClipboardCount);
 }

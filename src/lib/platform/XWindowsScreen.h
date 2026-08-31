@@ -26,11 +26,14 @@
 
 #include <X11/Xlib.h>
 
+#include <memory>
 #include <string>
 
 class XWindowsClipboard;
+struct XWindowsClipboardSnapshotWorkerContext;
 class XWindowsKeyState;
 class XWindowsScreenSaver;
+class Thread;
 
 //! Implementation of IPlatformScreen for X11
 class XWindowsScreen : public PlatformScreen {
@@ -90,6 +93,7 @@ public:
     virtual bool        leave() override;
     virtual bool        setClipboard(ClipboardID, const IClipboard*) override;
     virtual void        checkClipboards() override;
+    virtual bool        hasAsyncClipboardSnapshots() const override;
     virtual void        openScreensaver(bool notify) override;
     virtual void        closeScreensaver() override;
     virtual void        screensaver(bool activate) override;
@@ -120,6 +124,41 @@ public:
 	                            const VisibleAreas& areas,
 	                            SInt32 anchorX, SInt32 anchorY,
 	                            SInt32& x, SInt32& y);
+	static bool         visibleAreaTopologiesEqualForTest(
+	                            const VisibleAreas& first,
+	                            const VisibleAreas& second);
+	static bool         isExternalSelectionOwnerChangeForTest(
+	                            int eventType,
+	                            int selectionEventType,
+	                            int subtype,
+	                            int setOwnerSubtype,
+	                            Window owner,
+	                            Window ownWindow);
+	static bool         shouldObserveClipboardOnCheckForTest(
+	                            bool hasXFixes,
+	                            Window owner,
+	                            Window knownOwner,
+	                            Window ownWindow);
+	static double       primaryLeaveGrabTimeoutForTest(
+	                            bool lowLatencyMode);
+	static double       primaryLeaveGrabRetrySleepForTest(
+	                            bool lowLatencyMode);
+	static bool         shouldProcessCoreMotionForTest(
+	                            bool isPrimary,
+	                            bool isOnScreen,
+	                            bool xi2Detected,
+	                            bool xi2RawMotionOwned);
+	bool                xi2DetectedForTest() const;
+#ifdef HAVE_XI2
+	static bool         xInputCookieUsableForTest(
+	                            const XGenericEventCookie& cookie,
+	                            int expectedExtension);
+	static bool         xInputEventNeedsPayloadForTest(int eventType);
+	static bool         xInputRawMotionDeltasForTest(
+	                            const XIRawEvent& event,
+	                            double& dx,
+	                            double& dy);
+#endif
 	virtual bool        adjustPointToVisibleAreaNearAnchor(
 	                            SInt32 anchorX, SInt32 anchorY,
 	                            SInt32& x, SInt32& y) override;
@@ -151,6 +190,14 @@ private:
 
     // terminate a selection request
     void                destroyClipboardRequest(Window window);
+    bool                queueClipboardSnapshot(ClipboardID id, Window owner,
+                            Time timestamp, bool announceGrab);
+    void                wakeClipboardSnapshotWorker();
+    void                observeClipboardOwner(ClipboardID id, Window owner,
+                            Time timestamp, bool contentChanged,
+                            bool announceGrab);
+    void                bootstrapClipboardSnapshots();
+    void                stopClipboardSnapshotWorker();
 
     // X I/O error handler
     void                onError();
@@ -169,6 +216,8 @@ private:
     void                saveShape();
     Window                openWindow() const;
     void                openIM();
+	void                releaseResources(bool eventBufferInstalled,
+	                            bool systemHandlerInstalled);
 
     void                wakeDisplayFromPowerSave();
     bool                updateVisibleAreasFromRandR();
@@ -191,8 +240,9 @@ private:
     int                 y_accumulateMouseScroll(SInt32 yDelta) const;
 
     bool                detectXI2();
+    bool                detectXFixesSelectionNotifications();
 #ifdef HAVE_XI2
-    void                selectXIRawMotion();
+    bool                selectXIRawMotion();
     void                handleXIRawButtonEvent(const XIRawButtonEvent* event);
 #endif
     void                selectEvents(Window) const;
@@ -278,6 +328,11 @@ private:
     // clipboards
     XWindowsClipboard*    m_clipboard[kClipboardEnd];
     UInt32                m_sequenceNumber;
+    std::shared_ptr<XWindowsClipboardSnapshotWorkerContext>
+                        m_clipboardSnapshotContext;
+    Thread*             m_clipboardSnapshotThread;
+    bool                m_clipboardSnapshotsBootstrapped;
+    bool                m_clipboardSnapshotThreadingEnabled;
     mutable String        m_dropTargetPath;
 
     // screen saver stuff
@@ -309,6 +364,9 @@ private:
     int                    m_xkbEventBase;
 
     bool                m_xi2detected;
+    bool                m_xi2RawMotionOwned;
+    double              m_xi2MotionRemainderX;
+    double              m_xi2MotionRemainderY;
 
     // low latency mode - reduces sleep times and increases responsiveness
     bool                m_lowLatencyMode;
@@ -316,6 +374,10 @@ private:
     // XRandR extension stuff
     bool                m_xrandr;
     int                 m_xrandrEventBase;
+
+    // XFixes reports owner changes even when Weave did not own the selection.
+    bool                m_xfixes;
+    int                 m_xfixesEventBase;
 
     IEventQueue*        m_events;
     barrier::KeyMap                m_keyMap;

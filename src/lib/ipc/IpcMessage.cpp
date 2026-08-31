@@ -39,12 +39,96 @@ IpcHelloMessage::~IpcHelloMessage()
 {
 }
 
+IpcNodeReadyMessage::IpcNodeReadyMessage() :
+IpcMessage(kIpcReady)
+{
+}
+
+IpcNodeReadyMessage::~IpcNodeReadyMessage()
+{
+}
+
+IpcNodeReadyV2Message::IpcNodeReadyV2Message(
+    UInt32 processId, UInt32 sessionId, std::uint64_t inputGeneration,
+    bool inputReady, const std::string& desktopName,
+    const std::string& buildId, std::uint64_t queryNonce) :
+    IpcMessage(kIpcReadyV2),
+    m_processId(processId),
+    m_sessionId(sessionId),
+    m_inputGeneration(inputGeneration),
+    m_inputReady(inputReady),
+    m_desktopName(desktopName),
+    m_buildId(buildId),
+    m_queryNonce(queryNonce)
+{
+}
+
+IpcNodeReadyV2Message::~IpcNodeReadyV2Message()
+{
+}
+
+IpcInputReadyQueryMessage::IpcInputReadyQueryMessage(
+    std::uint64_t queryNonce) :
+    IpcMessage(kIpcReadyQuery),
+    m_queryNonce(queryNonce)
+{
+}
+
+IpcInputReadyQueryMessage::~IpcInputReadyQueryMessage()
+{
+}
+
+IpcActivateNodeMessage::IpcActivateNodeMessage(
+    std::uint64_t activationNonce) :
+    IpcMessage(kIpcActivate),
+    m_activationNonce(activationNonce)
+{
+}
+
+IpcActivateNodeMessage::~IpcActivateNodeMessage()
+{
+}
+
+IpcNodeActivatedMessage::IpcNodeActivatedMessage(
+    UInt32 processId, std::uint64_t activationNonce) :
+    IpcMessage(kIpcActivated),
+    m_processId(processId),
+    m_activationNonce(activationNonce)
+{
+}
+
+IpcNodeActivatedMessage::~IpcNodeActivatedMessage()
+{
+}
+
 IpcShutdownMessage::IpcShutdownMessage() :
 IpcMessage(kIpcShutdown)
 {
 }
 
 IpcShutdownMessage::~IpcShutdownMessage()
+{
+}
+
+IpcStopRequestMessage::IpcStopRequestMessage(std::uint64_t requestId) :
+    IpcMessage(kIpcStopRequest),
+    m_requestId(requestId)
+{
+}
+
+IpcStopRequestMessage::~IpcStopRequestMessage()
+{
+}
+
+IpcStopAckMessage::IpcStopAckMessage(
+    std::uint64_t requestId, std::uint64_t commandGeneration) :
+    IpcMessage(kIpcStopAck),
+    m_requestId(requestId),
+    m_commandGeneration(commandGeneration)
+{
+}
+
+IpcStopAckMessage::~IpcStopAckMessage()
 {
 }
 

@@ -16,6 +16,8 @@
 
 file(GLOB headers "*.h")
 file(GLOB sources "*.cpp")
+list(APPEND sources "${CMAKE_CURRENT_SOURCE_DIR}/SecureRandom.cpp")
+list(REMOVE_DUPLICATES sources)
 
 # arch
 if (WIN32)

@@ -6,18 +6,23 @@ unit_src="${project_dir}/scripts/weave-enhanced-user.service.in"
 unit_dir="${HOME}/.config/systemd/user"
 unit_dst="${unit_dir}/weave-enhanced.service"
 uid="$(id -u)"
+build_dir="${BUILD_DIR:-${project_dir}/build}"
+weave_bin="${WEAVE_BIN:-${build_dir}/bin/weave}"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
 
-if [[ ! -x "${project_dir}/_build/bin/weave" ]]; then
-    echo "missing executable: ${project_dir}/_build/bin/weave" >&2
+if [[ ! -x "${weave_bin}" ]]; then
+    echo "missing executable: ${weave_bin}" >&2
     echo "build the project before installing the user service" >&2
     exit 1
 fi
 
 mkdir -p "${unit_dir}"
-sed "s#@PROJECT_DIR@#${project_dir}#g" "${unit_src}" > "${unit_dst}"
+sed \
+    -e "s#@PROJECT_DIR@#${project_dir}#g" \
+    -e "s#@WEAVE_BIN@#${weave_bin}#g" \
+    "${unit_src}" > "${unit_dst}"
 
 systemctl --user import-environment DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS \
     XDG_CURRENT_DESKTOP XDG_SESSION_TYPE WAYLAND_DISPLAY

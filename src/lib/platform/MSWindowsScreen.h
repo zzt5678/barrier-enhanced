@@ -20,11 +20,13 @@
 #pragma once
 
 #include "platform/MSWindowsHook.h"
+#include "platform/MSWindowsClipboardChangeTracker.h"
 #include "barrier/PlatformScreen.h"
 #include "barrier/DragInformation.h"
 #include "platform/synwinhk.h"
 #include "mt/CondVar.h"
 #include "mt/Mutex.h"
+#include <memory>
 #include <string>
 
 #define WIN32_LEAN_AND_MEAN
@@ -36,6 +38,7 @@ class MSWindowsKeyState;
 class MSWindowsScreenSaver;
 class Thread;
 class MSWindowsDropTarget;
+struct MSWindowsClipboardSnapshotWorkerContext;
 
 //! Implementation of IPlatformScreen for Microsoft Windows
 class MSWindowsScreen : public PlatformScreen {
@@ -72,6 +75,18 @@ public:
     // IScreen overrides
     virtual void*        getEventTarget() const override;
     virtual bool        getClipboard(ClipboardID id, IClipboard*) const override;
+    virtual bool        getClipboardSnapshot(
+                            ClipboardID id,
+                            std::shared_ptr<const String>* data,
+                            UInt32* snapshotTime) const override;
+    virtual bool        setClipboardSnapshot(
+                            ClipboardID id,
+                            const std::shared_ptr<const String>& data) override;
+    virtual bool        setClipboardSnapshot(
+                            ClipboardID id,
+                            const std::shared_ptr<const String>& data,
+                            std::uint64_t publicationId) override;
+    virtual bool        hasAsyncClipboardPublications() const override;
     virtual void        getShape(SInt32& x, SInt32& y,
                             SInt32& width, SInt32& height) const override;
     virtual void        getCursorPos(SInt32& x, SInt32& y) const override;
@@ -91,6 +106,7 @@ public:
     // ISecondaryScreen overrides
     virtual void        fakeMouseButton(ButtonID id, bool press) override;
     virtual void        fakeMouseMove(SInt32 x, SInt32 y) override;
+    virtual bool        tryFakeMouseMove(SInt32 x, SInt32 y) override;
     virtual void        fakeMouseRelativeMove(SInt32 dx, SInt32 dy) const override;
     virtual void        fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const override;
 
@@ -105,11 +121,16 @@ public:
 
     // IPlatformScreen overrides
     virtual void        enable() override;
+    virtual bool        prepareInputBackend() override;
+    virtual bool        probeInputBackend(
+                            std::string& desktopName) const override;
     virtual void        disable() override;
     virtual void        enter() override;
+    virtual bool        tryEnter() override;
     virtual bool        leave() override;
     virtual bool        setClipboard(ClipboardID, const IClipboard*) override;
     virtual void        checkClipboards() override;
+    virtual bool        hasAsyncClipboardSnapshots() const override;
     virtual void        openScreensaver(bool notify) override;
     virtual void        closeScreensaver() override;
     virtual void        screensaver(bool activate) override;
@@ -117,6 +138,9 @@ public:
     virtual void        setOptions(const OptionsList& options) override;
     virtual void        setSequenceNumber(UInt32) override;
     virtual bool        isPrimary() const override;
+    virtual bool        canEnter() const override;
+    virtual std::uint64_t inputGeneration() const override;
+    virtual std::string inputDesktopName() const override;
     virtual void        fakeDraggingFiles(DragFileList fileList) override;
     virtual std::string& getDraggingFilename() override;
     virtual const std::string& getDropTarget() const override;
@@ -170,6 +194,14 @@ private: // HACK
     bool                onScreensaver(bool activated);
     bool                onDisplayChange();
     bool                onClipboardChange();
+    void                onClipboardSnapshotReady(std::uint64_t token);
+    void                onClipboardPublicationReady(std::uint64_t token);
+    bool                queueClipboardSnapshot(UInt32 windowsSequence,
+                            bool announceGrab);
+    void                wakeClipboardSnapshotWorker();
+    void                stopClipboardSnapshotWorker();
+    bool                reapSendDragThreadIfReady();
+    void                stopSendDragThread();
 
     // warp cursor without discarding queued events
     void                warpCursorNoFlush(SInt32 x, SInt32 y);
@@ -280,6 +312,7 @@ private:
     // timer for periodically checking stuff that requires polling
     EventQueueTimer*    m_fixTimer;
     bool                m_pendingShapeRefresh;
+    bool                m_initialMouseMovePending;
 
     // the keyboard layout to use when off primary screen
     HKL                    m_keyLayout;
@@ -295,6 +328,11 @@ private:
     HWND                m_window;
     HWND                m_nextClipboardWindow;
     bool                m_ownClipboard;
+    MSWindowsClipboardChangeTracker
+                        m_clipboardChangeTracker;
+    std::shared_ptr<MSWindowsClipboardSnapshotWorkerContext>
+                        m_clipboardSnapshotContext;
+    Thread*             m_clipboardSnapshotThread;
 
     // one desk per desktop and a cond var to communicate with it
     MSWindowsDesks*    m_desks;

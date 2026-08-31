@@ -21,6 +21,7 @@
 #include "base/EventTypes.h"
 
 #include <cstdint>
+#include <string>
 
 // protocol version number
 // 1.0:  initial protocol
@@ -31,9 +32,16 @@
 // 1.4:  adds crypto support
 // 1.5:  adds file transfer and removes home brew crypto
 // 1.6:  adds clipboard streaming
+// 1.7:  adds transactional input handoff readiness
+// 1.8:  adds input epochs, per-connection input sequence, and explicit
+//       keyboard broadcast routing
+// 1.9:  adds a separately authenticated bulk payload connection
+// 1.10: adds positive acknowledgment after a committed input handoff
+// 1.11: adds acknowledged source input-lease revocation before handoff commit
 // NOTE: with new version, barrier minor version should increment
 static const SInt16        kProtocolMajorVersion = 1;
-static const SInt16        kProtocolMinorVersion = 6;
+static const SInt16        kProtocolMinorVersion = 12;
+static const SInt16        kProtocolMinimumMinorVersion = 12;
 
 // default contact port number
 static const UInt16        kDefaultPort = 24800;
@@ -47,9 +55,11 @@ static const UInt32        kMaxHelloLength = 1024;
 static const double        kKeepAliveRate = 3.0;
 
 // number of skipped kMsgCKeepAlive messages that indicates a problem.
-// Pending stream input/output gets a separate deferral budget, so idle stale
-// sockets should be retired quickly enough for hands-off reconnects.
-static const double        kKeepAlivesUntilDeath = 2.0;
+// Desktop switches and secure-desktop transitions can briefly stall the
+// event loop even while the connection remains healthy. Pending stream work
+// has its own progress checks, so tolerate five missed idle keepalives before
+// retiring the socket.
+static const double        kKeepAlivesUntilDeath = 5.0;
 
 // obsolete heartbeat stuff
 static const double        kHeartRate = -1.0;
@@ -92,8 +102,15 @@ enum EDataTransfer {
 enum EDataReceived {
     kStart,
     kNotFinish,
+    kBackpressure,
     kFinish,
-    kError
+    kError,
+    kCancelled
+};
+
+enum EInputMessageFlags {
+    kInputMessageNoFlags = 0,
+    kInputMessageBroadcast = 1
 };
 
 //
@@ -122,6 +139,15 @@ extern const char*        kMsgHello;
 // name.
 extern const char*        kMsgHelloBack;
 
+// identify a secondary bulk connection; secondary -> primary
+// $1 = major, $2 = minor, $3 = client name, $4 = one-time binding token.
+extern const char*        kMsgHelloBulkBack;
+
+// identify a protocol 1.12 bulk connection; secondary -> primary
+// $1 = major, $2 = minor, $3 = client name, $4 = one-time token,
+// $5 = stable control-connection binding.
+extern const char*        kMsgHelloBulkBack1_12;
+
 
 //
 // command codes
@@ -142,6 +168,18 @@ extern const char*        kMsgCClose;
 // that is activated on entry to the screen.  the secondary screen
 // should adjust its toggle modifiers to reflect that state.
 extern const char*        kMsgCEnter;
+
+// prepare to enter screen: primary -> secondary
+// $1 = x, $2 = y, $3 = sequence number, $4 = modifier mask.
+extern const char*        kMsgCPrepareEnter;
+
+// abort a prepared enter: primary -> secondary
+// $1 = sequence number.
+extern const char*        kMsgCAbortEnter;
+
+// revoke an active source input lease: primary -> secondary
+// $1 = handoff sequence, $2 = expected active input epoch.
+extern const char*        kMsgCRevokeInput;
 
 // leave screen:  primary -> secondary
 // leaving screen.  the secondary screen should send clipboard
@@ -182,6 +220,21 @@ extern const char*        kMsgCInfoAck;
 // should disconnect from the server.  the appropriate interval is
 // defined by an option.
 extern const char*        kMsgCKeepAlive;
+
+// offer a one-time token for a secondary bulk connection; primary -> secondary
+extern const char*        kMsgCBulkOffer;
+
+// offer a protocol 1.12 bulk connection; primary -> secondary
+// $1 = one-time token, $2 = stable control-connection binding.
+extern const char*        kMsgCBulkOffer1_12;
+
+// accept/reject a secondary bulk connection; primary -> secondary
+extern const char*        kMsgDBulkAccepted;
+extern const char*        kMsgDBulkRejected;
+
+// independent liveness probe/acknowledgment on the secondary bulk stream
+extern const char*        kMsgBulkKeepAlive;
+extern const char*        kMsgBulkKeepAliveAck;
 
 //
 // data codes
@@ -243,6 +296,29 @@ extern const char*        kMsgDMouseWheel;
 // like as kMsgDMouseWheel except only sends $1 = yDelta.
 extern const char*        kMsgDMouseWheel1_0;
 
+// Protocol 1.8 input frames. Each carries $1 = InputEpoch and
+// $2 = InputSequence before the legacy input payload. Keyboard frames also
+// carry $3 = EInputMessageFlags so broadcast input remains explicit.
+extern const char*        kMsgDKeyDown1_8;
+extern const char*        kMsgDKeyRepeat1_8;
+extern const char*        kMsgDKeyUp1_8;
+extern const char*        kMsgDMouseDown1_8;
+extern const char*        kMsgDMouseUp1_8;
+extern const char*        kMsgDMouseMove1_8;
+extern const char*        kMsgDMouseRelMove1_8;
+extern const char*        kMsgDMouseWheel1_8;
+
+// response to kMsgCPrepareEnter: secondary -> primary.  A secondary that
+// becomes unavailable between prepare and commit sends a second rejection for
+// the same sequence. Protocol 1.10 sends a second positive response only after
+// the input backend has committed the lease. $1 = sequence number, $2 = 1 when
+// ready/committed and 0 when rejected.
+extern const char*        kMsgDEnterReady;
+
+// response to kMsgCRevokeInput: secondary -> primary.
+// $1 = handoff sequence, $2 = 1 when the matching lease is inactive.
+extern const char*        kMsgDRevokeInputAck;
+
 // clipboard data:  primary <-> secondary
 // $2 = sequence number, $3 = mark $4 = clipboard data.  the sequence number
 // is 0 when sent by the primary.  secondary screens should use the
@@ -278,6 +354,16 @@ extern const char*        kMsgDSetOptions;
 // 2 means the file transfer is finished.
 extern const char*        kMsgDFileTransfer;
 
+// Protocol 1.12 transactional file transfer. Every frame carries a 128-bit
+// control-connection binding and a role-qualified transfer identifier.
+extern const char*        kMsgDFileTransferStart1_12;
+extern const char*        kMsgDFileTransferStartAck1_12;
+extern const char*        kMsgDFileTransferData1_12;
+extern const char*        kMsgDFileTransferEnd1_12;
+extern const char*        kMsgDFileTransferCancel1_12;
+extern const char*        kMsgDFileTransferCancelAck1_12;
+extern const char*        kMsgDFileTransferCommitAck1_12;
+
 // drag information:  primary <-> secondary
 // transfer drag information. The first 2 bytes are used for storing
 // the number of dragging objects. Then the following string consists
@@ -312,6 +398,9 @@ extern const char*        kMsgEUnknown;
 // protocol violation:  primary -> secondary
 // primary should disconnect after sending this message.
 extern const char*        kMsgEBad;
+
+//! Validate the canonical 128-bit control-connection binding encoding.
+bool isValidConnectionBinding(const std::string& binding);
 
 
 //

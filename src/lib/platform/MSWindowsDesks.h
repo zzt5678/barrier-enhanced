@@ -26,6 +26,7 @@
 #include "mt/CondVar.h"
 #include "mt/Mutex.h"
 #include "common/stdmap.h"
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -57,6 +58,31 @@ object don't have to know anything about desks.
 */
 class MSWindowsDesks {
 public:
+    enum DeskInputCommand {
+        kDeskInputKey,
+        kDeskInputButton,
+        kDeskInputAbsoluteMove,
+        kDeskInputRelativeMove,
+        kDeskInputWheel,
+        kDeskControlEnter,
+        kDeskControlLeave,
+        kDeskControlSwitch,
+        kDeskControlOther
+    };
+
+    enum PendingMotionBoundary {
+        kNoPendingMotionBoundary,
+        kFlushPendingMotion,
+        kSupersedePendingMotion
+    };
+
+    enum DesktopTransitionAction {
+        kKeepActiveDesktop,
+        kWaitForObservedDesktop,
+        kActivateObservedDesktop,
+        kRecoverInputProcess
+    };
+
     //! Constructor
     /*!
     \p isPrimary is true iff the desk is for a primary screen.
@@ -94,13 +120,13 @@ public:
     /*!
     Prepares a desk for when the cursor enters it.
     */
-    void                enter();
+    bool                enter();
 
     //! Notify of leaving a desk
     /*!
     Prepares a desk for when the cursor leaves it.
     */
-    void                leave(HKL keyLayout);
+    bool                leave(HKL keyLayout);
 
     //! Notify of options changes
     /*!
@@ -177,7 +203,8 @@ public:
     /*!
     Synthesize a mouse move to the absolute coordinates \c x,y.
     */
-    void                fakeMouseMove(SInt32 x, SInt32 y) const;
+    bool                fakeMouseMove(SInt32 x, SInt32 y,
+                            bool waitForCompletion = true) const;
 
     //! Fake mouse move
     /*!
@@ -191,9 +218,137 @@ public:
     */
     void                fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const;
 
+    //! Return true when the active Windows desktop can process input.
+    bool                canEnter() const;
+
+    //! Probe access to the input desktop without starting a desk thread/hook.
+    bool                probeInputDesktop(std::string& desktopName) const;
+
+    //! Monotonically increasing identity for the active desktop backend.
+    std::uint64_t       inputDesktopGeneration() const;
+
+    //! Name of the active Windows input desktop.
+    std::string         inputDesktopName() const;
+
+    static bool         isDesktopReadyForTest(bool isPrimary, bool noHooks,
+                            bool threadAttached, bool windowReady,
+                            bool hookInstalled,
+                            bool commandResponsive = true,
+                            bool injectionProbeSucceeded = true);
+
+    static bool         isDeskCommandCompleteForTest(
+                            std::uint64_t expectedSequence,
+                            std::uint64_t completedSequence,
+                            bool threadRunning);
+
+    static bool         shouldProcessDeskCommandForTest(
+                            std::uint64_t sequence,
+                            std::uint64_t cancelledThroughSequence);
+
+    static bool         canCancelTimedOutDeskCommandForTest(
+                            std::uint64_t sequence,
+                            std::uint64_t executingSequence,
+                            bool orderedInputCommand = false);
+
+    static bool         commandCompletionProvesResponsiveForTest(
+                            bool commandExecuted,
+                            bool commandSucceeded,
+                            std::uint64_t sequence,
+                            std::uint64_t poisonedThroughSequence);
+
+    static bool         commandInjectionSucceededForTest(
+                            std::uint64_t sequence,
+                            std::uint64_t failedSequence);
+
+    static bool         canQueueDeskCommandForTest(
+                            std::uint64_t nextSequence,
+                            std::uint64_t completedSequence,
+                            std::uint64_t maxPendingCommands);
+
+    static std::uint64_t maxPendingDeskCommandsForTest();
+
+    static bool         deskCommandWaitsForCompletionForTest(
+                            DeskInputCommand command,
+                            bool forceCompletion = false);
+
+    static double        deskCommandAckTimeoutForTest(
+                            bool lowLatencyMode,
+                            bool nestedRemoteMode);
+
+    static double        deskCommandExecutionGraceForTest(
+                            bool lowLatencyMode,
+                            bool nestedRemoteMode);
+
+    static double        boundedDeskCommandWaitTimeoutForTest(
+                            double timeout);
+
+    static bool         canActivateDesktopForTest(
+                            bool startupComplete,
+                            bool threadRunning,
+                            bool threadAttached,
+                            bool windowReady);
+
+    static bool         canAcceptInputForActiveDesktopForTest(
+                            bool activeDesktopReady,
+                            bool observedDesktopMatchesActive);
+
+    static bool         hasDesktopStartupTimedOutForTest(
+                            bool startupComplete,
+                            std::uint64_t now,
+                            std::uint64_t deadline);
+
+    static bool         shouldPostDeskQuitForTest(
+                            bool startupComplete,
+                            DWORD threadID);
+
+    static bool         coalesceMouseMotionForTest(
+                            DeskInputCommand pendingCommand,
+                            SInt32& pendingFirst,
+                            SInt32& pendingSecond,
+                            DeskInputCommand nextCommand,
+                            SInt32 nextFirst,
+                            SInt32 nextSecond);
+
+    static PendingMotionBoundary pendingMotionBoundaryForTest(
+                            DeskInputCommand command,
+                            bool forceCompletion = false);
+
+    static DesktopTransitionAction desktopTransitionActionForTest(
+                            bool observedDesktopMatchesActive,
+                            bool observedDesktopReady,
+                            bool inputLeaseActive,
+                            bool startupComplete,
+                            std::uint64_t now,
+                            std::uint64_t deadline);
+
+    static bool         beginInputRecoveryForTest(bool& recoveryRequested);
+    static DWORD        inputRecoveryHardExitDelayForTest();
+
     //@}
 
 private:
+    enum DeskCommandDispatch {
+        kWaitForDeskCommand,
+        kPostDeskCommand
+    };
+
+    enum DeskCommandWaitResult {
+        kDeskCommandTimedOut,
+        kDeskCommandSucceeded,
+        kDeskCommandFailed
+    };
+
+    class DeskCommand {
+    public:
+        DeskCommand(UINT message, WPARAM wParam, LPARAM lParam,
+                    std::uint64_t sequence);
+
+        UINT            message;
+        WPARAM          wParam;
+        LPARAM          lParam;
+        std::uint64_t   sequence;
+    };
+
     class Desk {
     public:
         std::string m_name;
@@ -204,6 +359,41 @@ private:
         HWND            m_window;
         HWND            m_foregroundWindow;
         bool            m_lowLevel;
+        bool            m_threadAttached;
+        bool            m_windowReady;
+        bool            m_hookInstalled;
+        bool            m_injectionProbeSucceeded;
+        bool            m_startupComplete;
+        std::uint64_t   m_startupDeadline;
+        bool            m_shutdownRequested;
+        bool            m_threadRunning;
+        bool            m_commandResponsive;
+        std::uint64_t   m_completedCommandSequence;
+        std::uint64_t   m_cancelledCommandSequence;
+        std::uint64_t   m_executingCommandSequence;
+        std::uint64_t   m_poisonedThroughCommandSequence;
+        std::uint64_t   m_failedCommandSequence;
+        std::uint64_t   m_lastMotionCommandSequence;
+        DeskCommand*    m_pendingMotionCommand;
+    };
+
+    struct DeskReadinessSnapshot {
+        DeskReadinessSnapshot() :
+            threadAttached(false),
+            windowReady(false),
+            hookInstalled(false),
+            injectionProbeSucceeded(false),
+            commandResponsive(false),
+            ready(false)
+        {
+        }
+
+        bool threadAttached;
+        bool windowReady;
+        bool hookInstalled;
+        bool injectionProbeSucceeded;
+        bool commandResponsive;
+        bool ready;
     };
     typedef std::map<std::string, Desk*> Desks;
 
@@ -216,10 +406,10 @@ private:
     void                destroyWindow(HWND) const;
 
     // message handlers
-    void                deskMouseMove(SInt32 x, SInt32 y) const;
-    void                deskMouseRelativeMove(SInt32 dx, SInt32 dy) const;
+    bool                deskMouseMove(SInt32 x, SInt32 y) const;
+    bool                deskMouseRelativeMove(SInt32 dx, SInt32 dy) const;
     void                deskEnter(Desk* desk);
-    void                deskLeave(Desk* desk, HKL keyLayout);
+    bool                deskLeave(Desk* desk, HKL keyLayout);
     void                updateDeskTimer(double interval);
     void                beginLowLatencyRelativeMoves();
     void                endLowLatencyRelativeMoves();
@@ -230,19 +420,29 @@ private:
     void                removeDesks();
     void                checkDesk();
     bool                isDeskAccessible(const Desk* desk) const;
+    bool                isDeskReady(const Desk* desk) const;
+    bool                isDeskReadyLocked(const Desk* desk) const;
+    DeskReadinessSnapshot getDeskReadiness(const Desk* desk) const;
     void                handleCheckDesk(const Event& event, void*);
 
     // communication with desk threads
-    void                waitForDesk() const;
-    void                sendMessage(UINT, WPARAM, LPARAM) const;
+    DeskCommandWaitResult waitForDeskCommand(const Desk* desk,
+                            std::uint64_t sequence, double timeout) const;
+    bool                sendMessage(UINT, WPARAM, LPARAM,
+                            DeskCommandDispatch dispatch =
+                                kWaitForDeskCommand) const;
+    static DeskInputCommand classifyDeskCommand(UINT msg);
+    void                requestInputRecovery(UINT msg,
+                            const char* reason, bool orderedCommand) const;
 
     // work around for messed up keyboard events from low-level hooks
     HWND                getForegroundWindow() const;
 
     // desk API wrappers
-    HDESK                openInputDesktop();
-    void                closeDesktop(HDESK);
-    std::string getDesktopName(HDESK);
+    HDESK                openInputDesktop() const;
+    HDESK                openInputDesktopForProbe() const;
+    void                 closeDesktop(HDESK) const;
+    std::string getDesktopName(HDESK) const;
 
     // our desk window procs
     static LRESULT CALLBACK primaryDeskProc(HWND, UINT, WPARAM, LPARAM);
@@ -281,11 +481,18 @@ private:
     // the current desk and it's name
     Desk*                m_activeDesk;
     std::string m_activeDeskName;
+    std::string m_observedDeskName;
 
     // one desk per desktop and a cond var to communicate with it
-    Mutex                m_mutex;
+    mutable Mutex        m_mutex;
+    mutable Mutex        m_sendMutex;
     CondVar<bool>        m_deskReady;
     Desks                m_desks;
+    mutable std::uint64_t m_inputDesktopGeneration;
+    mutable std::uint64_t m_nextDeskCommandSequence;
+    mutable POINT        m_cursorPos;
+    mutable bool         m_inputRecoveryRequested;
+    ULONGLONG            m_nextDeskRecoveryProbe;
 
     // keyboard stuff
     std::function<void()> m_updateKeys;

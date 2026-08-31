@@ -15,9 +15,18 @@
 */
 
 #include <gtest/gtest.h>
+#include <QApplication>
 
 int main(int argc, char **argv)
 {
+#if !defined(Q_OS_WIN)
+    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM") &&
+        qEnvironmentVariableIsEmpty("DISPLAY")) {
+        qputenv("QT_QPA_PLATFORM", "offscreen");
+    }
+#endif
+
+    QApplication application(argc, argv);
     testing::InitGoogleTest(&argc, argv);
     return (RUN_ALL_TESTS() == 1) ? 1 : 0;
 }

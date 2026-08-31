@@ -52,7 +52,9 @@ TCPSocket::TCPSocket(IEventQueue* events, SocketMultiplexer* socketMultiplexer, 
     m_windowHighPriorityBytes(0),
     m_windowLowPriorityBytes(0),
     m_windowMaxHighPriorityBuffered(0),
-    m_windowMaxLowPriorityBuffered(0)
+    m_windowMaxLowPriorityBuffered(0),
+    m_outputBytesWritten(0),
+    m_inputBytesReceived(0)
 {
     try {
         m_socket = ARCH->newSocket(family, IArchNetwork::kSTREAM);
@@ -79,7 +81,9 @@ TCPSocket::TCPSocket(IEventQueue* events, SocketMultiplexer* socketMultiplexer, 
     m_windowHighPriorityBytes(0),
     m_windowLowPriorityBytes(0),
     m_windowMaxHighPriorityBuffered(0),
-    m_windowMaxLowPriorityBuffered(0)
+    m_windowMaxLowPriorityBuffered(0),
+    m_outputBytesWritten(0),
+    m_inputBytesReceived(0)
 {
     assert(m_socket != NULL);
 
@@ -195,7 +199,10 @@ TCPSocket::write(const void* buffer, UInt32 n)
 void
 TCPSocket::writeLowPriority(const void* buffer, UInt32 n)
 {
-    writeToBuffer(m_lowPriorityOutputBuffer, buffer, n);
+    // Raw byte priority cannot preserve message boundaries across partial
+    // writes.  Use the primary FIFO so reliable data is never interleaved or
+    // silently discarded when the low-priority budget is exhausted.
+    writeToBuffer(m_outputBuffer, buffer, n);
 }
 
 void
@@ -357,6 +364,20 @@ TCPSocket::getBufferedOutputSize() const
     return m_outputBuffer.getSize() + m_lowPriorityOutputBuffer.getSize();
 }
 
+std::uint64_t
+TCPSocket::getOutputBytesWritten() const
+{
+    Lock lock(&m_mutex);
+    return m_outputBytesWritten;
+}
+
+std::uint64_t
+TCPSocket::getInputBytesReceived() const
+{
+    Lock lock(&m_mutex);
+    return m_inputBytesReceived;
+}
+
 void
 TCPSocket::connect(const NetworkAddress& addr)
 {
@@ -425,61 +446,68 @@ TCPSocket::doRead()
     // Increased from 4096 to 65536 for better throughput on large transfers
     // (e.g., clipboard images). This reduces syscall overhead.
     UInt8 buffer[65536];
-    size_t bytesRead = 0;
+    const bool wasEmpty = (m_inputBuffer.getSize() == 0);
+    bool readAny = false;
 
-    size_t readSize = getInputReadSizeNoLock(sizeof(buffer));
-    if (readSize == 0) {
-        LOG((CLOG_DEBUG1 "socket input backlog full; pausing reads until buffered input is drained"));
-        return kNew;
-    }
-
-    bytesRead = ARCH->readSocket(m_socket, buffer, readSize);
-
-    if (bytesRead > 0) {
-        bool wasEmpty = (m_inputBuffer.getSize() == 0);
-
-        // slurp up as much as possible
-        do {
-            if (!queueInputOrDisconnectNoLock(buffer, static_cast<UInt32>(bytesRead))) {
-                return kNew;
+    while (true) {
+        const size_t readSize = getInputReadSizeNoLock(sizeof(buffer));
+        if (readSize == 0) {
+            LOG((CLOG_DEBUG1 "socket input backlog full; pausing reads until buffered input is drained"));
+            if (readAny && wasEmpty) {
+                sendEvent(m_events->forIStream().inputReady());
             }
-            if (!canReadInputNoLock()) {
-                if (wasEmpty) {
-                    sendEvent(m_events->forIStream().inputReady());
-                }
-                return kNew;
+            return kNew;
+        }
+
+        size_t bytesRead = 0;
+        try {
+            bytesRead = readSocketNoLock(buffer, readSize);
+        }
+        catch (XArchNetworkInterrupted& e) {
+            // A non-blocking read can race with the readiness notification.
+            // Preserve any bytes already drained in this pass and keep the
+            // connection open; zero is reserved for an orderly EOF.
+            if (readAny && wasEmpty) {
+                sendEvent(m_events->forIStream().inputReady());
             }
+            LOG((CLOG_DEBUG2 "socket read temporarily unavailable: %s", e.what()));
+            return kRetry;
+        }
 
-            readSize = getInputReadSizeNoLock(sizeof(buffer));
-            if (readSize == 0) {
-                if (wasEmpty) {
-                    sendEvent(m_events->forIStream().inputReady());
-                }
-                return kNew;
+        if (bytesRead == 0) {
+            // Deliver buffered data before forwarding shutdown. Filters use
+            // this ordering to drain the last complete packet before EOF.
+            LOG((CLOG_DEBUG1 "socket peer closed its write side"));
+            if (readAny && wasEmpty) {
+                sendEvent(m_events->forIStream().inputReady());
             }
+            sendEvent(m_events->forIStream().inputShutdown());
+            if (!m_writable && m_inputBuffer.getSize() == 0) {
+                sendEvent(m_events->forISocket().disconnected());
+                m_connected = false;
+            }
+            m_readable = false;
+            return kNew;
+        }
 
-            bytesRead = ARCH->readSocket(m_socket, buffer, readSize);
-        } while (bytesRead > 0);
+        if (!queueInputOrDisconnectNoLock(buffer, static_cast<UInt32>(bytesRead))) {
+            return kNew;
+        }
+        readAny = true;
 
-        // send input ready if input buffer was empty
-        if (wasEmpty) {
-            sendEvent(m_events->forIStream().inputReady());
+        if (!canReadInputNoLock()) {
+            if (wasEmpty) {
+                sendEvent(m_events->forIStream().inputReady());
+            }
+            return kNew;
         }
     }
-    else {
-        // remote write end of stream hungup.  our input side
-        // has therefore shutdown but don't flush our buffer
-        // since there's still data to be read.
-        sendEvent(m_events->forIStream().inputShutdown());
-        if (!m_writable && m_inputBuffer.getSize() == 0) {
-            sendEvent(m_events->forISocket().disconnected());
-            m_connected = false;
-        }
-        m_readable = false;
-        return kNew;
-    }
+}
 
-    return kRetry;
+size_t
+TCPSocket::readSocketNoLock(void* buffer, size_t size)
+{
+    return ARCH->readSocket(m_socket, buffer, size);
 }
 
 bool
@@ -501,6 +529,7 @@ TCPSocket::queueInputOrDisconnectNoLock(const void* buffer, UInt32 n)
     }
 
     m_inputBuffer.write(buffer, n);
+    m_inputBytesReceived += static_cast<std::uint64_t>(n);
     return true;
 }
 
@@ -631,7 +660,11 @@ TCPSocket::sendEvent(Event::Type type)
 void
 TCPSocket::discardWrittenData(StreamBuffer& outputBuffer, int bytesWrote)
 {
+    if (bytesWrote <= 0) {
+        return;
+    }
     outputBuffer.pop(bytesWrote);
+    m_outputBytesWritten += static_cast<std::uint64_t>(bytesWrote);
     if (!hasBufferedOutputNoLock()) {
         logOutputWindowStatsIfNeeded();
         sendEvent(m_events->forIStream().outputFlushed());

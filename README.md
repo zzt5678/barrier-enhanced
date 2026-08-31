@@ -1,148 +1,111 @@
-# Barrier
+# Weave
 
-Eliminate the barrier between your machines.
-Find [releases for windows and macOS here](https://github.com/debauchee/barrier/releases).
-Your distro probably already has barrier packaged for it, see [distro specific packages](#distro-specific-packages)
-below for a list. Alternatively, we also provide a [flatpak](https://github.com/flathub/com.github.debauchee.barrier)
-and a [snap](https://snapcraft.io/barrier).
+Weave shares one keyboard, mouse, and clipboard across trusted computers. Move
+the pointer across a configured screen edge to control the other machine while
+each computer keeps using its own display.
 
-### Contact info:
+This repository is a stability-focused fork of Barrier. The current work
+prioritizes deterministic input ownership, resilient Windows desktop changes,
+bounded memory use, and isolation of file and clipboard traffic from control
+input.
 
-- `#barrier` on LiberaChat IRC network
+## Current capabilities
 
-#### CI Build Status
+- Cross-screen mouse, keyboard, buttons, and wheel input.
+- Text, image, and file clipboard exchange.
+- A separate authenticated bulk channel for large clipboard and file payloads
+  between current Weave peers.
+- TLS transport with peer certificate trust.
+- Windows service mode with desktop and session recovery.
+- Linux/X11 raw-motion handling and multi-monitor geometry support.
+- A GUI that may be hidden or minimized without stopping the data plane;
+  explicit **Quit** stops it.
 
-Master branch overall build status: [![Build Status](https://dev.azure.com/debauchee/Barrier/_apis/build/status/debauchee.barrier?branchName=master)](https://dev.azure.com/debauchee/Barrier/_build/latest?definitionId=1&branchName=master)
+Use the same current Weave build on every peer. Protocol 1.12 is required so
+input epochs, transactional handoff, and the connection-bound bulk channel
+cannot be bypassed by a legacy peer.
 
-|Platform       |Build Status|
-|            --:|:--         |
-|Linux          |[![Build Status](https://dev.azure.com/debauchee/Barrier/_apis/build/status/debauchee.barrier?branchName=master&jobName=Linux%20Build)](https://dev.azure.com/debauchee/Barrier/_build/latest?definitionId=1&branchName=master)|
-|Mac            |[![Build Status](https://dev.azure.com/debauchee/Barrier/_apis/build/status/debauchee.barrier?branchName=master&jobName=Mac%20Build)](https://dev.azure.com/debauchee/Barrier/_build/latest?definitionId=1&branchName=master)|
-|Windows Debug  |[![Build Status](https://dev.azure.com/debauchee/Barrier/_apis/build/status/debauchee.barrier?branchName=master&jobName=Windows%20Build&configuration=Windows%20Build%20Debug)](https://dev.azure.com/debauchee/Barrier/_build/latest?definitionId=1&branchName=master)|
-|Windows Release|[![Build Status](https://dev.azure.com/debauchee/Barrier/_apis/build/status/debauchee.barrier?branchName=master&jobName=Windows%20Build&configuration=Windows%20Build%20Release%20with%20Release%20Installer)](https://dev.azure.com/debauchee/Barrier/_build/latest?definitionId=1&branchName=master)|
-|Snap           |[![Snap Status](https://build.snapcraft.io/badge/debauchee/barrier.svg)](https://build.snapcraft.io/user/debauchee/barrier)|
+## Release status
 
-Our CI Builds are provided by Microsoft Azure Pipelines, Flathub, and Canonical.
+The `codex/weave-stability-optimization` branch is under active hardening. A
+successful local build is not, by itself, a public-release qualification.
+Windows UAC/secure-desktop, sleep/resume, RDP/session switching, installer
+upgrade, long-running soak, and cross-machine transfer tests must pass for the
+exact release commit and signed package.
 
-### What is it?
+Primary regression targets for this branch are Windows 10/11 and Linux/X11.
+The inherited macOS code remains in the tree, but macOS packages should not be
+described as verified until they are built and tested from the same commit.
 
-Barrier is software that mimics the functionality of a KVM switch, which historically would allow you to use a single keyboard and mouse to control multiple computers by physically turning a dial on the box to switch the machine you're controlling at any given moment. Barrier does this in software, allowing you to tell it which machine to control by moving your mouse to the edge of the screen, or by using a keypress to switch focus to a different system.
+## Security model
 
-Barrier was forked from Symless's Synergy 1.9 codebase. Synergy was a commercialized reimplementation of the original CosmoSynergy written by Chris Schoeneman.
+Run Weave only between machines you trust, preferably on a private LAN or
+tailnet. Do not expose its ports directly to the public Internet.
 
-At the moment, barrier is not compatible with synergy. Barrier needs to be installed on all machines that will share keyboard and mouse.
+Keep TLS enabled. Verify peer fingerprints before trusting a new device. The
+Windows service accepts only authenticated local IPC peers and owns a bounded
+replacement transaction for the foreground node. Large payloads have explicit
+size, parser, queue, and archive extraction limits.
 
-### What's different?
+Security reports and reproducible defects belong in the
+[issue tracker](https://github.com/zzt5678/barrier-enhanced/issues). Do not put
+passwords, private keys, clipboard contents, or personal files in reports.
 
-Whereas Synergy has moved beyond its goals from the 1.x era, Barrier aims to maintain that simplicity.
-Barrier will let you use your keyboard and mouse from one computer to control one or more other computers.
-Clipboard sharing is supported.
-That's it.
+## Basic use
 
-### Project goals
+1. Install and start Weave on both computers.
+2. Select **Server** on the computer whose keyboard and mouse you use.
+3. Open **Configure server** and place the client screen on the correct edge.
+4. Select **Client** on the other computer and enter the server address.
+5. Confirm that the configured screen name exactly matches the client's name.
+6. Start both sides and verify the TLS fingerprint prompt before trusting it.
 
-Hassle-free reliability. We are users, too. Barrier was created so that we could solve the issues we had with synergy and then share these fixes with other users.
+Scroll Lock can intentionally prevent screen switching. If input does not
+cross an edge, check topology, screen names, connection state, and Scroll Lock
+before restarting either node.
 
-Compatibility. We use more than one operating system and you probably do, too. Windows, OSX, Linux, FreeBSD... Barrier should "just work". We will also have our eye on Wayland when the time comes.
+## Build and test
 
-Communication. Everything we do is in the open. Our issue tracker will let you see if others are having the same problem you're having and will allow you to add additional information. You will also be able to see when progress is made and how the issue gets resolved.
+Weave uses CMake, C++17, Qt 5, OpenSSL, and platform input libraries. A typical
+Linux release build is:
 
-### Usage
+```sh
+cmake -S . -B build-release \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBARRIER_BUILD_GUI=ON \
+  -DBARRIER_BUILD_TESTS=ON
+cmake --build build-release -j2
+ctest --test-dir build-release --output-on-failure
+```
 
-Install and run barrier on each machine that will be sharing.
-On the machine with the keyboard and mouse, make it the server.
+The executables are emitted under `build-release/bin` as `weave`, `weaves`,
+`weavec`, and `weaved` where supported. Windows release evidence must come from
+an MSVC build of the exact same source tree; copying binaries from a different
+commit invalidates the result.
 
-Click the "Configure server" button and drag a new screen onto the grid for each client machine.
-Ensure the "screen name" matches exactly (case-sensitive) for each configured screen -- the clients' barrier windows will tell you their screen names (just above the server IP).
+## Diagnostics
 
-On the client(s), put in the server machine's IP address (or use Bonjour/auto configuration when prompted) and "start" them.
-You should see `Barrier is running` on both server and clients.
-You should now be able to move the mouse between all the screens as if they were the same machine.
+When reporting a fault, include:
 
-Note that if the keyboard's Scroll Lock is active then this will prevent the mouse from switching screens.
+- the full build ID from both peers;
+- operating system, session type, and screen topology;
+- whether the GUI, desktop mode, or Windows service mode was used;
+- timestamps and the smallest reproducible sequence;
+- sanitized logs from both sides.
 
-### Contact & support
+Do not claim a disconnect or input failure is fixed from a single restart.
+Repeat the relevant switch, clipboard, transfer, desktop-change, and idle/rejoin
+scenario against the exact candidate build.
 
-Please be aware that the *only* way to draw our attention to a bug is to create a new issue in [the issue tracker](https://github.com/debauchee/barrier/issues). Write a clear, concise, detailed report and you will get a clear, concise, detailed response. Priority is always given to issues that affect a wider range of users.
+## Project links
 
-For short and simple questions or to just say hello find us on the LiberaChat IRC network in the #barrier channel.
+- Repository: <https://github.com/zzt5678/barrier-enhanced>
+- Issues: <https://github.com/zzt5678/barrier-enhanced/issues>
+- Releases: <https://github.com/zzt5678/barrier-enhanced/releases>
+- Architecture review: [`doc/WEAVE_SYSTEM_DESIGN_REVIEW.md`](doc/WEAVE_SYSTEM_DESIGN_REVIEW.md)
 
-### Contributions
+## Upstream and license
 
-At this time we are looking for developers to help fix the issues found in the issue tracker.
-Submit pull requests once you've polished up your patch and we'll review and possibly merge it.
-
-Most pull requests will need to include a release note.
-See docs/newsfragments/README.md for documentation of how to do that.
-
-## Distro specific packages
-
-While not a comprehensive list, repology provides a decent list of distro
-specific packages.
-
-[![Packaging status](https://repology.org/badge/vertical-allrepos/barrier.svg)](https://repology.org/project/barrier/versions)
-
-## FAQ - Frequently Asked Questions
-
-**Q: Does drag and drop work on linux?**
-
-> A: No *(see [#855](https://github.com/debauchee/barrier/issues/855) if you'd like to change that)*
-
-
-**Q: What OSes are supported?**
-
-> A: The [most recent release](https://github.com/debauchee/barrier/releases/latest) of Barrier is known to work on:
->  - Windows 7, 8, 8.1, 10, and 11
->  - macOS *(previously known as OS X or Mac OS X)*  
->    - _The current GUI does **not** work on OS versions prior to macOS 10.12 Sierra (but see the related answer below)_
->  - Linux
->  - FreeBSD
->  - OpenBSD
-
-
-**Q: Are 32-bit versions of Windows supported?**
-
-> A: No
-
-
-__Q: Is it possible to use Barrier on Mac OS X / OS X versions prior to 10.12?__
-
-> A: Not officially.
->   - For OS X 10.10 Yosemite and later:
->     - [Barrier v2.1.0](https://github.com/debauchee/barrier/releases/tag/v2.1.0) or earlier _may_ work.
->   - For Mac OS X 10.9 Mavericks _(and perhaps earlier)_:
->     1. the command-line portions of the [current release](https://github.com/debauchee/barrier/releases/latest) _should_ run fine.
->     2. The GUI will _not_ run, as that OS version does not include Apple's *Metal* framework.
->         - _(For a GUI workaround for Mac OS X 10.9, see the [discussion at issue #544](https://github.com/debauchee/barrier/issues/544))_
-
-> Note: Only versions [v2.3.4](https://github.com/debauchee/barrier/releases/tag/v2.3.4) and [later](https://github.com/debauchee/barrier/releases/latest) of Barrier can be supported by this project.
->  - Anyone using an earlier version is advised to upgrade due to recently-addressed security vulnerabilities *(and other bug fixes)*. 
->    - This is especially important for computers accessible from the public Internet *(or from other shared/untrusted networks, such as when using shared WiFi)*.
-
-
-**Q: How do I load my configuration on startup?**
-
-> A: Start the binary with the argument `--config <path_to_saved_configuration>`
-
-
-**Q: After loading my configuration on the client the field 'Server IP' is still empty!**
-
-> A: Edit your configuration to include the server's ip address manually with
-> 
->```
->(...)
->
->section: options
->    serverhostname=<AAA.BBB.CCC.DDD>
->```
-
-**Q: Are there any other significant limitations with the current version of Barrier?**
-
-> A: Currently:
->    - Barrier currently has limited UTF-8 support; issues have been reported with processing various languages.
->      - *(see [#860](https://github.com/debauchee/barrier/issues/860))*
->    - There is interest in future support for the Wayland compositor/display server protocol *([official site](https://wayland.freedesktop.org/) | [Wikipedia article](https://en.wikipedia.org/wiki/Wayland_(display_server_protocol)))* on Linux.
->      - As of late 2021, there is no expected completion date for *Wayland* support.
->      - *(see [#109](https://github.com/debauchee/barrier/issues/109) and [#1251](https://github.com/debauchee/barrier/issues/1251) for status or to volunteer your talents)*
->
-> The complete list of open issues can be found in the ['Issues' tab on GitHub](https://github.com/debauchee/barrier/issues?q=is%3Aissue+is%3Aopen). Help is always appreciated.
+Weave is derived from Barrier, which was derived from Synergy. The existing
+copyright notices and contributor history remain authoritative. The project is
+distributed under GPL-2.0; see [`LICENSE`](LICENSE).

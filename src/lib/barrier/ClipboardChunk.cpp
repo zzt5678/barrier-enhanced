@@ -17,6 +17,8 @@
 
 #include "barrier/ClipboardChunk.h"
 
+#include "barrier/BulkChannel.h"
+
 #include "barrier/ProtocolUtil.h"
 #include "barrier/protocol_types.h"
 #include "io/IStream.h"
@@ -53,9 +55,56 @@ ClipboardChunk::ReceiveBuffer::release()
 }
 
 ClipboardChunk::ClipboardChunk(size_t size) :
-    Chunk(size)
+    Chunk(size),
+    m_sendStream(nullptr),
+    m_bulkChannelLease(),
+    m_sendAttempt()
 {
         m_dataSize = size - CLIPBOARD_CHUNK_META_SIZE;
+}
+
+void
+ClipboardChunk::setSendRoute(
+                barrier::IStream* stream,
+                const std::shared_ptr<barrier::BulkChannel>& bulkChannel,
+                const std::shared_ptr<barrier::ClipboardSendAttempt>& attempt)
+{
+    m_sendStream = stream;
+    m_bulkChannelLease = bulkChannel;
+    m_sendAttempt = attempt;
+}
+
+barrier::IStream*
+ClipboardChunk::getSendStream(barrier::IStream* fallback) const
+{
+    return m_sendStream != nullptr ? m_sendStream : fallback;
+}
+
+bool
+ClipboardChunk::isSendRouteActive() const
+{
+    return !m_bulkChannelLease || m_bulkChannelLease->isActive();
+}
+
+ClipboardID
+ClipboardChunk::getClipboardId() const
+{
+    return static_cast<ClipboardID>(
+        static_cast<unsigned char>(m_chunk[0]));
+}
+
+std::shared_ptr<barrier::ClipboardSendAttempt>
+ClipboardChunk::getSendAttempt() const
+{
+    return m_sendAttempt;
+}
+
+void
+ClipboardChunk::failSendAttempt()
+{
+    if (m_sendAttempt) {
+        m_sendAttempt->fail();
+    }
 }
 
 ClipboardChunk*

@@ -21,6 +21,7 @@
 #include "net/TCPSocket.h"
 #include "net/XSocket.h"
 #include "io/filesystem.h"
+#include <atomic>
 #include <mutex>
 
 class IEventQueue;
@@ -44,6 +45,9 @@ public:
     // ISocket overrides
     void                close() override;
 
+    // IStream overrides
+    UInt32              read(void* buffer, UInt32 n) override;
+
     // IDataSocket overrides
     virtual void        connect(const NetworkAddress&) override;
 
@@ -61,8 +65,14 @@ public:
     bool load_certificates(const barrier::fs::path& path);
 
 #if defined(BARRIER_TEST_ENV)
-    void testDisconnectTLSFailureNoLock() { disconnect(); }
+    void testDisconnectTLSFailureNoLock() { disconnect(false); }
+    void testDisconnectPermanentTLSFailureNoLock() { disconnect(true); }
+    void testSecureConnectRetryExhaustedNoLock() { handleSecureConnectRetryExhaustion(); }
+    void testSetSecureReadyNoLock() { m_secureReady = true; }
 #endif
+
+protected:
+    virtual int secureReadForInput(void* buffer, int size, int& read);
 
 private:
     // SSL
@@ -72,11 +82,16 @@ private:
     int                    secureConnect(int s);
     bool ensure_peer_certificate(); // may only be called with ssl_mutex_ acquired
 
-    void checkResult(int n, int& retry); // may only be called with m_ssl_mutex_ acquired.
+    int secureReadInternal(void* buffer, int size, int& read,
+                           bool disconnectOnFatal);
+    bool checkResult(int n, int& retry,
+                     bool disconnectOnFatal = true); // may only be called with m_ssl_mutex_ acquired.
+    void handleSecureConnectRetryExhaustion();
+    EJobResult handleSecureReadFailureNoLock(bool inputWasEmpty);
 
     void                showError(const std::string& reason);
     std::string getError();
-    void                disconnect();
+    void                disconnect(bool stopRetry);
 
     // may only be called with ssl_mutex_ acquired
     bool verify_cert_fingerprint(const barrier::fs::path& fingerprint_db_path);
@@ -104,6 +119,10 @@ private:
     bool                m_secureReady;
     bool                m_fatal;
     bool                m_tlsFailureNotified = false;
+    bool                m_stopRetryNotified = false;
+    bool                m_secureReadFailureStopsRetry = false;
+    std::atomic<bool>   m_deferredReadDisconnect{false};
+    bool                m_deferredReadStopRetry = false;
     ConnectionSecurityLevel security_level_ = ConnectionSecurityLevel::ENCRYPTED;
 
     int secure_accept_retry_ = 0; // used only in secureAccept()

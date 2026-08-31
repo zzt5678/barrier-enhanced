@@ -31,7 +31,6 @@
 #include <WinSock2.h>
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
-#include <list>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -104,8 +103,5 @@ private:
     void                throwNameError(int);
 
 private:
-    typedef std::list<WSAEVENT> EventList;
-
     ArchMutex            m_mutex;
-    EventList            m_unblockEvents;
 };

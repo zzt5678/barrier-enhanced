@@ -29,6 +29,7 @@ class QCheckBox;
 class QSpinBox;
 class QLabel;
 class QPushButton;
+class QGroupBox;
 
 class SettingsDialog : public QDialog, public Ui::SettingsDialogBase
 {
@@ -51,11 +52,17 @@ class SettingsDialog : public QDialog, public Ui::SettingsDialogBase
         QCheckBox* m_pCheckBoxShowTrayNotifications;
         QSpinBox* m_pSpinBoxWorkflowHistoryLimit;
         QSpinBox* m_pSpinBoxWorkflowDormantSeconds;
+        QLabel* m_pLabelWorkflowHistoryLimit;
+        QLabel* m_pLabelWorkflowDormantSeconds;
+        QGroupBox* m_pPlatformGroup;
         QLabel* m_pLabelPlatformStatus;
         QLabel* m_pLabelPlatformDetail;
         QPushButton* m_pButtonPlatformAction;
 
         void updatePlatformReadiness();
+        void retranslateDynamicUi();
+        void configureResponsiveLayout();
+        void configureTabOrder();
 
     private slots:
         void on_m_pComboLanguage_currentIndexChanged(int index);

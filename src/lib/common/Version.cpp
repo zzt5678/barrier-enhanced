@@ -17,13 +17,17 @@
  */
 
 #include "common/Version.h"
+#include "common/ProductIdentity.h"
 
-const char* kApplication = "Barrier";
+const char* kApplication = WEAVE_PRODUCT_NAME;
 const char* kCopyright   = "Copyright (C) 2018 Debauchee Open Source Group\n"
                            "Copyright (C) 2012-2016 Symless Ltd.\n"
                            "Copyright (C) 2008-2014 Nick Bolton\n"
                            "Copyright (C) 2002-2014 Chris Schoeneman";
-const char* kContact     = "Email: todo@mail.com";
-const char* kWebsite     = "https://github.com/debauchee/barrier/";
+const char* kContact     = "Issues: " WEAVE_SUPPORT_URL;
+const char* kWebsite     = WEAVE_PROJECT_URL;
 const char* kVersion     = BARRIER_VERSION;
-const char* kAppVersion  = "Barrier " BARRIER_VERSION;
+const char* kAppVersion  = WEAVE_PRODUCT_NAME " " BARRIER_VERSION;
+const char* kBuildRevision = BARRIER_REVISION;
+const char* kBuildDate     = BARRIER_BUILD_DATE;
+const char* kBuildId       = BARRIER_VERSION "+" BARRIER_REVISION "." BARRIER_BUILD_DATE;

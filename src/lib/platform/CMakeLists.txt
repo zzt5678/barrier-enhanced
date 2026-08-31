@@ -20,6 +20,7 @@ if (WIN32)
 elseif (APPLE)
     file(GLOB headers "OSX*.h" "IOSX*.h")
     file(GLOB sources "OSX*.cpp" "IOSX*.cpp" "OSX*.m" "OSX*.mm")
+    list(REMOVE_ITEM sources "${CMAKE_CURRENT_SOURCE_DIR}/OSXMediaKeySimulator.mm")
 elseif (UNIX)
     file(GLOB headers "XWindows*.h")
     file(GLOB sources "XWindows*.cpp")
@@ -47,6 +48,10 @@ target_link_libraries(platform client ${libs})
 
 if (WIN32 OR UNIX)
     target_link_libraries(platform lodepng)
+endif()
+
+if (WIN32)
+    target_link_libraries(platform ipc)
 endif()
 
 if (UNIX)

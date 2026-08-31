@@ -38,6 +38,7 @@
 #include "base/log_outputters.h"
 #include "base/EventQueue.h"
 #include "base/Log.h"
+#include "base/finally.h"
 #include "common/Version.h"
 
 #if WINAPI_MSWINDOWS
@@ -55,6 +56,7 @@
 #include <iostream>
 #include <stdio.h>
 #include <algorithm>
+#include <memory>
 #include <sstream>
 
 namespace {
@@ -82,8 +84,11 @@ ClientApp::parseArgs(int argc, const char* const* argv)
     ArgParser argParser(this);
     bool result = argParser.parseClientArgs(args(), argc, argv);
 
-    if (!result || args().m_shouldExit) {
+    if (!result) {
         m_bye(kExitArgs);
+    }
+    else if (args().m_shouldExit) {
+        m_bye(kExitSuccess);
     }
     else {
         // save server address
@@ -378,7 +383,7 @@ ClientApp::foregroundStartup(int argc, char** argv)
 }
 
 bool
-ClientApp::startClient()
+ClientApp::prepareClient()
 {
     double retryTime;
     barrier::Screen* clientScreen = NULL;
@@ -391,8 +396,11 @@ ClientApp::startClient()
             LOG((CLOG_NOTE "started client"));
         }
 
-        m_client->connect();
-
+        if (!argsBase().m_serviceStandby &&
+            !m_clientScreen->prepareInputBackend()) {
+            LOG((CLOG_WARN
+                "local input backend is not ready yet; waiting for it to recover"));
+        }
         updateStatus();
         return true;
     }
@@ -413,7 +421,7 @@ ClientApp::startClient()
         return false;
     }
 
-    if (args().m_restartable) {
+    if (args().m_restartable && !argsBase().m_serviceStandby) {
         scheduleClientRestart(retryTime);
         return true;
     }
@@ -421,6 +429,39 @@ ClientApp::startClient()
         // don't try again
         return false;
     }
+}
+
+bool
+ClientApp::activatePreparedClient()
+{
+    if (m_client == NULL || m_clientScreen == NULL) {
+        LOG((CLOG_CRIT "cannot activate an unprepared client"));
+        return false;
+    }
+
+    try {
+        m_client->connect();
+        updateStatus();
+        return true;
+    }
+    catch (XBase& e) {
+        LOG((CLOG_CRIT "failed to activate client data plane: %s", e.what()));
+        return false;
+    }
+}
+
+bool
+ClientApp::startClient()
+{
+    if (!prepareClient()) {
+        return false;
+    }
+
+    // A transient screen-open failure may have installed a normal-mode retry.
+    if (m_client == NULL || m_clientScreen == NULL) {
+        return true;
+    }
+    return activatePreparedClient();
 }
 
 
@@ -441,8 +482,17 @@ ClientApp::mainLoop()
     // on unix because threads evaporate across a fork().
     setSocketMultiplexer(std::make_unique<SocketMultiplexer>());
 
-    // start client, etc
-    appUtil().startNode();
+    if (argsBase().m_serviceStandby) {
+        LOG((CLOG_INFO
+            "preparing client in service standby without connecting to the peer"));
+        if (!prepareClient() || m_client == NULL || m_clientScreen == NULL) {
+            stopClient();
+            return kExitFailed;
+        }
+    }
+    else {
+        appUtil().startNode();
+    }
 
     // init ipc client after node start, since create a new screen wipes out
     // the event queue (the screen ctors call adoptBuffer).
@@ -466,7 +516,28 @@ ClientApp::mainLoop()
 
     runCocoaApp();
 #else
-    m_events->loop();
+    int result = kExitSuccess;
+    bool runActiveLoop = true;
+    if (argsBase().m_serviceStandby) {
+        std::uint64_t activationNonce = 0;
+        if (!waitForServiceActivation(activationNonce)) {
+            runActiveLoop = false;
+        }
+        else {
+            if (!m_clientScreen->prepareInputBackend()) {
+                LOG((CLOG_INFO
+                    "Windows input helper activation is pending; active readiness will wait for it"));
+            }
+            if (!activatePreparedClient() ||
+                !sendIpcServiceActivated(activationNonce)) {
+                result = kExitFailed;
+                runActiveLoop = false;
+            }
+        }
+    }
+    if (runActiveLoop) {
+        m_events->loop();
+    }
 #endif
 
     DAEMON_RUNNING(false);
@@ -481,7 +552,11 @@ ClientApp::mainLoop()
         cleanupIpcClient();
     }
 
+#if defined(MAC_OS_X_VERSION_10_7)
     return kExitSuccess;
+#else
+    return result;
+#endif
 }
 
 static
@@ -509,7 +584,14 @@ int
 ClientApp::runInner(int argc, char** argv, ILogOutputter* outputter, StartupFunc startup)
 {
     // general initialization
-    m_serverAddress = new NetworkAddress;
+    std::unique_ptr<NetworkAddress> serverAddress(new NetworkAddress);
+    m_serverAddress = serverAddress.get();
+    const auto releaseRunState = barrier::finally([this]() {
+        delete m_taskBarReceiver;
+        m_taskBarReceiver = NULL;
+        m_serverAddress = NULL;
+    });
+
     argsBase().m_exename = ArgParser::parse_exename(argv[0]);
 
     // install caller's output filter
@@ -517,26 +599,7 @@ ClientApp::runInner(int argc, char** argv, ILogOutputter* outputter, StartupFunc
         CLOG->insert(outputter);
     }
 
-    int result;
-    try
-    {
-        // run
-        result = startup(argc, argv);
-    }
-    catch (...)
-    {
-        if (m_taskBarReceiver)
-        {
-            // done with task bar receiver
-            delete m_taskBarReceiver;
-        }
-
-        delete m_serverAddress;
-
-        throw;
-    }
-
-    return result;
+    return startup(argc, argv);
 }
 
 void
@@ -548,4 +611,40 @@ ClientApp::startNode()
     if (!startClient()) {
         m_bye(kExitFailed);
     }
+}
+
+bool
+ClientApp::ipcInputReady() const
+{
+    return m_clientScreen != NULL && m_clientScreen->canEnter();
+}
+
+std::uint64_t
+ClientApp::ipcInputGeneration() const
+{
+    return m_clientScreen == NULL ? 0 : m_clientScreen->inputGeneration();
+}
+
+std::string
+ClientApp::ipcInputDesktopName() const
+{
+    return m_clientScreen == NULL ? std::string() :
+        m_clientScreen->inputDesktopName();
+}
+
+bool
+ClientApp::ipcStandbyInputProbe(std::uint64_t& inputGeneration,
+                                std::string& desktopName) const
+{
+    inputGeneration = 0;
+    desktopName.clear();
+    if (m_clientScreen == NULL ||
+        !m_clientScreen->probeInputBackend(desktopName)) {
+        return false;
+    }
+
+    // The fresh post-activation challenge cannot reuse this probe because it
+    // is nonce-bound and switches to the real desktop-helper generation.
+    inputGeneration = 1;
+    return true;
 }

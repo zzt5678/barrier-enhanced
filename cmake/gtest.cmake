@@ -89,7 +89,7 @@ else()
         googletest
         GIT_REPOSITORY https://github.com/google/googletest.git
         GIT_TAG v${GTEST_VERSION}
-        GIT_SHOW_PROGRESS ON
+        GIT_PROGRESS TRUE
     )
 
     # Prevent FetchContent from capitalising the project name, which can cause

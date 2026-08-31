@@ -1,0 +1,29 @@
+if (NOT DEFINED PRODUCT_BINARY OR NOT DEFINED EXPECTED_BUILD_ID OR
+    NOT DEFINED EXPECTED_PROTOCOL)
+    message(FATAL_ERROR "product version test is missing required inputs")
+endif()
+
+execute_process(
+    COMMAND "${PRODUCT_BINARY}" --version
+    RESULT_VARIABLE version_result
+    OUTPUT_VARIABLE version_stdout
+    ERROR_VARIABLE version_stderr)
+
+if (NOT "${version_result}" STREQUAL "0")
+    message(FATAL_ERROR
+        "${PRODUCT_BINARY} --version failed (${version_result}):\n${version_stderr}")
+endif()
+
+set(version_output "${version_stdout}\n${version_stderr}")
+string(FIND "${version_output}" "${EXPECTED_BUILD_ID}" build_id_index)
+if (build_id_index EQUAL -1)
+    message(FATAL_ERROR
+        "${PRODUCT_BINARY} --version omitted build ID ${EXPECTED_BUILD_ID}")
+endif()
+
+string(FIND "${version_output}"
+            "Protocol version ${EXPECTED_PROTOCOL}" protocol_index)
+if (protocol_index EQUAL -1)
+    message(FATAL_ERROR
+        "${PRODUCT_BINARY} --version omitted protocol ${EXPECTED_PROTOCOL}")
+endif()

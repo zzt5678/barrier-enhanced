@@ -19,12 +19,27 @@
 #pragma once
 
 #include "barrier/IClient.h"
+#include "base/Event.h"
 
-namespace barrier { class IStream; }
+#include <memory>
+
+namespace barrier { class BulkChannel; class IStream; }
 
 //! Generic proxy for client or primary
 class BaseClientProxy : public IClient {
 public:
+    class InputHandoffReadyInfo : public EventData {
+    public:
+        InputHandoffReadyInfo(UInt32 seqNum, bool ready) :
+            m_seqNum(seqNum),
+            m_ready(ready)
+        {
+        }
+
+        UInt32 m_seqNum;
+        bool m_ready;
+    };
+
     /*!
     \c name is the name of the client.
     */
@@ -70,13 +85,36 @@ public:
                             UInt32 seqNum, KeyModifierMask mask,
                             bool forScreensaver) = 0;
     virtual bool        leave() = 0;
+    virtual bool        supportsInputHandoff() const { return false; }
+    virtual bool        supportsInputHandoffCommitAck() const { return false; }
+    virtual bool        supportsInputLeaseRevokeAck() const { return false; }
+    virtual UInt32      getInputEpoch() const { return 0; }
+    virtual bool        supportsBulkChannel() const { return false; }
+    virtual bool        supportsTransactionalFileTransfer() const
+                            { return false; }
+    virtual std::string getConnectionBinding() const
+                            { return std::string(); }
+    virtual void        offerBulkChannel(const std::string&) { }
+    virtual bool        attachBulkChannel(barrier::IStream*) { return false; }
+    virtual void        detachBulkChannel() { }
+    virtual std::shared_ptr<barrier::BulkChannel>
+                        acquireBulkChannel() const
+                        { return std::shared_ptr<barrier::BulkChannel>(); }
+    virtual void        prepareEnter(SInt32, SInt32, UInt32,
+                            KeyModifierMask) { }
+    virtual void        abortEnter(UInt32) { }
+    virtual void        requestInputLeaseRevoke(UInt32, UInt32) { }
     virtual void        setClipboard(ClipboardID, const IClipboard*) = 0;
     virtual void        grabClipboard(ClipboardID) = 0;
     virtual void        setClipboardDirty(ClipboardID, bool) = 0;
     virtual void        keyDown(KeyID, KeyModifierMask, KeyButton) = 0;
+    virtual void        keyDownBroadcast(KeyID key, KeyModifierMask mask,
+                            KeyButton button) { keyDown(key, mask, button); }
     virtual void        keyRepeat(KeyID, KeyModifierMask,
                             SInt32 count, KeyButton) = 0;
     virtual void        keyUp(KeyID, KeyModifierMask, KeyButton) = 0;
+    virtual void        keyUpBroadcast(KeyID key, KeyModifierMask mask,
+                            KeyButton button) { keyUp(key, mask, button); }
     virtual void        mouseDown(ButtonID) = 0;
     virtual void        mouseUp(ButtonID) = 0;
     virtual void        mouseMove(SInt32 xAbs, SInt32 yAbs) = 0;

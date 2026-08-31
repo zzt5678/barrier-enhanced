@@ -155,7 +155,7 @@ protected:
         ElevateMode m_ElevateMode;
         bool m_AutoConfigPrompted;
         bool m_CryptoEnabled;
-        bool m_RequireClientCertificate = false;
+        bool m_RequireClientCertificate = true;
         bool m_AutoHide;
         bool m_AutoStart;
         bool m_MinimizeToTray;

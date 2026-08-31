@@ -105,6 +105,26 @@ SecureSocket::close()
     TCPSocket::close();
 }
 
+UInt32
+SecureSocket::read(void* buffer, UInt32 n)
+{
+    const UInt32 bytesRead = TCPSocket::read(buffer, n);
+    if (!m_deferredReadDisconnect.load(std::memory_order_acquire)) {
+        return bytesRead;
+    }
+
+    Lock lock(&getMutex());
+    if (m_deferredReadDisconnect.load(std::memory_order_relaxed) &&
+        m_inputBuffer.getSize() == 0) {
+        const bool stopRetry = m_deferredReadStopRetry;
+        m_deferredReadDisconnect.store(false, std::memory_order_release);
+        m_deferredReadStopRetry = false;
+        disconnect(stopRetry);
+    }
+
+    return bytesRead;
+}
+
 void SecureSocket::freeSSLResources()
 {
     std::lock_guard<std::mutex> ssl_lock{ssl_mutex_};
@@ -175,6 +195,7 @@ SecureSocket::doRead()
     UInt8 buffer[4096];
     int bytesRead = 0;
     int status = 0;
+    const bool inputWasEmpty = (m_inputBuffer.getSize() == 0);
 
     if (isSecureReady()) {
         const size_t readSize = getInputReadSizeNoLock(sizeof(buffer));
@@ -183,9 +204,10 @@ SecureSocket::doRead()
             return kNew;
         }
 
-        status = secureRead(buffer, static_cast<int>(readSize), bytesRead);
+        m_secureReadFailureStopsRetry = false;
+        status = secureReadForInput(buffer, static_cast<int>(readSize), bytesRead);
         if (status < 0) {
-            return kBreak;
+            return handleSecureReadFailureNoLock(inputWasEmpty);
         }
         else if (status == 0) {
             return kNew;
@@ -196,15 +218,13 @@ SecureSocket::doRead()
     }
 
     if (bytesRead > 0) {
-        bool wasEmpty = (m_inputBuffer.getSize() == 0);
-
         // slurp up as much as possible
         do {
             if (!queueInputOrDisconnectNoLock(buffer, static_cast<UInt32>(bytesRead))) {
                 return kNew;
             }
             if (!canReadInputNoLock()) {
-                if (wasEmpty) {
+                if (inputWasEmpty) {
                     sendEvent(m_events->forIStream().inputReady());
                 }
                 return kNew;
@@ -212,20 +232,21 @@ SecureSocket::doRead()
 
             const size_t readSize = getInputReadSizeNoLock(sizeof(buffer));
             if (readSize == 0) {
-                if (wasEmpty) {
+                if (inputWasEmpty) {
                     sendEvent(m_events->forIStream().inputReady());
                 }
                 return kNew;
             }
 
-            status = secureRead(buffer, static_cast<int>(readSize), bytesRead);
+            m_secureReadFailureStopsRetry = false;
+            status = secureReadForInput(buffer, static_cast<int>(readSize), bytesRead);
             if (status < 0) {
-                return kBreak;
+                return handleSecureReadFailureNoLock(inputWasEmpty);
             }
         } while (bytesRead > 0 || status > 0);
 
         // send input ready if input buffer was empty
-        if (wasEmpty) {
+        if (inputWasEmpty) {
             sendEvent(m_events->forIStream().inputReady());
         }
     }
@@ -243,6 +264,33 @@ SecureSocket::doRead()
     }
 
     return kRetry;
+}
+
+TCPSocket::EJobResult
+SecureSocket::handleSecureReadFailureNoLock(bool inputWasEmpty)
+{
+    const bool stopRetry = m_secureReadFailureStopsRetry;
+    m_secureReadFailureStopsRetry = false;
+
+    if (m_inputBuffer.getSize() == 0) {
+        disconnect(stopRetry);
+        return kBreak;
+    }
+
+    // A TLS record can yield plaintext before the next SSL_read observes
+    // close_notify or a fatal transport error. Keep that tail readable and
+    // retire the transport only after the consumer drains it.
+    m_deferredReadStopRetry = stopRetry;
+    m_secureReady = false;
+    m_readable = false;
+    m_writable = false;
+    m_deferredReadDisconnect.store(true, std::memory_order_release);
+
+    if (inputWasEmpty) {
+        sendEvent(m_events->forIStream().inputReady());
+    }
+    sendEvent(m_events->forIStream().inputShutdown());
+    return kBreak;
 }
 
 TCPSocket::EJobResult
@@ -313,14 +361,27 @@ SecureSocket::doWrite()
 int
 SecureSocket::secureRead(void* buffer, int size, int& read)
 {
+    return secureReadInternal(buffer, size, read, true);
+}
+
+int
+SecureSocket::secureReadForInput(void* buffer, int size, int& read)
+{
+    return secureReadInternal(buffer, size, read, false);
+}
+
+int
+SecureSocket::secureReadInternal(void* buffer, int size, int& read,
+                                 bool disconnectOnFatal)
+{
     std::lock_guard<std::mutex> ssl_lock{ssl_mutex_};
 
     if (m_ssl->m_ssl != NULL) {
         LOG((CLOG_DEBUG2 "reading secure socket"));
         read = SSL_read(m_ssl->m_ssl, buffer, size);
 
-        // Check result will cleanup the connection in the case of a fatal
-        checkResult(read, secure_read_retry_);
+        m_secureReadFailureStopsRetry =
+            checkResult(read, secure_read_retry_, disconnectOnFatal);
 
         if (secure_read_retry_) {
             return 0;
@@ -423,6 +484,12 @@ bool SecureSocket::load_certificates(const barrier::fs::path& path)
 // This replaces the previous cert_verify_ignore_callback which bypassed all verification.
 static thread_local barrier::fs::path g_verify_fingerprint_path;
 
+static int reject_certificate(X509_STORE_CTX* ctx)
+{
+    X509_STORE_CTX_set_error(ctx, X509_V_ERR_CERT_REJECTED);
+    return 0;
+}
+
 // Certificate verification callback: accepts only certificates whose fingerprint
 // matches the user-configured fingerprint database. This prevents MITM attacks
 // by verifying identity at the TLS handshake level (not post-handshake).
@@ -430,7 +497,7 @@ static int cert_verify_fingerprint_callback(X509_STORE_CTX* ctx, void*)
 {
     X509* cert = X509_STORE_CTX_get0_cert(ctx);
     if (cert == nullptr) {
-        return 0;
+        return reject_certificate(ctx);
     }
 
     // Compute SHA256 fingerprint of peer's certificate
@@ -439,7 +506,7 @@ static int cert_verify_fingerprint_callback(X509_STORE_CTX* ctx, void*)
     const EVP_MD* sha256 = EVP_sha256();
     if (sha256 == nullptr || X509_digest(cert, sha256, hash, &hash_len) != 1) {
         LOG((CLOG_ERR "failed to compute certificate fingerprint"));
-        return 0;
+        return reject_certificate(ctx);
     }
 
     // Load and check against fingerprint database
@@ -450,7 +517,7 @@ static int cert_verify_fingerprint_callback(X509_STORE_CTX* ctx, void*)
         // ENCRYPTED_AUTHENTICATED mode demands a fingerprint database.
         // Refuse rather than silently accepting any certificate (MITM risk).
         LOG((CLOG_ERR "no trusted fingerprints configured; rejecting unauthenticated connection"));
-        return 0;
+        return reject_certificate(ctx);
     }
 
     // Check if the fingerprint matches any trusted fingerprint
@@ -460,12 +527,13 @@ static int cert_verify_fingerprint_callback(X509_STORE_CTX* ctx, void*)
     peer_fingerprint.data.assign(hash, hash + hash_len);
     for (const auto& fp : db.fingerprints()) {
         if (peer_fingerprint == fp) {
+            X509_STORE_CTX_set_error(ctx, X509_V_OK);
             return 1;  // Trusted
         }
     }
 
     LOG((CLOG_ERR "peer certificate fingerprint does not match any trusted fingerprint"));
-    return 0;  // Not trusted — reject the connection during handshake
+    return reject_certificate(ctx);
 }
 
 void
@@ -575,14 +643,14 @@ SecureSocket::secureAccept(int socket)
                 LOG((CLOG_INFO "accepted secure socket"));
                 if (!ensure_peer_certificate()) {
                     secure_accept_retry_ = 0;
-                    disconnect();
+                    disconnect(true);
                     return -1;// Cert fail, error
                 }
             }
             else {
                 LOG((CLOG_ERR "failed to verify client certificate fingerprint"));
                 secure_accept_retry_ = 0;
-                disconnect();
+                disconnect(true);
                 return -1; // Fingerprint failed, error
             }
         }
@@ -639,7 +707,7 @@ SecureSocket::secureConnect(int socket)
     if (!isFatal() && secure_connect_retry_ > kMaxSecureConnectRetries) {
         LOG((CLOG_WARN "timed out connecting secure socket after %d retries",
             secure_connect_retry_));
-        isFatal(true);
+        handleSecureConnectRetryExhaustion();
     }
 
     if (isFatal()) {
@@ -680,6 +748,15 @@ SecureSocket::secureConnect(int socket)
     return 1;
 }
 
+void
+SecureSocket::handleSecureConnectRetryExhaustion()
+{
+    isFatal(true);
+    // A peer that stops progressing during the handshake is a transport
+    // failure. Close this attempt while allowing ClientApp to reconnect.
+    disconnect(false);
+}
+
 bool
 SecureSocket::ensure_peer_certificate()
 {
@@ -703,8 +780,8 @@ SecureSocket::ensure_peer_certificate()
     return true;
 }
 
-void
-SecureSocket::checkResult(int status, int& retry)
+bool
+SecureSocket::checkResult(int status, int& retry, bool disconnectOnFatal)
 {
     // ssl_mutex_ is assumed to be acquired
 
@@ -780,11 +857,19 @@ SecureSocket::checkResult(int status, int& retry)
         break;
     }
 
+    bool stopRetry = false;
     if (isFatal()) {
         retry = 0;
+        stopRetry =
+            security_level_ == ConnectionSecurityLevel::ENCRYPTED_AUTHENTICATED &&
+            SSL_get_verify_result(m_ssl->m_ssl) != X509_V_OK;
         showError("");
-        disconnect();
+        if (disconnectOnFatal) {
+            disconnect(stopRetry);
+        }
     }
+
+    return stopRetry;
 }
 
 void SecureSocket::showError(const std::string& reason)
@@ -814,18 +899,27 @@ std::string SecureSocket::getError()
 }
 
 void
-SecureSocket::disconnect()
+SecureSocket::disconnect(bool stopRetry)
 {
+    if (stopRetry && !m_stopRetryNotified) {
+        m_stopRetryNotified = true;
+        sendEvent(getEvents()->forISocket().stopRetry());
+    }
+
     if (m_tlsFailureNotified) {
         return;
     }
 
     m_tlsFailureNotified = true;
+    m_deferredReadDisconnect.store(false, std::memory_order_release);
+    m_deferredReadStopRetry = false;
     m_secureReady = false;
     isFatal(true);
     removeTCPConnectedHandler();
-    removeJob();
-    sendEvent(getEvents()->forISocket().stopRetry());
+    // TLS failures are detected while the socket multiplexer owns and runs
+    // this job. Removing it synchronously here would wait on the job-list lock
+    // already held by the current thread. Returning from the callback retires
+    // the job; the destructor still removes jobs during external shutdown.
     disconnectSocketNoLock(true);
 }
 
@@ -890,7 +984,11 @@ MultiplexerJobStatus SecureSocket::serviceConnect(ISocketMultiplexerJob* job,
 
     // If status < 0, error happened
     if (status < 0) {
-        disconnect();
+        // Direct certificate/configuration failures are permanent. Transport
+        // failures were already classified and disconnected by checkResult().
+        if (!m_tlsFailureNotified) {
+            disconnect(true);
+        }
         sendTLSConnectionFailedEvent("TLS handshake failed");
         return {false, {}};
     }
@@ -925,7 +1023,9 @@ MultiplexerJobStatus SecureSocket::serviceAccept(ISocketMultiplexerJob* job,
 #endif
     // If status < 0, error happened
     if (status < 0) {
-        disconnect();
+        // Authentication failures notify permanently inside secureAccept().
+        // Ordinary handshake transport failures remain retryable.
+        disconnect(false);
         return {false, {}};
     }
 

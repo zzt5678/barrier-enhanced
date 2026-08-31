@@ -1,22 +1,42 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi" xmlns:fire="http://schemas.microsoft.com/wix/FirewallExtension" xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
 	<?include Include.wxi?>
+	<?if $(var.Configuration) != "Release" ?>
+		<?error The Weave MSI is produced only from the controlled Release staging directory. ?>
+	<?endif?>
+	<?if $(var.Platform) != "x64" ?>
+		<?error The Weave MSI is supported only for x64. ?>
+	<?endif?>
 	<Product Id="*" Language="1033" Manufacturer="$(var.Author)" Name="$(var.Name) ($(var.PlatformSimpleName))" UpgradeCode="$(var.UpgradeGuid)" Version="$(var.Version)">
 		<Package Compressed="yes" InstallScope="perMachine" InstallerVersion="301"/>
 		<MajorUpgrade DowngradeErrorMessage="A newer version of $(var.Name) is already installed."/>
 		<MediaTemplate EmbedCab="yes"/>
 		<UIRef Id="WixUI_InstallDir"/>
+		<Property Id="VCRUNTIME_X64_INSTALLED">
+			<RegistrySearch Id="VCRuntimeX64InstalledSearch" Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" Name="Installed" Root="HKLM" Type="integer" Win64="yes"/>
+		</Property>
+		<Property Id="VCRUNTIME_X64_MAJOR">
+			<RegistrySearch Id="VCRuntimeX64MajorSearch" Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" Name="Major" Root="HKLM" Type="integer" Win64="yes"/>
+		</Property>
+		<Property Id="VCRUNTIME_X64_MINOR">
+			<RegistrySearch Id="VCRuntimeX64MinorSearch" Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" Name="Minor" Root="HKLM" Type="integer" Win64="yes"/>
+		</Property>
+		<Condition Message="Microsoft Visual C++ 2015-2022 Redistributable (x64), version $(var.VcRedistMinimumVersion) or newer, must be installed before Weave."><![CDATA[Installed OR (VCRUNTIME_X64_INSTALLED = 1 AND (VCRUNTIME_X64_MAJOR > $(var.VcRedistMajorVersion) OR (VCRUNTIME_X64_MAJOR = $(var.VcRedistMajorVersion) AND VCRUNTIME_X64_MINOR >= $(var.VcRedistMinorVersion))))]]></Condition>
 		<!-- causes ICE61 warning, but stops user from installing many instances from nightly builds. -->
 		<Upgrade Id="$(var.UpgradeGuid)">
 			<UpgradeVersion Minimum="0.0.0.0" Property="UPGRADE"/>
 		</Upgrade>
 		<Feature Id="ProductFeature" Title="$(var.Name)">
 			<ComponentGroupRef Id="ProductComponents"/>
+			<ComponentGroupRef Id="ProductQtBearerComponents"/>
+			<ComponentGroupRef Id="ProductQtIconEngineComponents"/>
+			<ComponentGroupRef Id="ProductQtImageFormatComponents"/>
 			<ComponentGroupRef Id="ProductQtPluginComponents"/>
+			<ComponentGroupRef Id="ProductQtStyleComponents"/>
 			<ComponentRef Id="RegistryEntries"/>
 		</Feature>
 		<DirectoryRef Id="TARGETDIR">
-			<Component Guid="7CF3564D-1F8E-4D3D-9781-E1EE22D5BD67" Id="RegistryEntries">
+			<Component Guid="49069D9B-CD31-4482-9470-49DCD76C0EB5" Id="RegistryEntries">
 				<RegistryKey ForceCreateOnInstall="yes" ForceDeleteOnUninstall="yes" Key="Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" Root="HKLM">
 					<RegistryValue Name="[INSTALLFOLDER]weaves.exe" Type="string" Value="~ HIGHDPIAWARE WIN7RTM"/>
 				</RegistryKey>
@@ -29,6 +49,7 @@
 		<WixVariable Id="WixUIBannerBmp" Value="$(var.ResPath)\banner.bmp"/>
 		<WixVariable Id="WixUIDialogBmp" Value="$(var.ResPath)\dialog.bmp"/>
 		<Property Id="ARPPRODUCTICON" Value="weave.ico"/>
+		<Property Id="ARPURLINFOABOUT" Value="$(var.Web)"/>
 		<Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER"/>
 		<Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable"/>
 		<CustomAction ExeCommand="" FileKey="GuiProgram" Id="StartGui" Return="asyncNoWait"/>
@@ -40,8 +61,11 @@
 		<Directory Id="TARGETDIR" Name="SourceDir">
 			<Directory Id="$(var.ProgramFilesFolder)">
 				<Directory Id="INSTALLFOLDER" Name="$(var.Name)">
-					<Directory Id="OpenSSLDir" Name="OpenSSL"/>
-					<Directory Id="PlatformsDir" Name="Platforms"/>
+					<Directory Id="BearerDir" Name="bearer"/>
+					<Directory Id="IconEnginesDir" Name="iconengines"/>
+					<Directory Id="ImageFormatsDir" Name="imageformats"/>
+					<Directory Id="PlatformsDir" Name="platforms"/>
+					<Directory Id="StylesDir" Name="styles"/>
 				</Directory>
 			</Directory>
 			<Directory Id="ProgramMenuFolder"/>
@@ -49,54 +73,66 @@
 	</Fragment>
 	<Fragment>
 		<ComponentGroup Directory="INSTALLFOLDER" Id="ProductComponents">
-			<Component Guid="EC9AD3B0-277C-4157-B5C8-5FD5B6A5F4AD" Id="Core">
-				<File KeyPath="yes" Source="$(var.BinPath)/weaved.exe"/>
-				<ServiceInstall Description="Controls the $(var.Name) foreground processes." DisplayName="$(var.Name)" ErrorControl="normal" Id="ServiceInstall" Name="Weave" Start="auto" Type="ownProcess">
+			<Component Guid="C5B05265-C9FF-4076-8767-50DB840E049A" Id="Core">
+				<File KeyPath="yes" Source="$(var.BinPath)\weaved.exe"/>
+				<ServiceInstall Description="$(var.ServiceDescription)" DisplayName="$(var.ServiceDisplayName)" ErrorControl="normal" Id="ServiceInstall" Name="$(var.ServiceName)" Start="auto" Type="ownProcess">
 					<util:ServiceConfig FirstFailureActionType="restart" ResetPeriodInDays="1" RestartServiceDelayInSeconds="1" SecondFailureActionType="restart" ThirdFailureActionType="restart"/>
 				</ServiceInstall>
-				<ServiceControl Id="ServiceControl" Name="Weave" Remove="uninstall" Start="install" Stop="both"/>
-				<File Source="$(var.BinPath)/weaves.exe">
+				<ServiceControl Id="ServiceControl" Name="$(var.ServiceName)" Remove="uninstall" Start="install" Stop="both"/>
+				<File Source="$(var.BinPath)\weaves.exe">
 					<fire:FirewallException Id="ServerFirewallException" IgnoreFailure="yes" Name="$(var.Name)" Scope="any"/>
 				</File>
-				<File Source="$(var.BinPath)/weavec.exe"/>
-				<File Source="$(var.OpenSSLBinPath)/libeay32.dll"/>
-				<File Source="$(var.OpenSSLBinPath)/ssleay32.dll"/>
-				<File Source="$(var.OpenSSLBinPath)/openssl.exe"/>
-				<File Source="$(var.ResPath)/openssl/barrier.conf"/>
+				<File Source="$(var.BinPath)\weavec.exe"/>
+				<File Source="$(var.BinPath)\libssl-3-x64.dll"/>
+				<File Source="$(var.BinPath)\libcrypto-3-x64.dll"/>
+				<File Id="ReleaseManifest" Source="$(var.ReleaseManifestPath)"/>
 			</Component>
-			<Component Guid="BAC8149B-6287-45BF-9C27-43D71ED40214" Id="Gui">
-				<File Id="GuiProgram" KeyPath="yes" Source="$(var.BinPath)/weave.exe">
+			<Component Guid="65E1ED70-2BA3-420B-A4BB-1264D62DDC83" Id="Gui">
+				<File Id="GuiProgram" KeyPath="yes" Source="$(var.BinPath)\weave.exe">
 					<Shortcut Advertise="yes" Directory="ProgramMenuFolder" Icon="weave.ico" Id="GuiShortcut" Name="$(var.Name)"/>
 					<fire:FirewallException Id="GuiFirewallException" IgnoreFailure="yes" Name="$(var.Name)" Scope="any"/>
 				</File>
-				<?if $(var.Configuration) = "Debug" ?>
-				<File Source="$(var.QtBinPath)\Qt5Cored.dll"/>
-				<File Source="$(var.QtBinPath)\Qt5Guid.dll"/>
-				<File Source="$(var.QtBinPath)\Qt5Networkd.dll"/>
-				<File Source="$(var.QtBinPath)\Qt5Svgd.dll"/>
-				<File Source="$(var.QtBinPath)\Qt5Widgetsd.dll"/>
-				<File Source="$(var.QtBinPath)\libGLESv2d.dll"/>
-				<File Source="$(var.QtBinPath)\libEGLd.dll"/>
-				<!-- Hacky -->
-				<File Source="C:\Program Files (x86)\Windows Kits\10\bin\$(var.Platform)\ucrt\ucrtbased.dll"/>
-				<?else ?>
-				<File Source="$(var.QtBinPath)\Qt5Core.dll"/>
-				<File Source="$(var.QtBinPath)\Qt5Gui.dll"/>
-				<File Source="$(var.QtBinPath)\Qt5Network.dll"/>
-				<File Source="$(var.QtBinPath)\Qt5Svg.dll"/>
-				<File Source="$(var.QtBinPath)\Qt5Widgets.dll"/>
-				<File Source="$(var.QtBinPath)\libGLESv2.dll"/>
-				<File Source="$(var.QtBinPath)\libEGL.dll"/>
-				<?endif ?>
+				<File Source="$(var.BinPath)\Qt5Core.dll"/>
+				<File Source="$(var.BinPath)\Qt5Gui.dll"/>
+				<File Source="$(var.BinPath)\Qt5Network.dll"/>
+				<File Source="$(var.BinPath)\Qt5Svg.dll"/>
+				<File Source="$(var.BinPath)\Qt5Widgets.dll"/>
+				<File Source="$(var.BinPath)\Qt5WinExtras.dll"/>
+				<File Source="$(var.BinPath)\libEGL.dll"/>
+				<File Source="$(var.BinPath)\libGLESv2.dll"/>
 			</Component>
 		</ComponentGroup>
 		<ComponentGroup Directory="PlatformsDir" Id="ProductQtPluginComponents">
-			<Component Guid="684EFA14-856B-440E-A5E6-E90E04E36B41" Id="QtPlatformPlugin">
-				<?if $(var.Configuration) = "Debug" ?>
-				<File Source="$(var.QtPlatformPath)\qwindowsd.dll"/>
-				<?else ?>
-				<File Source="$(var.QtPlatformPath)\qwindows.dll"/>
-				<?endif ?>
+			<Component Guid="D46D7B3D-C698-43BC-9669-1CB763E409A8" Id="QtPlatformPlugin">
+				<File Source="$(var.BinPath)\platforms\qwindows.dll"/>
+			</Component>
+		</ComponentGroup>
+		<ComponentGroup Directory="BearerDir" Id="ProductQtBearerComponents">
+			<Component Guid="4D8D0D0B-A148-4BBF-B82A-1C28F33580DB" Id="QtBearerPlugin">
+				<File Source="$(var.BinPath)\bearer\qgenericbearer.dll"/>
+			</Component>
+		</ComponentGroup>
+		<ComponentGroup Directory="IconEnginesDir" Id="ProductQtIconEngineComponents">
+			<Component Guid="76C39CF7-A2F4-4CC9-9FC9-BF88AADE5B1E" Id="QtSvgIconPlugin">
+				<File Source="$(var.BinPath)\iconengines\qsvgicon.dll"/>
+			</Component>
+		</ComponentGroup>
+		<ComponentGroup Directory="ImageFormatsDir" Id="ProductQtImageFormatComponents">
+			<Component Guid="7255F73C-BB53-4E77-841B-A4FEE706F0A7" Id="QtImageFormatPlugins">
+				<File Source="$(var.BinPath)\imageformats\qgif.dll"/>
+				<File Source="$(var.BinPath)\imageformats\qicns.dll"/>
+				<File Source="$(var.BinPath)\imageformats\qico.dll"/>
+				<File Source="$(var.BinPath)\imageformats\qjpeg.dll"/>
+				<File Source="$(var.BinPath)\imageformats\qsvg.dll"/>
+				<File Source="$(var.BinPath)\imageformats\qtga.dll"/>
+				<File Source="$(var.BinPath)\imageformats\qtiff.dll"/>
+				<File Source="$(var.BinPath)\imageformats\qwbmp.dll"/>
+				<File Source="$(var.BinPath)\imageformats\qwebp.dll"/>
+			</Component>
+		</ComponentGroup>
+		<ComponentGroup Directory="StylesDir" Id="ProductQtStyleComponents">
+			<Component Guid="D6C15A8F-8F39-43AB-A31C-A7D2361C5507" Id="QtWindowsVistaStylePlugin">
+				<File Source="$(var.BinPath)\styles\qwindowsvistastyle.dll"/>
 			</Component>
 		</ComponentGroup>
 	</Fragment>

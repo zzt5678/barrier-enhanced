@@ -30,6 +30,9 @@
 #ifdef HAVE_XI2
 #	include <X11/extensions/XInput2.h>
 #endif
+#ifdef HAVE_XFIXES
+#	include <X11/extensions/Xfixes.h>
+#endif
 
 // XIRawButtonEvent may not exist in older XInput2 versions
 // Provide a fallback definition if not available
@@ -67,6 +70,7 @@ typedef struct {
 
 class IXWindowsImpl {
 public:
+    virtual ~IXWindowsImpl() = default;
 
     virtual Status XInitThreads() = 0;
     virtual XIOErrorHandler XSetIOErrorHandler(XIOErrorHandler handler) = 0;
@@ -206,13 +210,25 @@ public:
                              Bool owner_events, unsigned int event_mask,
                              int  pointer_mode, int keyboard_mode,
                              Window confine_to, Cursor cursor, Time time) = 0;
+    virtual int XUngrabPointer(Display* display, Time time) = 0;
     virtual int XUngrabKeyboard(Display* display, Time time) = 0;
     virtual int XPending(Display* display) = 0;
     virtual int XPeekEvent(Display* display, XEvent* event_return) = 0;
     virtual Status XkbRefreshKeyboardMapping(XkbMapNotifyEvent* event) = 0;
     virtual int XRefreshKeyboardMapping(XMappingEvent* event_map) = 0;
+#ifdef HAVE_XI2
+    virtual int XIQueryVersion(Display* display, int* major_version,
+                               int* minor_version) = 0;
     virtual int XISelectEvents(Display* display, Window w, XIEventMask* masks,
                                int num_masks) = 0;
+#endif
+#ifdef HAVE_XFIXES
+    virtual Bool XFixesQueryExtension(Display* display, int* event_base_return,
+                                      int* error_base_return) = 0;
+    virtual void XFixesSelectSelectionInput(Display* display, Window window,
+                                            Atom selection,
+                                            unsigned long event_mask) = 0;
+#endif
     virtual Atom XInternAtom(Display* display, _Xconst char* atom_name,
                              Bool only_if_exists) = 0;
     virtual int XGetScreenSaver(Display* display, int* timeout_return,

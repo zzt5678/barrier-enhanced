@@ -140,13 +140,25 @@ public:
                              Bool owner_events, unsigned int event_mask,
                              int  pointer_mode, int keyboard_mode,
                              Window confine_to, Cursor cursor, Time time);
+    virtual int XUngrabPointer(Display* display, Time time);
     virtual int XUngrabKeyboard(Display* display, Time time);
     virtual int XPending(Display* display);
     virtual int XPeekEvent(Display* display, XEvent* event_return);
     virtual Status XkbRefreshKeyboardMapping(XkbMapNotifyEvent* event);
     virtual int XRefreshKeyboardMapping(XMappingEvent* event_map);
+#ifdef HAVE_XI2
+    virtual int XIQueryVersion(Display* display, int* major_version,
+                               int* minor_version);
     virtual int XISelectEvents(Display* display, Window w, XIEventMask* masks,
                                int num_masks);
+#endif
+#ifdef HAVE_XFIXES
+    virtual Bool XFixesQueryExtension(Display* display, int* event_base_return,
+                                      int* error_base_return);
+    virtual void XFixesSelectSelectionInput(Display* display, Window window,
+                                            Atom selection,
+                                            unsigned long event_mask);
+#endif
     virtual Atom XInternAtom(Display* display, _Xconst char* atom_name,
                              Bool only_if_exists);
     virtual int XGetScreenSaver(Display* display, int* timeout_return,

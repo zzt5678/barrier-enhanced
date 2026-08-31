@@ -16,8 +16,11 @@
 
 file(GLOB_RECURSE headers "*.h")
 file(GLOB_RECURSE sources "*.cpp")
+list(REMOVE_ITEM sources "${CMAKE_CURRENT_SOURCE_DIR}/PolicyTestsMain.cpp")
 list(APPEND sources "barrier/PacketStreamFilterTests.cpp")
 list(APPEND sources "barrier/TransferArchiveTests.cpp")
+list(APPEND sources "${CMAKE_CURRENT_SOURCE_DIR}/barrier/SecureRandomTests.cpp")
+list(REMOVE_DUPLICATES sources)
 
 file(GLOB_RECURSE remove_platform "platform/*")
 list(REMOVE_ITEM headers ${remove_platform})
@@ -45,6 +48,11 @@ elseif (APPLE)
 elseif (UNIX)
     file(GLOB platform_sources "platform/XWindows*.cpp")
     file(GLOB platform_headers "platform/XWindows*.h")
+    # This Win32 state machine has no Win32 dependencies so its ordering and
+    # stale-result rules remain covered by Linux CI as well.
+    list(APPEND platform_sources
+        "platform/MSWindowsClipboardSnapshotStateTests.cpp"
+        "../../lib/platform/MSWindowsClipboardSnapshotState.cpp")
 endif()
 
 list(APPEND sources ${platform_sources})
@@ -67,6 +75,35 @@ if (BARRIER_ADD_HEADERS)
 endif()
 
 add_executable(unittests ${sources})
+if (MSVC)
+    # Debug information can exceed COFF's default section count in this
+    # intentionally broad server state-machine test translation unit.
+    set_source_files_properties(
+        server/ServerReconnectTests.cpp
+        PROPERTIES COMPILE_OPTIONS "/bigobj")
+endif()
 target_link_libraries(unittests
     arch base client server common io net platform server synlib mt ipc ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES} ${libs} ${OPENSSL_LIBS})
 add_test(NAME unittests COMMAND $<TARGET_FILE:unittests>)
+
+if (WIN32)
+    add_executable(policyunittests
+        PolicyTestsMain.cpp
+        ipc/ElevationPolicyTests.cpp
+        ../../lib/ipc/DesktopSwitchPolicy.cpp
+        ../../lib/ipc/ElevationPolicy.cpp
+    )
+    target_link_libraries(policyunittests ${GTEST_LIBRARIES})
+    add_test(NAME policyunittests COMMAND $<TARGET_FILE:policyunittests>)
+
+    add_executable(daemonlifecycleunittests
+        PolicyTestsMain.cpp
+        platform/MSWindowsDaemonLifecycleTests.cpp
+    )
+    target_link_libraries(daemonlifecycleunittests
+        arch base client server common io net platform synlib mt ipc
+        ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES} ${libs} ${OPENSSL_LIBS})
+    add_test(
+        NAME daemonlifecycleunittests
+        COMMAND $<TARGET_FILE:daemonlifecycleunittests>)
+endif()

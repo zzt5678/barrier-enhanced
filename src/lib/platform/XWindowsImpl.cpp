@@ -459,6 +459,11 @@ int XWindowsImpl::XGrabPointer(Display* display, Window grab_window,
                           time);
 }
 
+int XWindowsImpl::XUngrabPointer(Display* display, Time time)
+{
+    return ::XUngrabPointer(display, time);
+}
+
 int XWindowsImpl::XUngrabKeyboard(Display* display, Time time)
 {
     return ::XUngrabKeyboard(display, time);
@@ -484,11 +489,36 @@ int XWindowsImpl::XRefreshKeyboardMapping(XMappingEvent* event_map)
     return ::XRefreshKeyboardMapping(event_map);
 }
 
+#ifdef HAVE_XI2
+int XWindowsImpl::XIQueryVersion(Display* display, int* major_version,
+                                 int* minor_version)
+{
+    return ::XIQueryVersion(display, major_version, minor_version);
+}
+
 int XWindowsImpl::XISelectEvents(Display* display, Window w, XIEventMask* masks,
                                  int num_masks)
 {
     return ::XISelectEvents(display, w, masks, num_masks);
 }
+#endif
+
+#ifdef HAVE_XFIXES
+Bool XWindowsImpl::XFixesQueryExtension(Display* display,
+                                        int* event_base_return,
+                                        int* error_base_return)
+{
+    return ::XFixesQueryExtension(display, event_base_return,
+                                  error_base_return);
+}
+
+void XWindowsImpl::XFixesSelectSelectionInput(Display* display, Window window,
+                                              Atom selection,
+                                              unsigned long event_mask)
+{
+    ::XFixesSelectSelectionInput(display, window, selection, event_mask);
+}
+#endif
 
 Atom XWindowsImpl::XInternAtom(Display* display, _Xconst char* atom_name,
                                Bool only_if_exists)

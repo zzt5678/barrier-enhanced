@@ -66,16 +66,25 @@ public:
     Client* openClient(const String& name, const NetworkAddress& address,
                 barrier::Screen* screen);
     void closeClient(Client* client);
+    bool prepareClient();
+    bool activatePreparedClient();
     bool startClient();
     void stopClient();
     int mainLoop();
     void startNode();
+    bool ipcInputReady() const override;
+    std::uint64_t ipcInputGeneration() const override;
+    std::string ipcInputDesktopName() const override;
+    bool ipcStandbyInputProbe(std::uint64_t& inputGeneration,
+                              std::string& desktopName) const override;
 
     static ClientApp& instance() { return (ClientApp&)App::instance(); }
 
     Client* getClientPtr() { return m_client; }
 
 private:
+    friend class ClientAppTestAccess;
+
     Client*            m_client;
     barrier::Screen*m_clientScreen;
     NetworkAddress*    m_serverAddress;

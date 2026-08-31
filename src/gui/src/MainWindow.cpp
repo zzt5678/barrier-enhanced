@@ -25,17 +25,16 @@
 #include "ServerConfigDialog.h"
 #include "SettingsDialog.h"
 #include "ZeroconfService.h"
-#include "DataDownloader.h"
-#include "CommandProcess.h"
 #include "CommandLine.h"
 #include "FingerprintAcceptDialog.h"
 #include "ActionBus.h"
 #include "CommandPaletteDialog.h"
 #include "QUtility.h"
-#include "ProcessorArch.h"
 #include "SslCertificate.h"
 #include "ShutdownCh.h"
+#include "ServerLaunchProfile.h"
 #include "WorkflowHubDialog.h"
+#include "WindowLifecyclePolicy.h"
 #include "WorkflowStore.h"
 #include "base/String.h"
 #include "common/DataDirectories.h"
@@ -45,7 +44,6 @@
 #include <QtCore>
 #include <QtGui>
 #include <QtNetwork>
-#include <QNetworkAccessManager>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -56,6 +54,7 @@
 #include <QRegularExpression>
 #include <QBoxLayout>
 #include <QScrollArea>
+#include <QStyle>
 
 #if defined(Q_OS_MAC)
 #include <ApplicationServices/ApplicationServices.h>
@@ -71,10 +70,7 @@ static const QString allFilesFilter(QObject::tr("All files (*.*)"));
 #if defined(Q_OS_WIN)
 static const char barrierConfigName[] = "weave.sgc";
 static const QString barrierConfigFilter(QObject::tr("Weave Configurations (*.sgc)"));
-static QString bonjourBaseUrl = "http://binaries.symless.com/bonjour/";
-static const char bonjourFilename32[] = "Bonjour.msi";
-static const char bonjourFilename64[] = "Bonjour64.msi";
-static const char bonjourTargetFilename[] = "Bonjour.msi";
+static const char bonjourInstallGuideUrl[] = "https://support.apple.com/106380";
 #else
 static const char barrierConfigName[] = "weave.conf";
 static const QString barrierConfigFilter(QObject::tr("Weave Configurations (*.conf)"));
@@ -104,6 +100,12 @@ namespace {
 constexpr int kRestartBaseDelayMs = 500;
 constexpr int kRestartMaxDelayMs = 3000;
 constexpr int kRestartStabilityWindowMs = 10000;
+constexpr int kServiceStopAckTimeoutMs = 25000;
+#if defined(Q_OS_WIN)
+// ServerApp's USR_CONFIG_NAME is not exposed without also importing the core
+// IPC types, which conflict with the GUI IPC types.
+constexpr char kWindowsUserConfigName[] = "barrier.sgc";
+#endif
 
 void refreshDashboardScrollArea(QWidget* root)
 {
@@ -118,6 +120,17 @@ void refreshDashboardScrollArea(QWidget* root)
 
     QWidget* dashboard = scrollArea->widget();
     dashboard->resize(dashboard->width(), dashboard->sizeHint().height());
+}
+
+void repolishWidget(QWidget* widget)
+{
+    if (widget == nullptr || widget->style() == nullptr) {
+        return;
+    }
+
+    widget->style()->unpolish(widget);
+    widget->style()->polish(widget);
+    widget->update();
 }
 }
 
@@ -135,11 +148,7 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_pMenuBarrier(NULL),
     m_pMenuHelp(NULL),
     m_pZeroconfService(NULL),
-    m_pDataDownloader(NULL),
-    m_DownloadMessageBox(NULL),
-    m_pCancelButton(NULL),
     m_SuppressAutoConfigWarning(false),
-    m_BonjourInstall(NULL),
     m_SuppressEmptyServerWarning(false),
     m_ExpectedRunningState(kStopped),
     m_pSslCertificate(NULL),
@@ -151,8 +160,13 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_pActionWorkflowHub(NULL),
     m_pActionCommandPalette(NULL),
     m_RestartTimer(this),
+    m_ServiceStopAckTimer(this),
     m_UnexpectedExitCount(0),
-    m_AllowApplicationQuit(false)
+    m_AllowApplicationQuit(false),
+    m_ExplicitServiceQuitPending(false),
+    m_PendingServiceStopRequestId(0),
+    m_WindowGeometryInitialized(false),
+    m_DashboardSingleColumn(false)
 {
     // explicitly unset DeleteOnClose so the window can be show and hidden
     // repeatedly until Barrier is finished
@@ -164,61 +178,59 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     setupUi(this);
     setWindowIcon(QIcon(barrierLargeIcon));
 
-    gridLayout_dashboard->removeWidget(heroCard);
-    gridLayout_dashboard->removeWidget(overviewCard);
-    gridLayout_dashboard->removeWidget(m_pGroupServer);
-    gridLayout_dashboard->removeWidget(m_pGroupClient);
-    gridLayout_dashboard->removeWidget(m_pGroupExperience);
-    gridLayout_dashboard->removeWidget(workflowCard);
-    gridLayout_dashboard->removeWidget(footerCard);
-    int dashboardRow = 0;
-    gridLayout_dashboard->addWidget(overviewCard, dashboardRow++, 0, 1, 1);
-    gridLayout_dashboard->addWidget(footerCard, dashboardRow++, 0, 1, 1);
-    gridLayout_dashboard->addWidget(m_pGroupClient, dashboardRow++, 0, 1, 1);
-    gridLayout_dashboard->addWidget(m_pGroupServer, dashboardRow++, 0, 1, 1);
-    gridLayout_dashboard->addWidget(m_pGroupExperience, dashboardRow++, 0, 1, 1);
-    gridLayout_dashboard->addWidget(workflowCard, dashboardRow++, 0, 1, 1);
-    heroCard->hide();
     gridLayout_dashboard->setColumnStretch(0, 1);
-    gridLayout_dashboard->setColumnStretch(1, 0);
-
-    gridLayout_overview->removeWidget(m_pLabelWorkflowRuntimeCaption);
-    gridLayout_overview->removeWidget(m_pLabelWorkflowRuntimeValue);
-    gridLayout_overview->addWidget(m_pLabelWorkflowRuntimeCaption, 2, 0, 1, 1);
-    gridLayout_overview->addWidget(m_pLabelWorkflowRuntimeValue, 3, 0, 1, 2);
-    gridLayout_overview->setHorizontalSpacing(10);
+    gridLayout_dashboard->setColumnStretch(1, 1);
+    gridLayout_overview->setHorizontalSpacing(18);
     gridLayout_overview->setColumnStretch(0, 1);
     gridLayout_overview->setColumnStretch(1, 1);
-    gridLayout_overview->setColumnStretch(2, 0);
+    gridLayout_overview->setColumnStretch(2, 1);
     m_pLabelPeerValue->setWordWrap(true);
     m_pLabelWorkflowRuntimeValue->setWordWrap(true);
-    m_pButtonWorkflowHub->setText(tr("Workflow Hub"));
-    m_pButtonShowLog->setText(tr("Live Log"));
-    horizontalLayout_overviewActions->setDirection(QBoxLayout::TopToBottom);
     horizontalLayout_overviewActions->setSpacing(8);
+    m_pStatusLabel->setProperty("state", QStringLiteral("disconnected"));
+    m_pButtonToggleStart->setProperty("state", QStringLiteral("start"));
 
     QWidget* dashboard = takeCentralWidget();
     QScrollArea* scrollArea = new QScrollArea(this);
     scrollArea->setObjectName(QStringLiteral("m_pMainScrollArea"));
-    scrollArea->setWidgetResizable(false);
+    scrollArea->setWidgetResizable(true);
     scrollArea->setSizeAdjustPolicy(QAbstractScrollArea::AdjustIgnored);
-    scrollArea->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
+    scrollArea->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     scrollArea->setMinimumSize(QSize(0, 0));
     scrollArea->setFrameShape(QFrame::NoFrame);
-    scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    scrollArea->setAlignment(Qt::AlignHCenter | Qt::AlignTop);
+    scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     dashboard->setObjectName(QStringLiteral("dashboardContent"));
     dashboard->setMinimumSize(QSize(0, 0));
-    dashboard->setFixedWidth(560);
-    dashboard->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    dashboard->setMaximumWidth(1040);
+    dashboard->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     dashboard->adjustSize();
     scrollArea->setWidget(dashboard);
-    setCentralWidget(scrollArea);
+
+    verticalLayout_footerCard->removeItem(horizontalLayout);
+    QFrame* controlBar = new QFrame(this);
+    controlBar->setObjectName(QStringLiteral("fixedControlBar"));
+    QVBoxLayout* controlBarLayout = new QVBoxLayout(controlBar);
+    controlBarLayout->setContentsMargins(18, 10, 18, 10);
+    spacer->changeSize(0, 0, QSizePolicy::Minimum, QSizePolicy::Minimum);
+    m_pStatusLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    controlBarLayout->addLayout(horizontalLayout);
+
+    QWidget* controlCenter = new QWidget(this);
+    controlCenter->setObjectName(QStringLiteral("controlCenterShell"));
+    QVBoxLayout* controlCenterLayout = new QVBoxLayout(controlCenter);
+    controlCenterLayout->setContentsMargins(0, 0, 0, 0);
+    controlCenterLayout->setSpacing(0);
+    controlCenterLayout->addWidget(scrollArea, 1);
+    controlCenterLayout->addWidget(controlBar);
+    setCentralWidget(controlCenter);
+    setMinimumSize(QSize(560, 420));
 
     // Apply modern dark theme from QSS resource file
     QFile styleFile(":/res/styles/dark.qss");
     if (styleFile.open(QFile::ReadOnly)) {
-        setStyleSheet(QString::fromUtf8(styleFile.readAll()));
+        qApp->setStyleSheet(QString::fromUtf8(styleFile.readAll()));
     } else {
         qWarning() << "Failed to load stylesheet:" << styleFile.fileName();
     }
@@ -227,13 +239,12 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     m_pWorkflowStore->attachClipboard(QApplication::clipboard());
     m_pActionBus = new ActionBus(*m_pWorkflowStore, this);
 
-    m_pActionWorkflowHub = new QAction(tr("Workflow &Hub"), this);
-    m_pActionWorkflowHub->setToolTip(tr("Open clipboard history, task handoff, suggestions, and transfer receipts."));
+    m_pActionWorkflowHub = new QAction(this);
     m_pActionWorkflowHub->setShortcut(QKeySequence(Qt::CTRL + Qt::Key_H));
-    m_pActionCommandPalette = new QAction(tr("Command &Palette"), this);
-    m_pActionCommandPalette->setToolTip(tr("Run lightweight workflow commands."));
+    m_pActionCommandPalette = new QAction(this);
     m_pActionCommandPalette->setShortcut(QKeySequence(Qt::CTRL + Qt::SHIFT + Qt::Key_P));
     addAction(m_pActionCommandPalette);
+    retranslateDashboard();
 
     connect(m_pWorkflowStore, &WorkflowStore::notificationRequested,
             this, &MainWindow::handleWorkflowNotification);
@@ -262,20 +273,19 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     connect(&m_IpcClient, SIGNAL(readLogLine(const QString&)), this, SLOT(appendLogRaw(const QString&)));
     connect(&m_IpcClient, SIGNAL(errorMessage(const QString&)), this, SLOT(appendLogError(const QString&)));
     connect(&m_IpcClient, SIGNAL(infoMessage(const QString&)), this, SLOT(appendLogInfo(const QString&)));
+    connect(&m_IpcClient, &IpcClient::serviceStopAcknowledged,
+            this, &MainWindow::handleServiceStopAcknowledged);
     m_IpcClient.connectToHost();
 #endif
 
-    // change default size based on os
-#if defined(Q_OS_MAC)
-    resize(640, 560);
-    setMinimumSize(560, 420);
-#elif defined(Q_OS_LINUX)
-    resize(640, 560);
-    setMinimumSize(560, 420);
-#elif defined(Q_OS_WIN)
-    resize(640, 560);
-    setMinimumSize(560, 420);
-#endif
+    m_ServiceStopAckTimer.setSingleShot(true);
+    connect(&m_ServiceStopAckTimer, &QTimer::timeout,
+            this, &MainWindow::handleServiceStopTimeout);
+
+    // Preserve restored geometry; only apply the compact default on first launch.
+    if (!m_WindowGeometryInitialized) {
+        resize(640, 560);
+    }
 
     m_SuppressAutoConfigWarning = true;
     m_pCheckBoxAutoConfig->setChecked(appConfig.autoConfig());
@@ -299,7 +309,6 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
             toolbutton_show_fingerprint->setArrowType(Qt::ArrowType::DownArrow);
         }
     });
-
     m_RestartTimer.setSingleShot(true);
     connect(&m_RestartTimer, &QTimer::timeout, this, &MainWindow::startBarrier);
 
@@ -309,6 +318,8 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
         qMax(availableGeometry.height() - 80, minimumHeight()))));
     updateWorkflowPeerHint();
     updateWorkflowIndicators();
+    updateDashboardLayout(width());
+    updateControlBarMargins();
     refreshDashboardScrollArea(this);
 }
 
@@ -322,9 +333,8 @@ MainWindow::~MainWindow()
     saveSettings();
 
     delete m_pZeroconfService;
-    delete m_DownloadMessageBox;
-    delete m_BonjourInstall;
     delete m_pSslCertificate;
+    delete m_pTempConfigFile;
 
     // LogWindow is created as a sibling of the MainWindow rather than a child
     // so that the main window can be hidden without hiding the log. because of
@@ -338,7 +348,7 @@ void MainWindow::open()
 {
     createTrayIcon();
 
-    if (appConfig().getAutoHide()) {
+    if (appConfig().getAutoHide() && QSystemTrayIcon::isSystemTrayAvailable()) {
         hide();
     } else {
         showControlCenter();
@@ -357,6 +367,11 @@ void MainWindow::open()
         startBarrier();
         m_SuppressEmptyServerWarning = false;
     }
+}
+
+void MainWindow::activateFromSecondaryInstance()
+{
+    showControlCenter();
 }
 
 void MainWindow::setStatus(const QString &status)
@@ -400,6 +415,96 @@ void MainWindow::retranslateMenuBar()
     m_pMenuHelp->setTitle(tr("&Help"));
 }
 
+void MainWindow::retranslateDashboard()
+{
+    m_pLabelHeroTitle->setText(tr("Weave"));
+    m_pLabelHeroSubtitle->setText(tr("Share one keyboard, mouse, clipboard, and files across your desk."));
+    m_pGroupClient->setTitle(tr("Join another computer"));
+    m_pGroupServer->setTitle(tr("Share this computer"));
+    m_pGroupExperience->setTitle(tr("Transfer and input"));
+    m_pLabelWorkflowSectionTitle->setText(tr("Recent activity"));
+    m_pLineEditHostname->setPlaceholderText(tr("Server name or IP address"));
+    m_pLineEditConfigFile->setPlaceholderText(tr("Choose a .conf file"));
+    m_pButtonWorkflowHub->setText(tr("Workflow Hub"));
+    m_pButtonShowLog->setText(tr("Logs"));
+    m_pButtonWorkflowHub->setToolTip(tr("Open clipboard history, transfer receipts, and workflow actions."));
+    m_pButtonShowLog->setToolTip(tr("Open the live service log."));
+    toolbutton_show_fingerprint->setToolTip(tr("Show fingerprint details"));
+    toolbutton_show_fingerprint->setAccessibleName(tr("Show fingerprint details"));
+
+    if (m_pActionWorkflowHub != NULL) {
+        m_pActionWorkflowHub->setText(tr("Workflow &Hub"));
+        m_pActionWorkflowHub->setToolTip(
+            tr("Open clipboard history, task handoff, suggestions, and transfer receipts."));
+    }
+    if (m_pActionCommandPalette != NULL) {
+        m_pActionCommandPalette->setText(tr("Command &Palette"));
+        m_pActionCommandPalette->setToolTip(tr("Run lightweight workflow commands."));
+    }
+}
+
+void MainWindow::updateDashboardLayout(int windowWidth)
+{
+    const bool singleColumn = windowWidth < 760;
+    if (singleColumn == m_DashboardSingleColumn) {
+        return;
+    }
+
+    m_DashboardSingleColumn = singleColumn;
+    QWidget* const cards[] = {
+        heroCard,
+        overviewCard,
+        m_pGroupServer,
+        m_pGroupClient,
+        m_pGroupExperience,
+        workflowCard,
+        footerCard
+    };
+    for (QWidget* card : cards) {
+        gridLayout_dashboard->removeWidget(card);
+    }
+    for (int row = 0; row < 7; ++row) {
+        gridLayout_dashboard->setRowStretch(row, 0);
+    }
+
+    if (singleColumn) {
+        gridLayout_dashboard->addWidget(heroCard, 0, 0, 1, 2);
+        gridLayout_dashboard->addWidget(overviewCard, 1, 0, 1, 2);
+        gridLayout_dashboard->addWidget(m_pGroupServer, 2, 0, 1, 2);
+        gridLayout_dashboard->addWidget(m_pGroupClient, 3, 0, 1, 2);
+        gridLayout_dashboard->addWidget(m_pGroupExperience, 4, 0, 1, 2);
+        gridLayout_dashboard->addWidget(workflowCard, 5, 0, 1, 2);
+        gridLayout_dashboard->addWidget(footerCard, 6, 0, 1, 2);
+        gridLayout_dashboard->setColumnStretch(0, 1);
+        gridLayout_dashboard->setColumnStretch(1, 0);
+    }
+    else {
+        gridLayout_dashboard->addWidget(heroCard, 0, 0);
+        gridLayout_dashboard->addWidget(overviewCard, 0, 1);
+        gridLayout_dashboard->addWidget(m_pGroupServer, 1, 0);
+        gridLayout_dashboard->addWidget(m_pGroupClient, 1, 1);
+        gridLayout_dashboard->addWidget(m_pGroupExperience, 2, 0);
+        gridLayout_dashboard->addWidget(workflowCard, 2, 1);
+        gridLayout_dashboard->addWidget(footerCard, 3, 0, 1, 2);
+        gridLayout_dashboard->setColumnStretch(0, 1);
+        gridLayout_dashboard->setColumnStretch(1, 1);
+    }
+
+    refreshDashboardScrollArea(this);
+}
+
+void MainWindow::updateControlBarMargins()
+{
+    auto* controlBar = findChild<QFrame*>(QStringLiteral("fixedControlBar"));
+    if (controlBar == nullptr || controlBar->layout() == nullptr) {
+        return;
+    }
+
+    const int centeredInset = qMax(0, (controlBar->width() - 1040) / 2);
+    controlBar->layout()->setContentsMargins(
+        centeredInset + 18, 10, centeredInset + 18, 10);
+}
+
 void MainWindow::createMenuBar()
 {
     m_pMenuBar = new QMenuBar(this);
@@ -436,6 +541,10 @@ void MainWindow::loadSettings()
     m_pLineEditConfigFile->setText(settings().value("configFile", QDir::homePath() + "/" + barrierConfigName).toString());
     m_pGroupClient->setChecked(settings().value("groupClientChecked", true).toBool());
     m_pLineEditHostname->setText(settings().value("serverHostname").toString());
+    const QByteArray geometry = settings().value("mainWindowGeometry").toByteArray();
+    if (!geometry.isEmpty()) {
+        m_WindowGeometryInitialized = restoreGeometry(geometry);
+    }
 }
 
 void MainWindow::initConnections()
@@ -463,6 +572,7 @@ void MainWindow::saveSettings()
     settings().setValue("useInternalConfig", m_pRadioInternalConfig->isChecked());
     settings().setValue("groupClientChecked", m_pGroupClient->isChecked());
     settings().setValue("serverHostname", m_pLineEditHostname->text());
+    settings().setValue("mainWindowGeometry", saveGeometry());
     appConfig().setEnableDragDrop(m_pCheckBoxEnableDragDrop->isChecked());
     appConfig().setGameMode(m_pCheckBoxGameMode->isChecked());
     appConfig().saveSettings();
@@ -504,14 +614,17 @@ void MainWindow::showControlCenter()
     showNormal();
     refreshDashboardScrollArea(this);
 
-    const QRect availableGeometry = QApplication::desktop()->availableGeometry(this);
-    const QSize preferredSize(640, 560);
-    const QSize maxSize(
-        qMax(availableGeometry.width() - 80, minimumWidth()),
-        qMax(availableGeometry.height() - 80, minimumHeight()));
-    const QSize targetSize = preferredSize.boundedTo(maxSize).expandedTo(minimumSize());
-    resize(targetSize);
-    move(availableGeometry.center() - rect().center());
+    if (!m_WindowGeometryInitialized) {
+        const QRect availableGeometry = QApplication::desktop()->availableGeometry(this);
+        const QSize preferredSize(760, 680);
+        const QSize maxSize(
+            qMax(availableGeometry.width() - 80, minimumWidth()),
+            qMax(availableGeometry.height() - 80, minimumHeight()));
+        const QSize targetSize = preferredSize.boundedTo(maxSize).expandedTo(minimumSize());
+        resize(targetSize);
+        move(availableGeometry.center() - rect().center());
+        m_WindowGeometryInitialized = true;
+    }
 
     raise();
     activateWindow();
@@ -721,6 +834,12 @@ void MainWindow::proofreadInfo()
 
 void MainWindow::startBarrier()
 {
+    if (m_ExplicitServiceQuitPending) {
+        appendLogInfo(
+            "start ignored while the background service is stopping");
+        return;
+    }
+
     bool desktopMode = appConfig().processMode() == Desktop;
     bool serviceMode = appConfig().processMode() == Service;
 
@@ -752,6 +871,7 @@ void MainWindow::startBarrier()
 
     QString app;
     QStringList args;
+    QString configForLog;
 
     args << "-f" << "--no-tray" << "--debug" << appConfig().logLevelText();
 
@@ -768,10 +888,9 @@ void MainWindow::startBarrier()
         args << "--ipc";
 
 #if defined(Q_OS_WIN)
-        // Service mode must relaunch on Windows desktop switches even when the
-        // child is already elevated. UAC/Winlogon input only stays reliable when
-        // the watchdog can bind the process to the active input desktop.
-        if (appConfig().elevateMode() != ElevateNever) {
+        // As-needed elevation must relaunch on a secure desktop. An always-
+        // elevated client can switch its input thread without dropping TCP.
+        if (appConfig().elevateMode() == ElevateAsNeeded) {
             args << "--stop-on-desk-switch";
         }
 #endif
@@ -792,13 +911,36 @@ void MainWindow::startBarrier()
 
 #if defined(Q_OS_WIN)
     // QProcess passes arguments without shell parsing, so do not embed quotes.
-    args << "--profile-dir" << QString::fromStdString(barrier::DataDirectories::profile().u8string());
+    const QString profileDirectory =
+        QString::fromStdString(barrier::DataDirectories::profile().u8string());
+    if (!ServerLaunchProfile::appendProfileDirectoryArgument(
+            args, serviceMode, profileDirectory)) {
+        appendLogError("The Weave profile directory is unavailable.");
+        if (desktopMode) {
+            stopBarrier();
+        }
+        else {
+            m_ExpectedRunningState = kStopped;
+            resetRestartBackoff();
+            setBarrierState(barrierDisconnected);
+        }
+        return;
+    }
 #endif
 
     if ((barrier_type() == BarrierType::Client && !clientArgs(args, app))
-        || (barrier_type() == BarrierType::Server && !serverArgs(args, app)))
+        || (barrier_type() == BarrierType::Server &&
+            !serverArgs(args, app, configForLog)))
     {
-        stopBarrier();
+        if (desktopMode) {
+            stopBarrier();
+        }
+        else {
+            // Do not alter a running service when launch preparation failed.
+            m_ExpectedRunningState = kStopped;
+            resetRestartBackoff();
+            setBarrierState(barrierDisconnected);
+        }
         return;
     }
 
@@ -817,7 +959,9 @@ void MainWindow::startBarrier()
 
     appendLogDebug(QString("command: %1 %2").arg(app, args.join(" ")));
 
-    appendLogInfo("config file: " + configFilename());
+    if (!configForLog.isEmpty()) {
+        appendLogInfo("config file: " + configForLog);
+    }
     appendLogInfo("log level: " + appConfig().logLevelText());
 
     if (appConfig().logToFile())
@@ -896,18 +1040,26 @@ QString MainWindow::configFilename()
     QString filename;
     if (m_pRadioInternalConfig->isChecked())
     {
-        // TODO: no need to use a temporary file, since we need it to
-        // be permanent (since it'll be used for Windows services, etc).
+        delete m_pTempConfigFile;
         m_pTempConfigFile = new QTemporaryFile();
         if (!m_pTempConfigFile->open())
         {
             QMessageBox::critical(this, tr("Cannot write configuration file"), tr("The temporary configuration file required to start Weave can not be written."));
+            delete m_pTempConfigFile;
+            m_pTempConfigFile = NULL;
             return "";
         }
 
         serverConfig().save(*m_pTempConfigFile);
         filename = m_pTempConfigFile->fileName();
 
+        if (!m_pTempConfigFile->flush()) {
+            QMessageBox::critical(this, tr("Cannot write configuration file"),
+                                  tr("The temporary configuration file required to start Weave can not be written."));
+            delete m_pTempConfigFile;
+            m_pTempConfigFile = NULL;
+            return "";
+        }
         m_pTempConfigFile->close();
     }
     else
@@ -944,7 +1096,7 @@ QString MainWindow::appPath(const QString& name)
     return appConfig().barrierProgramDir() + name;
 }
 
-bool MainWindow::serverArgs(QStringList& args, QString& app)
+bool MainWindow::serverArgs(QStringList& args, QString& app, QString& configForLog)
 {
     app = appPath(appConfig().barriersName());
 
@@ -975,11 +1127,78 @@ bool MainWindow::serverArgs(QStringList& args, QString& app)
         args << "--nested-remote-mode";
     }
 
-    QString configFilename = this->configFilename();
-    args << "-c" << configFilename << "--address" << address();
+    bool usesCanonicalServiceConfig = false;
+#if defined(Q_OS_WIN)
+    usesCanonicalServiceConfig = appConfig().processMode() == Service;
+    if (usesCanonicalServiceConfig && !persistServiceServerConfig(configForLog)) {
+        return false;
+    }
+#endif
+
+    if (!usesCanonicalServiceConfig) {
+        configForLog = configFilename();
+    }
+    if (!ServerLaunchProfile::appendServerConfigArgument(
+            args, usesCanonicalServiceConfig, configForLog)) {
+        return false;
+    }
+
+    args << "--address" << address();
 
     return true;
 }
+
+#if defined(Q_OS_WIN)
+bool MainWindow::persistServiceServerConfig(QString& configForLog)
+{
+    const QString profileDirectory =
+        QString::fromStdString(barrier::DataDirectories::profile().u8string());
+    if (profileDirectory.isEmpty()) {
+        QMessageBox::critical(this, tr("Cannot write configuration file"),
+                              tr("The user profile directory required by the Weave service is unavailable."));
+        return false;
+    }
+
+    const QString destination = ServerLaunchProfile::canonicalConfigPath(
+        profileDirectory, QString::fromLatin1(kWindowsUserConfigName));
+    ServerLaunchProfile::PersistResult result;
+
+    if (m_pRadioInternalConfig->isChecked()) {
+        QByteArray contents;
+        QBuffer buffer(&contents);
+        if (!buffer.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::critical(this, tr("Cannot write configuration file"),
+                                  tr("The internal Weave configuration could not be serialized."));
+            return false;
+        }
+
+        QTextStream output(&buffer);
+        output << serverConfig();
+        output.flush();
+        if (output.status() != QTextStream::Ok) {
+            QMessageBox::critical(this, tr("Cannot write configuration file"),
+                                  tr("The internal Weave configuration could not be serialized."));
+            return false;
+        }
+        result = ServerLaunchProfile::persistContents(contents, destination);
+    }
+    else {
+        const QString source = configFilename();
+        if (source.isEmpty()) {
+            return false;
+        }
+        result = ServerLaunchProfile::persistExternal(source, destination);
+    }
+
+    if (!result.ok) {
+        QMessageBox::critical(this, tr("Cannot write configuration file"), result.error);
+        return false;
+    }
+
+    configForLog = destination;
+    return true;
+}
+#endif
 
 void MainWindow::stopBarrier()
 {
@@ -999,11 +1218,7 @@ void MainWindow::stopBarrier()
         stopDesktop();
     }
 
-    // HACK: deleting the object deletes the physical file, which is
-    // bad, since it could be in use by the Windows service!
-#if !defined(Q_OS_WIN)
     delete m_pTempConfigFile;
-#endif
     m_pTempConfigFile = NULL;
 
     // reset so that new connects cause auto-hide.
@@ -1012,6 +1227,9 @@ void MainWindow::stopBarrier()
 
 void MainWindow::stopService()
 {
+    if (m_ExplicitServiceQuitPending) {
+        return;
+    }
     // send empty command to stop service from launching anything.
     m_IpcClient.sendCommand("", appConfig().elevateMode());
 }
@@ -1074,6 +1292,7 @@ void MainWindow::barrierFinished(int exitCode, QProcess::ExitStatus)
     }
 
     if (m_ExpectedRunningState == kStarted) {
+        setBarrierState(barrierConnecting);
         scheduleAutoRestart();
     }
     else {
@@ -1087,11 +1306,14 @@ void MainWindow::setBarrierState(qBarrierState state)
     if (barrierState() == state)
         return;
 
+    QString visualState = QStringLiteral("disconnected");
+
     if (state == barrierConnected || state == barrierConnecting)
     {
         disconnect (m_pButtonToggleStart, SIGNAL(clicked()), m_pActionStartBarrier, SLOT(trigger()));
         connect (m_pButtonToggleStart, SIGNAL(clicked()), m_pActionStopBarrier, SLOT(trigger()));
         m_pButtonToggleStart->setText(tr("&Stop"));
+        m_pButtonToggleStart->setProperty("state", QStringLiteral("stop"));
         m_pButtonReload->setEnabled(true);
     }
     else if (state == barrierDisconnected)
@@ -1099,18 +1321,22 @@ void MainWindow::setBarrierState(qBarrierState state)
         disconnect (m_pButtonToggleStart, SIGNAL(clicked()), m_pActionStopBarrier, SLOT(trigger()));
         connect (m_pButtonToggleStart, SIGNAL(clicked()), m_pActionStartBarrier, SLOT(trigger()));
         m_pButtonToggleStart->setText(tr("&Start"));
+        m_pButtonToggleStart->setProperty("state", QStringLiteral("start"));
         m_pButtonReload->setEnabled(false);
     }
 
     const bool activeOrStarting =
         state == barrierConnected || state == barrierConnecting || state == barrierTransfering;
 
-    m_pActionStartBarrier->setEnabled(!activeOrStarting);
-    m_pActionStopBarrier->setEnabled(activeOrStarting);
+    m_pActionStartBarrier->setEnabled(
+        !m_ExplicitServiceQuitPending && !activeOrStarting);
+    m_pActionStopBarrier->setEnabled(
+        !m_ExplicitServiceQuitPending && activeOrStarting);
 
     switch (state)
     {
     case barrierConnected: {
+        visualState = QStringLiteral("connected");
         if (m_AppConfig->getCryptoEnabled()) {
             m_pLabelPadlock->show();
         }
@@ -1123,16 +1349,24 @@ void MainWindow::setBarrierState(qBarrierState state)
         break;
     }
     case barrierConnecting:
+        visualState = QStringLiteral("connecting");
         m_pLabelPadlock->hide();
         setStatus(tr("Weave is starting."));
         break;
     case barrierDisconnected:
+        visualState = QStringLiteral("disconnected");
         m_pLabelPadlock->hide();
         setStatus(tr("Weave is not running."));
         break;
     case barrierTransfering:
+        visualState = QStringLiteral("transfering");
+        setStatus(tr("Transferring data..."));
         break;
     }
+
+    m_pStatusLabel->setProperty("state", visualState);
+    repolishWidget(m_pStatusLabel);
+    repolishWidget(m_pButtonToggleStart);
 
     setIcon(state);
 
@@ -1163,8 +1397,91 @@ void MainWindow::scheduleAutoRestart()
 
 void MainWindow::quitApplication()
 {
+    const bool serviceMode = appConfig().processMode() == Service;
+    if (m_ExplicitServiceQuitPending) {
+        showControlCenter();
+        return;
+    }
+
+    if (!serviceMode) {
+        m_AllowApplicationQuit = true;
+        stopBarrier();
+        qApp->quit();
+        return;
+    }
+
+    m_ExplicitServiceQuitPending = true;
+    m_AllowApplicationQuit = false;
+    // Explicit Quit owns the data-plane lifecycle. Ordinary window close and
+    // minimize continue through closeEvent() and deliberately keep it alive.
+    stopBarrier();
+    m_PendingServiceStopRequestId = m_IpcClient.requestServiceStop();
+    if (m_PendingServiceStopRequestId == 0) {
+        m_ExplicitServiceQuitPending = false;
+        appendLogError(
+            "service stop request was not delivered; keeping the GUI open");
+        QMessageBox::warning(
+            this,
+            tr("Unable to stop Weave"),
+            tr("The Weave background service could not be reached. "
+               "The interface will remain open so the stop command can be retried."));
+        return;
+    }
+
+    m_pActionQuit->setEnabled(false);
+    m_pActionStartBarrier->setEnabled(false);
+    m_pActionStopBarrier->setEnabled(false);
+    setStatus(tr("Stopping the Weave background service..."));
+    m_ServiceStopAckTimer.start(kServiceStopAckTimeoutMs);
+}
+
+void MainWindow::handleServiceStopAcknowledged(
+    quint64 requestId, quint64 commandGeneration)
+{
+    const bool matchesPendingRequest = m_ExplicitServiceQuitPending &&
+        requestId != 0 && requestId == m_PendingServiceStopRequestId;
+    if (!WindowLifecyclePolicy::canCompleteExplicitQuit(
+            true, matchesPendingRequest)) {
+        return;
+    }
+
+    appendLogInfo(QString(
+        "service confirmed stopped request=%1 generation=%2")
+        .arg(requestId).arg(commandGeneration));
+    m_ServiceStopAckTimer.stop();
+    m_ExplicitServiceQuitPending = false;
+    m_PendingServiceStopRequestId = 0;
     m_AllowApplicationQuit = true;
     qApp->quit();
+}
+
+void MainWindow::handleServiceStopTimeout()
+{
+    if (!m_ExplicitServiceQuitPending) {
+        return;
+    }
+
+    const quint64 requestId = m_PendingServiceStopRequestId;
+    m_IpcClient.abandonServiceStopRequest(requestId);
+    m_ExplicitServiceQuitPending = false;
+    m_PendingServiceStopRequestId = 0;
+    m_AllowApplicationQuit = false;
+    m_pActionQuit->setEnabled(true);
+    const bool activeOrStarting =
+        barrierState() == barrierConnected ||
+        barrierState() == barrierConnecting ||
+        barrierState() == barrierTransfering;
+    m_pActionStartBarrier->setEnabled(!activeOrStarting);
+    m_pActionStopBarrier->setEnabled(activeOrStarting);
+    appendLogError(QString(
+        "service did not confirm stopped request=%1 before timeout")
+        .arg(requestId));
+    showControlCenter();
+    QMessageBox::warning(
+        this,
+        tr("Unable to stop Weave"),
+        tr("The Weave background process did not confirm that it stopped. "
+           "The interface will remain open so the stop can be retried."));
 }
 
 void MainWindow::setVisible(bool visible)
@@ -1296,6 +1613,7 @@ void MainWindow::changeEvent(QEvent* event)
         {
             retranslateUi(this);
             retranslateMenuBar();
+            retranslateDashboard();
 
             proofreadInfo();
 
@@ -1318,19 +1636,32 @@ void MainWindow::changeEvent(QEvent* event)
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
-    const bool runningOrStarting =
-        barrierState() == barrierConnected || barrierState() == barrierConnecting ||
-        barrierState() == barrierTransfering;
+    const bool canRestoreFromTray =
+        QSystemTrayIcon::isSystemTrayAvailable() &&
+        m_pTrayIcon != NULL && m_pTrayIcon->isVisible();
 
-    if (!m_AllowApplicationQuit &&
-        ((m_pTrayIcon != NULL && m_pTrayIcon->isVisible()) ||
-         (barrier_type() == BarrierType::Client && runningOrStarting))) {
+    const WindowLifecyclePolicy::CloseAction action =
+        WindowLifecyclePolicy::closeAction(m_AllowApplicationQuit, canRestoreFromTray);
+    if (action == WindowLifecyclePolicy::CloseAction::Hide) {
         event->ignore();
         hide();
         return;
     }
 
+    if (action == WindowLifecyclePolicy::CloseAction::Minimize) {
+        event->ignore();
+        showMinimized();
+        return;
+    }
+
     QMainWindow::closeEvent(event);
+}
+
+void MainWindow::resizeEvent(QResizeEvent* event)
+{
+    QMainWindow::resizeEvent(event);
+    updateDashboardLayout(event->size().width());
+    updateControlBarMargins();
 }
 
 bool MainWindow::event(QEvent* event)
@@ -1537,30 +1868,30 @@ void MainWindow::on_m_pButtonReload_clicked()
 #if defined(Q_OS_WIN)
 bool MainWindow::isServiceRunning(QString name)
 {
-    SC_HANDLE hSCManager;
-    hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+    SC_HANDLE hSCManager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
     if (hSCManager == NULL) {
         appendLogError("failed to open a service controller manager, error: " +
             GetLastError());
         return false;
     }
 
-    auto array = name.toLocal8Bit();
-    SC_HANDLE hService = OpenService(hSCManager, array.data(), SERVICE_QUERY_STATUS);
+    const std::wstring serviceName = name.toStdWString();
+    SC_HANDLE hService = OpenServiceW(
+        hSCManager, serviceName.c_str(), SERVICE_QUERY_STATUS);
 
     if (hService == NULL) {
         appendLogDebug("failed to open service: " + name);
+        CloseServiceHandle(hSCManager);
         return false;
     }
 
     SERVICE_STATUS status;
-    if (QueryServiceStatus(hService, &status)) {
-        if (status.dwCurrentState == SERVICE_RUNNING) {
-            return true;
-        }
-    }
+    const bool running = QueryServiceStatus(hService, &status) &&
+        status.dwCurrentState == SERVICE_RUNNING;
 
-    return false;
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+    return running;
 }
 #else
 bool MainWindow::isServiceRunning()
@@ -1582,97 +1913,18 @@ bool MainWindow::isBonjourRunning()
     return result;
 }
 
-void MainWindow::downloadBonjour()
+void MainWindow::openBonjourInstallationGuide()
 {
 #if defined(Q_OS_WIN)
-    QUrl url;
-    int arch = getProcessorArch();
-    if (arch == kProcessorArchWin32) {
-        url.setUrl(bonjourBaseUrl + bonjourFilename32);
-        appendLogInfo("downloading 32-bit Bonjour");
-    }
-    else if (arch == kProcessorArchWin64) {
-        url.setUrl(bonjourBaseUrl + bonjourFilename64);
-        appendLogInfo("downloading 64-bit Bonjour");
-    }
-    else {
-        QMessageBox::critical(
-            this, tr("Weave"),
-            tr("Failed to detect system architecture."));
+    const QUrl supportUrl(QString::fromLatin1(bonjourInstallGuideUrl));
+    if (QDesktopServices::openUrl(supportUrl)) {
+        appendLogInfo("opened Apple's official Bonjour installation page");
         return;
     }
 
-    if (m_pDataDownloader == NULL) {
-        m_pDataDownloader = new DataDownloader(this);
-        connect(m_pDataDownloader, SIGNAL(isComplete()), SLOT(installBonjour()));
-    }
-
-    m_pDataDownloader->download(url);
-
-    if (m_DownloadMessageBox == NULL) {
-        m_DownloadMessageBox = new QMessageBox(this);
-        m_DownloadMessageBox->setWindowTitle("Weave");
-        m_DownloadMessageBox->setIcon(QMessageBox::Information);
-        m_DownloadMessageBox->setText("Installing Bonjour, please wait...");
-        m_DownloadMessageBox->setStandardButtons(0);
-        m_pCancelButton = m_DownloadMessageBox->addButton(
-            tr("Cancel"), QMessageBox::RejectRole);
-    }
-
-    m_DownloadMessageBox->exec();
-
-    if (m_DownloadMessageBox->clickedButton() == m_pCancelButton) {
-        m_pDataDownloader->cancel();
-    }
-#endif
-}
-
-void MainWindow::installBonjour()
-{
-#if defined(Q_OS_WIN)
-#if QT_VERSION >= 0x050000
-    QString tempLocation = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
-#else
-    QString tempLocation = QDesktopServices::storageLocation(
-                                QDesktopServices::TempLocation);
-#endif
-    QString filename = tempLocation;
-    filename.append("\\").append(bonjourTargetFilename);
-    QFile file(filename);
-    if (!file.open(QIODevice::WriteOnly)) {
-        m_DownloadMessageBox->hide();
-
-        QMessageBox::warning(
-            this, "Weave",
-            tr("Failed to download Bonjour installer to location: %1")
-            .arg(tempLocation));
-        return;
-    }
-
-    file.write(m_pDataDownloader->data());
-    file.close();
-
-    QStringList arguments;
-    arguments.append("/i");
-    QString winFilename = QDir::toNativeSeparators(filename);
-    arguments.append(winFilename);
-    arguments.append("/passive");
-    if (m_BonjourInstall == NULL) {
-        m_BonjourInstall = new CommandProcess("msiexec", arguments);
-    }
-
-    QThread* thread = new QThread;
-    connect(m_BonjourInstall, SIGNAL(finished()), this,
-        SLOT(bonjourInstallFinished()));
-    connect(m_BonjourInstall, SIGNAL(finished()), thread, SLOT(quit()));
-    connect(thread, SIGNAL(finished()), thread, SLOT(deleteLater()));
-
-    m_BonjourInstall->moveToThread(thread);
-    thread->start();
-
-    QMetaObject::invokeMethod(m_BonjourInstall, "run", Qt::QueuedConnection);
-
-    m_DownloadMessageBox->hide();
+    QMessageBox::warning(
+        this, tr("Weave"),
+        tr("Unable to open Apple's official Bonjour installation page."));
 #endif
 }
 
@@ -1681,18 +1933,17 @@ void MainWindow::promptAutoConfig()
     if (!isBonjourRunning()) {
         int r = QMessageBox::question(
             this, tr("Weave"),
-            tr("Do you want to enable auto config and install Bonjour?\n\n"
-               "This feature helps you establish the connection."),
-            QMessageBox::Yes | QMessageBox::No);
+            tr("Auto config requires Bonjour on Windows.\n\n"
+               "Weave does not download or install Bonjour automatically. "
+               "Open Apple's official installation page?"),
+            QMessageBox::Open | QMessageBox::Cancel);
 
-        if (r == QMessageBox::Yes) {
-            m_AppConfig->setAutoConfig(true);
-            downloadBonjour();
+        if (r == QMessageBox::Open) {
+            openBonjourInstallationGuide();
         }
-        else {
-            m_AppConfig->setAutoConfig(false);
-            m_pCheckBoxAutoConfig->setChecked(false);
-        }
+
+        m_AppConfig->setAutoConfig(false);
+        m_pCheckBoxAutoConfig->setChecked(false);
     }
 
     m_AppConfig->setAutoConfigPrompted(true);
@@ -1712,11 +1963,12 @@ void MainWindow::on_m_pCheckBoxAutoConfig_toggled(bool checked)
             int r = QMessageBox::information(
                 this, tr("Weave"),
                 tr("Auto config feature requires Bonjour.\n\n"
-                   "Do you want to install Bonjour?"),
-                QMessageBox::Yes | QMessageBox::No);
+                   "Weave does not install it automatically. "
+                   "Open Apple's official installation page?"),
+                QMessageBox::Open | QMessageBox::Cancel);
 
-            if (r == QMessageBox::Yes) {
-                downloadBonjour();
+            if (r == QMessageBox::Open) {
+                openBonjourInstallationGuide();
             }
         }
 
@@ -1734,17 +1986,15 @@ void MainWindow::on_m_pCheckBoxAutoConfig_toggled(bool checked)
     }
 }
 
-void MainWindow::bonjourInstallFinished()
-{
-    appendLogInfo("Bonjour install finished");
-
-    m_pCheckBoxAutoConfig->setChecked(true);
-}
-
 void MainWindow::windowStateChanged()
 {
-    if (windowState() == Qt::WindowMinimized && appConfig().getMinimizeToTray())
+    const bool canRestoreFromTray =
+        QSystemTrayIcon::isSystemTrayAvailable() &&
+        m_pTrayIcon != NULL && m_pTrayIcon->isVisible();
+    if (WindowLifecyclePolicy::shouldHideOnMinimize(
+            windowState(), appConfig().getMinimizeToTray(), canRestoreFromTray)) {
         hide();
+    }
 }
 
 void MainWindow::refreshControlState()
@@ -1882,7 +2132,7 @@ void MainWindow::updateOverviewCards()
     }
     else {
         peerText = serverMode
-            ? tr("Connected or awaiting a remote client")
+            ? tr("Ready for a remote client")
             : (hostname().isEmpty() ? tr("Connected server") : hostname());
     }
     m_pLabelPeerValue->setText(peerText);

@@ -18,13 +18,18 @@
 
 #include "arch/win32/ArchMiscWindows.h"
 #include "arch/win32/ArchDaemonWindows.h"
+#include "arch/win32/XArchWindows.h"
 #include "base/Log.h"
 #include "common/Version.h"
+#include "common/win32/encoding_utilities.h"
 
 #include <Wtsapi32.h>
 #pragma warning(disable: 4099)
 #include <Userenv.h>
 #pragma warning(default: 4099)
+
+#include <limits>
+#include <vector>
 
 // parent process name for services in Vista
 #define SERVICE_LAUNCHER "services.exe"
@@ -228,42 +233,73 @@ void
 ArchMiscWindows::setValue(HKEY key,
                 const TCHAR* name, const std::string& value)
 {
-    assert(key != NULL);
-    if (key == NULL) {
-        // TODO: throw exception
-        return;
+    if (key == NULL || name == NULL) {
+        throw XArch("invalid registry key or value name");
     }
-    RegSetValueEx(key, name, 0, REG_SZ,
-                                reinterpret_cast<const BYTE*>(value.c_str()),
-                                (DWORD)value.size() + 1);
+    const LONG result = RegSetValueEx(
+        key, name, 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(value.c_str()),
+        static_cast<DWORD>(value.size() + 1u));
+    if (result != ERROR_SUCCESS) {
+        throw XArch(new XArchEvalWindows(static_cast<DWORD>(result)));
+    }
+}
+
+void
+ArchMiscWindows::setValueUtf8(HKEY key,
+                const char* name, const std::string& value)
+{
+    if (key == NULL || name == NULL || name[0] == '\0') {
+        throw XArch("invalid registry key or value name");
+    }
+
+    const std::vector<WCHAR> wideName = utf8_to_win_char(name);
+    const std::vector<WCHAR> wideValue = utf8_to_win_char(value);
+    if (wideName.size() <= 1u ||
+        (!value.empty() && wideValue.size() <= 1u) ||
+        wideValue.size() >
+            static_cast<std::size_t>((std::numeric_limits<DWORD>::max)()) /
+                sizeof(WCHAR)) {
+        throw XArch(new XArchEvalWindows(ERROR_NO_UNICODE_TRANSLATION));
+    }
+
+    const DWORD bytes = static_cast<DWORD>(wideValue.size() * sizeof(WCHAR));
+    const LONG result = RegSetValueExW(
+        key, wideName.data(), 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(wideValue.data()), bytes);
+    if (result != ERROR_SUCCESS) {
+        throw XArch(new XArchEvalWindows(static_cast<DWORD>(result)));
+    }
 }
 
 void
 ArchMiscWindows::setValue(HKEY key, const TCHAR* name, DWORD value)
 {
-    assert(key != NULL);
-    if (key == NULL) {
-        // TODO: throw exception
-        return;
+    if (key == NULL || name == NULL) {
+        throw XArch("invalid registry key or value name");
     }
-    RegSetValueEx(key, name, 0, REG_DWORD,
-                                reinterpret_cast<CONST BYTE*>(&value),
-                                sizeof(DWORD));
+    const LONG result = RegSetValueEx(
+        key, name, 0, REG_DWORD,
+        reinterpret_cast<CONST BYTE*>(&value), sizeof(DWORD));
+    if (result != ERROR_SUCCESS) {
+        throw XArch(new XArchEvalWindows(static_cast<DWORD>(result)));
+    }
 }
 
 void
 ArchMiscWindows::setValueBinary(HKEY key,
                 const TCHAR* name, const std::string& value)
 {
-    assert(key  != NULL);
-    assert(name != NULL);
     if (key == NULL || name == NULL) {
-        // TODO: throw exception
-        return;
+        throw XArch("invalid registry key or value name");
     }
-    RegSetValueEx(key, name, 0, REG_BINARY,
-                                reinterpret_cast<const BYTE*>(value.data()),
-                                (DWORD)value.size());
+    const LONG result = RegSetValueEx(
+        key, name, 0, REG_BINARY,
+        reinterpret_cast<const BYTE*>(value.data()),
+        static_cast<DWORD>(value.size()));
+    if (result != ERROR_SUCCESS) {
+        throw XArch(new XArchEvalWindows(static_cast<DWORD>(result)));
+    }
 }
 
 std::string
@@ -307,6 +343,52 @@ std::string
 ArchMiscWindows::readValueString(HKEY key, const TCHAR* name)
 {
     return readBinaryOrString(key, name, REG_SZ);
+}
+
+std::string
+ArchMiscWindows::readValueStringUtf8(HKEY key, const char* name)
+{
+    if (key == NULL || name == NULL || name[0] == '\0') {
+        return std::string();
+    }
+
+    const std::vector<WCHAR> wideName = utf8_to_win_char(name);
+    if (wideName.size() <= 1u) {
+        return std::string();
+    }
+
+    DWORD type = 0;
+    DWORD bytes = 0;
+    LONG result = RegQueryValueExW(
+        key, wideName.data(), 0, &type, NULL, &bytes);
+    if (result != ERROR_SUCCESS || type != REG_SZ ||
+        bytes < sizeof(WCHAR) || bytes % sizeof(WCHAR) != 0) {
+        return std::string();
+    }
+
+    std::vector<WCHAR> buffer(bytes / sizeof(WCHAR), L'\0');
+    result = RegQueryValueExW(
+        key, wideName.data(), 0, &type,
+        reinterpret_cast<BYTE*>(buffer.data()), &bytes);
+    if (result != ERROR_SUCCESS || type != REG_SZ ||
+        bytes < sizeof(WCHAR) || bytes % sizeof(WCHAR) != 0) {
+        return std::string();
+    }
+
+    const std::size_t length = bytes / sizeof(WCHAR);
+    if (length > buffer.size() || buffer[length - 1u] != L'\0') {
+        return std::string();
+    }
+    for (std::size_t i = 0; i + 1u < length; ++i) {
+        if (buffer[i] == L'\0') {
+            return std::string();
+        }
+    }
+    if (length == 1u) {
+        return std::string();
+    }
+
+    return win_wchar_to_utf8(buffer.data());
 }
 
 std::string

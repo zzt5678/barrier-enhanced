@@ -34,6 +34,48 @@ hashClipboardData(const String& data)
     return hash;
 }
 
+static UInt32
+readClipboardUInt32(const char* data)
+{
+    const unsigned char* bytes =
+        reinterpret_cast<const unsigned char*>(data);
+    return (static_cast<UInt32>(bytes[0]) << 24) |
+           (static_cast<UInt32>(bytes[1]) << 16) |
+           (static_cast<UInt32>(bytes[2]) << 8) |
+            static_cast<UInt32>(bytes[3]);
+}
+
+static bool
+inspectMarshalledClipboard(const String& data, UInt32 targetFormat,
+                           bool* found)
+{
+    if (data.size() < 4 || found == NULL) {
+        return false;
+    }
+
+    *found = false;
+    size_t offset = 0;
+    const UInt32 formatCount = readClipboardUInt32(data.data());
+    if (formatCount > 1024) {
+        return false;
+    }
+    offset += 4;
+    for (UInt32 i = 0; i < formatCount; ++i) {
+        if (data.size() - offset < 8) {
+            return false;
+        }
+        const UInt32 encodedFormat = readClipboardUInt32(data.data() + offset);
+        const UInt32 size = readClipboardUInt32(data.data() + offset + 4);
+        offset += 8;
+        if (size > data.size() - offset) {
+            return false;
+        }
+        *found = *found || encodedFormat == targetFormat;
+        offset += size;
+    }
+    return offset == data.size();
+}
+
 void
 ClipboardDataSnapshot::set(const String& data)
 {
@@ -73,6 +115,25 @@ ClipboardDataSnapshot::clear()
     m_size = 0;
     m_hash = 0;
     String().swap(m_exactData);
+}
+
+bool
+Clipboard::marshalledHasFormat(const String& data, IClipboard::EFormat format)
+{
+    if (format < 0 || format >= IClipboard::kNumFormats) {
+        return false;
+    }
+    bool found = false;
+    return inspectMarshalledClipboard(
+        data, static_cast<UInt32>(format), &found) && found;
+}
+
+bool
+Clipboard::isValidMarshalled(const String& data)
+{
+    bool ignored = false;
+    return inspectMarshalledClipboard(
+        data, static_cast<UInt32>(IClipboard::kNumFormats), &ignored);
 }
 
 //

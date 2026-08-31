@@ -37,7 +37,8 @@ private:
 Event::Type                                                            \
 type_##Events::name_()                                                    \
 {                                                                        \
-    return getEvents()->registerTypeOnce(m_##name_, __FUNCTION__);            \
+    return getEvents()->registerTypeOnce(                                 \
+        m_##name_, #type_ "Events::" #name_);                            \
 }
 
 class ClientEvents : public EventTypes {
@@ -87,7 +88,8 @@ public:
         m_outputFlushed(Event::kUnknown),
         m_outputError(Event::kUnknown),
         m_inputShutdown(Event::kUnknown),
-        m_outputShutdown(Event::kUnknown) { }
+        m_outputShutdown(Event::kUnknown),
+        m_inputFormatError(Event::kUnknown) { }
 
     //! @name accessors
     //@{
@@ -374,6 +376,7 @@ class ClientProxyEvents : public EventTypes {
 public:
     ClientProxyEvents() :
         m_ready(Event::kUnknown),
+        m_inputHandoffReady(Event::kUnknown),
         m_disconnected(Event::kUnknown) { }
 
     //! @name accessors
@@ -387,6 +390,9 @@ public:
     */
     Event::Type        ready();
 
+    //! Get input handoff readiness event type
+    Event::Type        inputHandoffReady();
+
     //! Get disconnect event type
     /*!
     Returns the disconnect event type.  This is sent when the client
@@ -398,6 +404,7 @@ public:
 
 private:
     Event::Type        m_ready;
+    Event::Type        m_inputHandoffReady;
     Event::Type        m_disconnected;
 };
 
@@ -705,6 +712,7 @@ public:
     ClipboardEvents() :
         m_clipboardGrabbed(Event::kUnknown),
         m_clipboardChanged(Event::kUnknown),
+        m_clipboardPublished(Event::kUnknown),
         m_clipboardSending(Event::kUnknown) { }
 
     //! @name accessors
@@ -726,6 +734,9 @@ public:
     */
     Event::Type        clipboardChanged();
 
+    //! Asynchronous platform clipboard publication reached a terminal state.
+    Event::Type        clipboardPublished();
+
     //! Clipboard sending event type
     /*!
     Returns the clipboard sending event type. This is used to send
@@ -738,6 +749,7 @@ public:
 private:
     Event::Type        m_clipboardGrabbed;
     Event::Type        m_clipboardChanged;
+    Event::Type        m_clipboardPublished;
     Event::Type        m_clipboardSending;
 };
 

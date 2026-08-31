@@ -20,6 +20,7 @@ class WorkflowStore : public QObject
 
 public:
     explicit WorkflowStore(AppConfig& appConfig, QObject* parent = nullptr);
+    ~WorkflowStore() override;
 
     void attachClipboard(QClipboard* clipboard);
     void setPeerDeviceHint(const QString& peerDevice);
@@ -46,6 +47,21 @@ public:
                        bool notify = true);
     void recordLogLine(const QString& line);
     bool addCapturedImageContext(const QImage& image, QString* contextId = nullptr);
+
+#if defined(BARRIER_TEST_ENV)
+    QString testAddTextContext(const QString& text);
+    void testConsumeClipboardMime(const QMimeData* mimeData)
+    {
+        consumeClipboardMime(mimeData);
+    }
+    void testExpireContext(const QString& contextId);
+    void testRemoveContext(const QString& contextId);
+    void testPruneHistory() { pruneHistory(); }
+    int testSensitivePayloadCount() const { return m_sensitivePayloads.size(); }
+    qint64 testSensitivePayloadBytes() const { return m_sensitivePayloadBytes; }
+    QString testPayloadDirectory() const { return m_payloadDir; }
+    QString testLastSignature() const { return m_lastSignature; }
+#endif
 
 signals:
     void historyChanged();
@@ -90,6 +106,17 @@ private:
     SensitivityLevel detectSensitivity(const QString& text) const;
     bool looksLikeUrl(const QString& text) const;
     bool looksLikeExistingPath(const QString& text) const;
+    bool storeSensitivePayload(const QString& contextId,
+                               const QByteArray& payload,
+                               const QDateTime& expiresAt);
+    void eraseSensitivePayload(const QString& contextId) const;
+    void pruneSensitivePayloads(const QDateTime& now) const;
+
+    struct SensitivePayload {
+        QByteArray data;
+        QDateTime expiresAt;
+        quint64 sequence = 0;
+    };
 
 private:
     AppConfig* m_appConfig;
@@ -108,4 +135,7 @@ private:
     QString m_previewDir;
     QString m_inboxDir;
     bool m_ignoreClipboardChanges;
+    mutable QHash<QString, SensitivePayload> m_sensitivePayloads;
+    mutable qint64 m_sensitivePayloadBytes;
+    quint64 m_nextSensitivePayloadSequence;
 };

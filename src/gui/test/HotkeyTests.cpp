@@ -28,8 +28,8 @@ struct TestAction
     std::vector<TestKey> keys;
     std::vector<std::string> type_screen_names;
     std::string screen_name;
-    Action::SwitchDirection switch_direction;
-    Action::LockCursorMode lock_cursor_mode;
+    Action::SwitchDirection switch_direction = Action::switchLeft;
+    Action::LockCursorMode lock_cursor_mode = Action::lockCursorToggle;
 
     static TestAction createKeyAction(Action::ActionType type, const std::vector<TestKey>& keys,
                                       const std::vector<std::string>& type_screen_names = {})
@@ -167,7 +167,7 @@ void doHotkeyLoadSaveTest(const TestHotKey& test_hotkey)
 
     Hotkey hotkey_before, hotkey_after;
     {
-        QSettings settings(filename, QSettings::NativeFormat);
+        QSettings settings(filename, QSettings::IniFormat);
 
         hotkey_before = createHotkey(test_hotkey);
 
@@ -176,7 +176,7 @@ void doHotkeyLoadSaveTest(const TestHotKey& test_hotkey)
         settings.endGroup();
     }
     {
-        QSettings settings(filename, QSettings::NativeFormat);
+        QSettings settings(filename, QSettings::IniFormat);
 
         settings.beginGroup("test");
         hotkey_after.loadSettings(settings);

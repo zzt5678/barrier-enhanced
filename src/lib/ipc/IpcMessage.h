@@ -19,8 +19,10 @@
 #pragma once
 
 #include "ipc/Ipc.h"
+#include "ipc/IpcPeerAuthentication.h"
 #include "base/EventTypes.h"
 #include "base/Event.h"
+#include <cstdint>
 #include <string>
 
 class IpcMessage : public EventData {
@@ -57,6 +59,106 @@ public:
     virtual ~IpcShutdownMessage();
 };
 
+class IpcStopRequestMessage : public IpcMessage {
+public:
+    explicit IpcStopRequestMessage(std::uint64_t requestId);
+    virtual ~IpcStopRequestMessage();
+
+    std::uint64_t requestId() const { return m_requestId; }
+    const CommandOrigin& origin() const { return m_origin; }
+
+private:
+    friend class IpcClientProxy;
+
+    void setOrigin(const CommandOrigin& origin) { m_origin = origin; }
+
+    std::uint64_t m_requestId;
+    CommandOrigin m_origin;
+};
+
+class IpcStopAckMessage : public IpcMessage {
+public:
+    IpcStopAckMessage(std::uint64_t requestId,
+                      std::uint64_t commandGeneration);
+    virtual ~IpcStopAckMessage();
+
+    std::uint64_t requestId() const { return m_requestId; }
+    std::uint64_t commandGeneration() const { return m_commandGeneration; }
+
+private:
+    std::uint64_t m_requestId;
+    std::uint64_t m_commandGeneration;
+};
+
+class IpcNodeReadyMessage : public IpcMessage {
+public:
+    IpcNodeReadyMessage();
+    virtual ~IpcNodeReadyMessage();
+};
+
+class IpcNodeReadyV2Message : public IpcMessage {
+public:
+    IpcNodeReadyV2Message(UInt32 processId, UInt32 sessionId,
+                          std::uint64_t inputGeneration, bool inputReady,
+                          const std::string& desktopName,
+                          const std::string& buildId,
+                          std::uint64_t queryNonce = 0);
+    virtual ~IpcNodeReadyV2Message();
+
+    UInt32 processId() const { return m_processId; }
+    UInt32 sessionId() const { return m_sessionId; }
+    std::uint64_t inputGeneration() const { return m_inputGeneration; }
+    bool inputReady() const { return m_inputReady; }
+    const std::string& desktopName() const { return m_desktopName; }
+    const std::string& buildId() const { return m_buildId; }
+    std::uint64_t queryNonce() const { return m_queryNonce; }
+
+private:
+    UInt32 m_processId;
+    UInt32 m_sessionId;
+    std::uint64_t m_inputGeneration;
+    bool m_inputReady;
+    std::string m_desktopName;
+    std::string m_buildId;
+    std::uint64_t m_queryNonce;
+};
+
+class IpcInputReadyQueryMessage : public IpcMessage {
+public:
+    explicit IpcInputReadyQueryMessage(std::uint64_t queryNonce);
+    virtual ~IpcInputReadyQueryMessage();
+
+    std::uint64_t queryNonce() const { return m_queryNonce; }
+
+private:
+    std::uint64_t m_queryNonce;
+};
+
+class IpcActivateNodeMessage : public IpcMessage {
+public:
+    explicit IpcActivateNodeMessage(std::uint64_t activationNonce);
+    virtual ~IpcActivateNodeMessage();
+
+    std::uint64_t activationNonce() const { return m_activationNonce; }
+
+private:
+    std::uint64_t m_activationNonce;
+};
+
+class IpcNodeActivatedMessage : public IpcMessage {
+public:
+    IpcNodeActivatedMessage(UInt32 processId,
+                            std::uint64_t activationNonce);
+    virtual ~IpcNodeActivatedMessage();
+
+    UInt32 processId() const { return m_processId; }
+    std::uint64_t activationNonce() const { return m_activationNonce; }
+
+private:
+    UInt32 m_processId;
+    std::uint64_t m_activationNonce;
+};
+
 
 class IpcLogLineMessage : public IpcMessage {
 public:
@@ -90,7 +192,15 @@ public:
     //! Gets the requested Windows elevation mode.
     UInt8               elevateMode() const { return m_elevateMode; }
 
+    //! Gets the server-authenticated origin. This metadata is never on wire.
+    const CommandOrigin& origin() const { return m_origin; }
+
 private:
+    friend class IpcClientProxy;
+
+    void setOrigin(const CommandOrigin& origin) { m_origin = origin; }
+
     std::string m_command;
     UInt8               m_elevateMode;
+    CommandOrigin       m_origin;
 };

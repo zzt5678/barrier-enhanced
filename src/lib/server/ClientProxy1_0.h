@@ -62,7 +62,11 @@ public:
     virtual void        sendDragInfo(UInt32 fileCount, const char* info, size_t size);
     virtual void        fileChunkSending(UInt8 mark, char* data, size_t dataSize);
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 protected:
+#endif
     virtual bool        parseHandshakeMessage(const UInt8* code);
     virtual bool        parseMessage(const UInt8* code);
 
@@ -72,7 +76,11 @@ protected:
     virtual void        addHeartbeatTimer();
     virtual void        removeHeartbeatTimer();
     virtual bool        recvClipboard();
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     void                disconnect();
     void                removeHandlers();
 
@@ -85,7 +93,11 @@ private:
     bool                recvInfo();
     bool                recvGrabClipboard();
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 protected:
+#endif
     struct ClientClipboard {
     public:
         ClientClipboard();
@@ -98,7 +110,11 @@ protected:
 
     ClientClipboard    m_clipboard[kClipboardEnd];
 
+#if defined(BARRIER_TEST_ENV) || defined(BARRIER_TEST_ACCESS)
+public:
+#else
 private:
+#endif
     typedef bool (ClientProxy1_0::*MessageParser)(const UInt8*);
 
     ClientInfo            m_info;

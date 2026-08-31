@@ -28,6 +28,38 @@ IClipboard::unmarshall(IClipboard* clipboard, const String& data, Time time)
 {
     assert(clipboard != NULL);
 
+    // Network entry points validate before calling this function, but keep
+    // every platform bridge and future caller safe from truncated buffers.
+    if (data.size() < sizeof(UInt32)) {
+        return;
+    }
+
+    const char* validationIndex = data.data();
+    size_t remaining = data.size();
+    const UInt32 validationFormats = readUInt32(validationIndex);
+    validationIndex += sizeof(UInt32);
+    remaining -= sizeof(UInt32);
+    if (validationFormats > remaining / (2 * sizeof(UInt32))) {
+        return;
+    }
+    for (UInt32 i = 0; i < validationFormats; ++i) {
+        if (remaining < 2 * sizeof(UInt32)) {
+            return;
+        }
+        validationIndex += sizeof(UInt32);
+        const UInt32 size = readUInt32(validationIndex);
+        validationIndex += sizeof(UInt32);
+        remaining -= 2 * sizeof(UInt32);
+        if (size > remaining) {
+            return;
+        }
+        validationIndex += size;
+        remaining -= size;
+    }
+    if (remaining != 0) {
+        return;
+    }
+
     const char* index = data.data();
 
     if (clipboard->open(time)) {
@@ -41,8 +73,7 @@ IClipboard::unmarshall(IClipboard* clipboard, const String& data, Time time)
         // read each format
         for (UInt32 i = 0; i < numFormats; ++i) {
             // get the format id
-            IClipboard::EFormat format =
-                static_cast<IClipboard::EFormat>(readUInt32(index));
+            const UInt32 encodedFormat = readUInt32(index);
             index += 4;
 
             // get the size of the format data
@@ -52,7 +83,12 @@ IClipboard::unmarshall(IClipboard* clipboard, const String& data, Time time)
             // save the data if it's a known format.  if either the client
             // or server supports more clipboard formats than the other
             // then one of them will get a format >= kNumFormats here.
-            if (format <IClipboard::kNumFormats) {
+            if (encodedFormat <
+                    static_cast<UInt32>(IClipboard::kNumFormats) &&
+                (size != 0 || encodedFormat ==
+                    static_cast<UInt32>(IClipboard::kText))) {
+                const IClipboard::EFormat format =
+                    static_cast<IClipboard::EFormat>(encodedFormat);
                 clipboard->add(format, String(index, size));
             }
             index += size;
@@ -79,6 +115,7 @@ IClipboard::marshall(const IClipboard* clipboard)
 
     std::vector<String> formatData;
     formatData.resize(IClipboard::kNumFormats);
+    std::vector<bool> includedFormats(IClipboard::kNumFormats, false);
     // FIXME -- use current time
     if (clipboard->open(0)) {
 
@@ -87,9 +124,14 @@ IClipboard::marshall(const IClipboard* clipboard)
         UInt32 numFormats = 0;
         for (UInt32 format = 0; format != IClipboard::kNumFormats; ++format) {
             if (clipboard->has(static_cast<IClipboard::EFormat>(format))) {
-                ++numFormats;
                 formatData[format] =
                     clipboard->get(static_cast<IClipboard::EFormat>(format));
+                if (formatData[format].empty() &&
+                    format != static_cast<UInt32>(IClipboard::kText)) {
+                    continue;
+                }
+                includedFormats[format] = true;
+                ++numFormats;
                 size += 4 + 4 + (UInt32)formatData[format].size();
             }
         }
@@ -100,7 +142,7 @@ IClipboard::marshall(const IClipboard* clipboard)
         // marshall the data
         writeUInt32(&data, numFormats);
         for (UInt32 format = 0; format != IClipboard::kNumFormats; ++format) {
-            if (clipboard->has(static_cast<IClipboard::EFormat>(format))) {
+            if (includedFormats[format]) {
                 writeUInt32(&data, format);
                 writeUInt32(&data, (UInt32)formatData[format].size());
                 data += formatData[format];

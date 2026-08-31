@@ -37,6 +37,7 @@
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "base/TMethodEventJob.h"
+#include "base/finally.h"
 #include "common/Version.h"
 #include "common/DataDirectories.h"
 
@@ -61,6 +62,7 @@
 #include <iostream>
 #include <stdio.h>
 #include <fstream>
+#include <memory>
 #include <sstream>
 
 //
@@ -89,8 +91,11 @@ ServerApp::parseArgs(int argc, const char* const* argv)
     ArgParser argParser(this);
     bool result = argParser.parseServerArgs(args(), argc, argv);
 
-    if (!result || args().m_shouldExit) {
+    if (!result) {
         m_bye(kExitArgs);
+    }
+    else if (args().m_shouldExit) {
+        m_bye(kExitSuccess);
     }
     else {
         if (!args().m_barrierAddress.empty()) {
@@ -764,8 +769,18 @@ ServerApp::mainLoop()
         return kExitFailed;
     }
 
-    // start server, etc
-    appUtil().startNode();
+    if (argsBase().m_serviceStandby) {
+        LOG((CLOG_INFO
+            "preparing server in service standby without opening a listener"));
+        if (!initServer() || m_serverState != kInitialized ||
+            m_serverScreen == NULL || m_primaryClient == NULL) {
+            cleanupServer();
+            return kExitFailed;
+        }
+    }
+    else {
+        appUtil().startNode();
+    }
 
     // init ipc client after node start, since create a new screen wipes out
     // the event queue (the screen ctors call adoptBuffer).
@@ -807,7 +822,28 @@ ServerApp::mainLoop()
 
     runCocoaApp();
 #else
-    m_events->loop();
+    int result = kExitSuccess;
+    bool runActiveLoop = true;
+    if (argsBase().m_serviceStandby) {
+        std::uint64_t activationNonce = 0;
+        if (!waitForServiceActivation(activationNonce)) {
+            runActiveLoop = false;
+        }
+        else {
+            if (!m_serverScreen->prepareInputBackend()) {
+                LOG((CLOG_INFO
+                    "Windows input helper activation is pending; active readiness will wait for it"));
+            }
+            if (!startServer() || m_serverState != kStarted ||
+                !sendIpcServiceActivated(activationNonce)) {
+                result = kExitFailed;
+                runActiveLoop = false;
+            }
+        }
+    }
+    if (runActiveLoop) {
+        m_events->loop();
+    }
 #endif
 
     DAEMON_RUNNING(false);
@@ -826,7 +862,11 @@ ServerApp::mainLoop()
         cleanupIpcClient();
     }
 
+#if defined(MAC_OS_X_VERSION_10_7)
     return kExitSuccess;
+#else
+    return result;
+#endif
 }
 
 void ServerApp::resetServer(const Event&, void*)
@@ -841,8 +881,17 @@ int
 ServerApp::runInner(int argc, char** argv, ILogOutputter* outputter, StartupFunc startup)
 {
     // general initialization
-    m_barrierAddress = new NetworkAddress;
-    args().m_config         = new Config(m_events);
+    std::unique_ptr<NetworkAddress> barrierAddress(new NetworkAddress);
+    std::unique_ptr<Config> config(new Config(m_events));
+    m_barrierAddress = barrierAddress.get();
+    args().m_config = config.get();
+    const auto releaseRunState = barrier::finally([this]() {
+        delete m_taskBarReceiver;
+        m_taskBarReceiver = NULL;
+        args().m_config = NULL;
+        m_barrierAddress = NULL;
+    });
+
     args().m_exename = ArgParser::parse_exename(argv[0]);
 
     // install caller's output filter
@@ -850,18 +899,7 @@ ServerApp::runInner(int argc, char** argv, ILogOutputter* outputter, StartupFunc
         CLOG->insert(outputter);
     }
 
-    // run
-    int result = startup(argc, argv);
-
-    if (m_taskBarReceiver)
-    {
-        // done with task bar receiver
-        delete m_taskBarReceiver;
-    }
-
-    delete args().m_config;
-    delete m_barrierAddress;
-    return result;
+    return startup(argc, argv);
 }
 
 int daemonMainLoopStatic(int argc, const char** argv) {
@@ -920,4 +958,40 @@ ServerApp::startNode()
     if (!startServer()) {
         m_bye(kExitFailed);
     }
+}
+
+bool
+ServerApp::ipcInputReady() const
+{
+    return m_serverScreen != NULL && m_serverScreen->canEnter();
+}
+
+std::uint64_t
+ServerApp::ipcInputGeneration() const
+{
+    return m_serverScreen == NULL ? 0 : m_serverScreen->inputGeneration();
+}
+
+std::string
+ServerApp::ipcInputDesktopName() const
+{
+    return m_serverScreen == NULL ? std::string() :
+        m_serverScreen->inputDesktopName();
+}
+
+bool
+ServerApp::ipcStandbyInputProbe(std::uint64_t& inputGeneration,
+                                std::string& desktopName) const
+{
+    inputGeneration = 0;
+    desktopName.clear();
+    if (m_serverScreen == NULL ||
+        !m_serverScreen->probeInputBackend(desktopName)) {
+        return false;
+    }
+
+    // Active readiness is challenged again after IACK and reports the real
+    // desktop-helper generation, so this phase-local token cannot be adopted.
+    inputGeneration = 1;
+    return true;
 }

@@ -117,6 +117,7 @@ REGISTER_EVENT(ClientListener, connected)
 //
 
 REGISTER_EVENT(ClientProxy, ready)
+REGISTER_EVENT(ClientProxy, inputHandoffReady)
 REGISTER_EVENT(ClientProxy, disconnected)
 
 //
@@ -194,6 +195,7 @@ REGISTER_EVENT(IpcServer, messageReceived)
 
 REGISTER_EVENT(Clipboard, clipboardGrabbed)
 REGISTER_EVENT(Clipboard, clipboardChanged)
+REGISTER_EVENT(Clipboard, clipboardPublished)
 REGISTER_EVENT(Clipboard, clipboardSending)
 
 //

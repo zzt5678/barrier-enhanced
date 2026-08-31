@@ -83,6 +83,18 @@ Screen::enable()
     m_enabled = true;
 }
 
+bool
+Screen::prepareInputBackend()
+{
+    return m_screen->prepareInputBackend();
+}
+
+bool
+Screen::probeInputBackend(std::string& desktopName) const
+{
+    return m_screen->probeInputBackend(desktopName);
+}
+
 void
 Screen::disable()
 {
@@ -102,26 +114,36 @@ Screen::disable()
         disableSecondary();
     }
 
+    // Platform disable returns input ownership to the local primary and
+    // removes secondary injection state even when a final enter/leave command
+    // could not be acknowledged during teardown.
+    m_entered = m_isPrimary;
+
     // note deactivation
     m_enabled = false;
 }
 
-void
+bool
 Screen::enter(KeyModifierMask toggleMask)
 {
     assert(m_entered == false);
-    LOG((CLOG_INFO "entering screen"));
+    LOG((CLOG_DEBUG1 "requesting platform screen enter"));
 
-    // now on screen
-    m_entered = true;
-
-    m_screen->enter();
+    if (!m_screen->tryEnter()) {
+        LOG((CLOG_WARN "platform rejected screen enter"));
+        return false;
+    }
     if (m_isPrimary) {
         enterPrimary();
     }
     else {
         enterSecondary(toggleMask);
     }
+
+    // now on screen
+    m_entered = true;
+    LOG((CLOG_INFO "platform screen enter applied"));
+    return true;
 }
 
 bool
@@ -166,13 +188,45 @@ Screen::warpCursor(SInt32 x, SInt32 y)
 void
 Screen::setClipboard(ClipboardID id, const IClipboard* clipboard)
 {
-    m_screen->setClipboard(id, clipboard);
+    if (!m_mock) {
+        m_screen->setClipboard(id, clipboard);
+    }
+}
+
+bool
+Screen::setClipboardChecked(ClipboardID id, const IClipboard* clipboard)
+{
+    return !m_mock && m_screen->setClipboard(id, clipboard);
+}
+
+bool
+Screen::setClipboardSnapshot(
+    ClipboardID id, const std::shared_ptr<const String>& data)
+{
+    return !m_mock && m_screen->setClipboardSnapshot(id, data);
+}
+
+bool
+Screen::setClipboardSnapshot(
+    ClipboardID id, const std::shared_ptr<const String>& data,
+    std::uint64_t publicationId)
+{
+    return !m_mock &&
+        m_screen->setClipboardSnapshot(id, data, publicationId);
+}
+
+bool
+Screen::hasAsyncClipboardPublications() const
+{
+    return !m_mock && m_screen->hasAsyncClipboardPublications();
 }
 
 void
 Screen::grabClipboard(ClipboardID id)
 {
-    m_screen->setClipboard(id, NULL);
+    if (!m_mock) {
+        m_screen->setClipboard(id, NULL);
+    }
 }
 
 void
@@ -244,6 +298,13 @@ Screen::mouseMove(SInt32 x, SInt32 y)
 {
     assert(!m_isPrimary);
     m_screen->fakeMouseMove(x, y);
+}
+
+bool
+Screen::tryMouseMove(SInt32 x, SInt32 y)
+{
+    assert(!m_isPrimary);
+    return m_screen->tryFakeMouseMove(x, y);
 }
 
 void
@@ -407,6 +468,18 @@ Screen::canEnter() const
     return m_screen->canEnter();
 }
 
+std::uint64_t
+Screen::inputGeneration() const
+{
+    return m_screen->inputGeneration();
+}
+
+std::string
+Screen::inputDesktopName() const
+{
+    return m_screen->inputDesktopName();
+}
+
 SInt32
 Screen::getJumpZoneSize() const
 {
@@ -500,6 +573,15 @@ bool
 Screen::getClipboard(ClipboardID id, IClipboard* clipboard) const
 {
     return m_screen->getClipboard(id, clipboard);
+}
+
+bool
+Screen::getClipboardSnapshot(
+    ClipboardID id, std::shared_ptr<const String>* data,
+    UInt32* snapshotTime) const
+{
+    return !m_mock &&
+        m_screen->getClipboardSnapshot(id, data, snapshotTime);
 }
 
 void

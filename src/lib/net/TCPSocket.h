@@ -26,18 +26,22 @@
 #include "arch/IArchNetwork.h"
 #include "base/Stopwatch.h"
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 class Mutex;
 class Thread;
 class IEventQueue;
 class SocketMultiplexer;
+class IpcPeerAuthenticator;
 
 //! TCP data socket
 /*!
 A data socket using TCP.
 */
 class TCPSocket : public IDataSocket {
+    friend class IpcPeerAuthenticator;
+
 public:
     TCPSocket(IEventQueue* events, SocketMultiplexer* socketMultiplexer, IArchNetwork::EAddressFamily family);
     TCPSocket(IEventQueue* events, SocketMultiplexer* socketMultiplexer, ArchSocket socket);
@@ -59,6 +63,8 @@ public:
     virtual bool        isFatal() const;
     virtual UInt32        getSize() const;
     virtual UInt32        getBufferedOutputSize() const;
+    virtual std::uint64_t getOutputBytesWritten() const;
+    virtual std::uint64_t getInputBytesReceived() const;
 
     // IDataSocket overrides
     virtual void        connect(const NetworkAddress&);
@@ -87,6 +93,7 @@ protected:
     IEventQueue*        getEvents() { return m_events; }
     virtual EJobResult    doRead();
     virtual EJobResult    doWrite();
+    virtual size_t        readSocketNoLock(void* buffer, size_t size);
 
     void removeJob();
     void setJob(std::unique_ptr<ISocketMultiplexerJob>&& job);
@@ -146,4 +153,6 @@ private:
     UInt32               m_windowLowPriorityBytes;
     UInt32               m_windowMaxHighPriorityBuffered;
     UInt32               m_windowMaxLowPriorityBuffered;
+    std::uint64_t        m_outputBytesWritten;
+    std::uint64_t        m_inputBytesReceived;
 };
