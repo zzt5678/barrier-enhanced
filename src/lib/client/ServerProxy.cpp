@@ -376,10 +376,12 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
 
     else if (memcmp(code, kMsgEIncompatible, 4) == 0) {
         SInt32 major, minor;
-        ProtocolUtil::readf(m_stream,
-                        kMsgEIncompatible + 4, &major, &minor);
+        if (!ProtocolUtil::readf(m_stream,
+                        kMsgEIncompatible + 4, &major, &minor)) {
+            return kUnknown;
+        }
         LOG((CLOG_ERR "server has incompatible version %d.%d", major, minor));
-        m_client->disconnect("server has incompatible version");
+        m_client->disconnect("server has incompatible version; install compatible Weave versions on both peers", false);
         return kDisconnect;
     }
 

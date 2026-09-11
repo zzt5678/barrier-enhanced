@@ -210,6 +210,9 @@ private:
     std::atomic<bool>   m_monitoring;
     bool                m_commandChanged;
     unsigned long long  m_commandGeneration;
+    unsigned long long  m_runningCommandGeneration = 0;
+    unsigned long long  m_permanentFailureGeneration = 0;
+    bool                m_hasPermanentFailure = false;
     HANDLE                m_stdOutWrite;
     HANDLE                m_stdOutRead;
     Thread*                m_outputThread;

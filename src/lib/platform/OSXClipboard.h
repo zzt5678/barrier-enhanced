@@ -30,7 +30,7 @@ class IOSXClipboardConverter;
 //! OS X clipboard implementation
 class OSXClipboard : public IClipboard {
 public:
-    OSXClipboard();
+    explicit OSXClipboard(CFStringRef pasteboardName = kPasteboardClipboard);
     virtual ~OSXClipboard();
 
     //! Test if clipboard is owned by barrier

@@ -1291,13 +1291,19 @@ void MainWindow::barrierFinished(int exitCode, QProcess::ExitStatus)
         resetRestartBackoff();
     }
 
-    if (m_ExpectedRunningState == kStarted) {
+    if (WindowLifecyclePolicy::shouldRestartCore(m_ExpectedRunningState == kStarted, exitCode)) {
         setBarrierState(barrierConnecting);
         scheduleAutoRestart();
     }
     else {
         resetRestartBackoff();
+        const bool permanentFailure = m_ExpectedRunningState == kStarted;
+        m_ExpectedRunningState = kStopped;
         setBarrierState(barrierDisconnected);
+        if (permanentFailure) {
+            appendLogError("Peer protocol versions are incompatible. Automatic restart stopped; install compatible Weave versions, then press Start.");
+            setStatus(tr("Incompatible peer version. Update Weave on both computers, then press Start."));
+        }
     }
 }
 

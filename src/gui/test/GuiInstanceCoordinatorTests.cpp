@@ -21,8 +21,10 @@ namespace {
 
 QString uniqueServerName()
 {
-    return QStringLiteral("weave-gui-test-") +
-        QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // macOS prepends its long per-user temporary directory to socket names.
+    // Keep the name short enough for sockaddr_un while retaining UUID entropy.
+    return QStringLiteral("wv-") +
+        QUuid::createUuid().toString(QUuid::Id128).left(16);
 }
 
 bool waitForActivation(const int& activationCount)

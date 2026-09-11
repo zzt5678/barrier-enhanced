@@ -8,8 +8,13 @@
  */
 
 #include "WindowLifecyclePolicy.h"
+#include "../../lib/common/CoreRestartPolicy.h"
 
 namespace WindowLifecyclePolicy {
+bool shouldRestartCore(bool expectedRunning, int exitCode)
+{
+    return expectedRunning && !barrier::coreExitRequiresCorrection(exitCode);
+}
 
 CloseAction closeAction(bool explicitQuitRequested, bool trayAvailable)
 {

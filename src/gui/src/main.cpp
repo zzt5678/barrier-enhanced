@@ -101,7 +101,7 @@ void installUnixSignalHandlers(QCoreApplication& app)
     struct sigaction action;
     std::memset(&action, 0, sizeof(action));
     action.sa_handler = forwardUnixSignal;
-    ::sigemptyset(&action.sa_mask);
+    sigemptyset(&action.sa_mask);
     action.sa_flags = SA_RESTART;
     ::sigaction(SIGTERM, &action, nullptr);
     ::sigaction(SIGINT, &action, nullptr);

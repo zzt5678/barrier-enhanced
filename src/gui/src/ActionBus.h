@@ -8,6 +8,7 @@
 
 class QWidget;
 class WorkflowStore;
+class QThread;
 
 class ActionBus : public QObject
 {
@@ -15,6 +16,9 @@ class ActionBus : public QObject
 
 public:
     explicit ActionBus(WorkflowStore& store, QObject* parent = nullptr);
+    ~ActionBus() override;
+    bool inboxSaveRunning() const { return m_inboxWorker != nullptr; }
+    void cancelInboxSave();
 
     QStringList capabilities() const;
     QList<ActionDescriptor> descriptorsForContext(const ContextItem& item) const;
@@ -46,6 +50,7 @@ public:
 #endif
 
 signals:
+    void inboxSaveFinished(const QString& contextId, bool success, const QString& detail);
     void notificationRequested(const QString& title, const QString& body);
 
 private:
@@ -53,7 +58,7 @@ private:
     bool revealContext(const ContextItem& item, QString* errorMessage);
     bool saveContextToInbox(const ContextItem& item, QString* savedPath, QString* errorMessage);
     bool captureScreenshot(QString* contextId, QString* errorMessage);
-    static void markInboxTargetManaged(const QString& path);
+    static bool markInboxTargetManaged(const QString& path);
     static void pruneManagedInboxDir(const QString& inboxDir, int maxItems, qint64 maxBytes);
     void pruneManagedInbox(int maxItems = -1, qint64 maxBytes = -1) const;
     bool confirmIfNeeded(const ContextItem& item,
@@ -64,4 +69,5 @@ private:
 
 private:
     WorkflowStore* m_store;
+    QThread* m_inboxWorker = nullptr;
 };

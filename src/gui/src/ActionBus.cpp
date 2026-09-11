@@ -17,6 +17,9 @@
 #include <QScreen>
 #include <QSet>
 #include <QTemporaryDir>
+#include <QThread>
+#include <QLockFile>
+#include <memory>
 #include <QUrl>
 
 #include <algorithm>
@@ -61,15 +64,16 @@ bool failCopy(QString* errorMessage, const QString& message)
 bool addCopyItem(const QFileInfo& sourceInfo, CopyBudget& budget, QString* errorMessage)
 {
     ++budget.items;
-    budget.bytes += sourceInfo.isFile() ? sourceInfo.size() : 0;
+    const qint64 bytes = sourceInfo.isFile() ? sourceInfo.size() : 0;
     if (budget.items > budget.maxItems) {
-        return failCopy(errorMessage, QStringLiteral("Refusing to save more than %1 files to the workflow inbox.")
+        return failCopy(errorMessage, QStringLiteral("Refusing to save more than %1 file/folder entries to the workflow inbox.")
             .arg(budget.maxItems));
     }
-    if (budget.bytes > budget.maxBytes) {
+    if (bytes < 0 || bytes > budget.maxBytes - budget.bytes) {
         return failCopy(errorMessage, QStringLiteral("Refusing to save more than %1 MiB to the workflow inbox.")
             .arg(budget.maxBytes / (1024 * 1024)));
     }
+    budget.bytes += bytes;
     return true;
 }
 
@@ -79,6 +83,9 @@ bool copyRecursively(const QString& sourcePath,
                      QString* errorMessage,
                      int depth = 0)
 {
+    if (QThread::currentThread()->isInterruptionRequested()) {
+        return failCopy(errorMessage, QStringLiteral("Inbox save cancelled."));
+    }
     if (depth > 64) {
         return failCopy(errorMessage, QStringLiteral("Inbox folder nesting exceeds 64 levels."));
     }
@@ -128,13 +135,37 @@ bool copyRecursively(const QString& sourcePath,
                 return false;
             }
         }
+        if (!QFile::setPermissions(destinationPath, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner)) {
+            return failCopy(errorMessage, QStringLiteral("Could not protect inbox folder permissions."));
+        }
         return true;
     }
 
     QDir().mkpath(QFileInfo(destinationPath).absolutePath());
-
-    if (!QFile::copy(sourcePath, destinationPath)) {
+    QFile source(sourcePath);
+    QFile destination(destinationPath);
+    if (!source.open(QIODevice::ReadOnly) ||
+        !destination.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
         return failCopy(errorMessage, QStringLiteral("Could not copy %1 to %2").arg(sourcePath, destinationPath));
+    }
+    qint64 copied = 0;
+    while (!source.atEnd()) {
+        if (QThread::currentThread()->isInterruptionRequested()) {
+            return failCopy(errorMessage, QStringLiteral("Inbox save cancelled."));
+        }
+        const QByteArray chunk = source.read(256 * 1024);
+        if (chunk.isEmpty() || chunk.size() > sourceInfo.size() - copied ||
+            destination.write(chunk) != chunk.size()) {
+            return failCopy(errorMessage, QStringLiteral("Read/write failed or source grew during inbox copy."));
+        }
+        copied += chunk.size();
+    }
+    if (!destination.flush()) {
+        return failCopy(errorMessage, QStringLiteral("Could not flush inbox output."));
+    }
+    destination.close();
+    if (!QFile::setPermissions(destinationPath, sourceInfo.permissions())) {
+        return failCopy(errorMessage, QStringLiteral("Could not preserve file permissions."));
     }
 
     const QFileInfo after(sourcePath);
@@ -162,10 +193,48 @@ bool copyInboxBatch(const QStringList& paths, const QString& destination,
     if (paths.isEmpty()) {
         return failCopy(errorMessage, QStringLiteral("The file manifest is empty."));
     }
-    QTemporaryDir staging(QFileInfo(destination).dir().filePath(".weave-staging-XXXXXX"));
+    const QDir inbox = QFileInfo(destination).dir();
+    const QString lockPath = inbox.filePath(".weave-inbox-copy.lock");
+    if (QFileInfo(lockPath).isSymLink()) {
+        return failCopy(errorMessage, QStringLiteral("Invalid inbox lock path."));
+    }
+    QLockFile lock(lockPath);
+    lock.setStaleLockTime(0); // only a dead owner may be recovered, never a slow copy
+    if (!lock.tryLock()) {
+        return failCopy(errorMessage, QStringLiteral("Another inbox save is active."));
+    }
+    // Only reclaim directories created by this transaction schema, while the
+    // process-wide inbox lock proves that no other writer is using them.
+    QDirIterator abandoned(inbox.path(), {".weave-staging-v1-*"},
+                           QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot);
+    while (abandoned.hasNext()) {
+        abandoned.next();
+        const QFileInfo entry = abandoned.fileInfo();
+        if (entry.isSymLink()) { continue; }
+        // A user can save a directory whose name resembles our staging prefix.
+        // A published item's sidecar takes precedence over staging recovery.
+        if (QFileInfo::exists(inbox.filePath(QStringLiteral(".%1.weave-managed").arg(entry.fileName())))) {
+            continue;
+        }
+        QFile marker(QDir(entry.absoluteFilePath()).filePath("owner"));
+        if (QFileInfo(marker).isSymLink() || marker.size() != 23 || !marker.open(QIODevice::ReadOnly) ||
+            marker.readAll() != QByteArray("weave-inbox-staging-v1\n")) { continue; }
+        marker.close();
+        if (!QDir(entry.absoluteFilePath()).removeRecursively()) {
+            return failCopy(errorMessage, QStringLiteral("Could not reclaim interrupted inbox save."));
+        }
+    }
+    QTemporaryDir staging(inbox.filePath(".weave-staging-v1-XXXXXX"));
     if (!staging.isValid()) {
         return failCopy(errorMessage, QStringLiteral("Could not create inbox staging folder."));
     }
+    QFile owner(staging.filePath("owner"));
+    const QByteArray ownership("weave-inbox-staging-v1\n");
+    if (!owner.open(QIODevice::WriteOnly | QIODevice::NewOnly) ||
+        owner.write(ownership) != ownership.size() || !owner.flush()) {
+        return failCopy(errorMessage, QStringLiteral("Could not register inbox staging ownership."));
+    }
+    owner.close();
     const QString output = staging.filePath("output");
     CopyBudget budget;
     budget.maxItems = maxItems;
@@ -193,6 +262,9 @@ bool copyInboxBatch(const QStringList& paths, const QString& destination,
                              budget, errorMessage)) {
             return false;
         }
+    }
+    if (QThread::currentThread()->isInterruptionRequested()) {
+        return failCopy(errorMessage, QStringLiteral("Inbox save cancelled."));
     }
     if (QFileInfo(destination).exists() || QFileInfo(destination).isSymLink() ||
         !QDir().rename(output, destination)) {
@@ -227,9 +299,8 @@ qint64 pathSize(const QString& path)
 QString managedMarkerPathForTarget(const QString& targetPath)
 {
     const QFileInfo info(targetPath);
-    if (info.isDir()) {
-        return QDir(targetPath).filePath(QString::fromLatin1(kManagedMarkerName));
-    }
+    // Keep metadata outside user payloads, including directories that contain
+    // a legitimate file called .weave-managed.
     return info.dir().filePath(QStringLiteral(".%1%2").arg(info.fileName(), QString::fromLatin1(kManagedMarkerSuffix)));
 }
 
@@ -281,6 +352,21 @@ ActionBus::ActionBus(WorkflowStore& store, QObject* parent) :
     QObject(parent),
     m_store(&store)
 {
+}
+
+ActionBus::~ActionBus()
+{
+    if (m_inboxWorker != nullptr) {
+        disconnect(m_inboxWorker, nullptr, this, nullptr);
+        m_inboxWorker->requestInterruption();
+        m_inboxWorker->wait();
+        delete m_inboxWorker;
+    }
+}
+
+void ActionBus::cancelInboxSave()
+{
+    if (m_inboxWorker != nullptr) { m_inboxWorker->requestInterruption(); }
 }
 
 #if defined(BARRIER_TEST_ENV)
@@ -385,18 +471,21 @@ bool ActionBus::execute(const QString& actionId,
     QString detail;
     QString createdContextId = contextId;
 
-    if (actionId == QStringLiteral("open_link") || actionId == QStringLiteral("open_file") ||
-        actionId == QStringLiteral("launch_allowed_app")) {
+    if (actionId == QStringLiteral("open_link") || actionId == QStringLiteral("open_file")) {
         success = openContext(*item, anchor, &detail);
     }
     else if (actionId == QStringLiteral("reveal_in_folder")) {
         success = revealContext(*item, &detail);
     }
     else if (actionId == QStringLiteral("save_to_inbox")) {
-        success = saveContextToInbox(*item, &detail, &detail);
+        // true means accepted; the completion receipt is emitted by the worker.
+        return saveContextToInbox(*item, nullptr, errorMessage);
     }
     else if (actionId == QStringLiteral("capture_screenshot")) {
-        success = captureScreenshot(&createdContextId, &detail);
+        return captureScreenshot(&createdContextId, errorMessage);
+    }
+    else if (actionId == QStringLiteral("launch_allowed_app")) {
+        detail = QStringLiteral("No executable allowlist is configured for this action.");
     }
     else if (actionId == QStringLiteral("show_notification")) {
         success = true;
@@ -570,6 +659,9 @@ bool ActionBus::revealContext(const ContextItem& item, QString* errorMessage)
 
 bool ActionBus::saveContextToInbox(const ContextItem& item, QString* savedPath, QString* errorMessage)
 {
+    if (m_inboxWorker != nullptr) {
+        return failCopy(errorMessage, QStringLiteral("An inbox save is already running; wait or cancel it."));
+    }
     QDir inbox(m_store->inboxDir());
     if (!inbox.exists() && !QDir().mkpath(inbox.path())) {
         if (errorMessage != nullptr) {
@@ -578,6 +670,8 @@ bool ActionBus::saveContextToInbox(const ContextItem& item, QString* savedPath, 
         return false;
     }
 
+    QStringList paths;
+    QString destination;
     if (item.kind == ContextKind::Text || item.kind == ContextKind::Link || item.kind == ContextKind::Image) {
         const QString payloadPath = m_store->payloadPath(item.id);
         if (payloadPath.isEmpty()) {
@@ -588,20 +682,15 @@ bool ActionBus::saveContextToInbox(const ContextItem& item, QString* savedPath, 
         }
 
         const QFileInfo payloadInfo(payloadPath);
-        const QString destination = uniqueInboxTarget(sanitizePathSegment(item.summary), QStringLiteral(".") + payloadInfo.suffix());
-        if (!copyInboxBatch({payloadPath}, destination, errorMessage)) {
-            return false;
-        }
-
-        if (savedPath != nullptr) {
-            *savedPath = destination;
-        }
-        markInboxTargetManaged(destination);
-        pruneManagedInbox();
-        return true;
+        destination = uniqueInboxTarget(sanitizePathSegment(item.summary), QStringLiteral(".") + payloadInfo.suffix());
+        paths = QStringList{payloadPath};
     }
-
-    const QStringList paths = manifestPathsForContext(item);
+    else {
+        paths = manifestPathsForContext(item);
+        destination = paths.size() > 1
+            ? uniqueInboxTarget(sanitizePathSegment(item.summary))
+            : paths.isEmpty() ? QString() : uniqueInboxTarget(QFileInfo(paths.first()).fileName());
+    }
     if (paths.isEmpty()) {
         if (errorMessage != nullptr) {
             *errorMessage = QStringLiteral("The file manifest is empty.");
@@ -609,18 +698,42 @@ bool ActionBus::saveContextToInbox(const ContextItem& item, QString* savedPath, 
         return false;
     }
 
-    const bool multipleSources = paths.size() > 1;
-    const QString destinationRoot = multipleSources
-        ? uniqueInboxTarget(sanitizePathSegment(item.summary))
-        : uniqueInboxTarget(QFileInfo(paths.first()).fileName());
-    if (!copyInboxBatch(paths, destinationRoot, errorMessage)) {
-        return false;
-    }
-    if (savedPath != nullptr) {
-        *savedPath = destinationRoot;
-    }
-    markInboxTargetManaged(destinationRoot);
-    pruneManagedInbox();
+    if (savedPath != nullptr) { savedPath->clear(); }
+    struct Result { bool success = false; QString detail; };
+    const auto result = std::make_shared<Result>();
+    const QString contextId = item.id;
+    const QString inboxPath = inbox.path();
+    m_inboxWorker = QThread::create([paths, destination, inboxPath, result]() {
+        try {
+            result->success = copyInboxBatch(paths, destination, &result->detail);
+            if (result->success) {
+                if (!markInboxTargetManaged(destination)) {
+                    result->success = false;
+                    result->detail = QStringLiteral("Saved to %1, but could not register inbox metadata; file retained.")
+                        .arg(destination);
+                    return;
+                }
+                pruneManagedInboxDir(inboxPath, kManagedInboxItemLimit, kManagedInboxBudgetBytes);
+                result->detail = destination;
+            }
+        }
+        catch (const std::exception&) {
+            result->success = false;
+            result->detail = QStringLiteral("Inbox worker failed.");
+        }
+    });
+    connect(m_inboxWorker, &QThread::finished, this, [this, contextId, result]() {
+        m_inboxWorker->deleteLater();
+        m_inboxWorker = nullptr;
+        const QString status = result->success ? QStringLiteral("Completed")
+            : result->detail == QStringLiteral("Inbox save cancelled.")
+                ? QStringLiteral("Cancelled") : QStringLiteral("Failed");
+        m_store->recordReceipt(contextId, QStringLiteral("save_to_inbox"), status, result->detail);
+        emit inboxSaveFinished(contextId, result->success, result->detail);
+    });
+    m_store->recordReceipt(contextId, QStringLiteral("save_to_inbox"), QStringLiteral("Queued"),
+                          QStringLiteral("Saving selected context to inbox…"), false);
+    m_inboxWorker->start();
     return true;
 }
 
@@ -642,7 +755,10 @@ bool ActionBus::captureScreenshot(QString* contextId, QString* errorMessage)
         return false;
     }
 
-    return m_store->addCapturedImageContext(pixmap.toImage(), contextId);
+    if (!m_store->queueImageContext(pixmap.toImage(), true, contextId)) {
+        return failCopy(errorMessage, QStringLiteral("Image worker is busy or screenshot exceeds the image budget."));
+    }
+    return true;
 }
 
 bool ActionBus::confirmIfNeeded(const ContextItem& item,
@@ -687,21 +803,23 @@ QString ActionBus::uniqueInboxTarget(const QString& baseName, const QString& suf
     const QDir inbox(m_store->inboxDir());
     QString candidate = inbox.filePath(baseName + suffix);
     int copyIndex = 1;
-    while (QFileInfo::exists(candidate)) {
+    while (QFileInfo::exists(candidate) || QFileInfo(candidate).isSymLink() ||
+           QFileInfo::exists(managedMarkerPathForTarget(candidate))) {
         candidate = inbox.filePath(QStringLiteral("%1-%2%3").arg(baseName).arg(copyIndex++).arg(suffix));
     }
     return candidate;
 }
 
-void ActionBus::markInboxTargetManaged(const QString& path)
+bool ActionBus::markInboxTargetManaged(const QString& path)
 {
     const QString markerPath = managedMarkerPathForTarget(path);
     QDir().mkpath(QFileInfo(markerPath).absolutePath());
     QFile marker(markerPath);
-    if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        marker.write("weave-managed-inbox-item\n");
-        marker.close();
+    if (marker.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+        const QByteArray magic("weave-managed-inbox-item\n");
+        return marker.write(magic) == magic.size() && marker.flush();
     }
+    return false;
 }
 
 void ActionBus::pruneManagedInbox(int maxItems, qint64 maxBytes) const
@@ -721,16 +839,12 @@ void ActionBus::pruneManagedInboxDir(const QString& inboxDir, int maxItems, qint
 {
     const QString inboxPath = QDir::cleanPath(inboxDir);
     QList<ManagedInboxItem> items;
-    QDirIterator it(inboxPath, QDir::Files | QDir::Hidden | QDir::System,
-                    QDirIterator::Subdirectories);
+    QDirIterator it(inboxPath, QDir::Files | QDir::Hidden | QDir::System);
     while (it.hasNext()) {
         it.next();
         const QFileInfo markerInfo = it.fileInfo();
         QString targetPath;
-        if (markerInfo.fileName() == QString::fromLatin1(kManagedMarkerName)) {
-            targetPath = markerInfo.dir().absolutePath();
-        }
-        else if (markerInfo.fileName().startsWith('.') &&
+        if (markerInfo.fileName().startsWith('.') &&
                  markerInfo.fileName().endsWith(QString::fromLatin1(kManagedMarkerSuffix))) {
             QString targetName = markerInfo.fileName().mid(1);
             targetName.chop(QString::fromLatin1(kManagedMarkerSuffix).size());
@@ -739,6 +853,15 @@ void ActionBus::pruneManagedInboxDir(const QString& inboxDir, int maxItems, qint
         else {
             continue;
         }
+
+        QFile marker(markerInfo.absoluteFilePath());
+        const QByteArray magic("weave-managed-inbox-item\n");
+        if (markerInfo.isSymLink() || markerInfo.size() != magic.size() ||
+            !marker.open(QIODevice::ReadOnly) || marker.readAll() != magic ||
+            QFileInfo(targetPath).isSymLink()) {
+            continue;
+        }
+        marker.close();
 
         if (!pathIsInside(inboxPath, targetPath) || QDir::cleanPath(targetPath) == inboxPath) {
             continue;

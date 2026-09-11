@@ -356,7 +356,7 @@ Client::connect()
 }
 
 void
-Client::disconnect(const char* msg)
+Client::disconnect(const char* msg, bool retry)
 {
     m_connectOnResume = false;
     cleanupTimer();
@@ -364,7 +364,7 @@ Client::disconnect(const char* msg)
     cleanupConnecting();
     cleanupConnection();
     if (msg != NULL) {
-        sendConnectionFailedEvent(msg);
+        sendConnectionFailedEvent(msg, retry);
     }
     else {
         sendDisconnectedEvent();
@@ -1510,7 +1510,7 @@ Client::sendEvent(Event::Type type, void* data)
 }
 
 void
-Client::sendConnectionFailedEvent(const char* msg)
+Client::sendConnectionFailedEvent(const char* msg, bool retry)
 {
     if (m_terminalEventSent) {
         return;
@@ -1518,7 +1518,7 @@ Client::sendConnectionFailedEvent(const char* msg)
     m_terminalEventSent = true;
 
     FailInfo* info = new FailInfo(msg);
-    info->m_retry = true;
+    info->m_retry = retry;
     Event event(m_events->forClient().connectionFailed(), getEventTarget(), info, Event::kDontFreeData);
     m_events->addEvent(event);
 }
@@ -2542,7 +2542,7 @@ Client::handleHello(const Event&, void*)
     // check versions
     LOG((CLOG_DEBUG1 "got hello version %d.%d", major, minor));
     if (!negotiateProtocolVersion(major, minor, m_protocolMinorVersion)) {
-        sendConnectionFailedEvent(XIncompatibleClient(major, minor).what());
+        sendConnectionFailedEvent(XIncompatibleClient(major, minor).what(), false);
         cleanupTimer();
         cleanupConnection();
         return;

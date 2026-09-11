@@ -16,11 +16,13 @@
 #include <QJsonObject>
 #include <QMimeData>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QThread>
 #include <QTimer>
 #include <QUrl>
 #include <QUuid>
+#include <memory>
 
 namespace {
 
@@ -33,6 +35,33 @@ const int kBurstSeconds = 15;
 const int kSensitivePayloadTtlSeconds = 15 * 60;
 const int kSensitivePayloadItemLimitBytes = 256 * 1024;
 const int kSensitivePayloadBudgetBytes = 1024 * 1024;
+const qint64 kImagePixelLimit = 32 * 1024 * 1024;
+const qint64 kImageDecodedByteLimit = 128 * 1024 * 1024;
+const qint64 kImageEncodedByteLimit = 32 * 1024 * 1024;
+const int kImageDimensionLimit = 16384;
+
+bool admitImage(const QImage& image)
+{
+    return !image.isNull() && image.width() <= kImageDimensionLimit &&
+        image.height() <= kImageDimensionLimit &&
+        qint64(image.width()) * image.height() <= kImagePixelLimit &&
+        qint64(image.bytesPerLine()) * image.height() <= kImageDecodedByteLimit;
+}
+
+// Reject before growing the PNG buffer, including for incompressible images.
+class BoundedImageBuffer : public QBuffer {
+public:
+    explicit BoundedImageBuffer(QByteArray* data) : QBuffer(data) {}
+protected:
+    qint64 writeData(const char* data, qint64 size) override
+    {
+        if (size < 0 || pos() > kImageEncodedByteLimit - size ||
+            QThread::currentThread()->isInterruptionRequested()) {
+            return -1;
+        }
+        return QBuffer::writeData(data, size);
+    }
+};
 
 QString normalizePathLikeText(const QString& text)
 {
@@ -77,7 +106,8 @@ QString sanitizeInboxDir(const QString& candidate, const QString& storageRoot)
 bool writeImageFile(const QString& filePath, const QImage& image)
 {
     QDir().mkpath(QFileInfo(filePath).absolutePath());
-    return image.save(filePath, "PNG");
+    QSaveFile file(filePath);
+    return file.open(QIODevice::WriteOnly) && image.save(&file, "PNG") && file.commit();
 }
 
 void assertWorkflowThread(const QObject* object)
@@ -125,6 +155,12 @@ WorkflowStore::WorkflowStore(AppConfig& appConfig, QObject* parent) :
 
 WorkflowStore::~WorkflowStore()
 {
+    if (m_imageWorker != nullptr) {
+        disconnect(m_imageWorker, nullptr, this, nullptr);
+        m_imageWorker->requestInterruption();
+        m_imageWorker->wait();
+        delete m_imageWorker;
+    }
     const QStringList contextIds = m_sensitivePayloads.keys();
     for (const QString& contextId : contextIds) {
         eraseSensitivePayload(contextId);
@@ -385,7 +421,8 @@ void WorkflowStore::recordLogLine(const QString& line)
         recordReceipt(QString(),
                       QStringLiteral("remote_clipboard"),
                       QStringLiteral("Materialized"),
-                      QStringLiteral("Remote clipboard ready with %1 item(s).").arg(materializedMatch.captured(2)));
+                      QStringLiteral("Remote files materialized (%1 item(s)); clipboard publication is pending.")
+                          .arg(materializedMatch.captured(2)));
         return;
     }
 
@@ -421,8 +458,8 @@ void WorkflowStore::recordLogLine(const QString& line)
     if (line.contains(QStringLiteral("file transfer finished"))) {
         recordReceipt(QString(),
                       QStringLiteral("save_to_inbox"),
-                      QStringLiteral("Finished"),
-                      QStringLiteral("File transfer finished successfully."));
+                      QStringLiteral("Reported"),
+                      QStringLiteral("Core reported a finished transfer; destination publication is not verified by this log."));
     }
 }
 
@@ -430,11 +467,17 @@ bool WorkflowStore::addCapturedImageContext(const QImage& image, QString* contex
 {
     assertWorkflowThread(this);
 
-    if (image.isNull()) {
+    if (contextId != nullptr) {
+        contextId->clear();
+    }
+    if (!admitImage(image)) {
         return false;
     }
 
     ContextItem item = buildImageContext(image);
+    if (!item.payloadAvailable) {
+        return false;
+    }
     item.summary = QStringLiteral("Screenshot %1x%2").arg(image.width()).arg(image.height());
     item.sourceDevice = m_appConfig->screenName();
     const QString signature = QStringLiteral("screenshot:%1:%2:%3")
@@ -445,12 +488,99 @@ bool WorkflowStore::addCapturedImageContext(const QImage& image, QString* contex
     recordReceipt(item.id,
                   QStringLiteral("capture_screenshot"),
                   QStringLiteral("Captured"),
-                  QStringLiteral("Saved a screenshot preview to the workflow history."));
+                  QStringLiteral("Saved a screenshot to the workflow history."));
 
     if (contextId != nullptr) {
         *contextId = item.id;
     }
 
+    return true;
+}
+
+bool WorkflowStore::queueImageContext(const QImage& image, bool screenshot, QString* requestId)
+{
+    assertWorkflowThread(this);
+    if (requestId != nullptr) { requestId->clear(); }
+    if (m_imageWorker != nullptr || !admitImage(image)) { return false; }
+    m_activeImageBytes = qint64(image.bytesPerLine()) * image.height();
+    m_activeImageIsScreenshot = screenshot;
+    struct Result {
+        ContextItem item;
+        QString signature;
+        bool adopted = false;
+        ~Result() {
+            // A shutdown may discard the queued GUI completion callback.
+            if (!adopted) {
+                if (!item.payloadRef.isEmpty()) { QFile::remove(item.payloadRef); }
+                if (!item.previewRef.isEmpty()) { QFile::remove(item.previewRef); }
+            }
+        }
+    };
+    auto result = std::make_shared<Result>();
+    auto& item = result->item;
+    item.id = newContextId();
+    item.sourceDevice = screenshot ? m_appConfig->screenName() : currentSourceDevice();
+    item.kind = ContextKind::Image;
+    item.summary = QStringLiteral("%1 %2x%3")
+        .arg(screenshot ? QStringLiteral("Screenshot") : QStringLiteral("Image"))
+        .arg(image.width()).arg(image.height());
+    item.mimeType = QStringLiteral("image/png");
+    item.createdAt = QDateTime::currentDateTimeUtc();
+    item.expiresAt = item.createdAt.addDays(7);
+    const QString payload = storageFilePath("payload", item.id, ".png");
+    const QString preview = storageFilePath("preview", item.id, ".png");
+    const quint64 revision = m_clipboardRevision;
+    if (requestId != nullptr) { *requestId = item.id; }
+    m_imageWorker = QThread::create([image, payload, preview, result]() {
+        // QImage is implicitly shared; no eager second decoded snapshot.
+        try {
+            QByteArray data;
+            BoundedImageBuffer buffer(&data);
+            if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG") || data.isEmpty()) { return; }
+            QSaveFile file(payload);
+            if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size() ||
+                QThread::currentThread()->isInterruptionRequested() || !file.commit()) { return; }
+            result->item.payloadRef = payload;
+            result->item.managedPayload = true;
+            result->item.byteSize = data.size();
+            result->signature = QStringLiteral("image:%1").arg(QString::fromLatin1(
+                QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex()));
+            if (!QThread::currentThread()->isInterruptionRequested() &&
+                writeImageFile(preview, image.scaled(320, 240, Qt::KeepAspectRatio, Qt::SmoothTransformation))) {
+                result->item.previewRef = preview;
+                result->item.managedPreview = true;
+            }
+            result->item.payloadAvailable = !QThread::currentThread()->isInterruptionRequested();
+        }
+        catch (const std::exception&) { result->item.payloadAvailable = false; }
+        if (!result->item.payloadAvailable) {
+            QFile::remove(payload);
+            QFile::remove(preview);
+        }
+    });
+    connect(m_imageWorker, &QThread::finished, this, [this, result, screenshot, revision]() {
+        m_imageWorker->deleteLater();
+        m_imageWorker = nullptr;
+        m_activeImageBytes = 0;
+        const bool current = screenshot || revision == m_clipboardRevision;
+        const bool success = result->item.payloadAvailable && current;
+        if (success) {
+            addContextItem(result->item, screenshot ? "screenshot:" + result->item.id : result->signature);
+            result->adopted = true;
+        }
+        else { removeManagedAssets(result->item); }
+        if (screenshot) {
+            recordReceipt(result->item.id, "capture_screenshot", success ? "Captured" : "Failed",
+                          success ? "Saved screenshot to workflow history." : "Screenshot encoding or storage failed.");
+        }
+        // At most one latest pending snapshot, sharing the decoded byte budget
+        // with the active image. A text update clears this slot.
+        auto pending = std::move(m_pendingClipboardImage);
+        if (pending) { queueImageContext(*pending, false); }
+        emit imageContextFinished(result->item.id, success);
+    });
+    if (screenshot) { recordReceipt(item.id, "capture_screenshot", "Queued", "Encoding screenshot…", false); }
+    m_imageWorker->start();
     return true;
 }
 
@@ -535,6 +665,9 @@ ContextItem WorkflowStore::buildTextContext(const QString& text)
 ContextItem WorkflowStore::buildImageContext(const QImage& image)
 {
     ContextItem item;
+    if (!admitImage(image)) {
+        return item;
+    }
     item.id = newContextId();
     item.sourceDevice = currentSourceDevice();
     item.kind = ContextKind::Image;
@@ -545,11 +678,15 @@ ContextItem WorkflowStore::buildImageContext(const QImage& image)
     item.expiresAt = item.createdAt.addDays(7);
 
     QByteArray data;
-    QBuffer buffer(&data);
-    buffer.open(QIODevice::WriteOnly);
-    image.save(&buffer, "PNG");
+    BoundedImageBuffer buffer(&data);
+    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG") || data.isEmpty()) {
+        return item;
+    }
     item.byteSize = data.size();
     item.payloadRef = writeBinaryPayload(item.id, data, QStringLiteral(".png"));
+    if (item.payloadRef.isEmpty()) {
+        return item;
+    }
     item.previewRef = writePreviewImage(item.id, image);
     item.payloadAvailable = !item.payloadRef.isEmpty();
     item.managedPayload = item.payloadAvailable;
@@ -634,6 +771,11 @@ void WorkflowStore::consumeClipboardMime(const QMimeData* mimeData)
     if (mimeData == nullptr) {
         return;
     }
+    ++m_clipboardRevision;
+    m_pendingClipboardImage.reset();
+    if (m_imageWorker != nullptr && !m_activeImageIsScreenshot) {
+        m_imageWorker->requestInterruption();
+    }
 
     ContextItem item;
     QString signature;
@@ -659,11 +801,24 @@ void WorkflowStore::consumeClipboardMime(const QMimeData* mimeData)
         if (image.isNull()) {
             return;
         }
-        item = buildImageContext(image);
-        signature = QStringLiteral("image:%1:%2:%3")
-            .arg(image.width())
-            .arg(image.height())
-            .arg(item.byteSize);
+        if (!admitImage(image)) {
+            recordReceipt(QString(), "clipboard_image", "Skipped",
+                          "Clipboard image exceeds the image dimensions or decoded byte budget.", false);
+            return;
+        }
+        if (m_imageWorker != nullptr) {
+            const qint64 bytes = qint64(image.bytesPerLine()) * image.height();
+            if (bytes <= kImageDecodedByteLimit - m_activeImageBytes) {
+                m_pendingClipboardImage = std::make_unique<QImage>(image);
+                if (!m_activeImageIsScreenshot) { m_imageWorker->requestInterruption(); }
+            }
+            else {
+                recordReceipt(QString(), "clipboard_image", "Skipped",
+                              "Latest clipboard image exceeds the active/pending image budget.", false);
+            }
+        }
+        else { queueImageContext(image, false); }
+        return;
     }
     else if (mimeData->hasText()) {
         const QString text = normalizePathLikeText(mimeData->text());
@@ -919,26 +1074,18 @@ QString WorkflowStore::storageFilePath(const QString& subDir, const QString& id,
 
 QString WorkflowStore::writeTextPayload(const QString& id, const QString& text, const QString& suffix)
 {
-    const QString filePath = storageFilePath(QStringLiteral("payload"), id, suffix);
-    QFile file(filePath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        return QString();
-    }
-
-    file.write(text.toUtf8());
-    return filePath;
+    return writeBinaryPayload(id, text.toUtf8(), suffix);
 }
 
 QString WorkflowStore::writeBinaryPayload(const QString& id, const QByteArray& data, const QString& suffix)
 {
     const QString filePath = storageFilePath(QStringLiteral("payload"), id, suffix);
-    QFile file(filePath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    QSaveFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly)) {
         return QString();
     }
 
-    file.write(data);
-    return filePath;
+    return file.write(data) == data.size() && file.commit() ? filePath : QString();
 }
 
 QString WorkflowStore::writeJsonPayload(const QString& id, const QStringList& paths)

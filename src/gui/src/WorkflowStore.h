@@ -6,6 +6,7 @@
 #include <QList>
 #include <QStringList>
 #include <QUrl>
+#include <memory>
 
 #include "WorkflowTypes.h"
 
@@ -13,6 +14,7 @@ class AppConfig;
 class QClipboard;
 class QImage;
 class QMimeData;
+class QThread;
 
 class WorkflowStore : public QObject
 {
@@ -47,6 +49,9 @@ public:
                        bool notify = true);
     void recordLogLine(const QString& line);
     bool addCapturedImageContext(const QImage& image, QString* contextId = nullptr);
+    // Acceptance only: publication is reported by imageContextFinished.
+    bool queueImageContext(const QImage& image, bool screenshot, QString* requestId = nullptr);
+    bool imageTaskRunning() const { return m_imageWorker != nullptr; }
 
 #if defined(BARRIER_TEST_ENV)
     QString testAddTextContext(const QString& text);
@@ -60,10 +65,12 @@ public:
     int testSensitivePayloadCount() const { return m_sensitivePayloads.size(); }
     qint64 testSensitivePayloadBytes() const { return m_sensitivePayloadBytes; }
     QString testPayloadDirectory() const { return m_payloadDir; }
+    void testSetStorageRoot(const QString& root) { m_storageRoot = root; }
     QString testLastSignature() const { return m_lastSignature; }
 #endif
 
 signals:
+    void imageContextFinished(const QString& requestId, bool success);
     void historyChanged();
     void suggestionsChanged();
     void receiptsChanged();
@@ -138,4 +145,9 @@ private:
     mutable QHash<QString, SensitivePayload> m_sensitivePayloads;
     mutable qint64 m_sensitivePayloadBytes;
     quint64 m_nextSensitivePayloadSequence;
+    QThread* m_imageWorker = nullptr;
+    quint64 m_clipboardRevision = 0;
+    std::unique_ptr<QImage> m_pendingClipboardImage;
+    qint64 m_activeImageBytes = 0;
+    bool m_activeImageIsScreenshot = false;
 };

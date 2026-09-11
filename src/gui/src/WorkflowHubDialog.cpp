@@ -120,6 +120,9 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     auto* actionLayout = new QHBoxLayout;
     auto* screenshotButton = new QPushButton(tr("Capture Screenshot"), this);
     auto* inboxButton = new QPushButton(tr("Open Inbox"), this);
+    auto* cancelSaveButton = new QPushButton(tr("Cancel Save"), this);
+    cancelSaveButton->setToolTip(tr("Cancel the active inbox save; completed files are kept."));
+    connect(cancelSaveButton, &QPushButton::clicked, m_actionBus, &ActionBus::cancelInboxSave);
     auto* closeButton = new QPushButton(tr("Close"), this);
     actionLayout->addWidget(m_executeSuggestionButton);
     actionLayout->addWidget(m_openButton);
@@ -128,6 +131,7 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     actionLayout->addStretch();
     actionLayout->addWidget(screenshotButton);
     actionLayout->addWidget(inboxButton);
+    actionLayout->addWidget(cancelSaveButton);
     actionLayout->addWidget(closeButton);
 
     auto* root = new QVBoxLayout(this);

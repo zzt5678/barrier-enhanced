@@ -297,6 +297,10 @@ ClientApp::handleClientFailed(const Event& e, void*)
     updateStatus(String("Failed to connect to server: ") + info->m_what);
     if (!args().m_restartable || !info->m_retry) {
         LOG((CLOG_ERR "failed to connect to server: %s", info->m_what.c_str()));
+        if (!info->m_retry) {
+            m_permanentFailure = true;
+            LOG((CLOG_ERR "automatic reconnect disabled for this permanent error; check peer versions and restart after correcting the configuration"));
+        }
         m_events->addEvent(Event(Event::kQuit));
     }
     else {
@@ -478,6 +482,7 @@ ClientApp::stopClient()
 int
 ClientApp::mainLoop()
 {
+    m_permanentFailure = false;
     // create socket multiplexer.  this must happen after daemonization
     // on unix because threads evaporate across a fork().
     setSocketMultiplexer(std::make_unique<SocketMultiplexer>());
@@ -553,9 +558,9 @@ ClientApp::mainLoop()
     }
 
 #if defined(MAC_OS_X_VERSION_10_7)
-    return kExitSuccess;
+    return m_permanentFailure ? kExitIncompatible : kExitSuccess;
 #else
-    return result;
+    return m_permanentFailure ? kExitIncompatible : result;
 #endif
 }
 

@@ -161,7 +161,7 @@ bool writeFileUrls(PasteboardRef pboard, const std::vector<barrier::fs::path>& p
 // OSXClipboard
 //
 
-OSXClipboard::OSXClipboard() :
+OSXClipboard::OSXClipboard(CFStringRef pasteboardName) :
     m_time(0),
     m_pboard(NULL)
 {
@@ -173,7 +173,7 @@ OSXClipboard::OSXClipboard() :
 
 
 
-    OSStatus createErr = PasteboardCreate(kPasteboardClipboard, &m_pboard);
+    OSStatus createErr = PasteboardCreate(pasteboardName, &m_pboard);
     if (createErr != noErr) {
         LOG((CLOG_DEBUG "failed to create clipboard reference: error %i", createErr));
         LOG((CLOG_ERR "unable to connect to pasteboard, clipboard sharing disabled", createErr));
@@ -324,8 +324,10 @@ OSXClipboard::has(EFormat format) const
         return !readFileUrls(m_pboard).empty();
     }
 
-    PasteboardItemID item;
-    PasteboardGetItemIdentifier(m_pboard, (CFIndex) 1, &item);
+    PasteboardItemID item = nullptr;
+    if (PasteboardGetItemIdentifier(m_pboard, (CFIndex) 1, &item) != noErr) {
+        return false;
+    }
 
     for (ConverterList::const_iterator index = m_converters.begin();
             index != m_converters.end(); ++index) {
@@ -348,7 +350,7 @@ OSXClipboard::has(EFormat format) const
 std::string OSXClipboard::get(EFormat format) const
 {
     CFStringRef type;
-    PasteboardItemID item;
+    PasteboardItemID item = nullptr;
     std::string result;
 
     if (m_pboard == NULL)
@@ -361,7 +363,9 @@ std::string OSXClipboard::get(EFormat format) const
         return payload.paths.empty() ? std::string() : RemoteFileClipboard::serialize(payload);
     }
 
-    PasteboardGetItemIdentifier(m_pboard, (CFIndex) 1, &item);
+    if (PasteboardGetItemIdentifier(m_pboard, (CFIndex) 1, &item) != noErr) {
+        return result;
+    }
 
 
     // find the converter for the first clipboard format we can handle
@@ -388,25 +392,23 @@ std::string OSXClipboard::get(EFormat format) const
 
     // get the clipboard data.
     CFDataRef buffer = NULL;
-    try {
-        OSStatus err = PasteboardCopyItemFlavorData(m_pboard, item, type, &buffer);
-
-        if (err != noErr) {
-            throw err;
-        }
-
-        result = std::string((char *) CFDataGetBytePtr(buffer), CFDataGetLength(buffer));
+    const OSStatus status = PasteboardCopyItemFlavorData(m_pboard, item, type, &buffer);
+    OwnedCFData ownedBuffer(buffer);
+    if (status != noErr || !ownedBuffer) {
+        LOG((CLOG_DEBUG "could not read clipboard flavor: error %i", status));
+        return result;
     }
-    catch (OSStatus err) {
-        LOG((CLOG_DEBUG "exception thrown in OSXClipboard::get MacError (%d)", err));
+    try {
+        const CFIndex length = CFDataGetLength(ownedBuffer.get());
+        if (length > 0) {
+            result.assign(reinterpret_cast<const char*>(CFDataGetBytePtr(ownedBuffer.get())),
+                          static_cast<size_t>(length));
+        }
     }
     catch (...) {
         LOG((CLOG_DEBUG "unknown exception in OSXClipboard::get"));
         RETHROW_XTHREAD
     }
-
-    if (buffer != NULL)
-        CFRelease(buffer);
 
     return converter->toIClipboard(result);
 }

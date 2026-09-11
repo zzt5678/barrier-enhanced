@@ -23,5 +23,6 @@ CloseAction closeAction(bool explicitQuitRequested, bool trayAvailable);
 bool shouldHideOnMinimize(Qt::WindowStates state, bool minimizeToTray,
                           bool trayAvailable);
 bool canCompleteExplicitQuit(bool serviceMode, bool stopAcknowledged);
+bool shouldRestartCore(bool expectedRunning, int exitCode);
 
 } // namespace WindowLifecyclePolicy

@@ -945,6 +945,78 @@ Clipboard makeTextClipboard(const std::string& text)
 
 }
 
+TEST(ServerReconnectTests, emergencyReturnAcceptsF12AndLegacyPauseWithAllModifiers)
+{
+    for (KeyID key : {kKeyF12, kKeyPause}) {
+        Config config;
+        config.addScreen("primary");
+        config.addScreen("client");
+        NiceMock<MockEventQueue> events;
+        ClientProxyEvents clientProxyEvents;
+        IScreenEvents screenEvents;
+        ClipboardEvents clipboardEvents;
+        ServerEvents serverEvents;
+        setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+        barrier::Screen screen(new DragPlatformScreen(), &events);
+        EnterablePrimaryClient primary(&screen);
+        RecordingClient client("client");
+        Server server;
+        initializeServer(server, config, primary, events, client);
+        server.onKeyDown(key, KeyModifierControl | KeyModifierAlt | KeyModifierShift, 1, "");
+        EXPECT_EQ(&primary, server.m_active);
+        EXPECT_EQ(1u, client.leaveCount);
+    }
+}
+
+TEST(ServerReconnectTests, emergencyReturnStillRecoversWhenRemoteLeaveThrows)
+{
+    class ThrowingLeaveClient : public RecordingClient {
+    public:
+        ThrowingLeaveClient() : RecordingClient("client") {}
+        bool leave() override {
+            ++leaveCount;
+            throw std::runtime_error("transport is unavailable");
+        }
+    };
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+    barrier::Screen screen(new DragPlatformScreen(), &events);
+    EnterablePrimaryClient primary(&screen);
+    ThrowingLeaveClient client;
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    EXPECT_NO_THROW(server.onKeyDown(kKeyF12,
+        KeyModifierControl | KeyModifierAlt | KeyModifierShift, 1, ""));
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, client.leaveCount);
+}
+
+TEST(ServerReconnectTests, emergencyReturnDoesNotCaptureOrdinaryF12)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+    EnterablePrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.onKeyDown(kKeyF12, KeyModifierControl | KeyModifierAlt, 1, "");
+    EXPECT_EQ(&client, server.m_active);
+}
+
 TEST(ServerReconnectTests, bulkBindingRejectsWrongNameAndConsumedTokenReplay)
 {
     Config config;

@@ -751,6 +751,65 @@ void setConnectedClientEventDefaults(MockEventQueue& events,
 
 }
 
+TEST(ClientDisconnectTests, incompatibleHelloIsPermanent)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+        streamEvents, clipboardEvents, dataSocketEvents, socketEvents);
+    TestScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(), &screen, args);
+    auto* stream = new ScriptedStream();
+    ProtocolUtil::writef(stream, kMsgHello, 1, 6);
+    client.testSetStreamOnly(stream);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke([](const Event& event) {
+        auto* info = static_cast<Client::FailInfo*>(event.getData());
+        ASSERT_NE(nullptr, info);
+        EXPECT_FALSE(info->m_retry);
+        EXPECT_NE(std::string::npos, info->m_what.find("1.6"));
+        delete info;
+    }));
+    client.testHandleHello();
+    // A subsequent transport-close event must not replace the permanent failure.
+    client.disconnect(NULL);
+}
+
+TEST(ClientDisconnectTests, incompatibleReplyIsPermanent)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    FileEvents fileEvents;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents;
+    ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events, clientEvents, screenEvents, fileEvents,
+        streamEvents, clipboardEvents, dataSocketEvents, socketEvents);
+    TestScreen screen;
+    ClientArgs args;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(), &screen, args);
+    ScriptedStream stream;
+    ServerProxy proxy(&client, &stream, &events, 12);
+    ProtocolUtil::writef(&stream, kMsgEIncompatible + 4, 1, 6);
+    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke([](const Event& event) {
+        auto* info = static_cast<Client::FailInfo*>(event.getData());
+        ASSERT_NE(nullptr, info);
+        EXPECT_FALSE(info->m_retry);
+        EXPECT_NE(std::string::npos, info->m_what.find("compatible Weave"));
+        delete info;
+    }));
+    proxy.parseHandshakeMessage(reinterpret_cast<const UInt8*>(kMsgEIncompatible));
+    client.disconnect(NULL);
+}
+
 TEST(ClientDisconnectTests, disconnectWithoutMessageIsIdempotent)
 {
     NiceMock<MockEventQueue> events;

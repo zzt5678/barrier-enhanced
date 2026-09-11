@@ -4,6 +4,7 @@
  */
 
 #include "barrier/StreamChunker.h"
+#include "barrier/BackpressureWait.h"
 #include "barrier/ClipboardChunk.h"
 #include "barrier/FileTransferProtocol.h"
 #include "barrier/FileTransferSendState.h"
@@ -33,6 +34,53 @@ using ::testing::Invoke;
 using ::testing::NiceMock;
 using ::testing::Return;
 using ::testing::ReturnRef;
+
+TEST(BackpressureWaitTests, timeoutUsesElapsedTimeInsteadOfPollCount)
+{
+    using Wait = barrier::BackpressureWait;
+    const Wait::TimePoint start{};
+    Wait wait(5.0, start, 100);
+    EXPECT_FALSE(wait.expired(start + std::chrono::milliseconds(4999)));
+    EXPECT_TRUE(wait.expired(start + std::chrono::seconds(5)));
+    EXPECT_DOUBLE_EQ(0.0, wait.sleepSeconds(start + std::chrono::seconds(6)));
+}
+
+TEST(BackpressureWaitTests, stalledPollingBacksOffButBoundsCancellationLatency)
+{
+    using Wait = barrier::BackpressureWait;
+    const Wait::TimePoint start{};
+    Wait wait(5.0, start, 100);
+    EXPECT_DOUBLE_EQ(0.001, wait.sleepSeconds(start));
+    for (int i = 0; i < 20; ++i) {
+        wait.observe(start, 100);
+        EXPECT_LE(wait.sleepSeconds(start), 0.010);
+    }
+    EXPECT_DOUBLE_EQ(0.010, wait.sleepSeconds(start));
+    EXPECT_NEAR(0.001, wait.sleepSeconds(start + std::chrono::milliseconds(4999)), 1e-12);
+}
+
+TEST(BackpressureWaitTests, bufferedDecreaseAndTransportProgressRenewDeadline)
+{
+    using Wait = barrier::BackpressureWait;
+    const Wait::TimePoint start{};
+    Wait wait(5.0, start, 100, 10);
+    wait.observe(start + std::chrono::seconds(4), 90, 10);
+    EXPECT_FALSE(wait.expired(start + std::chrono::seconds(5)));
+    EXPECT_DOUBLE_EQ(0.001, wait.sleepSeconds(start + std::chrono::seconds(4)));
+    // Concurrent producers can refill the buffer while the transport drains it.
+    wait.observe(start + std::chrono::seconds(8), 110, 20);
+    EXPECT_FALSE(wait.expired(start + std::chrono::seconds(12)));
+    EXPECT_TRUE(wait.expired(start + std::chrono::seconds(13)));
+}
+
+TEST(BackpressureWaitTests, growingQueueAndCounterResetAreNotProgress)
+{
+    using Wait = barrier::BackpressureWait;
+    const Wait::TimePoint start{};
+    Wait wait(5.0, start, 100, 10);
+    wait.observe(start + std::chrono::seconds(4), 110, 0);
+    EXPECT_TRUE(wait.expired(start + std::chrono::seconds(5)));
+}
 
 namespace {
 

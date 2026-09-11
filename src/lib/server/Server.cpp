@@ -189,7 +189,7 @@ bool isReturnToPrimaryHotKey(KeyID id, KeyModifierMask mask)
 {
     const KeyModifierMask required =
         KeyModifierShift | KeyModifierControl | KeyModifierAlt;
-    return id == kKeyPause && (mask & required) == required;
+    return (id == kKeyPause || id == kKeyF12) && (mask & required) == required;
 }
 
 DragFileList parseDraggedPaths(const std::string& pathList)
@@ -4224,6 +4224,18 @@ Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button,
 
 	if (m_active != m_primaryClient && isReturnToPrimaryHotKey(id, mask)) {
 		LOG((CLOG_WARN "emergency return to primary from \"%s\"", getName(m_active).c_str()));
+		// Unlike disconnect recovery, the peer is still connected here. COUT
+		// releases its pressed-input epoch and synthetic keys before local
+		// key-up events are routed back to the primary screen.
+		try {
+			if (!m_active->leave()) {
+				LOG((CLOG_WARN "remote leave rejected during emergency return"));
+			}
+		}
+        catch (const std::exception&) {
+			// A failed transport must not prevent recovery of local control.
+			LOG((CLOG_WARN "could not notify remote leave during emergency return"));
+		}
 		forceLeaveClient(m_active);
 		return;
 	}

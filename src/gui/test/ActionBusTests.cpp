@@ -1,4 +1,6 @@
 #include "ActionBus.h"
+#include "AppConfig.h"
+#include "WorkflowStore.h"
 
 #include "gtest/gtest.h"
 
@@ -8,6 +10,11 @@
 #include <QFileInfo>
 #include <QDateTime>
 #include <QTemporaryDir>
+#include <QSettings>
+#include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QThread>
+#include <QLockFile>
 
 #if defined(Q_OS_UNIX)
 #include <unistd.h>
@@ -159,6 +166,114 @@ TEST(ActionBusTests, batchBoundsDepth)
     EXPECT_FALSE(QFileInfo::exists(dir.filePath("saved")));
 }
 
+TEST(ActionBusTests, recoversOnlyOwnedInterruptedStaging)
+{
+    QTemporaryDir dir;
+    const QString abandoned = dir.filePath(".weave-staging-v1-dead");
+    const QString unmanaged = dir.filePath(".weave-staging-v1-user");
+    const QString published = dir.filePath(".weave-staging-v1-published");
+    writeFile(QDir(abandoned).filePath("owner"), "weave-inbox-staging-v1\n");
+    writeFile(QDir(abandoned).filePath("output/partial"), "incomplete");
+    writeFile(QDir(unmanaged).filePath("notes"), "keep");
+    writeFile(QDir(published).filePath("owner"), "weave-inbox-staging-v1\n");
+    ActionBus::testMarkInboxTargetManaged(published);
+    writeFile(dir.filePath("source"), "good");
+    QString error;
+    ASSERT_TRUE(ActionBus::testCopyInboxBatch({dir.filePath("source")}, dir.filePath("saved"), &error));
+    EXPECT_FALSE(QFileInfo::exists(abandoned));
+    EXPECT_TRUE(QFileInfo::exists(QDir(unmanaged).filePath("notes")));
+    EXPECT_TRUE(QFileInfo::exists(published));
+}
+
+TEST(ActionBusTests, metadataDoesNotOverwriteOrPruneUserPayloadMarkers)
+{
+    QTemporaryDir dir;
+    const QString folder = dir.filePath("archive");
+    const QString contentMarker = QDir(folder).filePath(".weave-managed");
+    writeFile(contentMarker, "user-owned content");
+    ActionBus::testMarkInboxTargetManaged(folder);
+    QFile file(contentMarker);
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly));
+    EXPECT_EQ(QByteArray("user-owned content"), file.readAll());
+    file.close();
+    const QString userFolder = dir.filePath("unmanaged");
+    writeFile(QDir(userFolder).filePath(".weave-managed"), "weave-managed-inbox-item\n");
+    writeFile(QDir(userFolder).filePath(".data.weave-managed"), "weave-managed-inbox-item\n");
+    writeFile(QDir(userFolder).filePath("data"), "keep");
+    ActionBus::testPruneManagedInboxDir(dir.path(), 1, 1);
+    EXPECT_FALSE(QFileInfo::exists(folder));
+    EXPECT_TRUE(QFileInfo::exists(QDir(userFolder).filePath("data")));
+}
+
+TEST(ActionBusTests, refusesConcurrentWriterWithoutReclaimingItsStaging)
+{
+    QTemporaryDir dir;
+    const QString active = dir.filePath(".weave-staging-v1-active");
+    writeFile(QDir(active).filePath("owner"), "weave-inbox-staging-v1\n");
+    writeFile(dir.filePath("source"));
+    QLockFile lock(dir.filePath(".weave-inbox-copy.lock"));
+    ASSERT_TRUE(lock.tryLock());
+    QString error;
+    EXPECT_FALSE(ActionBus::testCopyInboxBatch({dir.filePath("source")}, dir.filePath("saved"), &error));
+    EXPECT_TRUE(QFileInfo::exists(active));
+    EXPECT_FALSE(QFileInfo::exists(dir.filePath("saved")));
+}
+
+TEST(ActionBusTests, interruptedWorkerDoesNotPublishPartialOutput)
+{
+    QTemporaryDir dir;
+    writeFile(dir.filePath("source"));
+    bool success = true;
+    QString error;
+    QThread* worker = QThread::create([&]() {
+        QThread::currentThread()->requestInterruption();
+        success = ActionBus::testCopyInboxBatch({dir.filePath("source")}, dir.filePath("saved"), &error);
+    });
+    worker->start();
+    ASSERT_TRUE(worker->wait(5000));
+    delete worker;
+    EXPECT_FALSE(success);
+    EXPECT_TRUE(error.contains("cancelled"));
+    EXPECT_FALSE(QFileInfo::exists(dir.filePath("saved")));
+    EXPECT_TRUE(QDir(dir.path()).entryList({".weave-staging-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+}
+
+TEST(ActionBusTests, inboxSaveIsQueuedBoundedAndCompletesOnGuiThread)
+{
+    QTemporaryDir configDir;
+    QSettings settings(configDir.filePath("settings.ini"), QSettings::IniFormat);
+    AppConfig config(&settings);
+    WorkflowStore store(config);
+    ActionBus bus(store);
+    const QString id = store.testAddTextContext("async inbox payload");
+    bool completed = false;
+    bool succeeded = false;
+    QObject::connect(&bus, &ActionBus::inboxSaveFinished, &bus,
+        [&](const QString& contextId, bool success, const QString& detail) {
+            EXPECT_EQ(bus.thread(), QThread::currentThread());
+            EXPECT_EQ(id, contextId);
+            EXPECT_TRUE(QFileInfo::exists(detail));
+            completed = true;
+            succeeded = success;
+        });
+    QString error;
+    ASSERT_TRUE(bus.execute("save_to_inbox", id, nullptr, &error)) << error.toStdString();
+    EXPECT_TRUE(bus.inboxSaveRunning());
+    ASSERT_FALSE(store.receipts().isEmpty());
+    EXPECT_EQ(QStringLiteral("Queued"), store.receipts().first().status);
+    EXPECT_FALSE(bus.execute("save_to_inbox", id, nullptr, &error));
+    QElapsedTimer timer;
+    timer.start();
+    while (!completed && timer.elapsed() < 5000) {
+        QCoreApplication::processEvents();
+        QThread::msleep(1);
+    }
+    EXPECT_TRUE(completed);
+    EXPECT_TRUE(succeeded);
+    EXPECT_FALSE(bus.inboxSaveRunning());
+    EXPECT_EQ(QStringLiteral("Completed"), store.receipts().first().status);
+}
+
 TEST(ActionBusTests, pruneManagedInbox_removesMarkedFoldersOverByteBudgetWithoutDeletingUnmanagedFolders)
 {
     QTemporaryDir dir;
@@ -171,11 +286,11 @@ TEST(ActionBusTests, pruneManagedInbox_removesMarkedFoldersOverByteBudgetWithout
     writeFile(QDir(unmanagedFolder).filePath(QStringLiteral("small.bin")), QByteArray(4, 'x'));
     ActionBus::testMarkInboxTargetManaged(oldFolder);
 
-    const QString oldMarker = QDir(oldFolder).filePath(QStringLiteral(".weave-managed"));
+    const QString oldMarker = QDir(inbox).filePath(QStringLiteral(".old-folder.weave-managed"));
     const QDateTime now = QDateTime::currentDateTimeUtc();
     setModifiedTime(oldMarker, now.addSecs(-60));
 
-    ActionBus::testPruneManagedInboxDir(inbox, 10, 64);
+    ActionBus::testPruneManagedInboxDir(inbox, 10, 40);
 
     EXPECT_FALSE(QFileInfo::exists(oldFolder));
     EXPECT_TRUE(QFileInfo::exists(unmanagedFolder));

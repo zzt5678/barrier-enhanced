@@ -35,6 +35,7 @@
 #include "base/Log.h"
 #include "base/XBase.h"
 #include "common/Version.h"
+#include "common/CoreRestartPolicy.h"
 #include "common/win32/encoding_utilities.h"
 
 #include <openssl/rand.h>
@@ -1319,6 +1320,8 @@ void MSWindowsWatchdog::main_loop()
             }
 
             if (!state.command.empty() &&
+                barrier::coreGenerationMayRestart(m_hasPermanentFailure,
+                    m_permanentFailureGeneration, state.generation) &&
                 ((state.processFailures != 0) || m_session.hasChanged() ||
                  state.commandChanged || desktopChanged)) {
                 startProcess();
@@ -1327,7 +1330,16 @@ void MSWindowsWatchdog::main_loop()
             if (m_processRunning.load() &&
                 isProcessHandleStopped(m_processInfo.hProcess)) {
 
-                incrementProcessFailures();
+                DWORD exitCode = 0;
+                if (GetExitCodeProcess(m_processInfo.hProcess, &exitCode) &&
+                    barrier::coreExitRequiresCorrection(static_cast<int>(exitCode))) {
+                    m_hasPermanentFailure = true;
+                    m_permanentFailureGeneration = m_runningCommandGeneration;
+                    LOG((CLOG_ERR "peer protocol mismatch; automatic restart suspended; correct peer versions, then Stop and Start Weave"));
+                }
+                else {
+                    incrementProcessFailures();
+                }
                 m_processRunning.store(false);
 
                 LOG((CLOG_WARN "detected application not running, pid=%d",
@@ -1824,6 +1836,13 @@ MSWindowsWatchdog::startProcess()
 
             const auto discardActivatedProcessAndRetry =
                 [&](const char* discardFailureReason) {
+                    DWORD exitCode = 0;
+                    if (GetExitCodeProcess(newProcessInfo.hProcess, &exitCode) &&
+                        barrier::coreExitRequiresCorrection(static_cast<int>(exitCode))) {
+                        m_hasPermanentFailure = true;
+                        m_permanentFailureGeneration = state.generation;
+                        LOG((CLOG_ERR "peer protocol mismatch during activation; automatic restart suspended; correct peer versions, then Stop and Start Weave"));
+                    }
                     discardPendingProcessOrFailFast(
                         discardFailureReason, 3, true);
                     durableCandidateCommitted = false;
@@ -1999,6 +2018,7 @@ MSWindowsWatchdog::startProcess()
                 // Keep this durably committed B as last-good until C proves
                 // ready, but never publish B after a proven stop or owner swap.
                 m_processInfo = newProcessInfo;
+                m_runningCommandGeneration = state.generation;
                 ZeroMemory(&m_pendingProcessInfo,
                            sizeof(PROCESS_INFORMATION));
                 durableCandidateCommitted = false;

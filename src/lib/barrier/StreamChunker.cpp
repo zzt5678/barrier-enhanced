@@ -16,6 +16,7 @@
  */
 
 #include "barrier/StreamChunker.h"
+#include "barrier/BackpressureWait.h"
 
 #include "barrier/FileChunk.h"
 #include "barrier/FileTransferSendState.h"
@@ -44,10 +45,10 @@ using namespace std;
 
 namespace {
 
-const UInt32 kMaxFileOutputThrottleWaits = 120000;
-const UInt32 kMaxFileQueuedEventWaits = 5000;
-const UInt32 kMaxClipboardOutputThrottleWaits = 5000;
-const UInt32 kMaxClipboardQueuedEventWaits = 5000;
+const double kFileOutputStallSeconds = 120.0;
+const double kFileQueueStallSeconds = 5.0;
+const double kClipboardOutputStallSeconds = 5.0;
+const double kClipboardQueueStallSeconds = 5.0;
 const UInt32 kMaxQueuedFilePayloadBytes = 4 * 1024 * 1024;
 const UInt32 kMaxFileBufferedOutputBytes = 256 * 1024;
 
@@ -157,40 +158,41 @@ void cooperativeYield(size_t& bytesSinceYield, size_t threshold)
 
 bool waitForBufferedOutputBudget(barrier::IStream* stream,
                                   UInt32 maxBufferedBytes,
-                                  double sleepSeconds,
-                                  UInt32 maxWaitCount,
+                                  double stallSeconds,
                                   const std::function<bool()>& shouldInterrupt)
 {
     if (stream == nullptr) {
         return true;
     }
 
-    UInt32 waitCount = 0;
     UInt32 bufferedBytes = stream->getBufferedOutputSize();
+    const auto started = barrier::BackpressureWait::Clock::now();
+    barrier::BackpressureWait wait(stallSeconds, started,
+        bufferedBytes, stream->getOutputBytesWritten());
+    UInt32 waitCount = 0;
     while (bufferedBytes > maxBufferedBytes) {
         if (shouldInterrupt && shouldInterrupt()) {
             LOG((CLOG_DEBUG "bulk output throttling interrupted"));
             return false;
         }
-        if (maxWaitCount != 0 && waitCount >= maxWaitCount) {
+        const auto now = barrier::BackpressureWait::Clock::now();
+        if (wait.expired(now)) {
             LOG((CLOG_WARN "bulk output throttling timed out: waits=%u maxBufferedBudget=%u",
                 waitCount, maxBufferedBytes));
             return false;
         }
-        ARCH->sleep(sleepSeconds);
+        ARCH->sleep(wait.sleepSeconds(now));
+        ++waitCount;
         const UInt32 nextBufferedBytes = stream->getBufferedOutputSize();
-        if (nextBufferedBytes < bufferedBytes) {
-            waitCount = 0;
-        }
-        else {
-            ++waitCount;
-        }
+        wait.observe(barrier::BackpressureWait::Clock::now(), nextBufferedBytes,
+            stream->getOutputBytesWritten());
         bufferedBytes = nextBufferedBytes;
     }
 
     if (waitCount > 0) {
-        LOG((CLOG_DEBUG2 "bulk output throttled: waits=%u maxBufferedBudget=%u slept=%.3fs",
-            waitCount, maxBufferedBytes, waitCount * sleepSeconds));
+        LOG((CLOG_DEBUG2 "bulk output throttled: waits=%u maxBufferedBudget=%u elapsed=%.3fs",
+            waitCount, maxBufferedBytes,
+            std::chrono::duration<double>(barrier::BackpressureWait::Clock::now() - started).count()));
     }
 
     return true;
@@ -203,8 +205,7 @@ bool hasBufferedOutputBudget(barrier::IStream* stream, UInt32 maxBufferedBytes)
 
 bool waitForQueuedEventBudget(IEventQueue* events,
                               size_t maxQueuedEvents,
-                              double sleepSeconds,
-                              UInt32 maxWaitCount,
+                              double stallSeconds,
                               const std::function<bool()>& shouldInterrupt)
 {
     if (events == nullptr || maxQueuedEvents == 0) {
@@ -212,26 +213,32 @@ bool waitForQueuedEventBudget(IEventQueue* events,
     }
 
     UInt32 waitCount = 0;
-    while (events->getQueuedEventCount() >= maxQueuedEvents) {
+    size_t queuedEvents = events->getQueuedEventCount();
+    const auto started = barrier::BackpressureWait::Clock::now();
+    barrier::BackpressureWait wait(stallSeconds, started, queuedEvents);
+    while (queuedEvents >= maxQueuedEvents) {
         if (shouldInterrupt && shouldInterrupt()) {
             LOG((CLOG_DEBUG "bulk event queue throttling interrupted"));
             return false;
         }
-        if (maxWaitCount != 0 && waitCount >= maxWaitCount) {
+        const auto now = barrier::BackpressureWait::Clock::now();
+        if (wait.expired(now)) {
             LOG((CLOG_WARN "bulk event queue throttling timed out: waits=%u maxQueuedEvents=%lu",
                 waitCount,
                 static_cast<unsigned long>(maxQueuedEvents)));
             return false;
         }
         ++waitCount;
-        ARCH->sleep(sleepSeconds);
+        ARCH->sleep(wait.sleepSeconds(now));
+        queuedEvents = events->getQueuedEventCount();
+        wait.observe(barrier::BackpressureWait::Clock::now(), queuedEvents);
     }
 
     if (waitCount > 0) {
-        LOG((CLOG_DEBUG2 "bulk event queue throttled: waits=%u maxQueuedEvents=%lu slept=%.3fs",
+        LOG((CLOG_DEBUG2 "bulk event queue throttled: waits=%u maxQueuedEvents=%lu elapsed=%.3fs",
             waitCount,
             static_cast<unsigned long>(maxQueuedEvents),
-            waitCount * sleepSeconds));
+            std::chrono::duration<double>(barrier::BackpressureWait::Clock::now() - started).count()));
     }
 
     return true;
@@ -258,10 +265,10 @@ bool queueClipboardChunks(
     }
 
     if (waitForBudgets) {
-        if (!waitForQueuedEventBudget(events, maxQueuedBulkEvents, 0.001,
-                kMaxClipboardQueuedEventWaits, shouldInterrupt) ||
-            !waitForBufferedOutputBudget(stream, 128 * 1024, 0.001,
-                kMaxClipboardOutputThrottleWaits, shouldInterrupt)) {
+        if (!waitForQueuedEventBudget(events, maxQueuedBulkEvents,
+                kClipboardQueueStallSeconds, shouldInterrupt) ||
+            !waitForBufferedOutputBudget(stream, 128 * 1024,
+                kClipboardOutputStallSeconds, shouldInterrupt)) {
             LOG((CLOG_DEBUG "clipboard transmission not started because output is not ready"));
             return false;
         }
@@ -291,10 +298,10 @@ bool queueClipboardChunks(
         }
 
         if (waitForBudgets) {
-            if (!waitForQueuedEventBudget(events, maxQueuedBulkEvents, 0.001,
-                    kMaxClipboardQueuedEventWaits, shouldInterrupt) ||
-                !waitForBufferedOutputBudget(stream, 128 * 1024, 0.001,
-                    kMaxClipboardOutputThrottleWaits, shouldInterrupt)) {
+            if (!waitForQueuedEventBudget(events, maxQueuedBulkEvents,
+                    kClipboardQueueStallSeconds, shouldInterrupt) ||
+                !waitForBufferedOutputBudget(stream, 128 * 1024,
+                    kClipboardOutputStallSeconds, shouldInterrupt)) {
                 break;
             }
         }
@@ -304,8 +311,8 @@ bool queueClipboardChunks(
 
         events->addEvent(Event(events->forFile().keepAlive(), eventTarget));
         if (waitForBudgets &&
-            !waitForQueuedEventBudget(events, maxQueuedBulkEvents, 0.001,
-                kMaxClipboardQueuedEventWaits, shouldInterrupt)) {
+            !waitForQueuedEventBudget(events, maxQueuedBulkEvents,
+                kClipboardQueueStallSeconds, shouldInterrupt)) {
             break;
         }
 
@@ -432,10 +439,10 @@ StreamChunker::sendFile(const char* filename,
     };
 
     const size_t maxQueuedBulkEvents = getMaxQueuedFileEvents(size, stream);
-    if (!waitForQueuedEventBudget(events, maxQueuedBulkEvents, 0.001,
-            kMaxFileQueuedEventWaits, shouldStop) ||
-        !waitForBufferedOutputBudget(stream, kMaxFileBufferedOutputBytes, 0.001,
-            kMaxFileOutputThrottleWaits, shouldStop)) {
+    if (!waitForQueuedEventBudget(events, maxQueuedBulkEvents,
+            kFileQueueStallSeconds, shouldStop) ||
+        !waitForBufferedOutputBudget(stream, kMaxFileBufferedOutputBytes,
+            kFileOutputStallSeconds, shouldStop)) {
         LOG((CLOG_DEBUG "file transmission not started because output is not ready"));
         if (transactionState && !transactionState->stopped()) {
             transactionState->fail(barrier::FileTransferReason::kTimeout);
@@ -498,8 +505,8 @@ StreamChunker::sendFile(const char* filename,
         }
 
         events->addEvent(Event(events->forFile().keepAlive(), eventTarget));
-        if (!waitForQueuedEventBudget(events, maxQueuedBulkEvents, 0.001,
-                kMaxFileQueuedEventWaits, shouldStop)) {
+        if (!waitForQueuedEventBudget(events, maxQueuedBulkEvents,
+                kFileQueueStallSeconds, shouldStop)) {
             failureReason = transactionState &&
                     transactionState->result() !=
                         barrier::FileTransferReason::kNone ?
@@ -507,8 +514,8 @@ StreamChunker::sendFile(const char* filename,
                 barrier::FileTransferReason::kTimeout;
             break;
         }
-        if (!waitForBufferedOutputBudget(stream, kMaxFileBufferedOutputBytes, 0.001,
-                kMaxFileOutputThrottleWaits, shouldStop)) {
+        if (!waitForBufferedOutputBudget(stream, kMaxFileBufferedOutputBytes,
+                kFileOutputStallSeconds, shouldStop)) {
             failureReason = transactionState &&
                     transactionState->result() !=
                         barrier::FileTransferReason::kNone ?

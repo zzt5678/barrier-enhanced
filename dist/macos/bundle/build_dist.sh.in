@@ -12,12 +12,14 @@ B_BINDIR="@CMAKE_RUNTIME_OUTPUT_DIRECTORY@"
 B_BUILDTYPE="@CMAKE_BUILD_TYPE@"
 B_BARRIERC="Weave.app/Contents/MacOS/weavec"
 B_BARRIERS="Weave.app/Contents/MacOS/weaves"
+DEPLOYQT="${DEPLOYQT:-}"
 
 # Colorized output
-info() { tput bold; echo "$@"; tput sgr0 ; }
-error() { tput bold; tput setaf 1; echo "$@"; tput sgr0 ; }
-success() { tput bold; tput setaf 2; echo "$@"; tput sgr0 ; }
-warn() { tput bold; tput setaf 3; echo "$@"; tput sgr0 ; }
+color() { tput "$@" 2>/dev/null || true; }
+info() { color bold; echo "$@"; color sgr0; }
+error() { color bold; color setaf 1; echo "$@"; color sgr0; }
+success() { color bold; color setaf 2; echo "$@"; color sgr0; }
+warn() { color bold; color setaf 3; echo "$@"; color sgr0; }
 
 info "Checking for bundle contents"
 if [ ! -d "Weave.app/Contents" ]; then
@@ -28,15 +30,26 @@ fi
 
 if [ -d "$B_MACOS" ]; then
     info "Removing old binaries from bundle"
-    rm -r "$B_MACOS"
+    rm -r "$B_MACOS" || exit 1
 fi
 
 info "Copying binaries into bundle"
-# Copy the folder instead of globbing unquoted path
-cp -r "$B_BINDIR" "$B_MACOS" || exit 1
+# Include only shipping components, never test executables from the build.
+mkdir -p "$B_MACOS" || exit 1
+for component in weave weavec weaves; do
+    if [ ! -x "$B_BINDIR/$component" ]; then
+        error "Missing executable: $B_BINDIR/$component"
+        exit 1
+    fi
+    cp "$B_BINDIR/$component" "$B_MACOS/$component" || exit 1
+done
+
+if [ -z "$DEPLOYQT" ]; then
+    DEPLOYQT="$(command -v macdeployqt || true)"
+fi
 
 # Check for macdeployqt on MacPorts
-if which -s port ; then
+if [ -z "$DEPLOYQT" ] && command -v port >/dev/null 2>&1; then
     info "MacPorts found, searching for macdeployqt"
     DEPLOYQT="$(port contents qt5-qttools | grep --only --max-count 1 '/.*macdeployqt')"
     if [ ! -x "$DEPLOYQT" ]; then
@@ -46,13 +59,18 @@ if which -s port ; then
 fi
 
 # Check for macdeployqt on Homebrew
-if which -s brew ; then
+if [ -z "$DEPLOYQT" ] && command -v brew >/dev/null 2>&1; then
     info "Homebrew found, searching for macdeployqt"
     DEPLOYQT="$(brew list qt@5 | grep --only '/.*macdeployqt' | head -1)"
     if [ ! -x "$DEPLOYQT" ]; then
         error "Please install package qt"
         exit 1
     fi
+fi
+
+if [ -z "$DEPLOYQT" ] || [ ! -x "$DEPLOYQT" ]; then
+    error "macdeployqt not found; set DEPLOYQT to an executable Qt 5 macdeployqt path"
+    exit 1
 fi
 
 # Use macdeployqt to include libraries and create dmg

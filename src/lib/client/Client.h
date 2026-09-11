@@ -103,7 +103,7 @@ public:
     /*!
     Disconnects from the server with an optional error message.
     */
-    void                disconnect(const char* msg);
+    void                disconnect(const char* msg, bool retry = true);
 
     void                connectBulkChannel(const std::string& token);
     bool                connectBulkChannel(const std::string& token,
@@ -253,7 +253,7 @@ private:
                             ClipboardID id, const std::string& data,
                             const std::shared_ptr<const String>* immutable = NULL);
     void                sendEvent(Event::Type, void*);
-    void                sendConnectionFailedEvent(const char* msg);
+    void                sendConnectionFailedEvent(const char* msg, bool retry = true);
     void                sendFileChunk(const void* data);
     void                send_file_thread(barrier::IStream* stream,
                                          const std::string& filename,
@@ -369,6 +369,7 @@ private:
 public:
     bool                m_mock;
 #if defined(BARRIER_TEST_ENV)
+    void                testHandleHello() { handleHello(Event(), NULL); }
     void                testOnFileRecieveCompleted()
     {
         onFileRecieveCompleted(m_fileReceiveSession.generation());

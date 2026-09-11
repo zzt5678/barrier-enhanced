@@ -89,4 +89,5 @@ private:
     barrier::Screen*m_clientScreen;
     NetworkAddress*    m_serverAddress;
     double             m_restartTimeout;
+    bool               m_permanentFailure = false;
 };

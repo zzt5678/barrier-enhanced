@@ -10,6 +10,15 @@
 #include "../src/WindowLifecyclePolicy.h"
 
 #include <gtest/gtest.h>
+#include "../../lib/common/common.h"
+
+TEST(WindowLifecyclePolicyTests, permanentPeerMismatchStopsRestartButTransientExitRetries)
+{
+    EXPECT_FALSE(WindowLifecyclePolicy::shouldRestartCore(true, kExitIncompatible));
+    EXPECT_TRUE(WindowLifecyclePolicy::shouldRestartCore(true, kExitFailed));
+    EXPECT_TRUE(WindowLifecyclePolicy::shouldRestartCore(true, kExitSuccess));
+    EXPECT_FALSE(WindowLifecyclePolicy::shouldRestartCore(false, kExitFailed));
+}
 
 TEST(WindowLifecyclePolicyTests, onlyExplicitQuitMayCloseTheApplication)
 {
