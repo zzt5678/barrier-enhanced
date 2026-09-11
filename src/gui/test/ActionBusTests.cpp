@@ -13,6 +13,34 @@
 #include <unistd.h>
 #endif
 
+namespace { void writeFile(const QString& path, const QByteArray& data); }
+
+TEST(ActionBusTests, copyRecursively_preservesExistingDestination)
+{
+    QTemporaryDir dir;
+    const QString source = dir.filePath("source.txt");
+    const QString target = dir.filePath("target.txt");
+    writeFile(source, "new");
+    writeFile(target, "original");
+    QString error;
+    EXPECT_FALSE(ActionBus::testCopyRecursively(source, target, &error));
+    QFile file(target);
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly));
+    EXPECT_EQ(QByteArray("original"), file.readAll());
+}
+
+TEST(ActionBusTests, copyRecursively_boundsEmptyDirectories)
+{
+    QTemporaryDir dir;
+    const QString source = dir.filePath("source");
+    for (int i = 0; i < 5001; ++i) {
+        ASSERT_TRUE(QDir().mkpath(QDir(source).filePath(QString::number(i))));
+    }
+    QString error;
+    EXPECT_FALSE(ActionBus::testCopyRecursively(source, dir.filePath("target"), &error));
+    EXPECT_FALSE(error.isEmpty());
+}
+
 namespace {
 
 void writeFile(const QString& path, const QByteArray& data = QByteArray("payload"))
@@ -61,6 +89,74 @@ TEST(ActionBusTests, pruneManagedInbox_removesOldMarkedItemsButKeepsUnmanagedFil
     EXPECT_TRUE(QFileInfo::exists(currentItem));
     EXPECT_TRUE(QFileInfo::exists(currentMarker));
     EXPECT_TRUE(QFileInfo::exists(unmanaged));
+}
+
+TEST(ActionBusTests, batchPreservesCollidingNamesAndContents)
+{
+    QTemporaryDir dir;
+    const QString a = dir.filePath("a/results.csv");
+    const QString b = dir.filePath("b/results.csv");
+    writeFile(a, "first");
+    writeFile(b, "second");
+    QString error;
+    const QString target = dir.filePath("saved");
+    ASSERT_TRUE(ActionBus::testCopyInboxBatch({a, b}, target, &error)) << error.toStdString();
+    const auto files = QDir(target).entryList(QDir::Files);
+    ASSERT_EQ(2, files.size());
+    EXPECT_TRUE(files.contains("results.csv"));
+    EXPECT_TRUE(files.contains("results-1.csv"));
+    QList<QByteArray> contents;
+    for (const auto& name : files) {
+        QFile file(QDir(target).filePath(name));
+        ASSERT_TRUE(file.open(QIODevice::ReadOnly));
+        contents << file.readAll();
+    }
+    EXPECT_TRUE(contents.contains("first"));
+    EXPECT_TRUE(contents.contains("second"));
+}
+
+TEST(ActionBusTests, batchBudgetIsSharedAndFailureRemovesStaging)
+{
+    QTemporaryDir dir;
+    const QString a = dir.filePath("a");
+    const QString b = dir.filePath("b");
+    writeFile(a, QByteArray(6, 'a'));
+    writeFile(b, QByteArray(6, 'b'));
+    QString error;
+    EXPECT_FALSE(ActionBus::testCopyInboxBatch({a, b}, dir.filePath("saved"), &error, 10, 10));
+    EXPECT_FALSE(QFileInfo::exists(dir.filePath("saved")));
+    EXPECT_TRUE(QDir(dir.path()).entryList({".weave-staging-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+    EXPECT_TRUE(QFileInfo::exists(a));
+    EXPECT_TRUE(QFileInfo::exists(b));
+}
+
+TEST(ActionBusTests, batchRefusesExistingTargetAndCleansPartialCopy)
+{
+    QTemporaryDir dir;
+    const QString a = dir.filePath("a");
+    const QString target = dir.filePath("saved");
+    writeFile(a, "new");
+    writeFile(target, "original");
+    QString error;
+    EXPECT_FALSE(ActionBus::testCopyInboxBatch({a}, target, &error));
+    QFile file(target);
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly));
+    EXPECT_EQ(QByteArray("original"), file.readAll());
+    EXPECT_FALSE(ActionBus::testCopyInboxBatch({a, dir.filePath("missing")}, dir.filePath("batch"), &error));
+    EXPECT_FALSE(QFileInfo::exists(dir.filePath("batch")));
+    EXPECT_TRUE(QDir(dir.path()).entryList({".weave-staging-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+}
+
+TEST(ActionBusTests, batchBoundsDepth)
+{
+    QTemporaryDir dir;
+    QString path = dir.filePath("source");
+    for (int i = 0; i < 66; ++i) { path += "/d"; }
+    ASSERT_TRUE(QDir().mkpath(path));
+    QString error;
+    EXPECT_FALSE(ActionBus::testCopyInboxBatch({dir.filePath("source")}, dir.filePath("saved"), &error));
+    EXPECT_TRUE(error.contains("64"));
+    EXPECT_FALSE(QFileInfo::exists(dir.filePath("saved")));
 }
 
 TEST(ActionBusTests, pruneManagedInbox_removesMarkedFoldersOverByteBudgetWithoutDeletingUnmanagedFolders)

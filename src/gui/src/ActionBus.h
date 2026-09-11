@@ -40,6 +40,9 @@ public:
                                     const QString& destinationPath,
                                     QString* errorMessage);
     static bool testPathIsInside(const QString& rootPath, const QString& path);
+    static bool testCopyInboxBatch(const QStringList& paths, const QString& destination,
+                                  QString* error, int maxItems = 5000,
+                                  qint64 maxBytes = 512LL * 1024 * 1024);
 #endif
 
 signals:

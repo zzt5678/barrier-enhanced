@@ -34,6 +34,11 @@
 
 namespace {
 
+struct CFDataDeleter {
+    void operator()(const __CFData* value) const { CFRelease(value); }
+};
+using OwnedCFData = std::unique_ptr<const __CFData, CFDataDeleter>;
+
 CFStringRef kFileUrlFlavor()
 {
     return CFSTR("public.file-url");
@@ -160,11 +165,11 @@ OSXClipboard::OSXClipboard() :
     m_time(0),
     m_pboard(NULL)
 {
-    m_converters.push_back(new OSXClipboardHTMLConverter);
-    m_converters.push_back(new OSXClipboardBMPConverter);
-    m_converters.push_back(new OSXClipboardPNGConverter);
-    m_converters.push_back(new OSXClipboardUTF16Converter);
-    m_converters.push_back(new OSXClipboardTextConverter);
+    m_converters.push_back(std::make_unique<OSXClipboardHTMLConverter>());
+    m_converters.push_back(std::make_unique<OSXClipboardBMPConverter>());
+    m_converters.push_back(std::make_unique<OSXClipboardPNGConverter>());
+    m_converters.push_back(std::make_unique<OSXClipboardUTF16Converter>());
+    m_converters.push_back(std::make_unique<OSXClipboardTextConverter>());
 
 
 
@@ -172,20 +177,24 @@ OSXClipboard::OSXClipboard() :
     if (createErr != noErr) {
         LOG((CLOG_DEBUG "failed to create clipboard reference: error %i", createErr));
         LOG((CLOG_ERR "unable to connect to pasteboard, clipboard sharing disabled", createErr));
-        m_pboard = NULL;
+        if (m_pboard != NULL) {
+            CFRelease(m_pboard);
+            m_pboard = NULL;
+        }
         return;
 
     }
 
-    OSStatus syncErr = PasteboardSynchronize(m_pboard);
-    if (syncErr != noErr) {
-        LOG((CLOG_DEBUG "failed to synchronize clipboard: error %i", syncErr));
-    }
+    // PasteboardSynchronize returns flags, not an OSStatus error code.
+    PasteboardSynchronize(m_pboard);
 }
 
 OSXClipboard::~OSXClipboard()
 {
     clearConverters();
+    if (m_pboard != NULL) {
+        CFRelease(m_pboard);
+    }
 }
 
     bool
@@ -250,21 +259,30 @@ void OSXClipboard::add(EFormat format, const std::string& data)
     for (ConverterList::const_iterator index = m_converters.begin();
             index != m_converters.end(); ++index) {
 
-        IOSXClipboardConverter* converter = *index;
+        IOSXClipboardConverter* converter = index->get();
 
         // skip converters for other formats
         if (converter->getFormat() == format) {
             std::string osXData = converter->fromIClipboard(data);
             CFStringRef flavorType = converter->getOSXFormat();
-            CFDataRef dataRef = CFDataCreate(kCFAllocatorDefault, (UInt8 *)osXData.data(), osXData.size());
+            OwnedCFData dataRef(CFDataCreate(kCFAllocatorDefault,
+                reinterpret_cast<const UInt8*>(osXData.data()), osXData.size()));
+            if (!dataRef) {
+                LOG((CLOG_WARN "could not allocate clipboard flavor data"));
+                continue;
+            }
             PasteboardItemID itemID = 0;
 
-            PasteboardPutItemFlavor(
+            const OSStatus status = PasteboardPutItemFlavor(
                 m_pboard,
                 itemID,
                 flavorType,
-                dataRef,
+                dataRef.get(),
                 kPasteboardFlavorNoFlags);
+            if (status != noErr) {
+                LOG((CLOG_WARN "could not publish clipboard flavor: error %i", status));
+                continue;
+            }
 
             LOG((CLOG_DEBUG "added %d bytes to clipboard format: %d", data.size(), format));
         }
@@ -311,7 +329,7 @@ OSXClipboard::has(EFormat format) const
 
     for (ConverterList::const_iterator index = m_converters.begin();
             index != m_converters.end(); ++index) {
-        IOSXClipboardConverter* converter = *index;
+        IOSXClipboardConverter* converter = index->get();
         if (converter->getFormat() == format) {
             PasteboardFlavorFlags flags;
             CFStringRef type = converter->getOSXFormat();
@@ -350,7 +368,7 @@ std::string OSXClipboard::get(EFormat format) const
     IOSXClipboardConverter* converter = NULL;
     for (ConverterList::const_iterator index = m_converters.begin();
             index != m_converters.end(); ++index) {
-        converter = *index;
+        converter = index->get();
 
         PasteboardFlavorFlags flags;
         type = converter->getOSXFormat();
@@ -396,12 +414,5 @@ std::string OSXClipboard::get(EFormat format) const
     void
 OSXClipboard::clearConverters()
 {
-    if (m_pboard == NULL)
-        return;
-
-    for (ConverterList::iterator index = m_converters.begin();
-            index != m_converters.end(); ++index) {
-        delete *index;
-    }
     m_converters.clear();
 }

@@ -23,6 +23,7 @@
 #include <Carbon/Carbon.h>
 #include <string>
 #include <vector>
+#include <memory>
 
 class IOSXClipboardConverter;
 
@@ -49,7 +50,7 @@ private:
     void                clearConverters();
 
 private:
-    typedef std::vector<IOSXClipboardConverter*> ConverterList;
+    typedef std::vector<std::unique_ptr<IOSXClipboardConverter>> ConverterList;
 
     mutable Time        m_time;
     ConverterList        m_converters;

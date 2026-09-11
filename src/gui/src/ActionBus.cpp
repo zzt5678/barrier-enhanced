@@ -16,6 +16,7 @@
 #include <QRegularExpression>
 #include <QScreen>
 #include <QSet>
+#include <QTemporaryDir>
 #include <QUrl>
 
 #include <algorithm>
@@ -60,7 +61,7 @@ bool failCopy(QString* errorMessage, const QString& message)
 bool addCopyItem(const QFileInfo& sourceInfo, CopyBudget& budget, QString* errorMessage)
 {
     ++budget.items;
-    budget.bytes += sourceInfo.size();
+    budget.bytes += sourceInfo.isFile() ? sourceInfo.size() : 0;
     if (budget.items > budget.maxItems) {
         return failCopy(errorMessage, QStringLiteral("Refusing to save more than %1 files to the workflow inbox.")
             .arg(budget.maxItems));
@@ -75,8 +76,12 @@ bool addCopyItem(const QFileInfo& sourceInfo, CopyBudget& budget, QString* error
 bool copyRecursively(const QString& sourcePath,
                      const QString& destinationPath,
                      CopyBudget& budget,
-                     QString* errorMessage)
+                     QString* errorMessage,
+                     int depth = 0)
 {
+    if (depth > 64) {
+        return failCopy(errorMessage, QStringLiteral("Inbox folder nesting exceeds 64 levels."));
+    }
     QFileInfo sourceInfo(sourcePath);
     if (!sourceInfo.exists()) {
         return failCopy(errorMessage, QStringLiteral("Source path does not exist: %1").arg(sourcePath));
@@ -85,6 +90,17 @@ bool copyRecursively(const QString& sourcePath,
     if (sourceInfo.isSymLink()) {
         return failCopy(errorMessage, QStringLiteral("Refusing to save symbolic link to the workflow inbox: %1")
             .arg(sourcePath));
+    }
+
+    if (!sourceInfo.isDir() && !sourceInfo.isFile()) {
+        return failCopy(errorMessage, QStringLiteral("Refusing non-regular source: %1").arg(sourcePath));
+    }
+    if (!addCopyItem(sourceInfo, budget, errorMessage)) {
+        return false;
+    }
+    const QFileInfo destinationInfo(destinationPath);
+    if (destinationInfo.exists() || destinationInfo.isSymLink()) {
+        return failCopy(errorMessage, QStringLiteral("Destination already exists: %1").arg(destinationPath));
     }
 
     if (sourceInfo.isDir()) {
@@ -101,31 +117,31 @@ bool copyRecursively(const QString& sourcePath,
             return failCopy(errorMessage, QStringLiteral("Could not create folder: %1").arg(destinationPath));
         }
 
-        QDir sourceDir(sourcePath);
-        const QFileInfoList entries = sourceDir.entryInfoList(
+        QDirIterator entries(sourcePath,
             QDir::NoDotAndDotDot | QDir::AllEntries | QDir::Hidden | QDir::System);
-        for (const QFileInfo& entry : entries) {
+        while (entries.hasNext()) {
+            entries.next();
+            const QFileInfo entry = entries.fileInfo();
             const QString nextSource = entry.absoluteFilePath();
             const QString nextDestination = QDir(destinationPath).filePath(entry.fileName());
-            if (!copyRecursively(nextSource, nextDestination, budget, errorMessage)) {
+            if (!copyRecursively(nextSource, nextDestination, budget, errorMessage, depth + 1)) {
                 return false;
             }
         }
         return true;
     }
 
-    if (!addCopyItem(sourceInfo, budget, errorMessage)) {
-        return false;
-    }
-
     QDir().mkpath(QFileInfo(destinationPath).absolutePath());
-    if (QFile::exists(destinationPath)) {
-        QFile::remove(destinationPath);
-    }
 
     if (!QFile::copy(sourcePath, destinationPath)) {
-        QFile::remove(destinationPath);
         return failCopy(errorMessage, QStringLiteral("Could not copy %1 to %2").arg(sourcePath, destinationPath));
+    }
+
+    const QFileInfo after(sourcePath);
+    if (after.isSymLink() || after.size() != sourceInfo.size() ||
+        after.lastModified() != sourceInfo.lastModified() ||
+        QFileInfo(destinationPath).size() != sourceInfo.size()) {
+        return failCopy(errorMessage, QStringLiteral("Source changed during copy: %1").arg(sourcePath));
     }
 
     return true;
@@ -135,6 +151,54 @@ bool copyRecursively(const QString& sourcePath, const QString& destinationPath, 
 {
     CopyBudget budget;
     return copyRecursively(sourcePath, destinationPath, budget, errorMessage);
+}
+
+// The temporary directory owns every partial output. Publishing stays on the
+// same filesystem and never replaces an existing destination.
+bool copyInboxBatch(const QStringList& paths, const QString& destination,
+                    QString* errorMessage, int maxItems = kInboxCopyFileLimit,
+                    qint64 maxBytes = kInboxCopyByteLimit)
+{
+    if (paths.isEmpty()) {
+        return failCopy(errorMessage, QStringLiteral("The file manifest is empty."));
+    }
+    QTemporaryDir staging(QFileInfo(destination).dir().filePath(".weave-staging-XXXXXX"));
+    if (!staging.isValid()) {
+        return failCopy(errorMessage, QStringLiteral("Could not create inbox staging folder."));
+    }
+    const QString output = staging.filePath("output");
+    CopyBudget budget;
+    budget.maxItems = maxItems;
+    budget.maxBytes = maxBytes;
+    QSet<QString> names;
+    if (paths.size() > 1 && !QDir().mkpath(output)) {
+        return failCopy(errorMessage, QStringLiteral("Could not create batch folder."));
+    }
+    for (const QString& path : paths) {
+        const QString base = QFileInfo(path).fileName();
+        if (base.isEmpty() || base == "." || base == "..") {
+            return failCopy(errorMessage, QStringLiteral("Invalid source name."));
+        }
+        QString name = base;
+        const QFileInfo sourceInfo(path);
+        const QString extension = sourceInfo.isFile() && !sourceInfo.suffix().isEmpty()
+            ? QStringLiteral(".") + sourceInfo.suffix() : QString();
+        const QString stem = extension.isEmpty() ? base : sourceInfo.completeBaseName();
+        int index = 1;
+        while (names.contains(name.toCaseFolded())) {
+            name = QStringLiteral("%1-%2%3").arg(stem).arg(index++).arg(extension);
+        }
+        names.insert(name.toCaseFolded());
+        if (!copyRecursively(path, paths.size() > 1 ? QDir(output).filePath(name) : output,
+                             budget, errorMessage)) {
+            return false;
+        }
+    }
+    if (QFileInfo(destination).exists() || QFileInfo(destination).isSymLink() ||
+        !QDir().rename(output, destination)) {
+        return failCopy(errorMessage, QStringLiteral("Could not publish inbox item: %1").arg(destination));
+    }
+    return true;
 }
 
 qint64 pathSize(const QString& path)
@@ -230,6 +294,12 @@ bool ActionBus::testCopyRecursively(const QString& sourcePath,
 bool ActionBus::testPathIsInside(const QString& rootPath, const QString& path)
 {
     return pathIsInside(rootPath, path);
+}
+
+bool ActionBus::testCopyInboxBatch(const QStringList& paths, const QString& destination,
+                                 QString* error, int maxItems, qint64 maxBytes)
+{
+    return copyInboxBatch(paths, destination, error, maxItems, maxBytes);
 }
 #endif
 
@@ -519,7 +589,7 @@ bool ActionBus::saveContextToInbox(const ContextItem& item, QString* savedPath, 
 
         const QFileInfo payloadInfo(payloadPath);
         const QString destination = uniqueInboxTarget(sanitizePathSegment(item.summary), QStringLiteral(".") + payloadInfo.suffix());
-        if (!copyRecursively(payloadPath, destination, errorMessage)) {
+        if (!copyInboxBatch({payloadPath}, destination, errorMessage)) {
             return false;
         }
 
@@ -542,32 +612,15 @@ bool ActionBus::saveContextToInbox(const ContextItem& item, QString* savedPath, 
     const bool multipleSources = paths.size() > 1;
     const QString destinationRoot = multipleSources
         ? uniqueInboxTarget(sanitizePathSegment(item.summary))
-        : QString();
-
-    if (multipleSources && !QDir().mkpath(destinationRoot)) {
-        if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("Could not create inbox folder %1.").arg(destinationRoot);
-        }
+        : uniqueInboxTarget(QFileInfo(paths.first()).fileName());
+    if (!copyInboxBatch(paths, destinationRoot, errorMessage)) {
         return false;
     }
-
-    for (const QString& path : paths) {
-        const QFileInfo info(path);
-        const QString destination = multipleSources
-            ? QDir(destinationRoot).filePath(info.fileName())
-            : uniqueInboxTarget(info.fileName());
-        if (!copyRecursively(path, destination, errorMessage)) {
-            return false;
-        }
-        if (savedPath != nullptr) {
-            *savedPath = multipleSources ? destinationRoot : destination;
-        }
+    if (savedPath != nullptr) {
+        *savedPath = destinationRoot;
     }
-
-    if (savedPath != nullptr && !savedPath->isEmpty()) {
-        markInboxTargetManaged(*savedPath);
-        pruneManagedInbox();
-    }
+    markInboxTargetManaged(destinationRoot);
+    pruneManagedInbox();
     return true;
 }
 

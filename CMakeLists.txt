@@ -139,14 +139,9 @@ if (UNIX)
         find_package (CURL)
         if (CURL_FOUND)
             set (HAVE_LIBCURL 1)
-            include_directories(${CURL_INCLUDE_DIRS})
-            # Use system curl shared lib on Linux (xdev-usr has only static lib with many missing deps).
-            if (UNIX AND NOT APPLE)
-                list (APPEND libs curl brotlicommon brotlidec brotlienc ssh2 ssl crypto gssapi_krb5 ldap lber z pthread idn2 nghttp2 rtmp zstd psl ssh2 ssl crypto)
-                link_directories("/usr/lib/x86_64-linux-gnu")
-            else()
-                list (APPEND libs ${CURL_LIBRARIES})
-            endif()
+            # Carry includes and link requirements from the selected toolchain.
+            # Do not substitute libraries from the build host's architecture.
+            list (APPEND libs CURL::libcurl)
         else()
             message (WARNING "libcurl not found; Unix internet helpers will be built in disabled mode")
         endif()
