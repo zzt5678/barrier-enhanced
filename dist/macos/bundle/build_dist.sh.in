@@ -73,19 +73,67 @@ if [ -z "$DEPLOYQT" ] || [ ! -x "$DEPLOYQT" ]; then
     exit 1
 fi
 
-# Use macdeployqt to include libraries and create dmg
+# Deploy dependencies first. macdeployqt can report signing errors yet return
+# success, so signing and strict verification are explicit gates before a DMG.
 if [ "$B_BUILDTYPE" = "Release" ]; then
     info "Building Release disk image (dmg)"
-    "$DEPLOYQT" Weave.app -dmg \
+    "$DEPLOYQT" Weave.app \
     -executable="$B_BARRIERC" \
     -executable="$B_BARRIERS" || exit 1
-    mv "Weave.dmg" "Weave-$B_VERSION.dmg" || exit 1
-    success "Created Weave-$B_VERSION.dmg"
 else
     warn "Disk image (dmg) only created for Release builds"
     info "Building debug bundle"
     "$DEPLOYQT" Weave.app -no-strip \
     -executable="$B_BARRIERC" \
     -executable="$B_BARRIERS" || exit 1
-    success "Bundle created successfully"
+fi
+
+# Qt 5's deployer can omit WebP's @rpath SharpYUV dependency. Resolve it
+# beside the original WebP install ID, not from an architecture-specific prefix.
+for webp in Weave.app/Contents/Frameworks/libwebp*.dylib; do
+    [ -f "$webp" ] || continue
+    if otool -L "$webp" | grep -q '@rpath/libsharpyuv.0.dylib'; then
+        sharp="Weave.app/Contents/Frameworks/libsharpyuv.0.dylib"
+        if [ ! -f "$sharp" ]; then
+            origin="$(otool -D "$webp" | sed -n '2p')"
+            case "$origin" in
+                /*) ;;
+                *)
+                    # macdeployqt may already have rewritten the install ID.
+                    # Query the matching Qt installation's original plugin.
+                    qmake="$(dirname "$DEPLOYQT")/qmake"
+                    plugins="$("$qmake" -query QT_INSTALL_PLUGINS)" || exit 1
+                    origin="$(otool -L "$plugins/imageformats/libqwebp.dylib" |
+                        awk '$1 ~ /\/libwebp\.[0-9].*dylib$/ {print $1; exit}')" || exit 1
+                    ;;
+            esac
+            source="$(dirname "$origin")/libsharpyuv.0.dylib"
+            if [ ! -f "$source" ]; then
+                error "Missing WebP dependency: $source"
+                exit 1
+            fi
+            cp "$source" "$sharp" || exit 1
+            chmod u+w "$sharp" || exit 1
+            install_name_tool -id '@loader_path/libsharpyuv.0.dylib' "$sharp" || exit 1
+        fi
+        install_name_tool -change '@rpath/libsharpyuv.0.dylib' \
+            '@loader_path/libsharpyuv.0.dylib' "$webp" || exit 1
+    fi
+done
+
+# Local ad-hoc signing supports Apple Silicon execution; this is not notarized.
+minimum_os="$(bash "$(dirname "$0")/minimum_macos.sh" Weave.app)" || {
+    error "Could not determine minimum macOS version from bundled Mach-O files"
+    exit 1
+}
+"${PLISTBUDDY:-/usr/libexec/PlistBuddy}" -c \
+    "Set :LSMinimumSystemVersion $minimum_os" Weave.app/Contents/Info.plist || exit 1
+codesign --force --deep --sign - Weave.app || exit 1
+codesign --verify --deep --strict Weave.app || exit 1
+if [ "$B_BUILDTYPE" = "Release" ]; then
+    hdiutil create -ov -format UDZO -volname Weave \
+        -srcfolder Weave.app "Weave-$B_VERSION.dmg" || exit 1
+    success "Created Weave-$B_VERSION.dmg (ad-hoc signed, not notarized)"
+else
+    success "Bundle created successfully (ad-hoc signed, not notarized)"
 fi
