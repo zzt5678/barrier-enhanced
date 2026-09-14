@@ -986,6 +986,63 @@ TEST(ServerProxyTests, largeClipboardUsesAsyncSenderAndCanBeReaped)
     EXPECT_EQ(kDataEnd, clipboardMarks.back());
 }
 
+TEST(ServerProxyTests, otherClipboardWaitsWithoutCancellingOrStealingAsyncResult)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents, clientEvents, screenEvents);
+    TestScreen screen;
+    Client client(&events, "client", NetworkAddress(), new DummySocketFactory(),
+                  &screen, ClientArgs());
+    NiceMock<MockStream> stream;
+    ON_CALL(stream, getEventTarget()).WillByDefault(Return(&stream));
+    ON_CALL(stream, getBufferedOutputSize()).WillByDefault(Return(0u));
+    ON_CALL(events, getQueuedEventCount()).WillByDefault(Return(0u));
+    std::atomic<bool> started(false);
+    std::atomic<bool> release(false);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([&](const Event& event) {
+        if (event.getType() == clipboardEvents.clipboardSending()) {
+            started.store(true);
+            while (!release.load()) {
+                std::this_thread::yield();
+            }
+        }
+        Event::deleteData(event);
+    }));
+    ServerProxy proxy(&client, &stream, &events, 8);
+    const auto image = std::make_shared<const std::string>(300 * 1024, 'x');
+    const auto selection = std::make_shared<const std::string>("selection");
+    ASSERT_EQ(ServerProxy::kClipboardSendPending,
+              proxy.onClipboardDataChanged(kClipboardClipboard, image, false));
+    while (!started.load()) {
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(ServerProxy::kClipboardSendFailed,
+              proxy.onClipboardDataChanged(kClipboardSelection, selection, false));
+    Clipboard selectionClipboard;
+    selectionClipboard.open(41);
+    selectionClipboard.add(IClipboard::kText, "selection");
+    selectionClipboard.close();
+    EXPECT_EQ(ServerProxy::kClipboardSendFailed,
+              proxy.onClipboardChanged(kClipboardSelection, &selectionClipboard));
+    release.store(true);
+    ASSERT_TRUE(proxy.m_clipboardSendThread->wait(2.0));
+    // Even a completed result belongs to clipboard 0 until its caller reaps it.
+    EXPECT_EQ(ServerProxy::kClipboardSendFailed,
+              proxy.onClipboardDataChanged(kClipboardSelection, selection, false));
+    bool succeeded = false;
+    EXPECT_FALSE(proxy.reapClipboardSendResult(kClipboardSelection, succeeded));
+    EXPECT_TRUE(proxy.reapClipboardSendResult(kClipboardClipboard, succeeded));
+    EXPECT_TRUE(succeeded);
+    EXPECT_EQ(ServerProxy::kClipboardSendQueued,
+              proxy.onClipboardDataChanged(kClipboardSelection, selection, false));
+}
+
 TEST(ServerProxyTests, smallFileClipboardMetadataUsesBulkStream)
 {
     NiceMock<MockEventQueue> events;

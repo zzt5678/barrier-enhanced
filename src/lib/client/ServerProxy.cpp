@@ -754,6 +754,12 @@ ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard* clipboard)
         return kClipboardSendFailed;
     }
 
+    // Each clipboard has an independent owner/retry state, but shares this
+    // sender. Another selection must not cancel it or consume its result.
+    if (m_clipboardSendThread != NULL && m_clipboardSendId != id) {
+        return kClipboardSendFailed;
+    }
+
     // Do not marshal a potentially large clipboard when the previous sender
     // cannot yet be reaped. The immutable snapshot overload performs the same
     // gate before touching its payload.
@@ -785,6 +791,13 @@ ServerProxy::onClipboardDataChanged(
     if (m_protocolMinorVersion < 12 && needsOrderedBulkRoute) {
         LOG((CLOG_WARN
             "not sending ordered file clipboard metadata to a legacy server"));
+        return kClipboardSendFailed;
+    }
+
+    // Preserve both an in-flight send and an unconsumed completion for the
+    // originating clipboard. The other clipboard's existing retry will resume
+    // after that owner has reaped the result.
+    if (m_clipboardSendThread != NULL && m_clipboardSendId != id) {
         return kClipboardSendFailed;
     }
 
@@ -862,7 +875,7 @@ ServerProxy::sendClipboardThread(const std::shared_ptr<const std::string>& data,
 bool
 ServerProxy::reapClipboardSendResult(ClipboardID id, bool& succeeded)
 {
-    if (m_clipboardSendThread == NULL) {
+    if (m_clipboardSendThread == NULL || m_clipboardSendId != id) {
         return false;
     }
     if (!m_clipboardSendThread->wait(0.0)) {
