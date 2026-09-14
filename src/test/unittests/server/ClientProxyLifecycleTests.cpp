@@ -2140,6 +2140,157 @@ TEST(ClientProxyLifecycleTests, queuedFileClipboardRouteLossRedirtiesOnlyMatchin
     }
 }
 
+TEST(ClientProxyLifecycleTests, smallClipboardWaitsForBulkButLegacyUsesControl)
+{
+    for (bool modern : {false, true}) {
+        NiceMock<MockEventQueue> events;
+        IStreamEvents streamEvents;
+        ClipboardEvents clipboardEvents;
+        FileEvents fileEvents;
+        Event::Type nextType = Event::kLast;
+        setClientProxy16EventDefaults(events, streamEvents, clipboardEvents, fileEvents, nextType);
+        NiceMock<MockServer> server;
+        RecordingStream* control = new RecordingStream();
+        std::unique_ptr<ClientProxy1_6> proxy(modern
+            ? static_cast<ClientProxy1_6*>(new ClientProxy1_12("client", control, &server, &events))
+            : new ClientProxy1_6("client", control, &server, &events));
+        control->clear();
+        ON_CALL(events, addEvent(_)).WillByDefault(Invoke([&](const Event& event) {
+            if (event.getType() == clipboardEvents.clipboardSending()) {
+                proxy->testHandleClipboardSendingChunk(
+                    static_cast<ClipboardChunk*>(event.getDataObject()));
+            }
+            Event::deleteData(event);
+        }));
+        Clipboard clipboard;
+        clipboard.open(0);
+        clipboard.add(IClipboard::kText, "small");
+        clipboard.close();
+        proxy->setClipboardDirty(kClipboardClipboard, true);
+        proxy->setClipboard(kClipboardClipboard, &clipboard);
+        EXPECT_EQ(modern, proxy->testClipboardDirty(kClipboardClipboard));
+        EXPECT_EQ(modern, control->getSize() == 0);
+        if (modern) {
+            RecordingStream* bulk = new RecordingStream();
+            ASSERT_TRUE(proxy->attachBulkChannel(bulk));
+            EXPECT_FALSE(proxy->testClipboardDirty(kClipboardClipboard));
+            EXPECT_GT(bulk->getSize(), 4u); // acceptance plus clipboard frames
+            EXPECT_EQ(0u, control->getSize());
+        }
+    }
+}
+
+TEST(ClientProxyLifecycleTests, incomingControlSelectionCannotEraseBulkFileMetadata)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents, fileEvents, nextType);
+    NiceMock<MockServer> server;
+    RecordingStream* control = new RecordingStream();
+    RecordingStream* bulk = new RecordingStream();
+    ClientProxy1_12 proxy("client", control, &server, &events);
+    ASSERT_TRUE(proxy.attachBulkChannel(bulk));
+    control->clear();
+    bulk->clear();
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+    Clipboard files = makeFileClipboard();
+    Clipboard selection;
+    selection.open(0);
+    selection.add(IClipboard::kText, "primary-selection");
+    selection.close();
+    const String fileData = files.marshall();
+    const String selectionData = selection.marshall();
+    const auto receive = [&](RecordingStream* stream, ClipboardChunk* chunk) {
+        ClipboardChunk::send(stream, chunk);
+        delete chunk;
+        char code[4];
+        EXPECT_EQ(4u, stream->read(code, sizeof(code)));
+        EXPECT_TRUE(proxy.recvClipboard(stream));
+    };
+    receive(bulk, ClipboardChunk::start(kClipboardClipboard, 1, std::to_string(fileData.size())));
+    receive(control, ClipboardChunk::start(kClipboardSelection, 1, std::to_string(selectionData.size())));
+    receive(control, ClipboardChunk::data(kClipboardSelection, 1, selectionData));
+    receive(control, ClipboardChunk::end(kClipboardSelection, 1));
+    receive(bulk, ClipboardChunk::data(kClipboardClipboard, 1, fileData));
+    receive(bulk, ClipboardChunk::end(kClipboardClipboard, 1));
+    Clipboard receivedFiles;
+    ASSERT_TRUE(proxy.getClipboard(kClipboardClipboard, &receivedFiles));
+    RemoteFileClipboard::Data metadata;
+    ASSERT_TRUE(RemoteFileClipboard::readFromClipboard(receivedFiles, metadata));
+    ASSERT_EQ(1u, metadata.paths.size());
+    EXPECT_EQ(barrier::fs::u8path("/tmp/small.txt"), metadata.paths.front());
+    Clipboard receivedSelection;
+    ASSERT_TRUE(proxy.getClipboard(kClipboardSelection, &receivedSelection));
+    ASSERT_TRUE(receivedSelection.open(0));
+    EXPECT_EQ("primary-selection", receivedSelection.get(IClipboard::kText));
+    receivedSelection.close();
+}
+
+TEST(ClientProxyLifecycleTests, fileMetadataAndPrimarySelectionShareReceiveFifo)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents, fileEvents, nextType);
+    NiceMock<MockServer> server;
+    RecordingStream* control = new RecordingStream();
+    RecordingStream* bulk = new RecordingStream();
+    ClientProxy1_12 proxy("client", control, &server, &events);
+    ASSERT_TRUE(proxy.attachBulkChannel(bulk));
+    control->clear();
+    bulk->clear();
+    std::vector<ClipboardChunk*> chunks;
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([&](const Event& event) {
+        if (event.getType() == clipboardEvents.clipboardSending()) {
+            chunks.push_back(static_cast<ClipboardChunk*>(event.getDataObject()));
+        }
+        else { Event::deleteData(event); }
+    }));
+    Clipboard files = makeFileClipboard();
+    Clipboard selection;
+    selection.open(0);
+    selection.add(IClipboard::kText, "primary-selection");
+    selection.close();
+    ASSERT_TRUE(proxy.queueFileClipboardMetadata(&files));
+    proxy.setClipboardDirty(kClipboardSelection, true);
+    proxy.setClipboard(kClipboardSelection, &selection);
+    ASSERT_EQ(6u, chunks.size());
+    for (ClipboardChunk* chunk : chunks) {
+        proxy.testHandleClipboardSendingChunk(chunk);
+        delete chunk;
+    }
+    // Deployed receivers share one assembler for both IDs/routes. A second
+    // start on control can erase metadata in progress on bulk, even though
+    // each stream is FIFO. All six frames must therefore share the bulk FIFO.
+    EXPECT_EQ(0u, control->getSize());
+    ClipboardChunk::ReceiveBuffer receiver;
+    std::vector<ClipboardID> completed;
+    while (bulk->isReady()) {
+        char code[4];
+        ASSERT_EQ(4u, bulk->read(code, sizeof(code)));
+        ASSERT_EQ(0, std::memcmp(code, kMsgDClipboard, sizeof(code)));
+        ClipboardID id;
+        UInt32 sequence;
+        const int result = ClipboardChunk::assemble(bulk, receiver, id, sequence);
+        ASSERT_NE(kError, result);
+        if (result == kFinish) {
+            EXPECT_TRUE(Clipboard::isValidMarshalled(receiver.data));
+            completed.push_back(id);
+            receiver.release();
+        }
+    }
+    ASSERT_EQ(2u, completed.size());
+    EXPECT_EQ(kClipboardClipboard, completed[0]);
+    EXPECT_EQ(kClipboardSelection, completed[1]);
+}
+
 TEST(ClientProxyLifecycleTests, fileMetadataGateWaitsForSenderAndReplaysCleanSnapshot)
 {
     NiceMock<MockEventQueue> events;

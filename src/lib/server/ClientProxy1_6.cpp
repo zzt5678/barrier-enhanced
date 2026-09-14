@@ -119,11 +119,12 @@ ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard* clipboard)
         size_t size = data->size();
         LOG((CLOG_DEBUG "sending clipboard %d to \"%s\"", id, getName().c_str()));
 
-        const bool needsOrderedBulkRoute =
-            id == kClipboardClipboard &&
-            RemoteFileClipboard::containsFileList(m_clipboard[id].m_clipboard);
-        const bool requiresBulk =
-            data->size() > kSynchronousClipboardSendLimit || needsOrderedBulkRoute;
+        // Deployed receivers use a single clipboard assembler. Splitting
+        // small PRIMARY snapshots onto control while file/image snapshots
+        // use bulk lets one stream's start erase the other's in-flight data.
+        // Keep every clipboard ID on the same FIFO, including before the
+        // initial bulk attachment (which will retry the dirty snapshot).
+        const bool requiresBulk = supportsBulkChannel();
         m_clipboardBulkChannel = requiresBulk ? acquireBulkChannel() :
             std::shared_ptr<barrier::BulkChannel>();
         if (requiresBulk && supportsBulkChannel() && !m_clipboardBulkChannel) {
@@ -336,6 +337,12 @@ void
 ClientProxy1_6::handleBulkSendDisconnected(
     barrier::BulkChannel* channel)
 {
+    const std::shared_ptr<barrier::BulkChannel> receiveChannel =
+        m_clipboardReceiveBulkChannel.lock();
+    if (receiveChannel && receiveChannel.get() == channel) {
+        m_bulkClipboardReceiveBuffer.release();
+        m_clipboardReceiveBulkChannel.reset();
+    }
     if (m_clipboardBulkChannel &&
         m_clipboardBulkChannel.get() == channel && m_clipboardChunker) {
         m_clipboardChunker->interruptFile();
@@ -404,26 +411,41 @@ ClientProxy1_6::recvClipboard(barrier::IStream* stream)
     ClipboardID id;
     UInt32 seq;
 
-    int r = ClipboardChunk::assemble(stream, m_clipboardReceiveBuffer, id, seq);
+    ClipboardChunk::ReceiveBuffer* receiveBuffer = &m_clipboardReceiveBuffer;
+    if (stream != getStream()) {
+        const std::shared_ptr<barrier::BulkChannel> channel = acquireBulkChannel();
+        if (!channel || channel->getStream() != stream) {
+            return false;
+        }
+        if (m_clipboardReceiveBulkChannel.lock() != channel) {
+            m_bulkClipboardReceiveBuffer.release();
+            m_clipboardReceiveBulkChannel = channel;
+        }
+        receiveBuffer = &m_bulkClipboardReceiveBuffer;
+    }
+    // Older clients still send tiny selections on control and file metadata
+    // on bulk. Their independent arrival order must not share assembly state.
+    ClipboardChunk::ReceiveBuffer& buffer = *receiveBuffer;
+    int r = ClipboardChunk::assemble(stream, buffer, id, seq);
 
     if (r == kStart) {
-        size_t size = m_clipboardReceiveBuffer.expectedSize;
+        size_t size = buffer.expectedSize;
         LOG((CLOG_DEBUG "receiving clipboard %d size=%d", id, size));
     }
     else if (r == kFinish) {
         LOG((CLOG_DEBUG "received client \"%s\" clipboard %d seqnum=%d, size=%d",
-                getName().c_str(), id, seq, m_clipboardReceiveBuffer.data.size()));
-        if (!Clipboard::isValidMarshalled(m_clipboardReceiveBuffer.data)) {
+                getName().c_str(), id, seq, buffer.data.size()));
+        if (!Clipboard::isValidMarshalled(buffer.data)) {
             LOG((CLOG_ERR
                 "rejected malformed clipboard payload from client \"%s\"",
                 getName().c_str()));
-            m_clipboardReceiveBuffer.release();
+            buffer.release();
             return false;
         }
         // save clipboard
-        m_clipboard[id].m_clipboard.unmarshall(m_clipboardReceiveBuffer.data, 0);
+        m_clipboard[id].m_clipboard.unmarshall(buffer.data, 0);
         m_clipboard[id].m_sequenceNumber = seq;
-        m_clipboardReceiveBuffer.release();
+        buffer.release();
 
         // notify
         ClipboardInfo* info = (ClipboardInfo*)malloc(sizeof(ClipboardInfo));

@@ -85,6 +85,8 @@ private:
 private:
     IEventQueue*        m_events;
     ClipboardChunk::ReceiveBuffer m_clipboardReceiveBuffer;
+    ClipboardChunk::ReceiveBuffer m_bulkClipboardReceiveBuffer;
+    std::weak_ptr<barrier::BulkChannel> m_clipboardReceiveBulkChannel;
     Thread*             m_clipboardSendThread;
     std::shared_ptr<StreamChunker> m_clipboardChunker;
     ClipboardID         m_clipboardSendId;
