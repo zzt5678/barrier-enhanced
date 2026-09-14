@@ -20,6 +20,9 @@
 #include <algorithm>
 
 #include "MainWindow.h"
+#include "WorkspaceDashboard.h"
+#include "ExternalScreenLayout.h"
+#include <QFileInfo>
 
 #include "AboutDialog.h"
 #include "ServerConfigDialog.h"
@@ -224,7 +227,25 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     controlCenterLayout->setSpacing(0);
     controlCenterLayout->addWidget(scrollArea, 1);
     controlCenterLayout->addWidget(controlBar);
-    setCentralWidget(controlCenter);
+    m_workspaceDashboard = new WorkspaceDashboard(controlCenter, this);
+    setCentralWidget(m_workspaceDashboard);
+    heroCard->hide();
+    overviewCard->hide();
+    workflowCard->hide();
+    connect(m_workspaceDashboard, &WorkspaceDashboard::arrangeRequested, this,
+            [this]{ showConfigureServer(); updateWorkspaceDashboard(); });
+    connect(m_workspaceDashboard, &WorkspaceDashboard::sharingRequested,
+            m_pButtonToggleStart, &QPushButton::click);
+    connect(m_workspaceDashboard, &WorkspaceDashboard::transfersRequested,
+            this, &MainWindow::showWorkflowHub);
+    connect(m_workspaceDashboard, &WorkspaceDashboard::preferencesRequested,
+            this, &MainWindow::on_m_pActionSettings_triggered);
+    connect(m_workspaceDashboard, &WorkspaceDashboard::inboxRequested, this, [this]{
+        if (m_pWorkflowStore) QDesktopServices::openUrl(QUrl::fromLocalFile(m_pWorkflowStore->inboxDir()));
+    });
+    connect(m_pLineEditHostname, &QLineEdit::textChanged, this, &MainWindow::updateWorkspaceDashboard);
+    connect(m_pLineEditConfigFile, &QLineEdit::textChanged, this, &MainWindow::updateWorkspaceDashboard);
+    connect(m_pRadioExternalConfig, &QRadioButton::toggled, this, &MainWindow::updateWorkspaceDashboard);
     setMinimumSize(QSize(560, 420));
 
     // Apply modern dark theme from QSS resource file
@@ -377,6 +398,7 @@ void MainWindow::activateFromSecondaryInstance()
 void MainWindow::setStatus(const QString &status)
 {
     m_pStatusLabel->setText(status);
+    updateWorkspaceDashboard();
 }
 
 void MainWindow::createTrayIcon()
@@ -417,6 +439,7 @@ void MainWindow::retranslateMenuBar()
 
 void MainWindow::retranslateDashboard()
 {
+    if (m_workspaceDashboard) { m_workspaceDashboard->retranslate(); updateWorkspaceDashboard(); }
     m_pLabelHeroTitle->setText(tr("Weave"));
     m_pLabelHeroSubtitle->setText(tr("Share one keyboard, mouse, clipboard, and files across your desk."));
     m_pGroupClient->setTitle(tr("Join another computer"));
@@ -1859,6 +1882,7 @@ void MainWindow::showConfigureServer(const QString& message)
     m_pCheckBoxEnableDragDrop->setChecked(serverConfig().enableDragAndDrop());
     appConfig().setEnableDragDrop(serverConfig().enableDragAndDrop());
     appConfig().saveSettings();
+    updateWorkspaceDashboard();
 }
 
 void MainWindow::on_m_pButtonConfigureServer_clicked()
@@ -2127,6 +2151,7 @@ void MainWindow::updateWorkflowPeerHint()
 
 void MainWindow::updateOverviewCards()
 {
+    updateWorkspaceDashboard();
     const bool serverMode = barrier_type() == BarrierType::Server;
     m_pLabelModeValue->setText(serverMode ? tr("Server") : tr("Client"));
 
@@ -2146,4 +2171,51 @@ void MainWindow::updateOverviewCards()
     if (!m_pWorkflowStore) {
         m_pLabelWorkflowRuntimeValue->setText(tr("Unavailable"));
     }
+}
+
+void MainWindow::updateWorkspaceDashboard()
+{
+    if (!m_workspaceDashboard) return;
+    const bool serverMode = barrier_type() == BarrierType::Server;
+    QVector<WorkspaceDevice> devices;
+    const QString localName = getScreenName();
+    if (serverMode && !m_pRadioExternalConfig->isChecked()) {
+        const ServerConfig& config = m_ServerConfig;
+        const auto& screens = config.screens();
+        for (size_t i = 0; i < screens.size(); ++i) {
+            const auto& screen = screens[i];
+            if (!screen.isNull()) devices.append({screen.name(),
+                QPoint(int(i) % config.numColumns(), int(i) / config.numColumns()),
+                screen.name() == localName || screen.aliases().contains(localName)});
+        }
+    } else {
+        devices.append({localName, QPoint(0,0), true});
+    }
+    QString layoutNotice;
+    if (!serverMode && !hostname().isEmpty()) layoutNotice = tr("Server: %1").arg(hostname());
+    if (serverMode && m_pRadioExternalConfig->isChecked()) {
+        QFile external(m_pLineEditConfigFile->text());
+        if (QFileInfo(external).isFile() && external.open(QIODevice::ReadOnly) && external.size() <= ExternalScreenLayout::maximumCharacters) {
+            const auto parsed = ExternalScreenLayout::parse(QString::fromUtf8(external.readAll()));
+            if (parsed.trustworthy) {
+                devices.clear();
+                for (const auto& device : parsed.devices)
+                    devices.append({device.name, QPoint(device.x, device.y), device.name == localName});
+            } else layoutNotice = tr("External layout could not be displayed. Your configuration is unchanged.");
+        } else layoutNotice = tr("External layout could not be displayed. Your configuration is unchanged.");
+    }
+    m_workspaceDashboard->setDevices(devices);
+    m_workspaceDashboard->setConnectionState(layoutNotice.isEmpty() ? m_pStatusLabel->text() : m_pStatusLabel->text()+"\n"+layoutNotice,
+        m_ExpectedRunningState == kStarted, serverMode && !m_pRadioExternalConfig->isChecked());
+    QStringList transfers;
+    if (m_pWorkflowStore) {
+        const auto& receipts = m_pWorkflowStore->receipts();
+        for (int i = 0; i < qMin(3, receipts.size()); ++i) {
+            const auto& receipt = receipts[i];
+            transfers.append(QStringLiteral("%1  ·  %2\n%3")
+                .arg(receipt.status, receipt.detail.isEmpty() ? receipt.actionId : receipt.detail,
+                     receipt.createdAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm"))));
+        }
+    }
+    m_workspaceDashboard->setRecentTransfers(transfers);
 }

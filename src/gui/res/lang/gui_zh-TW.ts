@@ -175,6 +175,21 @@ Visit our website for help and info (symless.com).
 </context>
 <context>
     <name>MainWindow</name>
+    <message><source>Share this computer</source><translation>共享本機鍵鼠</translation></message>
+    <message><source>Join another computer</source><translation>連接另一台電腦</translation></message>
+    <message><source>Transfer and input</source><translation>傳輸與輸入</translation></message>
+    <message><source>Server name or IP address</source><translation>伺服器名稱或 IP 位址</translation></message>
+    <message><source>Choose a .conf file</source><translation>選擇 .conf 設定檔</translation></message>
+    <message><source>Settings</source><translation>設定</translation></message>
+    <message><source>Weave is running.</source><translation>共享服務執行中</translation></message>
+    <message><source>Weave is starting.</source><translation>正在啟動共享服務…</translation></message>
+    <message><source>Weave is not running.</source><translation>共享服務尚未啟動</translation></message>
+    <message><source>Transferring data...</source><translation>正在傳輸資料…</translation></message>
+    <message><source>Incompatible peer version. Update Weave on both computers, then press Start.</source><translation>對端版本不相容。請更新兩台電腦上的 Weave，然後開始共享。</translation></message>
+    <message><source>Weave stopped unexpectedly. Retrying in %1 second(s).</source><translation>共享服務意外停止，將在 %1 秒後重試。</translation></message>
+    <message><source>Stopping the Weave background service...</source><translation>正在停止共享服務…</translation></message>
+    <message><source>Server: %1</source><translation>伺服器：%1</translation></message>
+    <message><source>External layout could not be displayed. Your configuration is unchanged.</source><translation>暫時無法顯示外部設定的排列，原設定未被修改。</translation></message>
     <message>
         <location filename="src/MainWindow.cpp" line="790"/>
         <source>&amp;Start</source>
@@ -391,6 +406,14 @@ To automatically trust this fingerprint for future connections, click Yes. To re
 </context>
 <context>
     <name>MainWindowBase</name>
+    <message><source>Se&amp;ttings</source><translation>設定(&amp;T)</translation></message>
+    <message><source>Share this computer's mouse and keyboard with the rest of the desk.</source><translation>使用本機的鍵盤和滑鼠控制其他裝置。</translation></message>
+    <message><source>Configure interactively</source><translation>透過介面設定排列</translation></message>
+    <message><source>Use an existing configuration</source><translation>使用現有設定檔</translation></message>
+    <message><source>Let another computer drive this screen with the same layout and low-latency defaults.</source><translation>由另一台電腦的鍵鼠控制本機。</translation></message>
+    <message><source>Enable file, folder, and image drag and drop</source><translation>啟用檔案、資料夾和圖片傳輸</translation></message>
+    <message><source>Prefer lowest-latency server behavior</source><translation>優先使用低延遲輸入模式</translation></message>
+    <message><source>Core keyboard and mouse sharing stays optimized by default. These options tune transfer and server-side edge behavior further.</source><translation>鍵鼠共享預設已最佳化，可在此調整傳輸和跨螢幕體驗。</translation></message>
     <message>
         <location filename="res/MainWindowBase.ui" line="26"/>
         <source>Barrier</source>
@@ -1415,5 +1438,54 @@ Server response:
         <source>%1</source>
         <translation type="unfinished"></translation>
     </message>
+</context>
+<context>
+    <name>WorkspaceDashboard</name>
+    <message><source>Double-click a record or press Enter to open transfer history.</source><translation>按兩下記錄或按 Enter 鍵查看傳輸歷史。</translation></message>
+    <message><source>Arrange your configured computers.</source><translation>調整已設定裝置的排列。</translation></message>
+    <message><source>Layout is managed by the server configuration. View it in Settings.</source><translation>排列由伺服器設定管理，請在設定中查看。</translation></message>
+    <message><source>My devices</source><translation>我的裝置</translation></message>
+    <message><source>Devices</source><translation>裝置</translation></message>
+    <message><source>Transfers</source><translation>傳輸</translation></message>
+    <message><source>Settings</source><translation>設定</translation></message>
+    <message><source>Arrange layout</source><translation>調整排列</translation></message>
+    <message><source>Pause sharing</source><translation>暫停共享</translation></message>
+    <message><source>Start sharing</source><translation>開始共享</translation></message>
+    <message><source>Recent transfers</source><translation>最近傳輸</translation></message>
+    <message><source>Open inbox</source><translation>開啟接收資料夾</translation></message>
+    <message><source>Application preferences</source><translation>應用程式偏好設定</translation></message>
+    <message><source>No transfers yet. Received files and transfer activity will appear here.</source><translation>尚無傳輸記錄，接收的檔案和傳輸活動會顯示在這裡。</translation></message>
+    <message><source>This computer</source><translation>本機</translation></message>
+    <message><source>Configured · status unknown</source><translation>已設定 · 狀態未知</translation></message>
+    <message><source>Your configured computers will appear here.</source><translation>設定完成後，裝置會顯示在這裡。</translation></message>
+</context>
+<context>
+    <name>WorkflowHubDialog</name>
+    <message><source>Execute Suggestion</source><translation>執行建議</translation></message>
+    <message><source>Open</source><translation>開啟</translation></message>
+    <message><source>Save to Inbox</source><translation>儲存到接收資料夾</translation></message>
+    <message><source>Reveal</source><translation>在資料夾中顯示</translation></message>
+    <message><source>Weave Workflow Hub</source><translation>Weave 傳輸與歷史</translation></message>
+    <message><source>No preview</source><translation>尚無預覽</translation></message>
+    <message><source>History</source><translation>剪貼簿歷史</translation></message>
+    <message><source>Suggestions</source><translation>操作建議</translation></message>
+    <message><source>Receipts</source><translation>傳輸記錄</translation></message>
+    <message><source>Workflow Hub</source><translation>傳輸與歷史</translation></message>
+    <message><source>Review transferred context, suggested follow-up actions, and every receipt Weave records while you move content between devices.</source><translation>查看跨裝置傳輸的內容、操作建議與記錄。</translation></message>
+    <message><source>Collected Context</source><translation>內容與記錄</translation></message>
+    <message><source>Switch between history, suggestions, and receipts without leaving the desktop.</source><translation>切換查看剪貼簿歷史、建議和傳輸記錄。</translation></message>
+    <message><source>Inspector</source><translation>內容詳情</translation></message>
+    <message><source>Preview payloads, inspect transfer metadata, and execute the next step from one place.</source><translation>預覽內容、查看傳輸詳情並選擇後續操作。</translation></message>
+    <message><source>Capture Screenshot</source><translation>擷取螢幕</translation></message>
+    <message><source>Open Inbox</source><translation>開啟接收資料夾</translation></message>
+    <message><source>Cancel Save</source><translation>取消儲存</translation></message>
+    <message><source>Cancel the active inbox save; completed files are kept.</source><translation>取消目前儲存，保留已完成的檔案。</translation></message>
+    <message><source>Close</source><translation>關閉</translation></message>
+    <message><source>Runtime: %1 | Inbox: %2</source><translation>狀態：%1 ｜ 接收位置：%2</translation></message>
+    <message><source>Capabilities: %1</source><translation>支援能力：%1</translation></message>
+    <message><source>Sensitive content. Confirmation is required for risky actions.</source><translation>此內容可能敏感，執行高風險操作前需要確認。</translation></message>
+    <message><source>Requires confirmation.</source><translation>需要確認。</translation></message>
+    <message><source>&lt;p&gt;Select a history item, suggestion, or receipt.&lt;/p&gt;</source><translation>&lt;p&gt;請選擇一條歷史內容、操作建議或傳輸記錄。&lt;/p&gt;</translation></message>
+    <message><source>Workflow Action Failed</source><translation>操作失敗</translation></message>
 </context>
 </TS>

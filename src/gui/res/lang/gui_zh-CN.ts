@@ -205,6 +205,21 @@ Barrier GUI 基于 Volker Lanz 制作的 QSynergy.
 </context>
 <context>
     <name>MainWindow</name>
+    <message><source>Share this computer</source><translation>共享本机键鼠</translation></message>
+    <message><source>Join another computer</source><translation>连接另一台电脑</translation></message>
+    <message><source>Transfer and input</source><translation>传输与输入</translation></message>
+    <message><source>Server name or IP address</source><translation>服务器名称或 IP 地址</translation></message>
+    <message><source>Choose a .conf file</source><translation>选择 .conf 配置文件</translation></message>
+    <message><source>Settings</source><translation>设置</translation></message>
+    <message><source>Weave is running.</source><translation>共享服务运行中</translation></message>
+    <message><source>Weave is starting.</source><translation>正在启动共享服务…</translation></message>
+    <message><source>Weave is not running.</source><translation>共享服务未启动</translation></message>
+    <message><source>Transferring data...</source><translation>正在传输数据…</translation></message>
+    <message><source>Incompatible peer version. Update Weave on both computers, then press Start.</source><translation>对端版本不兼容。请更新两台电脑上的 Weave，然后开始共享。</translation></message>
+    <message><source>Weave stopped unexpectedly. Retrying in %1 second(s).</source><translation>共享服务意外停止，将在 %1 秒后重试。</translation></message>
+    <message><source>Stopping the Weave background service...</source><translation>正在停止共享服务…</translation></message>
+    <message><source>Server: %1</source><translation>服务器：%1</translation></message>
+    <message><source>External layout could not be displayed. Your configuration is unchanged.</source><translation>暂时无法显示外部配置的布局，原配置未被修改。</translation></message>
     <message>
         <location filename="../../src/MainWindow.cpp" line="790"/>
         <source>&amp;Start</source>
@@ -405,6 +420,14 @@ To automatically trust this fingerprint for future connections, click Yes. To re
 </context>
 <context>
     <name>MainWindowBase</name>
+    <message><source>Se&amp;ttings</source><translation>设置(&amp;T)</translation></message>
+    <message><source>Share this computer's mouse and keyboard with the rest of the desk.</source><translation>使用本机的键盘和鼠标控制其他设备。</translation></message>
+    <message><source>Configure interactively</source><translation>通过界面配置布局</translation></message>
+    <message><source>Use an existing configuration</source><translation>使用现有配置文件</translation></message>
+    <message><source>Let another computer drive this screen with the same layout and low-latency defaults.</source><translation>由另一台电脑的键鼠控制本机。</translation></message>
+    <message><source>Enable file, folder, and image drag and drop</source><translation>启用文件、文件夹和图片传输</translation></message>
+    <message><source>Prefer lowest-latency server behavior</source><translation>优先使用低延迟输入模式</translation></message>
+    <message><source>Core keyboard and mouse sharing stays optimized by default. These options tune transfer and server-side edge behavior further.</source><translation>键鼠共享默认已优化，可在此调整传输和跨屏体验。</translation></message>
     <message>
         <location filename="../../src/MainWindowBase.ui" line="26"/>
         <source>Barrier</source>
@@ -1319,5 +1342,54 @@ p, li { white-space: pre-wrap; }
         <source>%1</source>
         <translation>%1</translation>
     </message>
+</context>
+<context>
+    <name>WorkspaceDashboard</name>
+    <message><source>Double-click a record or press Enter to open transfer history.</source><translation>双击记录或按回车键查看传输历史。</translation></message>
+    <message><source>Arrange your configured computers.</source><translation>调整已配置设备的排列。</translation></message>
+    <message><source>Layout is managed by the server configuration. View it in Settings.</source><translation>布局由服务器配置管理，请在设置中查看。</translation></message>
+    <message><source>My devices</source><translation>我的设备</translation></message>
+    <message><source>Devices</source><translation>设备</translation></message>
+    <message><source>Transfers</source><translation>传输</translation></message>
+    <message><source>Settings</source><translation>设置</translation></message>
+    <message><source>Arrange layout</source><translation>调整布局</translation></message>
+    <message><source>Pause sharing</source><translation>暂停共享</translation></message>
+    <message><source>Start sharing</source><translation>开始共享</translation></message>
+    <message><source>Recent transfers</source><translation>最近传输</translation></message>
+    <message><source>Open inbox</source><translation>打开接收文件夹</translation></message>
+    <message><source>Application preferences</source><translation>应用偏好设置</translation></message>
+    <message><source>No transfers yet. Received files and transfer activity will appear here.</source><translation>暂无传输记录，接收的文件和传输活动会显示在这里。</translation></message>
+    <message><source>This computer</source><translation>本机</translation></message>
+    <message><source>Configured · status unknown</source><translation>已配置 · 状态未知</translation></message>
+    <message><source>Your configured computers will appear here.</source><translation>配置完成后，设备会显示在这里。</translation></message>
+</context>
+<context>
+    <name>WorkflowHubDialog</name>
+    <message><source>Execute Suggestion</source><translation>执行建议</translation></message>
+    <message><source>Open</source><translation>打开</translation></message>
+    <message><source>Save to Inbox</source><translation>保存到接收文件夹</translation></message>
+    <message><source>Reveal</source><translation>在文件夹中显示</translation></message>
+    <message><source>Weave Workflow Hub</source><translation>Weave 传输与历史</translation></message>
+    <message><source>No preview</source><translation>暂无预览</translation></message>
+    <message><source>History</source><translation>剪贴板历史</translation></message>
+    <message><source>Suggestions</source><translation>操作建议</translation></message>
+    <message><source>Receipts</source><translation>传输记录</translation></message>
+    <message><source>Workflow Hub</source><translation>传输与历史</translation></message>
+    <message><source>Review transferred context, suggested follow-up actions, and every receipt Weave records while you move content between devices.</source><translation>查看跨设备传输的内容、操作建议与记录。</translation></message>
+    <message><source>Collected Context</source><translation>内容与记录</translation></message>
+    <message><source>Switch between history, suggestions, and receipts without leaving the desktop.</source><translation>切换查看剪贴板历史、建议和传输记录。</translation></message>
+    <message><source>Inspector</source><translation>内容详情</translation></message>
+    <message><source>Preview payloads, inspect transfer metadata, and execute the next step from one place.</source><translation>预览内容、查看传输详情并选择后续操作。</translation></message>
+    <message><source>Capture Screenshot</source><translation>截图</translation></message>
+    <message><source>Open Inbox</source><translation>打开接收文件夹</translation></message>
+    <message><source>Cancel Save</source><translation>取消保存</translation></message>
+    <message><source>Cancel the active inbox save; completed files are kept.</source><translation>取消当前保存，保留已完成的文件。</translation></message>
+    <message><source>Close</source><translation>关闭</translation></message>
+    <message><source>Runtime: %1 | Inbox: %2</source><translation>状态：%1 ｜ 接收位置：%2</translation></message>
+    <message><source>Capabilities: %1</source><translation>支持能力：%1</translation></message>
+    <message><source>Sensitive content. Confirmation is required for risky actions.</source><translation>此内容可能敏感，执行高风险操作前需要确认。</translation></message>
+    <message><source>Requires confirmation.</source><translation>需要确认。</translation></message>
+    <message><source>&lt;p&gt;Select a history item, suggestion, or receipt.&lt;/p&gt;</source><translation>&lt;p&gt;请选择一条历史内容、操作建议或传输记录。&lt;/p&gt;</translation></message>
+    <message><source>Workflow Action Failed</source><translation>操作失败</translation></message>
 </context>
 </TS>

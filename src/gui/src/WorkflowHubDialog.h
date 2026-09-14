@@ -11,6 +11,7 @@ class QHideEvent;
 class QTabWidget;
 class QTextBrowser;
 class WorkflowStore;
+class ElidingLabel;
 
 class WorkflowHubDialog : public QDialog
 {
@@ -42,7 +43,7 @@ private:
 private:
     WorkflowStore* m_store;
     ActionBus* m_actionBus;
-    QLabel* m_runtimeLabel;
+    ElidingLabel* m_runtimeLabel;
     QLabel* m_capabilityLabel;
     QLabel* m_previewLabel;
     QTabWidget* m_tabs;

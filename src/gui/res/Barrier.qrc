@@ -10,6 +10,12 @@
         <file>icons/256x256/barrier.ico</file>
         <file>icons/256x256/weave.png</file>
         <file>image/about.png</file>
+        <file>image/device-display.png</file>
+        <file>icons/workspace/devices.png</file>
+        <file>icons/workspace/transfers.png</file>
+        <file>icons/workspace/settings.png</file>
+        <file>icons/workspace/folder.png</file>
+        <file>icons/workspace/COPYRIGHT</file>
         <file>lang/gui_ar.qm</file>
         <file>lang/gui_bg-BG.qm</file>
         <file>lang/gui_ca-AD.qm</file>

@@ -8,6 +8,8 @@ set (CMAKE_INCLUDE_CURRENT_DIR ON)
 
 # files that are used both in tests and the app
 set(GUI_COMMON_SOURCE_FILES
+    src/ExternalScreenLayout.cpp
+    src/WorkspaceDashboard.cpp
     src/Action.cpp
     src/CommandLine.cpp
     src/ElidingLabel.cpp
@@ -19,6 +21,8 @@ set(GUI_COMMON_SOURCE_FILES
 )
 
 set(GUI_COMMON_HEADER_FILES
+    src/ExternalScreenLayout.h
+    src/WorkspaceDashboard.h
     src/Action.h
     src/CommandLine.h
     src/ElidingLabel.h
@@ -241,6 +245,10 @@ endif()
 
 if (BARRIER_BUILD_TESTS)
     set(GUI_TEST_SOURCE_FILES
+        test/WorkflowHubDialogTests.cpp
+        src/WorkflowHubDialog.cpp
+        test/ExternalScreenLayoutTests.cpp
+        test/WorkspaceDashboardTests.cpp
         test/KeySequenceTests.cpp
         test/CommandLineTests.cpp
         test/ActionBusTests.cpp

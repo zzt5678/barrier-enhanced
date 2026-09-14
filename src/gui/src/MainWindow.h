@@ -62,6 +62,7 @@ class ActionBus;
 class WorkflowStore;
 class WorkflowHubDialog;
 class CommandPaletteDialog;
+class WorkspaceDashboard;
 
 class MainWindow : public QMainWindow, public Ui::MainWindowBase
 {
@@ -194,6 +195,7 @@ public slots:
         void showControlCenter();
         void updateWorkflowPeerHint();
         void updateOverviewCards();
+        void updateWorkspaceDashboard();
 
     private:
         QSettings& m_Settings;
@@ -236,6 +238,7 @@ public slots:
         quint64 m_PendingServiceStopRequestId;
         bool m_WindowGeometryInitialized;
         bool m_DashboardSingleColumn;
+        WorkspaceDashboard* m_workspaceDashboard = nullptr;
 
         bool m_fingerprint_expanded = false;
 

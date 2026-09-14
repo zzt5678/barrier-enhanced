@@ -2,12 +2,14 @@
 
 #include "ActionBus.h"
 #include "WorkflowStore.h"
+#include "ElidingLabel.h"
 
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDialogButtonBox>
 #include <QFileInfo>
 #include <QHBoxLayout>
+#include <QGridLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QListWidget>
@@ -42,7 +44,7 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     QDialog(parent),
     m_store(&store),
     m_actionBus(&actionBus),
-    m_runtimeLabel(new QLabel(this)),
+    m_runtimeLabel(new ElidingLabel(this)),
     m_capabilityLabel(new QLabel(this)),
     m_previewLabel(new QLabel(this)),
     m_tabs(new QTabWidget(this)),
@@ -58,6 +60,10 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     setWindowTitle(tr("Weave Workflow Hub"));
     resize(860, 620);
     setObjectName(QStringLiteral("WorkflowHubDialog"));
+    m_runtimeLabel->setObjectName(QStringLiteral("workflowRuntime"));
+    m_capabilityLabel->setWordWrap(true);
+    m_runtimeLabel->setTextFormat(Qt::PlainText);
+    m_capabilityLabel->setTextFormat(Qt::PlainText);
 
     m_previewLabel->setAlignment(Qt::AlignCenter);
     m_previewLabel->setMinimumHeight(140);
@@ -117,22 +123,21 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     rightCard->setLayout(detailLayout);
     contentLayout->addWidget(rightCard, 3);
 
-    auto* actionLayout = new QHBoxLayout;
+    auto* actionLayout = new QGridLayout;
     auto* screenshotButton = new QPushButton(tr("Capture Screenshot"), this);
     auto* inboxButton = new QPushButton(tr("Open Inbox"), this);
     auto* cancelSaveButton = new QPushButton(tr("Cancel Save"), this);
     cancelSaveButton->setToolTip(tr("Cancel the active inbox save; completed files are kept."));
     connect(cancelSaveButton, &QPushButton::clicked, m_actionBus, &ActionBus::cancelInboxSave);
     auto* closeButton = new QPushButton(tr("Close"), this);
-    actionLayout->addWidget(m_executeSuggestionButton);
-    actionLayout->addWidget(m_openButton);
-    actionLayout->addWidget(m_saveButton);
-    actionLayout->addWidget(m_revealButton);
-    actionLayout->addStretch();
-    actionLayout->addWidget(screenshotButton);
-    actionLayout->addWidget(inboxButton);
-    actionLayout->addWidget(cancelSaveButton);
-    actionLayout->addWidget(closeButton);
+    const QList<QPushButton*> actions{m_executeSuggestionButton, m_openButton,
+        m_saveButton, m_revealButton, screenshotButton, inboxButton, cancelSaveButton, closeButton};
+    for (int index = 0; index < actions.size(); ++index) {
+        actions[index]->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
+        actionLayout->addWidget(actions[index], index / 4, index % 4);
+    }
+    actionLayout->setHorizontalSpacing(10);
+    actionLayout->setVerticalSpacing(10);
 
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(20, 20, 20, 20);
