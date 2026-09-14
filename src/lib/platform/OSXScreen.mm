@@ -269,8 +269,7 @@ OSXScreen::getEventTarget() const
 bool
 OSXScreen::getClipboard(ClipboardID, IClipboard* dst) const
 {
-	Clipboard::copy(dst, &m_pasteboard);
-	return true;
+	return m_pasteboard.copyTo(dst);
 }
 
 void

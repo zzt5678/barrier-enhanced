@@ -197,6 +197,48 @@ OSXClipboard::~OSXClipboard()
     }
 }
 
+bool
+OSXClipboard::copyTo(IClipboard* dst) const
+{
+    assert(dst != NULL);
+    const Time time = getTime();
+    if (!open(time)) {
+        return false;
+    }
+    // Keep the same open/empty/close contract as IClipboard::copy, including
+    // closing both clipboards if a format read or allocation throws.
+    struct CloseClipboard {
+        const IClipboard* clipboard;
+        ~CloseClipboard() { clipboard->close(); }
+    } closeSource{this};
+    if (!dst->open(time)) {
+        return false;
+    }
+    CloseClipboard closeDestination{dst};
+    if (!dst->empty()) {
+        return false;
+    }
+
+    // The PNG converter returns empty on read/format failure. Only a
+    // successfully read PNG can replace the redundant BMP representation:
+    // some macOS providers regenerate BMP padding on each read, making an
+    // unchanged image appear to be a new clipboard and cancelling its send.
+    const std::string png = has(kPNG) ? get(kPNG) : std::string();
+    if (!png.empty()) {
+        dst->add(kPNG, png);
+    }
+    for (SInt32 format = 0; format != kNumFormats; ++format) {
+        const EFormat eFormat = static_cast<EFormat>(format);
+        if (eFormat == kPNG || (eFormat == kBitmap && !png.empty())) {
+            continue;
+        }
+        if (has(eFormat)) {
+            dst->add(eFormat, get(eFormat));
+        }
+    }
+    return true;
+}
+
     bool
 OSXClipboard::empty()
 {

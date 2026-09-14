@@ -46,6 +46,8 @@ public:
     virtual std::string get(EFormat) const;
 
     bool                synchronize();
+    //! Copy a stable snapshot, preferring successfully read PNG over BMP.
+    bool                copyTo(IClipboard* dst) const;
 private:
     void                clearConverters();
 
