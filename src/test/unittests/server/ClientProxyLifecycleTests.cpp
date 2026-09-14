@@ -2228,6 +2228,41 @@ TEST(ClientProxyLifecycleTests, clientProxy16ClearsClipboardDirtyAfterAsyncSendC
     EXPECT_FALSE(proxy.testClipboardDirty(kClipboardClipboard));
 }
 
+TEST(ClientProxyLifecycleTests, otherSelectionDoesNotCancelPendingImage)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents, fileEvents, nextType);
+    auto* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    std::atomic<bool> blocked(true);
+    std::atomic<bool> observed(false);
+    ON_CALL(*stream, getBufferedOutputSize()).WillByDefault(Invoke([&]() -> size_t {
+        observed.store(true);
+        return blocked.load() ? 64 * 1024 * 1024 : 0;
+    }));
+    NiceMock<MockServer> server;
+    ClientProxy1_6 proxy("client", stream, &server, &events);
+    Clipboard image = makeLargeClipboard();
+    proxy.setClipboardDirty(kClipboardClipboard, true);
+    proxy.setClipboard(kClipboardClipboard, &image);
+    for (int i = 0; i < 500 && !observed.load(); ++i) ARCH->sleep(0.001);
+    EXPECT_TRUE(observed.load());
+    CountingClipboard selection;
+    proxy.setClipboardDirty(kClipboardSelection, true);
+    proxy.setClipboard(kClipboardSelection, &selection);
+    // The deferred selection must be retained before its caller goes away.
+    EXPECT_GT(selection.openCount, 0);
+    blocked.store(false);
+    for (int i = 0; i < 500 && !proxy.cleanupClipboardSendThread(false); ++i)
+        ARCH->sleep(0.001);
+    EXPECT_TRUE(proxy.cleanupClipboardSendThread(false));
+    EXPECT_FALSE(proxy.testClipboardDirty(kClipboardClipboard));
+}
+
 TEST(ClientProxyLifecycleTests, clientProxy16CleanupFailureSkipsClipboardCopyAndMarshall)
 {
     NiceMock<MockEventQueue> events;

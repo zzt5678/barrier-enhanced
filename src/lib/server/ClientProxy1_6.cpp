@@ -85,6 +85,14 @@ ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard* clipboard)
 {
     // ignore if this clipboard is already clean
     if (m_clipboard[id].m_dirty) {
+        // Clipboard and primary selection share a sender, not ownership.
+        // Preserve this caller's snapshot for the retry without cancelling
+        // an unrelated image transfer or consuming its completion.
+        if (m_clipboardSendThread != NULL && m_clipboardSendId != id) {
+            Clipboard::copy(&m_clipboard[id].m_clipboard, clipboard);
+            scheduleClipboardSendRetry();
+            return;
+        }
         if (!cleanupClipboardSendThread(true)) {
             LOG((CLOG_WARN "clipboard %d send skipped for \"%s\" because previous sender is still stopping",
                 id, getName().c_str()));
