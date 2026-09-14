@@ -22,6 +22,7 @@
 #include "platform/MSWindowsDropTarget.h"
 #include "client/Client.h"
 #include "platform/MSWindowsClipboard.h"
+#include "platform/MSWindowsClipboardVirtualPNG.h"
 #include "platform/MSWindowsDesks.h"
 #include "platform/MSWindowsEventQueueBuffer.h"
 #include "platform/MSWindowsKeyState.h"
@@ -213,11 +214,10 @@ bool readClipboardSnapshot(
 
     if (bridgeResult == MSWindowsClipboardBridge::ReadResult::NotRequired) {
         Clipboard clipboard;
-        MSWindowsClipboard source(NULL);
         bool copied = false;
         for (int attempt = 0;
              attempt < kClipboardSnapshotReadAttempts && !copied; ++attempt) {
-            copied = Clipboard::copy(&clipboard, &source);
+            copied = MSWindowsClipboardVirtualPNG::copySnapshot(clipboard);
             if (!copied) {
                 ARCH->sleep(kClipboardSnapshotReadRetrySeconds);
             }

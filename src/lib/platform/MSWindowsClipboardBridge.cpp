@@ -13,6 +13,7 @@
 #include "base/Log.h"
 #include "common/win32/SessionUserImpersonation.h"
 #include "platform/MSWindowsClipboard.h"
+#include "platform/MSWindowsClipboardVirtualPNG.h"
 
 #include <openssl/rand.h>
 
@@ -1176,10 +1177,9 @@ int MSWindowsClipboardBridge::runHelper(const std::string& pipeName)
                 return 6;
             }
             Clipboard clipboard;
-            MSWindowsClipboard source(NULL);
             bool copied = false;
             for (int attempt = 0; attempt < 8 && !copied; ++attempt) {
-                copied = Clipboard::copy(&clipboard, &source);
+                copied = MSWindowsClipboardVirtualPNG::copySnapshot(clipboard);
                 if (!copied) {
                     Sleep(25);
                 }
