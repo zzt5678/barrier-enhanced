@@ -18,6 +18,7 @@
 #include "MSWindowsClipboardPNGConverter.h"
 #include "base/Log.h"
 #include <windows.h>
+#include <cstring>
 
 // Static format ID for PNG - registered at runtime
 static UINT s_pngFormatId = 0;
@@ -60,8 +61,7 @@ MSWindowsClipboardPNGConverter::fromIClipboard(const std::string& pngData) const
         return NULL;
     }
 
-    if (pngData[0] != 0x89 || pngData[1] != 'P' ||
-        pngData[2] != 'N' || pngData[3] != 'G') {
+    if (std::memcmp(pngData.data(), "\x89PNG\r\n\x1a\n", 8) != 0) {
         return NULL;
     }
 
