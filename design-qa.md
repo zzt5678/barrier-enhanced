@@ -34,6 +34,9 @@ Navigation Devices → Settings → Devices → Transfers was exercised.
   expanded it. Changed to two action rows and elided the path with full tooltip.
   Two tests reproduced the failure and passed after the fix; real dialog
   capture confirms full labels.
+- Live Ubuntu capture then exposed a status-source bug: the homepage copied
+  already-elided text from the hidden settings footer. It now reads the
+  ElidingLabel fullText contract; existing elision tests cover that source.
 
 An independent reviewer inspected target, desktop and narrow captures and
 confirmed no remaining P0/P1/P2 homepage findings. The actual transfer dialog

@@ -2205,7 +2205,10 @@ void MainWindow::updateWorkspaceDashboard()
         } else layoutNotice = tr("External layout could not be displayed. Your configuration is unchanged.");
     }
     m_workspaceDashboard->setDevices(devices);
-    m_workspaceDashboard->setConnectionState(layoutNotice.isEmpty() ? m_pStatusLabel->text() : m_pStatusLabel->text()+"\n"+layoutNotice,
+    // The settings-page status label may already be elided while hidden.
+    // The workspace has its own wrapping area and needs the original message.
+    const QString status = m_pStatusLabel->fullText();
+    m_workspaceDashboard->setConnectionState(layoutNotice.isEmpty() ? status : status+"\n"+layoutNotice,
         m_ExpectedRunningState == kStarted, serverMode && !m_pRadioExternalConfig->isChecked());
     QStringList transfers;
     if (m_pWorkflowStore) {
