@@ -614,11 +614,40 @@ OSXScreen::fakeMouseButton(ButtonID id, bool press)
 
 	if (!press && (id == kButtonLeft)) {
 		if (m_fakeDraggingStarted) {
-            m_getDropTargetThread = new Thread([this](){ get_drop_target_thread(); });
+            finishFakeDrag();
 		}
 
 		m_draggingStarted = false;
 	}
+}
+
+const std::string& OSXScreen::getDropTarget() const
+{
+    // The legacy interface returns a reference. Keep a caller-thread snapshot
+    // so Finder's background discovery cannot mutate it while it is copied.
+    thread_local std::string target;
+    std::lock_guard<std::mutex> lock(m_dropTargetMutex);
+    target = m_configuredDropTarget.empty() ? m_dropTarget : m_configuredDropTarget;
+    return target;
+}
+
+void OSXScreen::setDropTarget(const std::string& target)
+{
+    std::lock_guard<std::mutex> lock(m_dropTargetMutex);
+    m_configuredDropTarget = target;
+}
+
+void OSXScreen::finishFakeDrag()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_dropTargetMutex);
+        if (!m_configuredDropTarget.empty()) {
+            // A configured inbox does not depend on Finder's drop destination.
+            m_fakeDraggingStarted = false;
+            return;
+        }
+    }
+    m_getDropTargetThread = new Thread([this](){ get_drop_target_thread(); });
 }
 
 void OSXScreen::get_drop_target_thread()
@@ -631,8 +660,10 @@ void OSXScreen::get_drop_target_thread()
 
 	while (ARCH->time() < timeout) {
 		CFStringRef cfstr = getCocoaDropTarget();
-		cstr = CFStringRefToUTF8String(cfstr);
-		CFRelease(cfstr);
+        if (cfstr != NULL) {
+            cstr = CFStringRefToUTF8String(cfstr);
+            CFRelease(cfstr);
+        }
 
 		if (cstr != NULL) {
 			break;
@@ -642,12 +673,16 @@ void OSXScreen::get_drop_target_thread()
 
 	if (cstr != NULL) {
 		LOG((CLOG_DEBUG "drop target: %s", cstr));
-		m_dropTarget = cstr;
 	}
 	else {
 		LOG((CLOG_ERR "failed to get drop target"));
-		m_dropTarget.clear();
 	}
+    {
+        std::lock_guard<std::mutex> lock(m_dropTargetMutex);
+        // Discovery remains a fallback; it never writes the explicit inbox.
+        m_dropTarget = cstr != NULL ? cstr : "";
+    }
+    free(cstr);
 #else
 	LOG((CLOG_WARN "drag drop not supported"));
 #endif
@@ -1223,7 +1258,7 @@ OSXScreen::onMouseButton(bool pressed, UInt16 macButton)
 		}
 		else {
 			if (m_fakeDraggingStarted) {
-                m_getDropTargetThread = new Thread([this](){ get_drop_target_thread(); });
+                finishFakeDrag();
 			}
 
 			m_draggingStarted = false;

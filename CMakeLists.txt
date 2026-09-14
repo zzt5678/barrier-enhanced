@@ -315,6 +315,11 @@ if (UNIX)
     endif()
 
 elseif (${CMAKE_SYSTEM_NAME} MATCHES "Windows")
+    if (MSVC)
+        # Source strings are UTF-8 regardless of the Windows system code page.
+        set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /utf-8")
+        set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8")
+    endif()
     set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP /D _BIND_TO_CURRENT_VCLIBS_VERSION=1")
     set (CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MD /O2 /Ob2")
 
@@ -524,6 +529,9 @@ add_subdirectory (src)
 
 if (BARRIER_BUILD_TESTS)
     set (WEAVE_VERSION_TEST_TARGETS barrierc barriers)
+    if (WIN32)
+        list (APPEND WEAVE_VERSION_TEST_TARGETS barrierd)
+    endif()
     if (BARRIER_BUILD_GUI)
         list (APPEND WEAVE_VERSION_TEST_TARGETS barrier)
     endif()

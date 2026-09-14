@@ -33,10 +33,24 @@ main(int argc, char** argv)
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include "common/Version.h"
+#include "barrier/protocol_types.h"
+#include <cstdio>
+#include <cstring>
 
 int WINAPI
 WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
+    // Diagnostics must not initialize service state or display an error dialog.
+    for (int index = 1; index < __argc; ++index) {
+        if (std::strcmp(__argv[index], "--version") == 0) {
+            std::printf("Weave %s\n", kBuildId);
+            std::printf("Protocol version %d.%d\n",
+                        static_cast<int>(kProtocolMajorVersion),
+                        static_cast<int>(kProtocolMinorVersion));
+            return 0;
+        }
+    }
     DaemonApp app;
     return app.run(__argc, __argv);
 }

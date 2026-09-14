@@ -21,6 +21,8 @@
 #include "base/IEventQueueBuffer.h"
 
 #include <Carbon/Carbon.h>
+#include <deque>
+#include <mutex>
 
 class IEventQueue;
 
@@ -43,5 +45,8 @@ public:
 private:
     EventRef            m_event;
     IEventQueue*        m_eventQueue;
-    EventQueueRef        m_carbonEventQueue;
+    CFRunLoopRef        m_runLoop;
+    CFRunLoopSourceRef  m_wakeupSource;
+    mutable std::mutex  m_userMutex;
+    std::deque<UInt32>  m_userEvents;
 };

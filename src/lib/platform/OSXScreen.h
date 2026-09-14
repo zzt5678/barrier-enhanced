@@ -26,6 +26,7 @@
 #include "common/stdvector.h"
 
 #include <bitset>
+#include <mutex>
 #include <Carbon/Carbon.h>
 #include <mach/mach_port.h>
 #include <mach/mach_interface.h>
@@ -99,7 +100,8 @@ public:
     virtual void        fakeDraggingFiles(DragFileList fileList) override;
     virtual std::string& getDraggingFilename() override;
 
-    const std::string& getDropTarget() const override { return m_dropTarget; }
+    const std::string& getDropTarget() const override;
+    void                setDropTarget(const std::string& target) override;
     void                waitForCarbonLoop() const;
 
 protected:
@@ -202,6 +204,7 @@ private:
     static char*        CFStringRefToUTF8String(CFStringRef aString);
 
     void get_drop_target_thread();
+    void finishFakeDrag();
 
 private:
     struct HotKeyItem {
@@ -338,6 +341,8 @@ private:
     IEventQueue*            m_events;
 
     Thread*                m_getDropTargetThread;
+    mutable std::mutex m_dropTargetMutex;
+    std::string m_configuredDropTarget;
     std::string m_dropTarget;
 
 #if defined(MAC_OS_X_VERSION_10_7)
