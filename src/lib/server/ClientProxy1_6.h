@@ -38,6 +38,7 @@ public:
     ~ClientProxy1_6();
 
     virtual void        setClipboard(ClipboardID id, const IClipboard* clipboard);
+    bool                queueFileClipboardMetadata(const IClipboard* clipboard) override;
     virtual bool        recvClipboard();
     bool                recvClipboard(barrier::IStream* stream);
 

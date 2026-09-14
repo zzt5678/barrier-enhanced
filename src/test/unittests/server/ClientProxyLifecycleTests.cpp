@@ -2140,6 +2140,53 @@ TEST(ClientProxyLifecycleTests, queuedFileClipboardRouteLossRedirtiesOnlyMatchin
     }
 }
 
+TEST(ClientProxyLifecycleTests, fileMetadataGateWaitsForSenderAndReplaysCleanSnapshot)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    Event::Type nextType = Event::kLast;
+    setClientProxy16EventDefaults(events, streamEvents, clipboardEvents, fileEvents, nextType);
+    NiceMock<MockStream>* control = new NiceMock<MockStream>();
+    ON_CALL(*control, getEventTarget()).WillByDefault(Return(control));
+    NiceMock<MockStream>* bulk = new NiceMock<MockStream>();
+    ON_CALL(*bulk, getEventTarget()).WillByDefault(Return(bulk));
+    ON_CALL(*bulk, getBufferedOutputSize()).WillByDefault(Return(0));
+    NiceMock<MockServer> server;
+    ClientProxy1_12 proxy("client", control, &server, &events);
+    ASSERT_TRUE(proxy.attachBulkChannel(bulk));
+    std::vector<ClipboardChunk*> chunks;
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([&](const Event& event) {
+        if (event.getType() == clipboardEvents.clipboardSending()) {
+            chunks.push_back(static_cast<ClipboardChunk*>(event.getDataObject()));
+        }
+        else { Event::deleteData(event); }
+    }));
+    Clipboard clipboard = makeFileClipboard();
+    std::atomic<bool> release(false);
+    proxy.testSetClipboardSendThread(new Thread([&release]() {
+        while (!release.load()) { ARCH->sleep(0.001); }
+    }));
+    EXPECT_FALSE(proxy.queueFileClipboardMetadata(&clipboard));
+    EXPECT_TRUE(chunks.empty());
+    release.store(true);
+    for (int i = 0; i < 200 && !proxy.cleanupClipboardSendThread(false); ++i) {
+        ARCH->sleep(0.001);
+    }
+    ASSERT_TRUE(proxy.cleanupClipboardSendThread(false));
+    proxy.setClipboardDirty(kClipboardClipboard, false);
+    EXPECT_TRUE(proxy.queueFileClipboardMetadata(&clipboard));
+    EXPECT_TRUE(proxy.queueFileClipboardMetadata(&clipboard));
+    ASSERT_EQ(6u, chunks.size());
+    EXPECT_CALL(*control, writeLowPriority(_, _)).Times(0);
+    EXPECT_CALL(*bulk, writeLowPriority(_, _)).Times(6);
+    for (ClipboardChunk* chunk : chunks) {
+        proxy.testHandleClipboardSendingChunk(chunk);
+        delete chunk;
+    }
+}
+
 TEST(ClientProxyLifecycleTests, replacementBulkRetriesAfterOldClipboardSenderStops)
 {
     NiceMock<MockEventQueue> events;

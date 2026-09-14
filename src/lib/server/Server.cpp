@@ -2173,7 +2173,13 @@ Server::fetchPendingPrimaryClipboards()
                     "suppressed remote file clipboard echo: session=%s items=%lu",
                     m_readyFileClipboardSession.c_str(),
                     static_cast<unsigned long>(m_readyFileClipboardPaths.size())));
-                clipboard.m_clipboard = observedClipboard;
+                // Native file managers report our published cache paths as
+                // SourcePaths. Keep their trusted local provenance in the
+                // replay state, otherwise a later third-host relay treats
+                // these paths as foreign source paths and refuses to send.
+                RemoteFileClipboard::buildMaterializedClipboard(
+                    utf8PathsToFsPaths(m_readyFileClipboardPaths),
+                    m_readyFileClipboardSession, clipboard.m_clipboard);
                 clipboard.m_clipboardData.set(observedClipboard.marshall());
                 clipboard.m_pendingClipboardFetch = false;
                 m_readyFileClipboardSession.clear();
@@ -2254,12 +2260,15 @@ Server::replayClipboardsToActive()
         }
 		if (id == kClipboardClipboard) {
 			RemoteFileClipboard::Data remoteFileClipboard;
-			if (RemoteFileClipboard::readFromClipboard(clipboard.m_clipboard, remoteFileClipboard) &&
-				remoteFileClipboard.mode == RemoteFileClipboard::Mode::SourcePaths) {
-				if (clipboard.m_clipboardOwner == primaryName &&
+			if (RemoteFileClipboard::readFromClipboard(clipboard.m_clipboard, remoteFileClipboard)) {
+                // Only the primary's source paths or paths materialized and
+                // committed locally may be read here. Foreign source paths
+                // must first arrive through the checked package receiver.
+                const bool localPaths = clipboard.m_clipboardOwner == primaryName ||
+                    remoteFileClipboard.mode == RemoteFileClipboard::Mode::MaterializedPaths;
+				if (localPaths &&
 					m_active != m_primaryClient &&
 					m_active->supportsTransactionalFileTransfer()) {
-					m_active->setClipboard(id, &clipboard.m_clipboard);
                     if (!m_clipboardRevision.valid()) {
                         m_clipboardRevision.advance();
                     }
@@ -2267,6 +2276,10 @@ Server::replayClipboardsToActive()
                         m_active, remoteFileClipboard.paths,
                         remoteFileClipboard.sessionId,
                         m_clipboardRevision);
+                }
+                else if (m_active == m_primaryClient &&
+                         remoteFileClipboard.mode == RemoteFileClipboard::Mode::MaterializedPaths) {
+                    m_active->setClipboard(id, &clipboard.m_clipboard);
                 }
                 else {
                     LOG((CLOG_INFO
@@ -5438,6 +5451,21 @@ Server::startPendingFileClipboardPrefetch()
 		cleanupSendFileCancelAckTimeout();
 		cleanupSendFileReap();
 		m_sendFileCancelAckPending = false;
+	}
+
+	RemoteFileClipboard::Data metadata;
+	metadata.mode = RemoteFileClipboard::Mode::SourcePaths;
+	metadata.sessionId = m_pendingFileClipboardPrefetchSession;
+	metadata.paths = m_pendingFileClipboardPrefetchPaths;
+	Clipboard metadataClipboard;
+	metadataClipboard.open(0);
+	metadataClipboard.empty();
+	metadataClipboard.add(IClipboard::kFileList, RemoteFileClipboard::serialize(metadata));
+	metadataClipboard.close();
+	if (!pendingTarget->queueFileClipboardMetadata(&metadataClipboard)) {
+		LOG((CLOG_DEBUG "remote clipboard prefetch waiting for complete metadata enqueue"));
+        scheduleClipboardSync(false);
+		return;
 	}
 
 	std::vector<barrier::fs::path> sourcePaths;

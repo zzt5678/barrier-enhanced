@@ -205,6 +205,43 @@ ClientProxy1_6::retryOneDirtyClipboard()
     }
 }
 
+bool
+ClientProxy1_6::queueFileClipboardMetadata(const IClipboard* clipboard)
+{
+    if (clipboard == NULL || !supportsTransactionalFileTransfer() ||
+        !cleanupClipboardSendThread(false)) {
+        return false;
+    }
+    RemoteFileClipboard::Data metadata;
+    if (!RemoteFileClipboard::readFromClipboard(*clipboard, metadata) ||
+        metadata.mode != RemoteFileClipboard::Mode::SourcePaths) {
+        return false;
+    }
+    const std::shared_ptr<barrier::BulkChannel> channel = acquireBulkChannel();
+    if (supportsBulkChannel() && !channel) {
+        return false;
+    }
+    const String data = IClipboard::marshall(clipboard);
+    ++m_nextClipboardSendAttempt;
+    if (m_nextClipboardSendAttempt == 0) {
+        ++m_nextClipboardSendAttempt;
+    }
+    const std::shared_ptr<barrier::ClipboardSendAttempt> attempt(
+        new barrier::ClipboardSendAttempt(kClipboardClipboard, m_nextClipboardSendAttempt));
+    m_latestClipboardSendAttempt[kClipboardClipboard] = m_nextClipboardSendAttempt;
+    // File metadata is bounded by the path-list limits. Queue it without
+    // waiting on socket backpressure; the package worker starts only after
+    // this complete sequence has entered the event queue. Both use bulk FIFO.
+    if (!StreamChunker::sendClipboard(data, data.size(), kClipboardClipboard, 0,
+            m_events, this, channel ? channel->getStream() : getStream(),
+            channel, attempt)) {
+        return false;
+    }
+    Clipboard::copy(&m_clipboard[kClipboardClipboard].m_clipboard, clipboard);
+    m_clipboard[kClipboardClipboard].m_dirty = false;
+    return true;
+}
+
 void
 ClientProxy1_6::scheduleClipboardSendRetry()
 {

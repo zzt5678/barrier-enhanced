@@ -105,6 +105,10 @@ public:
     virtual void        abortEnter(UInt32) { }
     virtual void        requestInputLeaseRevoke(UInt32, UInt32) { }
     virtual void        setClipboard(ClipboardID, const IClipboard*) = 0;
+    // Queue the complete source-path metadata ahead of a file package on the
+    // same route. Unlike setClipboard(), a clean cache must not suppress it.
+    virtual bool        queueFileClipboardMetadata(const IClipboard*)
+                            { return false; }
     virtual void        grabClipboard(ClipboardID) = 0;
     virtual void        setClipboardDirty(ClipboardID, bool) = 0;
     virtual void        keyDown(KeyID, KeyModifierMask, KeyButton) = 0;

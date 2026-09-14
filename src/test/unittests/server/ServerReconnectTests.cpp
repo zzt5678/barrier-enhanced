@@ -345,6 +345,11 @@ public:
     }
 
     bool supportsTransactionalFileTransfer() const override { return true; }
+    bool queueFileClipboardMetadata(const IClipboard* clipboard) override
+    {
+        setClipboard(kClipboardClipboard, clipboard);
+        return true;
+    }
     std::string getConnectionBinding() const override
     {
         return connectionBinding;
@@ -2734,6 +2739,60 @@ TEST(ServerReconnectTests, replayClipboardsToActivePrefetchesPrimarySourcePaths)
     EXPECT_EQ(0u, client.fileChunkCount);
     EXPECT_TRUE(server.m_sendFileThread != NULL);
     EXPECT_EQ(&client, server.m_sendFileTarget);
+    for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
+        ARCH->sleep(0.001);
+    }
+    EXPECT_TRUE(server.cleanupSendFileThread(true));
+}
+
+TEST(ServerReconnectTests, fileReplayQueuesMetadataEvenWhenTargetClipboardIsClean)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    IStreamEvents streamEvents;
+    FileEvents fileEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents, clipboardEvents, serverEvents);
+    Event::Type nextType = Event::kLast;
+    ON_CALL(events, registerTypeOnce(_, _)).WillByDefault(Invoke(
+        [&nextType](Event::Type& type, const char*) {
+            if (type == Event::kUnknown) { type = ++nextType; }
+            return type;
+        }));
+    fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+    ClipboardPrimaryClient primary;
+    Server server;
+    NiceMock<MockStream>* stream = new NiceMock<MockStream>();
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    ClientProxy1_12 client("client", stream, &server, &events);
+    initializeServer(server, config, primary, events, client);
+    attachTestBulkRoute(client, events, streamEvents);
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_enableClipboard = true;
+    server.m_active = &client;
+    server.m_clipboards[kClipboardSelection].m_clipboardOwner = "client";
+    Server::ClipboardInfo& clipboard = server.m_clipboards[kClipboardClipboard];
+    clipboard.m_clipboardOwner = "primary";
+    clipboard.m_clipboard = makeSourcePathsClipboard(barrier::fs::u8path("/tmp/primary-file.txt"));
+    client.setClipboardDirty(kClipboardClipboard, false);
+    std::atomic<unsigned> metadataChunks(0);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([&](const Event& event) {
+        if (event.getType() == clipboardEvents.clipboardSending()) {
+            ++metadataChunks;
+        }
+        Event::deleteData(event);
+    }));
+    server.replayClipboardsToActive();
+    EXPECT_EQ(3u, metadataChunks.load());
     for (int i = 0; i < 200 && !server.cleanupSendFileThread(true); ++i) {
         ARCH->sleep(0.001);
     }
@@ -7395,13 +7454,15 @@ TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsDoesNotEchoMaterializedR
     clipboard.m_clipboardOwner = client.getName();
     clipboard.m_clipboardSeqNum = 10;
     clipboard.m_pendingClipboardFetch = false;
-    clipboard.m_clipboard = makeSourcePathsClipboard(cachedPath);
     Clipboard materializedClipboard = makeMaterializedPathsClipboard(cachedPath);
+    clipboard.m_clipboard = materializedClipboard;
     clipboard.m_clipboardData.set(materializedClipboard.marshall());
     primary.sourceClipboard = makeSourcePathsClipboard(cachedPath);
     primary.clipboardAvailable = true;
     server.m_readyFileClipboardSession = kMaterializedFileSessionId;
     server.m_readyFileClipboardPaths.push_back(cachedPath.u8string());
+    server.m_clipboardRevision.advance();
+    server.m_readyFileClipboardRevision = server.m_clipboardRevision;
 
     server.fetchPendingPrimaryClipboards();
 
@@ -7410,6 +7471,9 @@ TEST(ServerReconnectTests, fetchPendingPrimaryClipboardsDoesNotEchoMaterializedR
     EXPECT_EQ(0u, client.clipboardDirtyCount);
     EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
     EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
+    RemoteFileClipboard::Data retained;
+    ASSERT_TRUE(RemoteFileClipboard::readFromClipboard(clipboard.m_clipboard, retained));
+    EXPECT_EQ(RemoteFileClipboard::Mode::MaterializedPaths, retained.mode);
 }
 
 TEST(ServerReconnectTests, onClipboardChangedForwardsTextAfterBlockingLocalFileList)
@@ -7588,7 +7652,7 @@ TEST(ServerReconnectTests, trustedMaterializedFileEchoCommitsReadyPathsForReplay
 
     ClipboardPrimaryClient primary;
     RecordingClient source("source");
-    RecordingClient target("target");
+    BoundBulkRecordingClient target("target");
     Server server;
     initializeServer(server, config, primary, events, target);
     server.m_clients.insert(std::make_pair(primary.getName(), &primary));
@@ -7630,13 +7694,13 @@ TEST(ServerReconnectTests, trustedMaterializedFileEchoCommitsReadyPathsForReplay
         target.getName();
     server.replayClipboardsToActive();
 
-    ASSERT_EQ(1u, target.setClipboardCount);
-    RemoteFileClipboard::Data replayed;
-    ASSERT_TRUE(RemoteFileClipboard::readFromClipboard(
-        target.lastSetClipboard, replayed));
-    EXPECT_EQ(RemoteFileClipboard::Mode::MaterializedPaths, replayed.mode);
-    ASSERT_EQ(1u, replayed.paths.size());
-    EXPECT_EQ(readyPath, replayed.paths.front());
+    // A remote client cannot use the primary's local materialized paths.
+    // Queue a package from the trusted local cache; absent bulk connectivity
+    // must leave it pending, not publish those paths over the control wire.
+    EXPECT_EQ(0u, target.setClipboardCount);
+    EXPECT_EQ(&target, server.m_pendingFileClipboardPrefetchTarget);
+    ASSERT_EQ(1u, server.m_pendingFileClipboardPrefetchPaths.size());
+    EXPECT_EQ(readyPath, server.m_pendingFileClipboardPrefetchPaths.front());
 }
 
 TEST(ServerReconnectTests, invalidRemoteClipboardRollsBackPendingGrab)
