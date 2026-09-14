@@ -43,6 +43,7 @@
 #include "io/filesystem.h"
 
 #include <math.h>
+#include <unistd.h>
 #include <mach-o/dyld.h>
 #include <AvailabilityMacros.h>
 #include <IOKit/hidsystem/event_status_driver.h>
@@ -58,6 +59,10 @@ enum {
 enum {
 	kCarbonLoopWaitTimeout = 10
 };
+
+// Distinguish remote input posted by Weave from a local trackpad/mouse event,
+// including when a downstream event source does not preserve the sender PID.
+static constexpr int64_t kWeavePointerEventMarker = 0x5745415645505452;
 
 // TODO: upgrade deprecated function usage in these functions.
 void setZeroSuppressionInterval();
@@ -537,6 +542,7 @@ OSXScreen::postMouseEvent(CGPoint& pos) const
     CGEventSetDoubleValueField(event, kCGMouseEventDeltaX, deltaFX);
     CGEventSetDoubleValueField(event, kCGMouseEventDeltaY, deltaFY);
 
+	CGEventSetIntegerValueField(event, kCGEventSourceUserData, kWeavePointerEventMarker);
 	CGEventPost(kCGHIDEventTap, event);
 
 	CFRelease(event);
@@ -607,6 +613,7 @@ OSXScreen::fakeMouseButton(ButtonID id, bool press)
     CGEventSetFlags(event, modifiers);
 
     m_buttonState.set(index, state);
+    CGEventSetIntegerValueField(event, kCGEventSourceUserData, kWeavePointerEventMarker);
     CGEventPost(kCGHIDEventTap, event);
 
     CFRelease(event);
@@ -752,6 +759,7 @@ OSXScreen::fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const
         CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
         CGEventSetFlags(scrollEvent, modifiers);
 
+		CGEventSetIntegerValueField(scrollEvent, kCGEventSourceUserData, kWeavePointerEventMarker);
 		CGEventPost(kCGHIDEventTap, scrollEvent);
 		CFRelease(scrollEvent);
 	}
@@ -760,6 +768,10 @@ OSXScreen::fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const
 void
 OSXScreen::showCursor()
 {
+	// CoreGraphics counts hide/show requests. Only release our own hide.
+	if (!m_cursorHidden) {
+		return;
+	}
 	LOG((CLOG_DEBUG "showing cursor"));
 
 	CFStringRef propertyString = CFStringCreateWithCString(
@@ -774,6 +786,7 @@ OSXScreen::showCursor()
 	CGError error = CGDisplayShowCursor(m_displayID);
 	if (error != kCGErrorSuccess) {
 		LOG((CLOG_ERR "failed to show cursor, error=%d", error));
+		return;
 	}
 
 	// appears to fix "mouse randomly not showing" bug
@@ -787,6 +800,9 @@ OSXScreen::showCursor()
 void
 OSXScreen::hideCursor()
 {
+	if (m_cursorHidden) {
+		return;
+	}
 	LOG((CLOG_DEBUG "hiding cursor"));
 
 	CFStringRef propertyString = CFStringCreateWithCString(
@@ -801,6 +817,7 @@ OSXScreen::hideCursor()
 	CGError error = CGDisplayHideCursor(m_displayID);
 	if (error != kCGErrorSuccess) {
 		LOG((CLOG_ERR "failed to hide cursor, error=%d", error));
+		return;
 	}
 
 	// appears to fix "mouse randomly not hiding" bug
@@ -1968,20 +1985,45 @@ OSXScreen::handleCGInputEventSecondary(
 	CGEventRef event,
 	void* refcon)
 {
-	// this fix is really screwing with the correct show/hide behavior. it
-	// should be tested better before reintroducing.
-	return event;
-
-	OSXScreen* screen = (OSXScreen*)refcon;
-	if (screen->m_cursorHidden && type == kCGEventMouseMoved) {
-
-		CGPoint pos = CGEventGetLocation(event);
-		if (pos.x != screen->m_xCenter || pos.y != screen->m_yCenter) {
-
-			LOG((CLOG_DEBUG "show cursor on secondary, type=%d pos=%d,%d",
-					type, pos.x, pos.y));
-			screen->showCursor();
+	OSXScreen* screen = static_cast<OSXScreen*>(refcon);
+	if (screen == nullptr) {
+		return event;
+	}
+	if (type == kCGEventTapDisabledByTimeout) {
+		if (screen->m_eventTapPort != nullptr) {
+			CGEventTapEnable(screen->m_eventTapPort, true);
+			LOG((CLOG_INFO "secondary quartz event tap timed out, re-enabling"));
 		}
+		return event;
+	}
+	if (type == kCGEventTapDisabledByUserInput || event == nullptr ||
+		!screen->m_cursorHidden) {
+		return event;
+	}
+	// Do not infer origin from position: remote input and local HID input can
+	// both occur at the screen center. Nor should we require PID zero, since
+	// legitimate local input drivers can have their own process identity.
+	if (CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid() ||
+		CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kWeavePointerEventMarker) {
+		return event;
+	}
+	switch (type) {
+	case kCGEventMouseMoved:
+	case kCGEventLeftMouseDragged:
+	case kCGEventRightMouseDragged:
+	case kCGEventOtherMouseDragged:
+	case kCGEventLeftMouseDown:
+	case kCGEventLeftMouseUp:
+	case kCGEventRightMouseDown:
+	case kCGEventRightMouseUp:
+	case kCGEventOtherMouseDown:
+	case kCGEventOtherMouseUp:
+	case kCGEventScrollWheel:
+		LOG((CLOG_DEBUG "restoring secondary cursor for local pointer input, type=%d", type));
+		screen->showCursor();
+		break;
+	default:
+		break;
 	}
 	return event;
 }

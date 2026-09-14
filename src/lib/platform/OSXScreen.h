@@ -111,6 +111,7 @@ protected:
     virtual IKeyState*    getKeyState() const override;
 
 private:
+    friend class OSXScreenCursorTestAccess;
     void                updateScreenShape();
     void                updateScreenShape(const CGDirectDisplayID, const CGDisplayChangeSummaryFlags);
     void                postMouseEvent(CGPoint&) const;
