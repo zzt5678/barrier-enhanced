@@ -344,6 +344,9 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     });
     m_RestartTimer.setSingleShot(true);
     connect(&m_RestartTimer, &QTimer::timeout, this, &MainWindow::startBarrier);
+    m_TopologyTimer.setInterval(1000);
+    connect(&m_TopologyTimer, &QTimer::timeout, this, &MainWindow::pollRuntimeTopology);
+    m_TopologyTimer.start();
 
     const QRect availableGeometry = QApplication::desktop()->availableGeometry(this);
     resize(size().boundedTo(QSize(
@@ -907,6 +910,8 @@ void MainWindow::startBarrier()
     }
 
     appendLogDebug("starting process");
+    clearRuntimeTopology();
+    m_topologyReadsAllowed = true;
     m_ExpectedRunningState = kStarted;
     setBarrierState(barrierConnecting);
     m_PendingStdOutLog.clear();
@@ -1012,18 +1017,28 @@ void MainWindow::startBarrier()
 
     if (desktopMode)
     {
+        const auto launchFallback = configuredTopologyFallback();
         barrierProcess()->start(app, args);
         if (!barrierProcess()->waitForStarted())
         {
             show();
             QMessageBox::warning(this, tr("Program can not be started"), QString(tr("The executable<br><br>%1<br><br>could not be successfully started, although it does exist. Please check if you have sufficient permissions to run this program.").arg(app)));
             m_ExpectedRunningState = kStopped;
+            clearRuntimeTopology();
             resetRestartBackoff();
             delete barrierProcess();
             setBarrierProcess(NULL);
             setBarrierState(barrierDisconnected);
             return;
         }
+
+        // The expected process comes only from this QProcess launch. Query its
+        // kernel birth/owner/session now, before any later snapshot lookup.
+        weave::topology::processIdentity(static_cast<std::uint64_t>(barrierProcess()->processId()),
+                                         m_expectedTopologyProcess);
+        m_launchTopologyFallback = launchFallback;
+        m_hasLaunchTopologyFallback = true;
+        pollRuntimeTopology();
 
         m_ProcessLifetime.restart();
         QTimer::singleShot(2000, this, [this, expectedApp]() {
@@ -1246,6 +1261,8 @@ bool MainWindow::persistServiceServerConfig(QString& configForLog)
 void MainWindow::stopBarrier()
 {
     appendLogDebug("stopping process");
+    m_topologyReadsAllowed = false;
+    clearRuntimeTopology();
 
     m_ExpectedRunningState = kStopped;
     resetRestartBackoff();
@@ -1280,6 +1297,7 @@ void MainWindow::stopService()
 void MainWindow::stopDesktop()
 {
     QMutexLocker locker(&m_StopDesktopMutex);
+    clearRuntimeTopology();
     QProcess* process = barrierProcess();
     if (process == nullptr) {
         return;
@@ -1313,6 +1331,7 @@ void MainWindow::stopDesktop()
 
 void MainWindow::barrierFinished(int exitCode, QProcess::ExitStatus)
 {
+    if (sender() == barrierProcess()) clearRuntimeTopology();
     flushPendingProcessLogs();
 
     if (exitCode == 0) {
@@ -2204,43 +2223,107 @@ void MainWindow::updateOverviewCards()
     }
 }
 
-void MainWindow::updateWorkspaceDashboard()
+RuntimeTopologyFallback MainWindow::configuredTopologyFallback()
 {
-    if (!m_workspaceDashboard) return;
+    RuntimeTopologyFallback fallback;
     const bool serverMode = barrier_type() == BarrierType::Server;
-    QVector<WorkspaceDevice> devices;
+    auto& devices = fallback.devices;
     const QString localName = getScreenName();
+    fallback.localName = localName;
+    fallback.serverAddress = hostname();
+    fallback.server = serverMode;
+    fallback.editable = serverMode && !m_pRadioExternalConfig->isChecked();
+    fallback.spatial = fallback.editable;
     if (serverMode && !m_pRadioExternalConfig->isChecked()) {
         const ServerConfig& config = m_ServerConfig;
         const auto& screens = config.screens();
         for (size_t i = 0; i < screens.size(); ++i) {
             const auto& screen = screens[i];
-            if (!screen.isNull()) devices.append({screen.name(),
-                QPoint(int(i) % config.numColumns(), int(i) / config.numColumns()),
-                screen.name() == localName || screen.aliases().contains(localName)});
+            if (!screen.isNull()) {
+                const bool local = screen.name() == localName || screen.aliases().contains(localName);
+                devices.append({screen.name(), QPoint(int(i) % config.numColumns(), int(i) / config.numColumns()),
+                    local, local ? WorkspaceDeviceRole::Server : WorkspaceDeviceRole::Client});
+            }
         }
     } else {
-        devices.append({localName, QPoint(0,0), true});
+        devices.append({localName, QPoint(0,0), true,
+            serverMode ? WorkspaceDeviceRole::Server : WorkspaceDeviceRole::Client});
     }
-    QString layoutNotice;
-    if (!serverMode && !hostname().isEmpty()) layoutNotice = tr("Server: %1").arg(hostname());
     if (serverMode && m_pRadioExternalConfig->isChecked()) {
         QFile external(m_pLineEditConfigFile->text());
         if (QFileInfo(external).isFile() && external.open(QIODevice::ReadOnly) && external.size() <= ExternalScreenLayout::maximumCharacters) {
             const auto parsed = ExternalScreenLayout::parse(QString::fromUtf8(external.readAll()));
             if (parsed.trustworthy) {
+                fallback.spatial = true;
                 devices.clear();
                 for (const auto& device : parsed.devices)
-                    devices.append({device.name, QPoint(device.x, device.y), device.name == localName});
-            } else layoutNotice = tr("External layout could not be displayed. Your configuration is unchanged.");
-        } else layoutNotice = tr("External layout could not be displayed. Your configuration is unchanged.");
+                    devices.append({device.name, QPoint(device.x, device.y), device.name == localName,
+                        device.name == localName ? WorkspaceDeviceRole::Server : WorkspaceDeviceRole::Client});
+            }
+        }
     }
-    m_workspaceDashboard->setDevices(devices);
-    // The settings-page status label may already be elided while hidden.
-    // The workspace has its own wrapping area and needs the original message.
-    const QString status = m_pStatusLabel->fullText();
-    m_workspaceDashboard->setConnectionState(layoutNotice.isEmpty() ? status : status+"\n"+layoutNotice,
-        m_ExpectedRunningState == kStarted, serverMode && !m_pRadioExternalConfig->isChecked());
+    return fallback;
+}
+
+void MainWindow::clearRuntimeTopology()
+{
+    m_expectedTopologyProcess = {};
+    m_runtimeSnapshot = {};
+    m_topologyReadStatus = weave::topology::ReadStatus::Missing;
+    m_runtimeTopology.reset();
+    m_hasLaunchTopologyFallback = false;
+}
+
+void MainWindow::pollRuntimeTopology()
+{
+    using namespace weave::topology;
+    m_topologyReadStatus = ReadStatus::Missing;
+    // Actual MainWindow test fixtures must never discover a production core or
+    // daemon proof, even if the test account has an existing live installation.
+    if (m_topologyReadsAllowed && qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST") != "1") {
+        const auto now = monotonicMillis();
+        if (appConfig().processMode() == Desktop && m_expectedTopologyProcess.pid &&
+            barrierProcess() && barrierProcess()->state() == QProcess::Running) {
+            m_topologyReadStatus = readSnapshot(privateSnapshotDirectory(), m_expectedTopologyProcess, now, m_runtimeSnapshot);
+        }
+#if defined(Q_OS_WIN)
+        else if (appConfig().processMode() == Service) {
+            const auto viewer = currentProcessIdentity();
+            if (!viewer.owner.empty())
+                m_topologyReadStatus = readPublishedSnapshot(viewer.owner, viewer.session, now, m_runtimeSnapshot);
+        }
+#endif
+    }
+    const auto& s = m_runtimeSnapshot;
+    const char* const statusNames[] = {"Fresh", "Stale", "NotReady", "Missing", "Invalid", "WrongOwner"};
+    const QString diagnostic = QStringLiteral("topology read=%1 pid=%2 birth=%3 generation=%4 run=%5 role=%6 nodes=%7 epoch=%8")
+        .arg(statusNames[static_cast<int>(m_topologyReadStatus)]).arg(s.identity.pid).arg(s.identity.birth)
+        .arg(s.ownerGeneration).arg(s.run).arg(!s.identity.pid ? "Unknown" : s.localRole == Role::Server ? "Server" : "Client")
+        .arg(s.topology.nodes.size()).arg(s.topology.epoch);
+    if (diagnostic != m_topologyDiagnostic) {
+        m_topologyDiagnostic = diagnostic;
+        appendLogInfo(diagnostic + QStringLiteral(" revision=%1").arg(s.topology.revision));
+    }
+    updateWorkspaceDashboard();
+}
+
+void MainWindow::updateWorkspaceDashboard()
+{
+    if (!m_workspaceDashboard) return;
+    using namespace weave::topology;
+    auto fallback = configuredTopologyFallback();
+    if (m_hasLaunchTopologyFallback) {
+        // Unapplied settings cannot rename an already launched, older core.
+        const bool editable = fallback.editable;
+        fallback = m_launchTopologyFallback;
+        fallback.editable = editable;
+    }
+    const bool readable = m_topologyReadStatus == ReadStatus::Fresh ||
+        m_topologyReadStatus == ReadStatus::Stale || m_topologyReadStatus == ReadStatus::NotReady;
+    const auto view = m_runtimeTopology.apply(m_topologyReadStatus,
+        readable ? &m_runtimeSnapshot : nullptr, monotonicMillis(), fallback);
+    m_workspaceDashboard->setDevices(view.devices, view.spatial, view.layoutReason);
+    m_workspaceDashboard->setConnectionState(view.status, m_ExpectedRunningState == kStarted, view.canArrange);
     QStringList transfers;
     if (m_pWorkflowStore) {
         const auto& receipts = m_pWorkflowStore->receipts();

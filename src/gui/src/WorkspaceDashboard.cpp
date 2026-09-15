@@ -35,6 +35,8 @@ WorkspaceDashboard::WorkspaceDashboard(QWidget* settings, QWidget* parent): QWid
     auto* home = new QWidget; home->setObjectName("workspaceHome"); auto* content = new QVBoxLayout(home); content->setContentsMargins(34,30,34,24); content->setSpacing(16);
     m_title = new QLabel; m_title->setObjectName("workspaceTitle"); content->addWidget(m_title);
     m_status = new QLabel; m_status->setTextFormat(Qt::PlainText); m_status->setObjectName("workspaceStatus"); m_status->setWordWrap(true); content->addWidget(m_status);
+    m_layoutDescription = new QLabel; m_layoutDescription->setObjectName("deviceLayoutDescription");
+    m_layoutDescription->setWordWrap(true); content->addWidget(m_layoutDescription); m_layoutDescription->hide();
     m_canvas = new QWidget; m_canvas->setObjectName("deviceCanvas"); auto* grid = new QGridLayout(m_canvas); grid->setContentsMargins(0,20,0,16); grid->setSpacing(18); content->addWidget(m_canvas);
     auto* actions = new QHBoxLayout; actions->setSpacing(12);
     m_arrange = new QPushButton; m_arrange->setObjectName("arrangeButton"); m_arrange->setProperty("primary",true);
@@ -60,10 +62,13 @@ WorkspaceDashboard::WorkspaceDashboard(QWidget* settings, QWidget* parent): QWid
     connect(m_recent,&QListWidget::itemActivated,this,[this]{emit transfersRequested();});
     retranslate(); setDevices({});
 }
-void WorkspaceDashboard::setDevices(const QVector<WorkspaceDevice>& devices)
+void WorkspaceDashboard::setDevices(const QVector<WorkspaceDevice>& devices, bool spatial, const QString& layoutReason)
 {
     m_deviceData = devices;
-    QStringList signature{tr("This computer"), tr("Configured"), tr("Connected"), tr("Awaiting sync")};
+    m_spatial = spatial; m_layoutReason = layoutReason;
+    m_layoutDescription->setText(spatial ? QString() : tr("Device list · %1").arg(layoutReason));
+    m_layoutDescription->setVisible(!spatial);
+    QStringList signature{tr("This computer"), tr("Configured"), tr("Connected"), tr("Awaiting sync"), QString::number(spatial), layoutReason};
     for (const auto& device : devices) signature.append(QStringLiteral("%1\n%2,%3,%4,%5,%6").arg(device.name).arg(device.position.x()).arg(device.position.y()).arg(device.local).arg(static_cast<int>(device.role)).arg(static_cast<int>(device.state)));
     if (signature == m_deviceSignature) return;
     m_deviceSignature = signature;
@@ -73,14 +78,18 @@ void WorkspaceDashboard::setDevices(const QVector<WorkspaceDevice>& devices)
     QStringList accessible; QList<int> columns,rows;
     for(const auto& device:devices) { if(!columns.contains(device.position.x())) columns.append(device.position.x()); if(!rows.contains(device.position.y())) rows.append(device.position.y()); }
     std::sort(columns.begin(),columns.end()); std::sort(rows.begin(),rows.end());
-    m_columns = qMax(1, columns.size());
+    m_columns = spatial ? qMax(1, columns.size()) : 1;
     for (int column = 0; column < m_columns; ++column) grid->setColumnStretch(column, 1);
+    int listRow = 0;
     for(const auto& device:devices) {
-        auto* card = new QWidget; card->setMinimumWidth(64); auto* layout = new QVBoxLayout(card); layout->setContentsMargins(0,0,0,0); layout->setSpacing(8); layout->setAlignment(Qt::AlignCenter);
+        auto* card = new QWidget; card->setMinimumWidth(64);
+        auto* layout = new QBoxLayout(spatial ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight, card);
+        layout->setContentsMargins(0,0,0,0); layout->setSpacing(8); layout->setAlignment(Qt::AlignCenter);
         auto* monitor = new QLabel; monitor->setObjectName("deviceIllustration"); QPixmap picture(":/res/image/device-display.png"); if(picture.isNull()) picture=style()->standardPixmap(QStyle::SP_ComputerIcon); const int side=illustrationSide();
         picture = picture.scaled(qRound(side * devicePixelRatioF()),qRound(side * devicePixelRatioF()),Qt::KeepAspectRatio,Qt::SmoothTransformation);
         picture.setDevicePixelRatio(devicePixelRatioF()); monitor->setPixmap(picture);
         monitor->setFixedSize(side,side); monitor->setAlignment(Qt::AlignCenter); layout->addWidget(monitor,0,Qt::AlignHCenter);
+        monitor->setVisible(spatial);
         auto* name = new ElidingLabel; name->setObjectName("deviceName"); name->setAlignment(Qt::AlignCenter); name->setTextFormat(Qt::PlainText); name->setText(device.name); layout->addWidget(name);
         const QString role = device.role == WorkspaceDeviceRole::Server ? QStringLiteral("Server")
             : device.role == WorkspaceDeviceRole::Client ? QStringLiteral("Client") : tr("Role unknown");
@@ -101,7 +110,7 @@ void WorkspaceDashboard::setDevices(const QVector<WorkspaceDevice>& devices)
         detail->setAlignment(Qt::AlignCenter); detail->setWordWrap(true); layout->addWidget(detail);
         const QString description = role + (device.local ? " · " + tr("This computer") : QString()) + " · " + status;
         name->setAccessibleDescription(description); card->setAccessibleName(device.name); card->setAccessibleDescription(description);
-        grid->addWidget(card,rows.indexOf(device.position.y()),columns.indexOf(device.position.x())); accessible.append(device.name+": "+description);
+        grid->addWidget(card,spatial ? rows.indexOf(device.position.y()) : listRow++,spatial ? columns.indexOf(device.position.x()) : 0); accessible.append(device.name+": "+description);
     }
     if(devices.isEmpty()) { auto* empty=new QLabel(tr("Your configured computers will appear here.")); empty->setWordWrap(true); grid->addWidget(empty,0,0); }
     m_canvas->setAccessibleDescription(accessible.join("\n"));
@@ -149,5 +158,5 @@ void WorkspaceDashboard::retranslate()
     m_title->setText(tr("My devices")); m_devices->setText(tr("Devices")); m_transfers->setText(tr("Local history")); m_settings->setText(tr("Settings")); m_arrange->setText(tr("Arrange layout")); m_sharing->setText(m_running?tr("Pause sharing"):tr("Start sharing")); m_recentTitle->setText(tr("Recent local activity")); m_inbox->setText(tr("Open inbox")); m_preferences->setText(tr("Application preferences")); m_empty->setText(tr("No local activity yet. Open history to review clipboard items and local action records."));
     m_layoutNotice->setText(tr("Read-only layout · managed by Server"));
     m_deviceSignature.clear();
-    setDevices(m_deviceData);
+    setDevices(m_deviceData, m_spatial, m_layoutReason);
 }

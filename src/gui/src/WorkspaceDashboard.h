@@ -19,7 +19,8 @@ class WorkspaceDashboard : public QWidget {
     Q_OBJECT
 public:
     explicit WorkspaceDashboard(QWidget* settings, QWidget* parent = nullptr);
-    void setDevices(const QVector<WorkspaceDevice>& devices);
+    void setDevices(const QVector<WorkspaceDevice>& devices, bool spatial = true,
+                    const QString& layoutReason = QString());
     void setConnectionState(const QString& status, bool running, bool canArrange);
     void setRecentTransfers(const QStringList& transfers);
     void retranslate();
@@ -39,6 +40,7 @@ private:
     QLabel* m_recentTitle = nullptr;
     QLabel* m_empty = nullptr;
     QLabel* m_layoutNotice = nullptr;
+    QLabel* m_layoutDescription = nullptr;
     QPushButton* m_devices = nullptr;
     QPushButton* m_transfers = nullptr;
     QPushButton* m_settings = nullptr;
@@ -51,6 +53,8 @@ private:
     bool m_running = false;
     bool m_canArrange = true;
     QVector<WorkspaceDevice> m_deviceData;
+    bool m_spatial = true;
+    QString m_layoutReason;
     QStringList m_deviceSignature;
     int m_columns = 1;
 };

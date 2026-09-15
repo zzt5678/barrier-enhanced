@@ -8,6 +8,7 @@ set (CMAKE_INCLUDE_CURRENT_DIR ON)
 
 # files that are used both in tests and the app
 set(GUI_COMMON_SOURCE_FILES
+    src/RuntimeTopologyAdapter.cpp
     src/ExternalScreenLayout.cpp
     src/WorkspaceDashboard.cpp
     src/Action.cpp
@@ -21,6 +22,7 @@ set(GUI_COMMON_SOURCE_FILES
 )
 
 set(GUI_COMMON_HEADER_FILES
+    src/RuntimeTopologyAdapter.h
     src/ExternalScreenLayout.h
     src/WorkspaceDashboard.h
     src/Action.h
@@ -152,7 +154,7 @@ add_executable (barrier WIN32
 
 include_directories (./src)
 
-target_link_libraries(barrier net base io Qt5::Core Qt5::Widgets Qt5::Network ${OPENSSL_LIBS})
+target_link_libraries(barrier net base io Qt5::Core Qt5::Widgets Qt5::Network ${OPENSSL_LIBS} weave_topology)
 target_compile_definitions (barrier PRIVATE -DBARRIER_VERSION_STAGE="${BARRIER_VERSION_STAGE}")
 target_compile_definitions (barrier PRIVATE -DBARRIER_REVISION="${BARRIER_REVISION}")
 set_target_properties(barrier PROPERTIES OUTPUT_NAME weave)
@@ -245,6 +247,7 @@ endif()
 
 if (BARRIER_BUILD_TESTS)
     set(GUI_TEST_SOURCE_FILES
+        test/RuntimeTopologyAdapterTests.cpp
         test/WorkflowHubDialogTests.cpp
         src/WorkflowHubDialog.cpp
         test/ExternalScreenLayoutTests.cpp
@@ -284,7 +287,7 @@ if (BARRIER_BUILD_TESTS)
 
     target_include_directories(guiunittests PUBLIC ../../ext)
     target_compile_definitions(guiunittests PRIVATE BARRIER_TEST_ENV)
-    target_link_libraries(guiunittests gtest gmock Qt5::Core Qt5::Widgets Qt5::Network ${libs})
+    target_link_libraries(guiunittests gtest gmock Qt5::Core Qt5::Widgets Qt5::Network ${libs} weave_topology)
     # This integration harness is launched by the isolated Xvfb runner on Linux.
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set(GUI_LAYOUT_SOURCES ${GUI_SOURCE_FILES})
@@ -294,7 +297,7 @@ if (BARRIER_BUILD_TESTS)
             ${GUI_COMMON_HEADER_FILES} ${GUI_UI_FILES} res/Barrier.qrc)
         target_include_directories(guilayouttests PRIVATE ../../ext)
         target_compile_definitions(guilayouttests PRIVATE BARRIER_VERSION_STAGE="${BARRIER_VERSION_STAGE}" BARRIER_REVISION="${BARRIER_REVISION}")
-        target_link_libraries(guilayouttests gtest Qt5::Core Qt5::Widgets Qt5::Network net base io ${OPENSSL_LIBS} common)
+        target_link_libraries(guilayouttests gtest Qt5::Core Qt5::Widgets Qt5::Network net base io ${OPENSSL_LIBS} common weave_topology)
         target_link_libraries(guilayouttests dns_sd)
         if (HAVE_X11)
             target_link_libraries(guilayouttests X11)

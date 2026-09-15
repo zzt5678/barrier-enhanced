@@ -6,6 +6,21 @@
 #include <QListWidget>
 #include <QFile>
 #include <QTranslator>
+TEST(WorkspaceDashboardTests, MissingCoordinatesRenderDistinctListRowsInsteadOfStackedDevices) {
+    WorkspaceDashboard view(new QWidget);
+    view.setDevices({{"first", {}, true, WorkspaceDeviceRole::Client},
+        {"server", {}, false, WorkspaceDeviceRole::Server},
+        {"third", {}, false, WorkspaceDeviceRole::Client}}, false, "Conflicting layout links");
+    view.resize(760,640); view.show(); QApplication::processEvents();
+    auto* description = view.findChild<QLabel*>("deviceLayoutDescription");
+    ASSERT_NE(nullptr, description);
+    EXPECT_TRUE(description->isVisible());
+    EXPECT_TRUE(description->text().contains("Conflicting layout links"));
+    const auto labels = view.findChildren<QLabel*>("deviceName");
+    ASSERT_EQ(3, labels.size());
+    EXPECT_LT(labels[0]->mapTo(&view, {}).y(), labels[1]->mapTo(&view, {}).y());
+    EXPECT_LT(labels[1]->mapTo(&view, {}).y(), labels[2]->mapTo(&view, {}).y());
+}
 TEST(WorkspaceDashboardTests, RolesLocalBadgeAndFreshnessAreIndependentAcrossViewers) {
     WorkspaceDashboard view(new QWidget);
     const QVector<WorkspaceDevice> devices{

@@ -37,6 +37,7 @@
 #include "IpcClient.h"
 #include "Ipc.h"
 #include "LogWindow.h"
+#include "RuntimeTopologyAdapter.h"
 
 #include <QMutex>
 
@@ -197,6 +198,9 @@ public slots:
         void updateWorkflowPeerHint();
         void updateOverviewCards();
         void updateWorkspaceDashboard();
+        RuntimeTopologyFallback configuredTopologyFallback();
+        void pollRuntimeTopology();
+        void clearRuntimeTopology();
 
     private:
         QSettings& m_Settings;
@@ -240,6 +244,15 @@ public slots:
         bool m_WindowGeometryInitialized;
         bool m_DashboardSingleColumn;
         WorkspaceDashboard* m_workspaceDashboard = nullptr;
+        QTimer m_TopologyTimer;
+        RuntimeTopologyAdapter m_runtimeTopology;
+        weave::topology::ProcessIdentity m_expectedTopologyProcess;
+        weave::topology::Snapshot m_runtimeSnapshot;
+        weave::topology::ReadStatus m_topologyReadStatus = weave::topology::ReadStatus::Missing;
+        RuntimeTopologyFallback m_launchTopologyFallback;
+        bool m_hasLaunchTopologyFallback = false;
+        bool m_topologyReadsAllowed = true;
+        QString m_topologyDiagnostic;
 
         bool m_fingerprint_expanded = false;
 

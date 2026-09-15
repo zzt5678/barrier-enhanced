@@ -1667,4 +1667,19 @@ Weave 不会自动安装。是否打开 Apple 官方安装页面？</translation
 <context><name>WorkspaceDashboard</name>
 <message><source>Double-click a record or press Enter to open local history.</source><translation>双击记录或按 Enter 打开本地历史。</translation></message>
 </context>
+<context><name>RuntimeTopologyAdapter</name>
+<message><source>Some devices have no layout links</source><translation>部分设备尚未设置布局连接</translation></message>
+<message><source>Partial screen links cannot be drawn as a grid</source><translation>局部屏幕连接无法显示为网格布局</translation></message>
+<message><source>Layout links conflict</source><translation>布局连接相互冲突</translation></message>
+<message><source>The configured layout is invalid</source><translation>设备布局配置无效</translation></message>
+<message><source>Waiting for layout coordinates</source><translation>等待布局坐标</translation></message>
+<message><source>Configured devices · awaiting runtime state</source><translation>已配置设备 · 等待运行状态</translation></message>
+<message><source>Server: %1</source><translation>Server：%1</translation></message>
+<message><source>Live device state</source><translation>实时设备状态</translation></message>
+<message><source>Historical layout · runtime state unavailable</source><translation>历史布局 · 当前运行状态不可用</translation></message>
+<message><source>Awaiting topology from Server</source><translation>等待 Server 同步设备信息</translation></message>
+</context>
+<context><name>WorkspaceDashboard</name>
+<message><source>Device list · %1</source><translation>设备列表 · %1</translation></message>
+</context>
 </TS>

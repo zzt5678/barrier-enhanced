@@ -24,6 +24,7 @@
 #include "../src/HotkeyDialog.h"
 #include "../src/ActionDialog.h"
 #include "../src/WorkspaceDashboard.h"
+#include "../src/RuntimeTopologyAdapter.h"
 #include <QListWidget>
 #include <QScreen>
 #include <QTimer>
@@ -32,6 +33,69 @@
 #include <QMouseEvent>
 #include <QDrag>
 #include <QMessageBox>
+
+TEST(RuntimeTopologyLayoutTests, SnapshotAdapterRendersThreeViewersAndHistoricalListInBothLanguages) {
+    using namespace weave::topology;
+    QFile style(":/res/styles/dark.qss"); ASSERT_TRUE(style.open(QIODevice::ReadOnly));
+    WorkspaceDashboard dashboard(new QWidget);
+    dashboard.setStyleSheet(QString::fromUtf8(style.readAll()));
+    RuntimeTopologyFallback fallback; fallback.localName = "pending-name";
+    fallback.server = true; fallback.editable = true; fallback.serverAddress = "192.0.2.1";
+    const QString out = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
+    for (const QString& language : {QString("en"), QString("zh-CN")}) {
+        BarrierLocale::switchLanguage(language); QApplication::processEvents(); dashboard.retranslate();
+        for (int viewer = 0; viewer < 3; ++viewer) {
+            RuntimeTopologyAdapter adapter; Snapshot snapshot;
+            snapshot.identity = {42,43,"fixture",1}; snapshot.run = 44; snapshot.sequence = 45;
+            snapshot.updatedMillis = 1000; snapshot.localName = "alias";
+            snapshot.localRole = viewer == 1 ? Role::Server : Role::Client; snapshot.ready = true;
+            snapshot.topology.viewerName = viewer == 0 ? "zyt" : viewer == 1 ? "zyt-System-Product-Name" : "macbook-air";
+            snapshot.topology.layout = Layout::Available;
+            snapshot.topology.nodes = {{"zyt",Role::Client,true,-1,0}, {"zyt-System-Product-Name",Role::Server,true,0,0}, {"macbook-air",Role::Client,false,1,0}};
+            for (int state = 0; state < 3; ++state) {
+                if (state == 2) {
+                    snapshot.topology.layout = Layout::Contradictory;
+                    for (auto& node : snapshot.topology.nodes) node.x = node.y = 0;
+                }
+                const auto view = adapter.apply(state == 1 ? ReadStatus::Missing : ReadStatus::Fresh,
+                    state == 1 ? nullptr : &snapshot, 2000, fallback);
+                dashboard.setDevices(view.devices, view.spatial, view.layoutReason);
+                dashboard.setConnectionState(QStringLiteral("[Fixture] ") + view.status, false, view.canArrange);
+                dashboard.resize(760,640); dashboard.show(); QApplication::processEvents();
+                ASSERT_EQ(3, dashboard.findChildren<QLabel*>("deviceName").size());
+                EXPECT_EQ(viewer != 1, dashboard.findChild<QPushButton*>("arrangeButton")->isHidden());
+                if (!out.isEmpty()) EXPECT_TRUE(dashboard.grab().save(out + "/" + language + QString("-runtime-viewer-%1-state-%2.png").arg(viewer).arg(state)));
+            }
+        }
+    }
+    BarrierLocale::switchLanguage("en"); QApplication::processEvents();
+}
+
+TEST(RuntimeTopologyLayoutTests, LegacyMainWindowStatusCannotInventDeviceConnectivity) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    class WindowFixture : public MainWindow {
+    public:
+        using MainWindow::MainWindow;
+        using MainWindow::setBarrierState;
+        using MainWindow::pollRuntimeTopology;
+    };
+    QTemporaryDir directory; QSettings settings(directory.filePath("runtime.ini"), QSettings::IniFormat);
+    settings.setValue("autoStart", false); settings.setValue("autoConfig", false);
+    settings.setValue("autoConfigPrompted", true); settings.setValue("workflowEnabled", false);
+    settings.setValue("wizardLastRun", 999); settings.setValue("screenName", "configured-client");
+    settings.setValue("groupServerChecked", false); settings.setValue("groupClientChecked", true);
+    AppConfig config(&settings); WindowFixture window(settings, config);
+    window.m_pLineEditHostname->setText("configured.example");
+    window.setBarrierState(MainWindow::barrierConnected);
+    window.pollRuntimeTopology();
+    const auto names = window.findChildren<QLabel*>("deviceName");
+    ASSERT_EQ(1, names.size());
+    EXPECT_EQ(QString("configured-client"), names[0]->accessibleName());
+    EXPECT_EQ(QString("Client"), window.findChild<QLabel*>("deviceRole")->text());
+    EXPECT_EQ(QString("Configured"), window.findChild<QLabel*>("deviceState")->text());
+    EXPECT_TRUE(window.findChild<QLabel*>("workspaceStatus")->text().contains("configured.example"));
+    EXPECT_TRUE(window.findChild<QPushButton*>("arrangeButton")->isHidden());
+}
 
 TEST(DialogPolishTests, HotkeyEditorLoadsExistingSequenceAndCancelPreservesIt) {
     Hotkey hotkey; KeySequence sequence;

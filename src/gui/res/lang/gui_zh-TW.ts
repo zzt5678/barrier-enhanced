@@ -1537,4 +1537,19 @@ Server response:
 <context><name>WorkspaceDashboard</name>
 <message><source>Double-click a record or press Enter to open local history.</source><translation>按兩下記錄或按 Enter 開啟本機歷史。</translation></message>
 </context>
+<context><name>RuntimeTopologyAdapter</name>
+<message><source>Some devices have no layout links</source><translation>部分裝置尚未設定配置連結</translation></message>
+<message><source>Partial screen links cannot be drawn as a grid</source><translation>局部螢幕連結無法顯示為網格配置</translation></message>
+<message><source>Layout links conflict</source><translation>配置連結互相衝突</translation></message>
+<message><source>The configured layout is invalid</source><translation>裝置配置無效</translation></message>
+<message><source>Waiting for layout coordinates</source><translation>等待配置座標</translation></message>
+<message><source>Configured devices · awaiting runtime state</source><translation>已設定裝置 · 等待執行狀態</translation></message>
+<message><source>Server: %1</source><translation>Server：%1</translation></message>
+<message><source>Live device state</source><translation>即時裝置狀態</translation></message>
+<message><source>Historical layout · runtime state unavailable</source><translation>歷史配置 · 目前執行狀態不可用</translation></message>
+<message><source>Awaiting topology from Server</source><translation>等待 Server 同步裝置資訊</translation></message>
+</context>
+<context><name>WorkspaceDashboard</name>
+<message><source>Device list · %1</source><translation>裝置清單 · %1</translation></message>
+</context>
 </TS>
