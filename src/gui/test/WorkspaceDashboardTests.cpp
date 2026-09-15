@@ -104,9 +104,10 @@ TEST(WorkspaceDashboardTests, DeviceIllustrationsAreNotCroppedAtDesktopWidth) {
     view.setDevices({{"left", {0,0}, false}, {"local", {1,0}, true}, {"right", {2,0}, false}});
     view.resize(1488,1056); view.show(); QApplication::processEvents();
     for (auto* label : view.findChildren<QLabel*>("deviceIllustration")) {
-        const QPixmap picture = label->pixmap(Qt::ReturnByValue);
-        ASSERT_FALSE(picture.isNull());
-        EXPECT_GE(label->width(), picture.width() / picture.devicePixelRatioF());
+        const QPixmap* picture = label->pixmap();
+        ASSERT_NE(nullptr, picture);
+        ASSERT_FALSE(picture->isNull());
+        EXPECT_GE(label->width(), picture->width() / picture->devicePixelRatioF());
     }
 }
 TEST(WorkspaceDashboardTests, UnchangedReceiptsPreserveUserSelection) {
