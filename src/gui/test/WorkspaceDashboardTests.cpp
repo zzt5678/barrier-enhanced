@@ -6,6 +6,49 @@
 #include <QListWidget>
 #include <QFile>
 #include <QTranslator>
+#include <QTextDocument>
+TEST(WorkspaceDashboardTests, LocalIdentityIsAnAccessibleCardHighlightAndSharingReplacesActivity) {
+    WorkspaceDashboard view(new QWidget);
+    view.setDevices({{"windows", {-1,0}, false, WorkspaceDeviceRole::Client, WorkspaceDeviceState::Connected, "windows"},
+        {"ubuntu", {0,0}, true, WorkspaceDeviceRole::Server, WorkspaceDeviceState::Connected, "ubuntu"},
+        {"macbook", {1,0}, false, WorkspaceDeviceRole::Client, WorkspaceDeviceState::Connected, "macos"}});
+    EXPECT_EQ(nullptr, view.findChild<QLabel*>("deviceLocal"));
+    const auto cards = view.findChildren<QWidget*>("deviceCard");
+    ASSERT_EQ(3, cards.size());
+    EXPECT_TRUE(cards[1]->property("local").toBool());
+    EXPECT_FALSE(cards[0]->property("local").toBool());
+    EXPECT_TRUE(cards[1]->accessibleDescription().contains("This computer"));
+    QTextDocument tip; tip.setHtml(cards[1]->toolTip());
+    EXPECT_TRUE(tip.toPlainText().contains("This computer"));
+    EXPECT_TRUE(tip.toPlainText().contains("Ubuntu"));
+    EXPECT_EQ(nullptr, view.findChild<QListWidget*>("recentTransfers"));
+    EXPECT_EQ(nullptr, view.findChild<QLabel*>("emptyTransfers"));
+    auto* controls = view.findChild<QWidget*>("sharingControl");
+    ASSERT_NE(nullptr, controls);
+    auto* sharing = controls->findChild<QPushButton*>("sharingButton");
+    auto* settings = controls->findChild<QPushButton*>("sharingSettingsButton");
+    ASSERT_NE(nullptr, sharing); ASSERT_NE(nullptr, settings);
+    int requested = 0;
+    QObject::connect(&view, &WorkspaceDashboard::preferencesRequested, [&] { ++requested; });
+    settings->click(); EXPECT_EQ(1, requested);
+    view.setConnectionState("Runtime fixture", true, true);
+    EXPECT_EQ(QString("Pause sharing"), sharing->text());
+    EXPECT_TRUE(view.findChild<QLabel*>("keyboardSharingState")->text().contains("sharing enabled"));
+    view.setConnectionState("Stopped fixture", false, false);
+    EXPECT_TRUE(view.findChild<QLabel*>("keyboardSharingState")->text().contains("paused"));
+    view.setClipboardSharingState("Awaiting authoritative clipboard state");
+    EXPECT_TRUE(view.findChild<QLabel*>("clipboardSharingState")->text().contains("Awaiting authoritative clipboard state"));
+}
+
+TEST(WorkspaceDashboardTests, PlatformMetadataReachesEachIllustrationWithoutNameInference) {
+    WorkspaceDashboard view(new QWidget);
+    view.setDevices({{"not-an-os-name", {0,0}, true, WorkspaceDeviceRole::Server, WorkspaceDeviceState::Connected, "ubuntu"},
+        {"windows", {1,0}, false, WorkspaceDeviceRole::Client, WorkspaceDeviceState::Configured, "unknown"}});
+    const auto illustrations = view.findChildren<QLabel*>("deviceIllustration");
+    ASSERT_EQ(2, illustrations.size());
+    EXPECT_EQ(QString("ubuntu"), illustrations[0]->property("platform").toString());
+    EXPECT_EQ(QString("unknown"), illustrations[1]->property("platform").toString());
+}
 TEST(WorkspaceDashboardTests, MissingCoordinatesRenderDistinctListRowsInsteadOfStackedDevices) {
     WorkspaceDashboard view(new QWidget);
     view.setDevices({{"first", {}, true, WorkspaceDeviceRole::Client},
@@ -51,7 +94,7 @@ TEST(WorkspaceDashboardTests, NarrowHomeActionsFitTheirViewport) {
     EXPECT_LE(home->width(), home->parentWidget()->width());
     auto* arrange = view.findChild<QPushButton*>("arrangeButton");
     auto* sharing = view.findChild<QPushButton*>("sharingButton");
-    EXPECT_FALSE(arrange->geometry().intersects(sharing->geometry()));
+    EXPECT_FALSE(QRect(arrange->mapTo(&view, {}), arrange->size()).intersects(QRect(sharing->mapTo(&view, {}), sharing->size())));
 }
 TEST(WorkspaceDashboardTests, UnknownRemoteNeverClaimsOnline) {
     WorkspaceDashboard view(new QWidget);
@@ -81,16 +124,13 @@ TEST(WorkspaceDashboardTests, SharingAndLayoutActionsRespectAvailability) {
     EXPECT_TRUE(notice->isHidden());
     EXPECT_EQ(QString("Pause sharing"), sharing->text());
 }
-TEST(WorkspaceDashboardTests, EmptyReceiptsAndNarrowWindowRemainUsable) {
+TEST(WorkspaceDashboardTests, UnknownClipboardAndNarrowWindowRemainUsable) {
     WorkspaceDashboard view(new QWidget);
     view.resize(560, 420); view.show(); QApplication::processEvents();
-    auto* empty = view.findChild<QLabel*>("emptyTransfers");
-    ASSERT_NE(nullptr, empty);
-    EXPECT_TRUE(empty->isVisible());
-    view.setRecentTransfers({"Received example.txt"});
-    EXPECT_FALSE(empty->isVisible());
-    auto* list = view.findChild<QListWidget*>("recentTransfers");
-    ASSERT_NE(nullptr, list); EXPECT_EQ(1, list->count());
+    auto* state = view.findChild<QLabel*>("clipboardSharingState");
+    ASSERT_NE(nullptr, state);
+    EXPECT_TRUE(state->isVisible());
+    EXPECT_EQ(QString("Clipboard: State unknown"), state->text());
     EXPECT_LE(view.minimumSizeHint().width(), 560);
 }
 TEST(WorkspaceDashboardTests, IsolatedVisualPreview) {
@@ -107,7 +147,6 @@ TEST(WorkspaceDashboardTests, IsolatedVisualPreview) {
     view.setStyleSheet(QString::fromUtf8(style.readAll()));
     view.setDevices({{"Studio desktop", {0,0}, false}, {"My workstation", {1,0}, true}, {"Travel laptop", {2,0}, false}});
     view.setConnectionState(QApplication::translate("MainWindow", "Weave is running."), true, true);
-    view.setRecentTransfers(language.startsWith("zh") ? QStringList{"已接收  ·  示例.txt\n2026-09-14 09:41", "已接收  ·  说明.md\n2026-09-14 09:38"} : QStringList{"Received  ·  example.txt\n2026-09-14 09:41", "Received  ·  notes.md\n2026-09-14 09:38"});
     const int width = qEnvironmentVariableIntValue("WEAVE_DASHBOARD_PREVIEW_WIDTH");
     const int height = qEnvironmentVariableIntValue("WEAVE_DASHBOARD_PREVIEW_HEIGHT");
     view.resize(width > 0 ? width : 1100, height > 0 ? height : 760); view.show(); QApplication::processEvents();
@@ -125,15 +164,22 @@ TEST(WorkspaceDashboardTests, DeviceIllustrationsAreNotCroppedAtDesktopWidth) {
         EXPECT_GE(label->width(), picture->width() / picture->devicePixelRatioF());
     }
 }
-TEST(WorkspaceDashboardTests, UnchangedReceiptsPreserveUserSelection) {
+TEST(WorkspaceDashboardTests, PlatformIllustrationsSurviveResizeAndUnknownRemainsNeutral) {
     WorkspaceDashboard view(new QWidget);
-    const QStringList receipts{"first", "second"};
-    view.setRecentTransfers(receipts);
-    auto* list = view.findChild<QListWidget*>("recentTransfers");
-    ASSERT_NE(nullptr, list);
-    list->setCurrentRow(1);
-    view.setRecentTransfers(receipts);
-    EXPECT_EQ(1, list->currentRow());
+    view.setDevices({{"one", {0,0}, true, WorkspaceDeviceRole::Server, WorkspaceDeviceState::Connected, "ubuntu"},
+        {"two", {1,0}, false, WorkspaceDeviceRole::Client, WorkspaceDeviceState::Connected, "windows"},
+        {"three", {2,0}, false, WorkspaceDeviceRole::Client, WorkspaceDeviceState::Connected, "macos"},
+        {"windows-name-only", {3,0}, false}});
+    view.resize(1100,760); view.show(); QApplication::processEvents();
+    const auto monitors = view.findChildren<QLabel*>("deviceIllustration");
+    ASSERT_EQ(4, monitors.size());
+    QVector<QImage> pictures;
+    for (auto* monitor : monitors) { ASSERT_NE(nullptr, monitor->pixmap()); pictures.append(monitor->pixmap()->toImage()); }
+    for (int i=0; i<3; ++i) EXPECT_NE(pictures[i], pictures[3]);
+    EXPECT_NE(pictures[0], pictures[1]); EXPECT_NE(pictures[1], pictures[2]);
+    view.resize(620,760); QApplication::processEvents();
+    view.resize(1100,760); QApplication::processEvents();
+    for (int i=0; i<4; ++i) EXPECT_EQ(pictures[i], monitors[i]->pixmap()->toImage());
 }
 TEST(WorkspaceDashboardTests, LongNamesDoNotOverlapIllustrationsInSmallWindow) {
     QFile style(":/res/styles/dark.qss"); ASSERT_TRUE(style.open(QIODevice::ReadOnly));

@@ -65,17 +65,15 @@ TEST(ReceiptPresentationTests, MainAndHistoryTranslateOnlyInternalMessagesAndKee
         window.resize(620,760); window.show(); history.resize(620,540); history.show();
         QApplication::processEvents(); QApplication::processEvents();
         const auto* recent = window.findChild<QListWidget*>("recentTransfers");
-        ASSERT_NE(nullptr, recent); ASSERT_EQ(1, recent->count());
-        EXPECT_TRUE(recent->wordWrap());
-        EXPECT_EQ(Qt::ElideNone, recent->textElideMode());
+        EXPECT_EQ(nullptr, recent);
         EXPECT_TRUE(receipts->wordWrap());
-        EXPECT_TRUE(recent->item(0)->text().contains(target));
-        QTextDocument tip; tip.setHtml(recent->item(0)->toolTip());
+        EXPECT_EQ(Qt::ElideNone, receipts->textElideMode());
+        EXPECT_TRUE(receipts->item(0)->text().contains(target));
+        QTextDocument tip; tip.setHtml(receipts->item(0)->toolTip());
         EXPECT_TRUE(tip.toPlainText().contains(target));
         EXPECT_TRUE(history.findChild<QTextBrowser*>()->toPlainText().contains(target));
         if (language == "zh-CN") {
-            EXPECT_TRUE(recent->item(0)->text().contains(QString::fromUtf8("正在预取")));
-            EXPECT_FALSE(recent->item(0)->text().contains("Remote clipboard"));
+            EXPECT_TRUE(receipts->item(0)->text().contains(QString::fromUtf8("正在预取")));
             EXPECT_FALSE(receipts->item(0)->text().contains("Remote clipboard"));
             EXPECT_FALSE(history.findChild<QTextBrowser*>()->toPlainText().contains("Remote clipboard"));
         }
@@ -90,7 +88,6 @@ TEST(ReceiptPresentationTests, MainAndHistoryTranslateOnlyInternalMessagesAndKee
         ASSERT_NE(nullptr, tray);
         EXPECT_TRUE(tray->toolTip().contains(language == "en" ? QString("Local history") : QString::fromUtf8("本地历史")));
         if (!out.isEmpty()) {
-            EXPECT_TRUE(window.grab().save(out + "/" + language + "-recent-local-activity.png"));
             EXPECT_TRUE(history.grab().save(out + "/" + language + "-local-action-details.png"));
         }
         EXPECT_EQ(QString("Prefetching"), store->receipts().front().status);
@@ -109,6 +106,41 @@ TEST(ReceiptPresentationTests, MainAndHistoryTranslateOnlyInternalMessagesAndKee
     EXPECT_TRUE(workflowReceiptDetail(stage).contains(QString::fromUtf8("尚待")));
     stage.status = "Failed"; stage.detail = rawDetail;
     EXPECT_EQ(rawDetail, workflowReceiptDetail(stage)); // An arbitrary failure detail is not a prefetch event.
+    BarrierLocale::switchLanguage("en"); QApplication::processEvents();
+}
+
+TEST(DeviceSharingLayoutTests, LocalHighlightPlatformsAndControlsFitBothLanguagesAndWidths) {
+    QFile style(":/res/styles/dark.qss"); ASSERT_TRUE(style.open(QIODevice::ReadOnly));
+    WorkspaceDashboard dashboard(new QWidget);
+    dashboard.setStyleSheet(QString::fromUtf8(style.readAll()));
+    const QString out = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
+    for (const QString& language : {QString("en"), QString("zh-CN")}) {
+        BarrierLocale::switchLanguage(language); QApplication::processEvents(); dashboard.retranslate();
+        dashboard.setDevices({{"zyt", {-1,0}, false, WorkspaceDeviceRole::Client, WorkspaceDeviceState::Connected, "windows"},
+            {"zyt-System-Product-Name", {0,0}, true, WorkspaceDeviceRole::Server, WorkspaceDeviceState::Connected, "ubuntu"},
+            {"macbook-air", {1,0}, false, WorkspaceDeviceRole::Client, WorkspaceDeviceState::Connected, "macos"}});
+        dashboard.setConnectionState(QApplication::translate("RuntimeTopologyAdapter", "Live device state"), true, true);
+        dashboard.setClipboardSharingState(QString()); // Unknown is explicit; no synthetic backend success.
+        for (int width : {620,1100}) {
+            dashboard.resize(width,760); dashboard.show(); QApplication::processEvents(); QApplication::processEvents();
+            auto* home = dashboard.findChild<QWidget*>("workspaceHome");
+            EXPECT_LE(home->width(), home->parentWidget()->width());
+            for (auto* button : dashboard.findChildren<QPushButton*>()) {
+                if (button->property("navigation").toBool()) EXPECT_GE(button->width(), button->sizeHint().width()) << button->text().toStdString();
+            }
+            const auto cards = dashboard.findChildren<QWidget*>("deviceCard");
+            ASSERT_EQ(3, cards.size());
+            for (auto* card : cards) {
+                auto* detail = card->findChild<QWidget*>("deviceDetailRow");
+                EXPECT_LE(detail->width(), card->width());
+                EXPECT_TRUE(card->rect().contains(QRect(detail->mapTo(card,{}),detail->size())));
+            }
+            auto* controls = dashboard.findChild<QWidget*>("sharingControl");
+            EXPECT_LT(controls->height(), 200);
+            EXPECT_EQ(nullptr, dashboard.findChild<QListWidget*>("recentTransfers"));
+            if (!out.isEmpty()) EXPECT_TRUE(dashboard.grab().save(out + "/" + language + QString("-device-sharing-%1.png").arg(width)));
+        }
+    }
     BarrierLocale::switchLanguage("en"); QApplication::processEvents();
 }
 
