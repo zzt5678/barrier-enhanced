@@ -406,15 +406,23 @@ struct SnapshotPublisher::State {
         name=snapshotFilename(snapshot.identity);
         worker=std::thread([this] {
             std::unique_lock<std::mutex> lock(mutex);
+            bool retry=false;
             while (!stop) {
-                changed.wait_for(lock,std::chrono::seconds(2),[this]{return stop||dirty;});
+                // Only producer updates advance freshness. Once published,
+                // identical bytes need no timeout rewrite; failed I/O still
+                // gets a bounded retry without requiring a producer update.
+                if (retry)
+                    changed.wait_for(lock,std::chrono::seconds(2),[this]{return stop||dirty;});
+                else
+                    changed.wait(lock,[this]{return stop||dirty;});
                 if (stop) break;
                 dirty=false;
                 Snapshot copy=snapshot;
                 lock.unlock();
                 std::string b;
-                if (encodeSnapshot(copy,b)) writePrivate(directory,name,b);
+                const bool failed=encodeSnapshot(copy,b) && !writePrivate(directory,name,b);
                 lock.lock();
+                retry=failed;
             }
             lock.unlock(); removePrivate(directory,name);
         });

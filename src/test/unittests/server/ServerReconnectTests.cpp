@@ -15,6 +15,7 @@
 #include "barrier/StreamChunker.h"
 #include "arch/Arch.h"
 #include "base/IEventJob.h"
+#include "base/ILogOutputter.h"
 #include "base/Stopwatch.h"
 #include "io/filesystem.h"
 #include "mt/Thread.h"
@@ -51,6 +52,44 @@ using ::testing::Return;
 using ::testing::ReturnRef;
 
 namespace {
+
+class ScopedWarningCapture : public ILogOutputter
+{
+public:
+    ScopedWarningCapture()
+    {
+        CLOG->insert(this);
+    }
+
+    ~ScopedWarningCapture() override
+    {
+        CLOG->remove(this);
+    }
+
+    void open(const char*) override { }
+    void close() override { }
+    void show(bool) override { }
+
+    bool write(ELevel level, const char* message) override
+    {
+        if (level == kWARNING) {
+            warnings.push_back(message != NULL ? message : "");
+        }
+        return true;
+    }
+
+    size_t countContaining(const std::string& text) const
+    {
+        return static_cast<size_t>(std::count_if(
+            warnings.begin(), warnings.end(),
+            [&text](const std::string& warning) {
+                return warning.find(text) != std::string::npos;
+            }));
+    }
+
+private:
+    std::vector<std::string> warnings;
+};
 
 constexpr const char* kLocalFileSessionId =
     "00000000000000000000000000000051";
@@ -4015,6 +4054,7 @@ TEST(ServerReconnectTests, activeClientShapeChangedToUnusableRecoversToPrimary)
     client.shapeW = 0;
     client.shapeH = 0;
 
+    ScopedWarningCapture warnings;
     server.handleShapeChanged(Event(), &client);
 
     EXPECT_EQ(&primary, server.m_active);
@@ -4023,6 +4063,71 @@ TEST(ServerReconnectTests, activeClientShapeChangedToUnusableRecoversToPrimary)
 	EXPECT_EQ(100, primary.enterX);
 	EXPECT_EQ(100, primary.enterY);
     EXPECT_EQ(1u, screenSwitchedCount);
+    EXPECT_EQ(1u, warnings.countContaining("unusable screen shape for \"client\""));
+}
+
+TEST(ServerReconnectTests, repeatedInvalidNeighborLookupDoesNotRepeatShapeWarnings)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kRight, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    EnterablePrimaryClient primary;
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, primary);
+    server.m_clients.insert(std::make_pair(client.getName(), &client));
+    server.m_clientSet.insert(&client);
+    client.shapeW = 0;
+    client.shapeH = 0;
+
+    ScopedWarningCapture warnings;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        SInt32 x = 1023;
+        SInt32 y = 100;
+        EXPECT_EQ(NULL, server.getNeighbor(&primary, kRight, x, y));
+    }
+
+    EXPECT_EQ(0u, warnings.countContaining("unusable screen shape"));
+}
+
+TEST(ServerReconnectTests, initiallyUnusableClientShapeWarnsOnceWhenAdded)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    NiceMock<MockPrimaryClient> primary;
+    ON_CALL(primary, getEventTarget()).WillByDefault(Return(&primary));
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, primary);
+    client.shapeW = 1;
+    client.shapeH = 1;
+
+    ScopedWarningCapture warnings;
+    ASSERT_TRUE(server.addClient(&client));
+
+    EXPECT_EQ(1u, warnings.countContaining(
+        "initial unusable screen shape for \"client\": 0,0 1x1"));
 }
 
 TEST(ServerReconnectTests, activeClientShapeRecoveryUsesRememberedPhysicalEdge)

@@ -4,10 +4,15 @@
 #include <chrono>
 #include <thread>
 #include <filesystem>
+#include <fstream>
 #include <climits>
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/stat.h>
+#endif
+#ifdef __linux__
+#include <poll.h>
+#include <sys/inotify.h>
 #endif
 
 using namespace weave::topology;
@@ -195,6 +200,10 @@ TEST(DeviceTopologyTests, AtomicPrivateSnapshotLifecycleAndDisconnect)
         ASSERT_EQ(0,stat((directory+"/"+snapshotFilename(identity)).c_str(),&st));
         EXPECT_EQ(0600,st.st_mode&0777);
         EXPECT_EQ("Mac",s.localName);
+        // Keep the original inode alive so an atomic rewrite cannot hide
+        // behind filesystem inode reuse during this idle interval.
+        std::ifstream originalFile(directory+"/"+snapshotFilename(identity));
+        ASSERT_TRUE(originalFile.is_open());
         const auto pulseTime=s.updatedMillis;
         const auto pulseSequence=s.sequence;
         std::this_thread::sleep_for(std::chrono::milliseconds(2100));
@@ -203,6 +212,9 @@ TEST(DeviceTopologyTests, AtomicPrivateSnapshotLifecycleAndDisconnect)
         // remote server is still responsive.
         EXPECT_EQ(pulseTime,s.updatedMillis);
         EXPECT_EQ(pulseSequence,s.sequence);
+        struct stat idleStat{};
+        ASSERT_EQ(0,stat((directory+"/"+snapshotFilename(identity)).c_str(),&idleStat));
+        EXPECT_EQ(st.st_ino,idleStat.st_ino) << "Unchanged state must not be rewritten on a worker timeout";
         EXPECT_EQ(ReadStatus::Stale,readSnapshot(directory,identity,pulseTime+6001,s));
         publisher.update(trio(),"Mac",Role::Client,false);
         for (int n=0;n<100 && state!=ReadStatus::NotReady;++n) {
@@ -216,6 +228,49 @@ TEST(DeviceTopologyTests, AtomicPrivateSnapshotLifecycleAndDisconnect)
     EXPECT_TRUE(std::filesystem::is_empty(directory));
     std::filesystem::remove(directory);
 }
+
+#ifdef __linux__
+TEST(DeviceTopologyTests, FailedPublicationRetriesWithoutAnotherUpdate)
+{
+    char pattern[]="/tmp/weave-topology-test-XXXXXX";
+    const char* path=mkdtemp(pattern); ASSERT_NE(nullptr,path);
+    const std::string directory(path);
+    const auto identity=currentProcessIdentity();
+    ASSERT_EQ(0,chmod(directory.c_str(),0755));
+    struct DirectoryWatch {
+        int fd=inotify_init1(IN_CLOEXEC|IN_NONBLOCK);
+        ~DirectoryWatch() { if (fd>=0) close(fd); }
+    } watch;
+    ASSERT_GE(watch.fd,0);
+    ASSERT_GE(inotify_add_watch(watch.fd,directory.c_str(),IN_CLOSE_NOWRITE),0);
+    {
+        SnapshotPublisher publisher(directory);
+        publisher.update(trio(),"Mac",Role::Client,true);
+        // No other thread opens this isolated directory. Its close event
+        // proves the worker finished the rejected 0755-directory check;
+        // a sleep alone could let the initial attempt occur after chmod.
+        pollfd ready{watch.fd,POLLIN,0};
+        ASSERT_EQ(1,poll(&ready,1,3000));
+        inotify_event closed{};
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(closed)),read(watch.fd,&closed,sizeof(closed)));
+        ASSERT_NE(0u,closed.mask&IN_CLOSE_NOWRITE);
+        ASSERT_NE(0u,closed.mask&IN_ISDIR);
+        ASSERT_EQ(0,chmod(directory.c_str(),0700));
+        Snapshot s; ReadStatus state=ReadStatus::Missing;
+        // The failed write must recover on its bounded retry timer, even
+        // though the producer does not submit any new state.
+        for (int n=0;n<300 && state!=ReadStatus::Fresh;++n) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            state=readSnapshot(directory,identity,monotonicMillis(),s);
+        }
+        ASSERT_EQ(ReadStatus::Fresh,state);
+        EXPECT_EQ(1u,s.sequence);
+        EXPECT_EQ("Mac",s.localName);
+    }
+    EXPECT_TRUE(std::filesystem::is_empty(directory));
+    std::filesystem::remove(directory);
+}
+#endif
 
 TEST(DeviceTopologyTests, PrivatePublisherRejectsPublicDirectoryAndSymlink)
 {

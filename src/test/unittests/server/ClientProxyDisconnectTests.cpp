@@ -2,6 +2,7 @@
 #include "server/ClientProxy1_0.h"
 
 #include "barrier/protocol_types.h"
+#include "base/ILogOutputter.h"
 
 #include "test/global/gmock.h"
 #include "test/global/gtest.h"
@@ -21,6 +22,33 @@ using ::testing::Return;
 using ::testing::ReturnRef;
 
 namespace {
+
+class ScopedWarningCapture : public ILogOutputter
+{
+public:
+    ScopedWarningCapture() { CLOG->insert(this); }
+    ~ScopedWarningCapture() override { CLOG->remove(this); }
+    void open(const char*) override { }
+    void close() override { }
+    void show(bool) override { }
+    bool write(ELevel level, const char* message) override
+    {
+        if (level == kWARNING) {
+            warnings.push_back(message != NULL ? message : "");
+        }
+        return true;
+    }
+    size_t countContaining(const std::string& text) const
+    {
+        return static_cast<size_t>(std::count_if(
+            warnings.begin(), warnings.end(),
+            [&text](const std::string& warning) {
+                return warning.find(text) != std::string::npos;
+            }));
+    }
+private:
+    std::vector<std::string> warnings;
+};
 
 void setClientProxyEventDefaults(MockEventQueue& events,
                                  IStreamEvents& streamEvents,
@@ -427,6 +455,7 @@ TEST(ClientProxyDisconnectTests, dInfoWithUnavailableShapeStillRaisesShapeChange
             Event::deleteData(event);
         }));
 
+    ScopedWarningCapture warnings;
     EXPECT_TRUE(proxy.parseMessage(reinterpret_cast<const UInt8*>(kMsgDInfo)));
 
     SInt32 x, y, w, h;
@@ -438,4 +467,6 @@ TEST(ClientProxyDisconnectTests, dInfoWithUnavailableShapeStillRaisesShapeChange
     proxy.getCursorPos(x, y);
     EXPECT_EQ(0, x);
     EXPECT_EQ(0, y);
+    EXPECT_EQ(1u, warnings.countContaining(
+        "client \"client\" reported unavailable screen shape=0,0 0x0"));
 }

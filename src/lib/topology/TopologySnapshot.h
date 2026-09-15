@@ -42,8 +42,9 @@ public:
     ~SnapshotPublisher();
     SnapshotPublisher(const SnapshotPublisher&) = delete;
     SnapshotPublisher& operator=(const SnapshotPublisher&) = delete;
-    // Copies bounded metadata only. Disk I/O and 2s liveness publication occur
-    // on the worker, never on the input event thread.
+    // Copies bounded metadata and advances freshness from the producer event.
+    // Disk I/O runs on the worker; failed writes retry every 2s without
+    // advancing freshness, and successful unchanged state is not rewritten.
     void update(const Topology&, const std::string& localName, Role, bool ready);
 private:
     struct State;

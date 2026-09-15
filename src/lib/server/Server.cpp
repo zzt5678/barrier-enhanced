@@ -123,8 +123,6 @@ bool clampToClientShape(BaseClientProxy* client, SInt32& x, SInt32& y)
     client->getShape(sx, sy, sw, sh);
 
     if (sw < kMinUsableScreenDimension || sh < kMinUsableScreenDimension) {
-        LOG((CLOG_WARN "ignoring unusable screen shape for \"%s\": %d,%d %dx%d",
-            client->getName().c_str(), sx, sy, sw, sh));
         return false;
     }
 
@@ -159,12 +157,7 @@ bool hasValidClientShape(BaseClientProxy* client)
 {
     SInt32 sx, sy, sw, sh;
     client->getShape(sx, sy, sw, sh);
-    if (sw < kMinUsableScreenDimension || sh < kMinUsableScreenDimension) {
-        LOG((CLOG_WARN "unusable screen shape for \"%s\": %d,%d %dx%d",
-            client->getName().c_str(), sx, sy, sw, sh));
-        return false;
-    }
-    return true;
+    return sw >= kMinUsableScreenDimension && sh >= kMinUsableScreenDimension;
 }
 
 bool readClipboardWithRetry(BaseClientProxy* sender, ClipboardID id, Clipboard& clipboard)
@@ -2492,8 +2485,6 @@ Server::getNeighbor(BaseClientProxy* src,
 		ClientList::const_iterator index = m_clients.find(dstName);
 		if (index != m_clients.end()) {
 			if (!hasValidClientShape(index->second)) {
-				LOG((CLOG_WARN "ignoring neighbor \"%s\" with unusable screen shape",
-					dstName.c_str()));
 				return NULL;
 			}
 			LOG((CLOG_DEBUG2 "\"%s\" is on %s of \"%s\" at %f", dstName.c_str(), Config::dirName(dir), srcName.c_str(), t));
@@ -3311,6 +3302,10 @@ Server::handleShapeChanged(const Event&, void* vclient)
 	LOG((CLOG_DEBUG "screen \"%s\" shape changed", getName(client).c_str()));
 
 	if (!hasValidClientShape(client)) {
+		SInt32 sx, sy, sw, sh;
+		client->getShape(sx, sy, sw, sh);
+		LOG((CLOG_WARN "unusable screen shape for \"%s\": %d,%d %dx%d",
+			getName(client).c_str(), sx, sy, sw, sh));
 		if (client == m_primaryClient && m_active != m_primaryClient) {
 			recoverToPrimaryFromActive("invalid primary screen shape");
 		}
@@ -5647,6 +5642,12 @@ Server::addClient(BaseClientProxy* client)
 	client->getCursorPos(x, y);
 	if (client == m_primaryClient || clampToClientShape(client, x, y)) {
 		client->setJumpCursorPos(x, y);
+	}
+	else {
+		SInt32 sx, sy, sw, sh;
+		client->getShape(sx, sy, sw, sh);
+		LOG((CLOG_WARN "initial unusable screen shape for \"%s\": %d,%d %dx%d",
+			name.c_str(), sx, sy, sw, sh));
 	}
 
 	// tell primary client about the active sides
