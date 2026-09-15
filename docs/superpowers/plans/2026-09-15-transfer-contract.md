@@ -40,6 +40,9 @@ resume is introduced. Retry creates a new attempt after explicit user action.
   state remains alive after CommitAck retires the hop transaction.
 - Worker completion is delivered to the core event thread by stable IDs;
   workers do not access network streams or retain disconnectable proxy pointers.
+  Archive, hashing and journal disk I/O run outside the input event thread;
+  serialize journal writes and acknowledge state only after the matching write
+  completes. Transfer persistence must not stall keyboard/mouse delivery.
 - Initial limits: one active explicit send, eight queued tasks, 128 selected
   roots, 512 MiB archive limit, and 2 GiB aggregate owned spool/staging budget.
   Existing archive safety limits and transfer backpressure remain binding.
@@ -52,6 +55,10 @@ resume is introduced. Retry creates a new attempt after explicit user action.
   running-core state. Published output is never deleted by history cleanup.
   Authenticated TaskStatusQuery/TaskStatusResult reconcile a remote receipt by
   task/attempt and owner, with an explicit unknown result after receipt expiry.
+  Preserve up to4096 compact current-core request replay tombstones separately
+  from visible history. At capacity reject new sends explicitly while allowing
+  duplicates, queries and cancellation; never auto-restart input or silently
+  evict replay protection. Reject unknown old-core requests after restart.
 
 ## Local control security
 
