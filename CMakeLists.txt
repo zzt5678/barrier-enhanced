@@ -542,7 +542,7 @@ if (BARRIER_BUILD_TESTS)
             COMMAND ${CMAKE_COMMAND}
                 -DPRODUCT_BINARY=$<TARGET_FILE:${version_target}>
                 -DEXPECTED_BUILD_ID=${BARRIER_VERSION}+${BARRIER_REVISION}.${BARRIER_BUILD_DATE}
-                -DEXPECTED_PROTOCOL=1.12
+                -DEXPECTED_PROTOCOL=1.13
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/src/test/ProductVersionCommandTest.cmake.in)
         set_tests_properties (${version_target}_version_identity
                               PROPERTIES TIMEOUT 5)
