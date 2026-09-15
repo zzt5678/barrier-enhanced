@@ -38,6 +38,7 @@
 #include "Ipc.h"
 #include "LogWindow.h"
 #include "RuntimeTopologyAdapter.h"
+#include "DevicePlatformCatalog.h"
 
 #include <QMutex>
 
@@ -246,11 +247,13 @@ public slots:
         WorkspaceDashboard* m_workspaceDashboard = nullptr;
         QTimer m_TopologyTimer;
         RuntimeTopologyAdapter m_runtimeTopology;
+        DevicePlatformCatalog m_devicePlatforms;
         weave::topology::ProcessIdentity m_expectedTopologyProcess;
         weave::topology::Snapshot m_runtimeSnapshot;
         weave::topology::ReadStatus m_topologyReadStatus = weave::topology::ReadStatus::Missing;
         RuntimeTopologyFallback m_launchTopologyFallback;
         bool m_hasLaunchTopologyFallback = false;
+        int m_launchClipboardSharing = -1;
         bool m_topologyReadsAllowed = true;
         QString m_topologyDiagnostic;
 

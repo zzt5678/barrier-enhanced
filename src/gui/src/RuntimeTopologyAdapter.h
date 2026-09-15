@@ -3,6 +3,8 @@
 #include "WorkspaceDashboard.h"
 #include "topology/TopologySnapshot.h"
 
+QString runtimeClipboardSharingState(bool running, bool fresh, bool server, int launchSetting);
+
 struct RuntimeTopologyFallback {
     QVector<WorkspaceDevice> devices;
     QString localName;

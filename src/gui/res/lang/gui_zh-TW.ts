@@ -1593,4 +1593,22 @@ Local history: %1
 <message><source>No local action records yet.</source><translation>尚無本機操作記錄。</translation></message>
 <message><source>%1 local action record(s). Latest: %2</source><translation>%1 筆本機操作記錄。最新：%2</translation></message>
 </context>
+<context><name>WorkspaceDashboard</name>
+<message><source>Sharing control</source><translation>共享控制</translation></message>
+<message><source>Keyboard and mouse: sharing enabled</source><translation>鍵鼠共享：已開啟</translation></message>
+<message><source>Keyboard and mouse: sharing paused</source><translation>鍵鼠共享：已暫停</translation></message>
+<message><source>Clipboard: %1</source><translation>剪貼簿：%1</translation></message>
+<message><source>State unknown</source><translation>狀態未知</translation></message>
+<message><source>Sharing settings</source><translation>共享設定</translation></message>
+<message><source>Operating system unknown</source><translation>系統未知</translation></message>
+<message><source>Verified device profile</source><translation>已核實的裝置資料</translation></message>
+</context>
+<context><name>RuntimeTopologyAdapter</name>
+<message><source>Paused</source><translation>已暫停</translation></message>
+<message><source>Awaiting runtime state</source><translation>等待執行狀態</translation></message>
+<message><source>Managed by Server</source><translation>由 Server 管理</translation></message>
+<message><source>Managed by server configuration</source><translation>由伺服端設定管理</translation></message>
+<message><source>Enabled in running configuration</source><translation>執行設定已開啟</translation></message>
+<message><source>Disabled in running configuration</source><translation>執行設定已關閉</translation></message>
+</context>
 </TS>

@@ -19,6 +19,16 @@ QString layoutReason(Layout value) {
 }
 }
 
+QString runtimeClipboardSharingState(bool running, bool fresh, bool server, int launchSetting)
+{
+    if (!running) return text("Paused");
+    if (!fresh) return text("Awaiting runtime state");
+    if (!server) return text("Managed by Server");
+    if (launchSetting == 1) return text("Enabled in running configuration");
+    if (launchSetting == 0) return text("Disabled in running configuration");
+    return text("Managed by server configuration");
+}
+
 RuntimeTopologyView RuntimeTopologyAdapter::apply(ReadStatus status,
     const Snapshot* evidence, std::uint64_t now,
     const RuntimeTopologyFallback& fallback)

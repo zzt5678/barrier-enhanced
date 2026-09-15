@@ -19,6 +19,15 @@ Snapshot threeDevices(const std::string& viewer = "ubuntu") {
         {"ubuntu", Role::Server, true, 0, 0}, {"mac", Role::Client, false, 1, 0}};
     return s;
 }
+
+TEST(RuntimeTopologyAdapterTests, ClipboardSummaryNeverInfersRemoteOrPendingConfiguration) {
+    EXPECT_EQ(QString("Paused"), runtimeClipboardSharingState(false, true, true, 1));
+    EXPECT_EQ(QString("Awaiting runtime state"), runtimeClipboardSharingState(true, false, true, 1));
+    EXPECT_EQ(QString("Managed by Server"), runtimeClipboardSharingState(true, true, false, 1));
+    EXPECT_EQ(QString("Managed by server configuration"), runtimeClipboardSharingState(true, true, true, -1));
+    EXPECT_EQ(QString("Enabled in running configuration"), runtimeClipboardSharingState(true, true, true, 1));
+    EXPECT_EQ(QString("Disabled in running configuration"), runtimeClipboardSharingState(true, true, true, 0));
+}
 RuntimeTopologyFallback pendingSettings() {
     RuntimeTopologyFallback f;
     f.localName = "pending-name"; f.serverAddress = "configured.example";

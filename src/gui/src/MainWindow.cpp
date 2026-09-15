@@ -239,6 +239,12 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     controlCenterLayout->addWidget(scrollArea, 1);
     controlCenterLayout->addWidget(controlBar);
     m_workspaceDashboard = new WorkspaceDashboard(controlCenter, this);
+    // This is explicitly verified display metadata, never authentication or
+    // discovery. Test harnesses must not read the user's production profile.
+    if (qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST") != "1") {
+        const auto catalog = barrier::DataDirectories::profile() / "device-platforms.json";
+        m_devicePlatforms.load(QString::fromStdString(catalog.u8string()));
+    }
     setCentralWidget(m_workspaceDashboard);
     heroCard->hide();
     overviewCard->hide();
@@ -253,9 +259,6 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
             this, &MainWindow::on_m_pActionSettings_triggered);
     // Keep the settings header entry; the footer opens the same preferences dialog.
     m_pButtonSettings->hide();
-    connect(m_workspaceDashboard, &WorkspaceDashboard::inboxRequested, this, [this]{
-        if (m_pWorkflowStore) QDesktopServices::openUrl(QUrl::fromLocalFile(m_pWorkflowStore->inboxDir()));
-    });
     connect(m_pLineEditHostname, &QLineEdit::textChanged, this, &MainWindow::updateWorkspaceDashboard);
     connect(m_pLineEditConfigFile, &QLineEdit::textChanged, this, &MainWindow::updateWorkspaceDashboard);
     connect(m_pRadioExternalConfig, &QRadioButton::toggled, this, &MainWindow::updateWorkspaceDashboard);
@@ -1019,6 +1022,8 @@ void MainWindow::startBarrier()
     if (desktopMode)
     {
         const auto launchFallback = configuredTopologyFallback();
+        const int launchClipboard = barrier_type() == BarrierType::Server && !m_pRadioExternalConfig->isChecked()
+            ? (serverConfig().clipboardSharing() ? 1 : 0) : -1;
         barrierProcess()->start(app, args);
         if (!barrierProcess()->waitForStarted())
         {
@@ -1039,6 +1044,7 @@ void MainWindow::startBarrier()
                                          m_expectedTopologyProcess);
         m_launchTopologyFallback = launchFallback;
         m_hasLaunchTopologyFallback = true;
+        m_launchClipboardSharing = launchClipboard;
         pollRuntimeTopology();
 
         m_ProcessLifetime.restart();
@@ -2274,6 +2280,7 @@ void MainWindow::clearRuntimeTopology()
     m_topologyReadStatus = weave::topology::ReadStatus::Missing;
     m_runtimeTopology.reset();
     m_hasLaunchTopologyFallback = false;
+    m_launchClipboardSharing = -1;
 }
 
 void MainWindow::pollRuntimeTopology()
@@ -2322,19 +2329,15 @@ void MainWindow::updateWorkspaceDashboard()
     }
     const bool readable = m_topologyReadStatus == ReadStatus::Fresh ||
         m_topologyReadStatus == ReadStatus::Stale || m_topologyReadStatus == ReadStatus::NotReady;
-    const auto view = m_runtimeTopology.apply(m_topologyReadStatus,
+    auto view = m_runtimeTopology.apply(m_topologyReadStatus,
         readable ? &m_runtimeSnapshot : nullptr, monotonicMillis(), fallback);
+    for (auto& device : view.devices)
+        device.platform = m_devicePlatforms.resolve(device.name, device.local);
     m_workspaceDashboard->setDevices(view.devices, view.spatial, view.layoutReason);
     m_workspaceDashboard->setConnectionState(view.status, m_ExpectedRunningState == kStarted, view.canArrange);
-    QStringList transfers;
-    if (m_pWorkflowStore) {
-        const auto& receipts = m_pWorkflowStore->receipts();
-        for (int i = 0; i < qMin(3, receipts.size()); ++i) {
-            const auto& receipt = receipts[i];
-            transfers.append(QStringLiteral("%1  ·  %2\n%3")
-                .arg(workflowReceiptStatus(receipt), receipt.detail.isEmpty() ? receipt.actionId : workflowReceiptDetail(receipt),
-                     receipt.createdAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm"))));
-        }
-    }
-    m_workspaceDashboard->setRecentTransfers(transfers);
+    const bool fresh = m_topologyReadStatus == ReadStatus::Fresh &&
+        classifySnapshot(m_runtimeSnapshot, m_runtimeSnapshot.identity, monotonicMillis()) == ReadStatus::Fresh;
+    m_workspaceDashboard->setClipboardSharingState(runtimeClipboardSharingState(
+        m_ExpectedRunningState == kStarted, fresh,
+        fresh && m_runtimeSnapshot.localRole == Role::Server, m_launchClipboardSharing));
 }

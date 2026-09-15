@@ -11,6 +11,11 @@
         <file>icons/256x256/weave.png</file>
         <file>image/about.png</file>
         <file>image/device-display.png</file>
+        <file>icons/platform/ubuntu.svg</file>
+        <file>icons/platform/windows.svg</file>
+        <file>icons/platform/macos.svg</file>
+        <file>icons/platform/DEVICON-LICENSE</file>
+        <file>icons/platform/SOURCES.md</file>
         <file>icons/workspace/devices.png</file>
         <file>icons/workspace/transfers.png</file>
         <file>icons/workspace/settings.png</file>
