@@ -1,0 +1,7 @@
+add_library(weave_topology STATIC DeviceTopology.cpp TopologySnapshot.cpp)
+target_include_directories(weave_topology PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
+if(WIN32)
+    target_link_libraries(weave_topology PUBLIC advapi32 shell32)
+else()
+    target_link_libraries(weave_topology PUBLIC Threads::Threads)
+endif()

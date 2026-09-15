@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+add_subdirectory(topology)
 add_subdirectory(arch)
 add_subdirectory(base)
 add_subdirectory(client)
