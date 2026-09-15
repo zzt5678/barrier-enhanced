@@ -3,6 +3,9 @@
 #include "ActionBus.h"
 #include "WorkflowStore.h"
 #include "ElidingLabel.h"
+#include "DialogPresentation.h"
+#include "WorkflowDisplayText.h"
+#include <QEvent>
 
 #include <QDateTime>
 #include <QDesktopServices>
@@ -90,6 +93,7 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     headerLayout->addWidget(m_capabilityLabel);
 
     auto* contentLayout = new QHBoxLayout;
+    contentLayout->setObjectName("historyContentLayout");
     contentLayout->setSpacing(18);
     auto* leftCard = new QFrame(this);
     leftCard->setObjectName(QStringLiteral("workflowCard"));
@@ -124,12 +128,27 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     contentLayout->addWidget(rightCard, 3);
 
     auto* actionLayout = new QGridLayout;
+    actionLayout->setObjectName("historyActionsLayout");
+    actionLayout->setProperty("columns", 4);
     auto* screenshotButton = new QPushButton(tr("Capture Screenshot"), this);
     auto* inboxButton = new QPushButton(tr("Open Inbox"), this);
     auto* cancelSaveButton = new QPushButton(tr("Cancel Save"), this);
     cancelSaveButton->setToolTip(tr("Cancel the active inbox save; completed files are kept."));
     connect(cancelSaveButton, &QPushButton::clicked, m_actionBus, &ActionBus::cancelInboxSave);
     auto* closeButton = new QPushButton(tr("Close"), this);
+    const QList<QPair<QWidget*, const char*>> translatedWidgets {
+        {titleLabel, "Workflow Hub"},
+        {subtitleLabel, "Review transferred context, suggested follow-up actions, and every receipt Weave records while you move content between devices."},
+        {leftTitle, "Collected Context"},
+        {leftSubtitle, "Switch between history, suggestions, and receipts without leaving the desktop."},
+        {detailTitle, "Inspector"},
+        {detailSubtitle, "Preview payloads, inspect transfer metadata, and execute the next step from one place."},
+        {m_executeSuggestionButton, "Execute Suggestion"}, {m_openButton, "Open"},
+        {m_saveButton, "Save to Inbox"}, {m_revealButton, "Reveal"},
+        {screenshotButton, "Capture Screenshot"}, {inboxButton, "Open Inbox"},
+        {cancelSaveButton, "Cancel Save"}, {closeButton, "Close"}
+    };
+    for (const auto& entry : translatedWidgets) entry.first->setProperty("translationSource", entry.second);
     const QList<QPushButton*> actions{m_executeSuggestionButton, m_openButton,
         m_saveButton, m_revealButton, screenshotButton, inboxButton, cancelSaveButton, closeButton};
     for (int index = 0; index < actions.size(); ++index) {
@@ -142,8 +161,20 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(20, 20, 20, 20);
     root->setSpacing(18);
-    root->addLayout(headerLayout);
-    root->addLayout(contentLayout, 1);
+    auto* body = new QWidget(this);
+    body->setObjectName("historyBody");
+    auto* bodyLayout = new QVBoxLayout(body);
+    bodyLayout->setContentsMargins(0, 0, 0, 0);
+    bodyLayout->addLayout(headerLayout);
+    bodyLayout->addLayout(contentLayout, 1);
+    auto* scroll = new QScrollArea(this);
+    scroll->setObjectName("historyBodyScroll");
+    scroll->setStyleSheet("QScrollArea#historyBodyScroll, QWidget#historyBody { background: #faf9f6; }");
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidgetResizable(true);
+    scroll->setMinimumHeight(120);
+    scroll->setWidget(body);
+    root->addWidget(scroll, 1);
     root->addLayout(actionLayout);
 
     connect(m_tabs, &QTabWidget::currentChanged, this, &WorkflowHubDialog::updateDetails);
@@ -166,6 +197,40 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     connect(m_store, &WorkflowStore::runtimeModeChanged, this, &WorkflowHubDialog::refreshAll);
 
     refreshAll();
+    DialogPresentation::fit(this, QSize(920, 700));
+}
+
+void WorkflowHubDialog::changeEvent(QEvent* event)
+{
+    if (event->type() == QEvent::LanguageChange) {
+        setWindowTitle(tr("Weave Workflow Hub"));
+        m_tabs->setTabText(0, tr("History"));
+        m_tabs->setTabText(1, tr("Suggestions"));
+        m_tabs->setTabText(2, tr("Receipts"));
+        for (auto* widget : findChildren<QWidget*>()) {
+            const QByteArray source = widget->property("translationSource").toByteArray();
+            if (source.isEmpty()) continue;
+            if (auto* label = qobject_cast<QLabel*>(widget)) label->setText(tr(source.constData()));
+            if (auto* button = qobject_cast<QPushButton*>(widget)) button->setText(tr(source.constData()));
+        }
+        refreshAll();
+    }
+    QDialog::changeEvent(event);
+}
+
+void WorkflowHubDialog::resizeEvent(QResizeEvent* event)
+{
+    auto* content = findChild<QHBoxLayout*>("historyContentLayout");
+    if (content) content->setDirection(width() < 720 ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+    auto* actions = findChild<QGridLayout*>("historyActionsLayout");
+    const int columns = width() < 720 ? 2 : 4;
+    if (actions && actions->property("columns").toInt() != columns) {
+        QList<QWidget*> buttons;
+        while (auto* item = actions->takeAt(0)) { buttons.append(item->widget()); delete item; }
+        for (int i = 0; i < buttons.size(); ++i) actions->addWidget(buttons[i], i / columns, i % columns);
+        actions->setProperty("columns", columns);
+    }
+    QDialog::resizeEvent(event);
 }
 
 void WorkflowHubDialog::showEvent(QShowEvent* event)
@@ -189,15 +254,20 @@ void WorkflowHubDialog::refreshAll()
     const QString selectedSuggestionId = m_suggestionList->currentItem()
         ? m_suggestionList->currentItem()->data(Qt::UserRole).toString()
         : QString();
+    const QString selectedReceiptId = m_receiptList->currentItem()
+        ? m_receiptList->currentItem()->data(Qt::UserRole).toString() : QString();
 
     m_runtimeLabel->setText(tr("Runtime: %1 | Inbox: %2")
-        .arg(m_store->runtimeModeText(), m_store->inboxDir()));
-    m_capabilityLabel->setText(tr("Capabilities: %1").arg(m_store->capabilities().join(QStringLiteral(", "))));
+        .arg(workflowDisplayText(m_store->runtimeModeText()), m_store->inboxDir()));
+    QStringList capabilities;
+    for (const auto& capability : m_store->capabilities()) capabilities << workflowDisplayText(capability);
+    m_capabilityLabel->setText(tr("Capabilities: %1").arg(capabilities.join(QStringLiteral(", "))));
+    m_capabilityLabel->setToolTip(m_store->capabilities().join(QStringLiteral(", ")));
 
     m_historyList->clear();
     for (const ContextItem& item : m_store->history()) {
         auto* listItem = new QListWidgetItem(
-            QStringLiteral("[%1] %2").arg(contextKindText(item.kind), item.summary),
+            QStringLiteral("[%1] %2").arg(workflowDisplayText(contextKindText(item.kind)), item.summary),
             m_historyList);
         listItem->setData(Qt::UserRole, item.id);
         if (item.sensitivity == SensitivityLevel::Sensitive) {
@@ -225,9 +295,10 @@ void WorkflowHubDialog::refreshAll()
     m_receiptList->clear();
     for (const TransferReceipt& receipt : m_store->receipts()) {
         auto* listItem = new QListWidgetItem(
-            QStringLiteral("[%1] %2").arg(receipt.status, receipt.detail),
+            QStringLiteral("[%1] %2").arg(workflowDisplayText(receipt.status), receipt.detail),
             m_receiptList);
         listItem->setData(Qt::UserRole, receipt.id);
+        if (receipt.id == selectedReceiptId) m_receiptList->setCurrentItem(listItem);
     }
 
     updateDetails();
@@ -243,7 +314,7 @@ void WorkflowHubDialog::updateDetails()
         const ContextItem* item = m_store->contextById(contextId);
         if (item != nullptr) {
             previewPath = item->previewRef;
-            html = QStringLiteral(
+            html = tr(
                 "<h3>%1</h3>"
                 "<p><b>Type:</b> %2<br>"
                 "<b>Source:</b> %3<br>"
@@ -252,10 +323,10 @@ void WorkflowHubDialog::updateDetails()
                 "<b>Created:</b> %6<br>"
                 "<b>Actions:</b> %7</p>")
                 .arg(htmlEscape(item->summary),
-                     contextKindText(item->kind),
+                     workflowDisplayText(contextKindText(item->kind)),
                      htmlEscape(item->sourceDevice),
                      QString::number(item->byteSize),
-                     sensitivityText(item->sensitivity),
+                     workflowDisplayText(sensitivityText(item->sensitivity)),
                      formatDateTime(item->createdAt),
                      htmlEscape(item->suggestedActions.join(QStringLiteral(", "))));
         }
@@ -265,9 +336,9 @@ void WorkflowHubDialog::updateDetails()
         const QString receiptId = m_receiptList->currentItem()->data(Qt::UserRole).toString();
         for (const TransferReceipt& receipt : m_store->receipts()) {
             if (receipt.id == receiptId) {
-                html = QStringLiteral(
+                html = tr(
                     "<h3>%1</h3><p><b>Action:</b> %2<br><b>Detail:</b> %3<br><b>Time:</b> %4</p>")
-                    .arg(htmlEscape(receipt.status),
+                    .arg(htmlEscape(workflowDisplayText(receipt.status)),
                          htmlEscape(receipt.actionId),
                          htmlEscape(receipt.detail),
                          formatDateTime(receipt.createdAt));

@@ -17,6 +17,8 @@
  */
 
 #include "ActionDialog.h"
+#include "DialogPresentation.h"
+#include <QEvent>
 
 #include "Hotkey.h"
 #include "Action.h"
@@ -36,6 +38,7 @@ ActionDialog::ActionDialog(QWidget* parent, ServerConfig& config, Hotkey& hotkey
     m_pButtonGroupType(new QButtonGroup(this))
 {
     setupUi(this);
+    DialogPresentation::scrollEditor(this, QSize(600, 600));
 
     // work around Qt Designer's lack of a QButtonGroup; we need it to get
     // at the button id of the checked radio button
@@ -73,6 +76,12 @@ ActionDialog::ActionDialog(QWidget* parent, ServerConfig& config, Hotkey& hotkey
             idx++;
         }
     }
+}
+
+void ActionDialog::changeEvent(QEvent* event)
+{
+    if (event->type() == QEvent::LanguageChange) retranslateUi(this);
+    QDialog::changeEvent(event);
 }
 
 void ActionDialog::accept()

@@ -18,6 +18,7 @@
 
 #include "QBarrierApplication.h"
 #include "MainWindow.h"
+#include "BarrierLocale.h"
 
 #include <QtCore>
 #include <QtGui>
@@ -58,10 +59,9 @@ void QBarrierApplication::switchTranslator(QString lang)
         delete m_Translator;
     }
 
-    QResource locale(":/res/lang/gui_" + lang + ".qm");
-    m_Translator = new QTranslator();
-    m_Translator->load(locale.data(), locale.size());
-    installTranslator(m_Translator);
+    m_Translator = nullptr;
+    if (!BarrierLocale::switchLanguage(lang))
+        qWarning() << "Unable to load requested UI translation; using English";
 }
 
 void QBarrierApplication::setTranslator(QTranslator* translator)

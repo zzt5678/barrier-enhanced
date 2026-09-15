@@ -36,6 +36,9 @@ class ScreenSettingsDialog : public QDialog, public Ui::ScreenSettingsDialogBase
     public:
         ScreenSettingsDialog(QWidget* parent, Screen* pScreen = NULL);
 
+    protected:
+        void changeEvent(QEvent* event) override;
+
     public slots:
         void accept();
 

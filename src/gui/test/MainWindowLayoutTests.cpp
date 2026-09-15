@@ -10,6 +10,193 @@
 #include <QPushButton>
 #include <QFrame>
 #include <QLabel>
+#include "../src/SettingsDialog.h"
+#include "../src/ServerConfigDialog.h"
+#include "../src/ScreenSettingsDialog.h"
+#include <QTranslator>
+#include <QLineEdit>
+#include <QDialogButtonBox>
+#include "../src/BarrierLocale.h"
+#include "../src/CommandPaletteDialog.h"
+#include "../src/WorkflowHubDialog.h"
+#include "../src/WorkflowStore.h"
+#include "../src/ActionBus.h"
+#include "../src/HotkeyDialog.h"
+#include "../src/ActionDialog.h"
+#include <QListWidget>
+#include <QScreen>
+#include <QTimer>
+#include <QTextBrowser>
+#include <QTabWidget>
+
+TEST(DialogLanguageTests, PreviewCancelRestoresLanguageWithoutSavingEdits) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    EXPECT_EQ(QString("en"), BarrierLocale::normalize("unavailable"));
+    EXPECT_EQ(QString("en"), BarrierLocale::normalize("en_US.UTF-8"));
+    EXPECT_EQ(QString("zh-CN"), BarrierLocale::normalize("zh-Hans-CN"));
+    EXPECT_EQ(QString("zh-TW"), BarrierLocale::normalize("zh_tw"));
+    QTemporaryDir dir;
+    QSettings settings(dir.filePath("preview.ini"), QSettings::IniFormat);
+    settings.setValue("language", "en");
+    AppConfig config(&settings);
+    SettingsDialog dialog(nullptr, config);
+    const QString title = dialog.windowTitle();
+    dialog.m_pLineEditScreenName->setText("unsaved");
+    dialog.m_pComboLanguage->setCurrentIndex(dialog.m_pComboLanguage->findData("zh-CN"));
+    QApplication::processEvents();
+    EXPECT_NE(title, dialog.windowTitle());
+    dialog.buttonBox->button(QDialogButtonBox::Cancel)->click();
+    QApplication::processEvents();
+    EXPECT_EQ(title, dialog.windowTitle());
+    EXPECT_NE(QString("unsaved"), config.screenName());
+    EXPECT_TRUE(BarrierLocale::switchLanguage("unavailable"));
+}
+
+TEST(DialogLanguageTests, PaletteAndHistoryRetainSelectionAndTranslateWhileOpen) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    QTemporaryDir dir;
+    QSettings settings(dir.filePath("history.ini"), QSettings::IniFormat);
+    settings.setValue("workflowEnabled", false);
+    AppConfig config(&settings);
+    WorkflowStore store(config);
+    ActionBus bus(store);
+    CommandPaletteDialog palette(store, bus);
+    WorkflowHubDialog history(store, bus);
+    store.recordReceipt("", "open_latest", "success", "Test receipt", false);
+    auto* tabs = history.findChild<QTabWidget*>();
+    tabs->setCurrentIndex(2);
+    auto* receipts = qobject_cast<QListWidget*>(tabs->widget(2));
+    receipts->setCurrentRow(0);
+    const QVariant receiptId = receipts->currentItem()->data(Qt::UserRole);
+    const QString paletteTitle = palette.windowTitle(), historyTitle = history.windowTitle();
+    auto* list = palette.findChild<QListWidget*>();
+    list->setCurrentRow(6);
+    const QVariant id = list->currentItem()->data(Qt::UserRole);
+    BarrierLocale::switchLanguage("zh_CN");
+    QApplication::processEvents();
+    EXPECT_NE(paletteTitle, palette.windowTitle());
+    EXPECT_NE(historyTitle, history.windowTitle());
+    EXPECT_FALSE(history.findChild<QLabel*>("workflowRuntime")->toolTip().contains("Dormant"));
+    EXPECT_EQ(QString("Text"), contextKindText(ContextKind::Text));
+    EXPECT_EQ(QString("Sensitive"), sensitivityText(SensitivityLevel::Sensitive));
+    EXPECT_EQ(receiptId, receipts->currentItem()->data(Qt::UserRole));
+    EXPECT_EQ(QString("success"), store.receipts().front().status);
+    EXPECT_TRUE(history.findChild<QTextBrowser*>()->toPlainText().contains(QString::fromUtf8("成功")));
+    EXPECT_TRUE(history.findChild<QTextBrowser*>()->toPlainText().contains(QString::fromUtf8("操作")));
+    EXPECT_EQ(id, list->currentItem()->data(Qt::UserRole));
+    BarrierLocale::switchLanguage("en");
+    QApplication::processEvents();
+    EXPECT_EQ(paletteTitle, palette.windowTitle());
+}
+
+TEST(DialogLanguageTests, NormalizesSavedLocaleAndRetainsEditsAcrossLiveSwitches) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    QTemporaryDir dir;
+    QSettings settings(dir.filePath("locale.ini"), QSettings::IniFormat);
+    settings.setValue("language", "zh_CN.UTF-8");
+    AppConfig config(&settings);
+    SettingsDialog dialog(nullptr, config);
+    EXPECT_EQ(QString("zh-CN"), dialog.m_pComboLanguage->currentData().toString());
+    ServerConfig server(&settings, 5, 3, "my-device", nullptr);
+    ServerConfigDialog layout(nullptr, server, "my-device");
+    EXPECT_GT(layout.m_pScreenSetupView->maximumHeight(), 273);
+    auto* view = layout.m_pScreenSetupView;
+    layout.show(); QApplication::processEvents();
+    view->setCurrentIndex(view->model()->index(0, 0));
+    QTimer::singleShot(0, [&] {
+        for (QWidget* widget : QApplication::topLevelWidgets())
+            if (auto* popup = qobject_cast<ScreenSettingsDialog*>(widget)) popup->reject();
+    });
+    layout.findChild<QPushButton*>("editScreenButton")->click();
+    EXPECT_TRUE(view->model()->index(0, 0).data().toString().isEmpty());
+    Screen screen("original");
+    ScreenSettingsDialog editor(nullptr, &screen);
+    editor.m_pLineEditName->setText("edited-device");
+    const QString englishTitle = editor.windowTitle();
+    QTranslator translator;
+    ASSERT_TRUE(translator.load(":/res/lang/gui_zh-CN.qm"));
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        qApp->installTranslator(&translator);
+        QApplication::processEvents();
+        EXPECT_NE(englishTitle, editor.windowTitle());
+        EXPECT_EQ(QString("edited-device"), editor.m_pLineEditName->text());
+        qApp->removeTranslator(&translator);
+        QApplication::processEvents();
+        EXPECT_EQ(englishTitle, editor.windowTitle());
+    }
+}
+
+TEST(DialogLayoutTests, EditorsStayInsideScreenWithReachableActionsInBothLanguages) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    QTemporaryDir dir;
+    QSettings settings(dir.filePath("dialogs.ini"), QSettings::IniFormat);
+    settings.setValue("language", "en"); settings.setValue("workflowEnabled", false);
+    AppConfig config(&settings);
+    ServerConfig server(&settings, 5, 3, "my-device", nullptr);
+    WorkflowStore store(config); ActionBus bus(store);
+    SettingsDialog preferences(nullptr, config);
+    ServerConfigDialog layout(nullptr, server, "my-device");
+    Screen screen("Studio desktop"); ScreenSettingsDialog editor(nullptr, &screen);
+    Hotkey hotkey; HotkeyDialog keys(nullptr, hotkey); Action action;
+    ActionDialog actions(nullptr, server, hotkey, action);
+    CommandPaletteDialog palette(store, bus); WorkflowHubDialog history(store, bus);
+    const QList<QPair<QString, QDialog*>> dialogs{{"preferences", &preferences}, {"layout", &layout},
+        {"screen", &editor}, {"hotkey", &keys}, {"action", &actions}, {"palette", &palette}, {"history", &history}};
+    QFile file(":/res/styles/dark.qss"); ASSERT_TRUE(file.open(QIODevice::ReadOnly));
+    const QString style = QString::fromUtf8(file.readAll());
+    for (const QString& language : {QString("en"), QString("zh-CN")}) {
+        preferences.m_pComboLanguage->setCurrentIndex(preferences.m_pComboLanguage->findData(language));
+        BarrierLocale::switchLanguage(language); QApplication::processEvents();
+        for (const auto& item : dialogs) {
+            auto* dialog = item.second;
+            SCOPED_TRACE((language + "/" + item.first).toStdString());
+            dialog->setStyleSheet(style);
+            if (language == "en") dialog->move(-100, -100);
+            dialog->show();
+            QApplication::processEvents(); QApplication::processEvents();
+            EXPECT_LE(dialog->height(), dialog->screen()->availableGeometry().height());
+            EXPECT_LE(dialog->width(), dialog->screen()->availableGeometry().width());
+            EXPECT_TRUE(dialog->screen()->availableGeometry().contains(dialog->frameGeometry()));
+            if (auto* box = dialog->findChild<QDialogButtonBox*>()) {
+                for (auto* button : box->buttons())
+                    EXPECT_TRUE(dialog->rect().contains(QRect(button->mapTo(dialog, QPoint()), button->size())));
+                if (box->button(QDialogButtonBox::Cancel)) {
+                    EXPECT_EQ(language == "en" ? QString("Cancel") : QString::fromUtf8("取消"), box->button(QDialogButtonBox::Cancel)->text());
+                    EXPECT_TRUE(box->button(QDialogButtonBox::Cancel)->icon().isNull());
+                }
+            }
+            const QString out = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
+            if (!out.isEmpty()) EXPECT_TRUE(dialog->grab().save(out + "/" + language + "-" + item.first + ".png"));
+            if (item.first == "history") {
+                for (auto* button : dialog->findChildren<QPushButton*>())
+                    EXPECT_TRUE(dialog->rect().contains(QRect(button->mapTo(dialog, QPoint()), button->size())));
+                dialog->resize(620, 500); QApplication::processEvents(); QApplication::processEvents();
+                for (auto* button : dialog->findChildren<QPushButton*>())
+                    EXPECT_TRUE(dialog->rect().contains(QRect(button->mapTo(dialog, QPoint()), button->size())));
+                if (!out.isEmpty()) EXPECT_TRUE(dialog->grab().save(out + "/" + language + "-history-narrow.png"));
+            }
+            if (item.first == "layout") {
+                for (int tab = 1; tab < layout.m_pTabWidget->count(); ++tab) {
+                    layout.m_pTabWidget->setCurrentIndex(tab); QApplication::processEvents();
+                    auto* scroll = layout.findChild<QScrollArea*>("dialogEditorScroll");
+                    scroll->verticalScrollBar()->setValue(scroll->verticalScrollBar()->maximum());
+                    QApplication::processEvents();
+                    EXPECT_TRUE(layout.rect().contains(QRect(layout.m_pButtonBox->mapTo(&layout, QPoint()), layout.m_pButtonBox->size())));
+                    if (!out.isEmpty()) EXPECT_TRUE(layout.grab().save(out + "/" + language + QString("-layout-tab-%1.png").arg(tab)));
+                }
+                layout.m_pTabWidget->setCurrentIndex(0);
+            }
+            if (item.first == "screen") {
+                dialog->resize(420, 540); QApplication::processEvents(); QApplication::processEvents();
+                auto* scroll = dialog->findChild<QScrollArea*>("dialogEditorScroll");
+                EXPECT_LE(scroll->widget()->width(), scroll->viewport()->width());
+                if (!out.isEmpty()) EXPECT_TRUE(dialog->grab().save(out + "/" + language + "-screen-narrow.png"));
+            }
+            dialog->hide();
+        }
+    }
+    BarrierLocale::switchLanguage("en"); QApplication::processEvents();
+}
 
 TEST(MainWindowLayoutTests, SettingsReflowInsideViewportAndKeepActionsReachable) {
     ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"))
@@ -50,6 +237,8 @@ TEST(MainWindowLayoutTests, SettingsReflowInsideViewportAndKeepActionsReachable)
         EXPECT_LE(scroll->widget()->width(), scroll->viewport()->width());
         auto* bar = window.findChild<QWidget*>("fixedControlBar");
         EXPECT_TRUE(window.rect().contains(QRect(bar->mapTo(&window, QPoint()), bar->size())));
+        for (auto* action : bar->findChildren<QPushButton*>())
+            if (action->isVisible()) EXPECT_TRUE(window.rect().contains(QRect(action->mapTo(&window, QPoint()), action->size())));
         auto* status = window.findChild<QLabel*>("m_pStatusLabel");
         EXPECT_EQ(QString("Ready"), status->text());
         const QString out = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
@@ -74,5 +263,18 @@ TEST(MainWindowLayoutTests, SettingsReflowInsideViewportAndKeepActionsReachable)
         QApplication::processEvents(); QApplication::processEvents();
         const QString out = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
         if (!out.isEmpty()) EXPECT_TRUE(window.grab().save(out + QString("/home-%1.png").arg(width)));
+        for (auto* illustration : window.findChildren<QLabel*>("deviceIllustration"))
+            EXPECT_EQ(illustration->devicePixelRatioF(), illustration->pixmap(Qt::ReturnByValue).devicePixelRatioF());
     }
+    BarrierLocale::switchLanguage("zh-CN");
+    QApplication::processEvents(); QApplication::processEvents();
+    EXPECT_NE(QString("Ready"), window.findChild<QLabel*>("m_pStatusLabel")->text());
+    const QString out = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
+    if (!out.isEmpty()) EXPECT_TRUE(window.grab().save(out + "/zh-CN-home.png"));
+    for (auto* button : window.findChildren<QPushButton*>())
+        if (button->text() == QString::fromUtf8("设置")) button->click();
+    QApplication::processEvents(); QApplication::processEvents();
+    if (!out.isEmpty()) EXPECT_TRUE(window.grab().save(out + "/zh-CN-settings.png"));
+    BarrierLocale::switchLanguage("en"); QApplication::processEvents();
+    EXPECT_EQ(QString("Ready"), window.findChild<QLabel*>("m_pStatusLabel")->text());
 }

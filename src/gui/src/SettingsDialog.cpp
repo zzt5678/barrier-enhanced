@@ -19,6 +19,7 @@
 #include "SettingsDialog.h"
 
 #include "BarrierLocale.h"
+#include "DialogPresentation.h"
 #include "QBarrierApplication.h"
 #include "common/ProductIdentity.h"
 #include "QUtility.h"
@@ -39,6 +40,7 @@
 #include <QSpinBox>
 #include <QDesktopServices>
 #include <QUrl>
+#include <QFormLayout>
 
 #if defined(Q_OS_MAC)
 #include <ApplicationServices/ApplicationServices.h>
@@ -82,7 +84,9 @@ SettingsDialog::SettingsDialog(QWidget* parent, AppConfig& config) :
     m_pComboLogLevel->setCurrentIndex(appConfig().logLevel());
     m_pCheckBoxLogToFile->setChecked(appConfig().logToFile());
     m_pLineEditLogFilename->setText(appConfig().logFilename());
-    setIndexFromItemData(m_pComboLanguage, appConfig().language());
+    m_pComboLanguage->blockSignals(true);
+    setIndexFromItemData(m_pComboLanguage, BarrierLocale::normalize(appConfig().language()));
+    m_pComboLanguage->blockSignals(false);
     m_pCheckBoxAutoHide->setChecked(appConfig().getAutoHide());
     m_pCheckBoxAutoStart->setChecked(appConfig().getAutoStart());
     m_pCheckBoxMinimizeToTray->setChecked(appConfig().getMinimizeToTray());
@@ -142,6 +146,7 @@ void SettingsDialog::configureResponsiveLayout()
 {
     auto* scrollContent = new QWidget(this);
     scrollContent->setObjectName(QStringLiteral("settingsScrollContent"));
+    for (auto* form : findChildren<QFormLayout*>()) form->setRowWrapPolicy(QFormLayout::WrapLongRows);
     auto* contentLayout = new QVBoxLayout(scrollContent);
     contentLayout->setContentsMargins(0, 0, 0, 0);
     contentLayout->setSpacing(verticalLayout->spacing());
@@ -179,8 +184,9 @@ void SettingsDialog::configureResponsiveLayout()
         ? screen->availableGeometry()
         : QRect(0, 0, 800, 600);
     resize(
-        qMin(440, qMax(360, available.width() - 40)),
+        qMin(560, qMax(360, available.width() - 40)),
         qMin(680, qMax(360, available.height() - 80)));
+    DialogPresentation::fit(this, size());
 }
 
 void SettingsDialog::configureTabOrder()
@@ -253,7 +259,7 @@ void SettingsDialog::accept()
 void SettingsDialog::reject()
 {
     if (m_appConfig.language() != m_pComboLanguage->itemData(m_pComboLanguage->currentIndex()).toString()) {
-        QBarrierApplication::getInstance()->switchTranslator(m_appConfig.language());
+        BarrierLocale::switchLanguage(m_appConfig.language());
     }
     QDialog::reject();
 }
@@ -320,7 +326,7 @@ void SettingsDialog::on_m_pButtonBrowseLog_clicked()
 void SettingsDialog::on_m_pComboLanguage_currentIndexChanged(int index)
 {
     QString ietfCode = m_pComboLanguage->itemData(index).toString();
-    QBarrierApplication::getInstance()->switchTranslator(ietfCode);
+    BarrierLocale::switchLanguage(ietfCode);
 }
 
 void SettingsDialog::updatePlatformReadiness()

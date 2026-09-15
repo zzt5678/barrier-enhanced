@@ -12,4 +12,6 @@ if [[ -n ${2:-} ]]; then
     mkdir -p "$2"
     export WEAVE_LAYOUT_PREVIEW="$2"
 fi
-xvfb-run -a -s '-screen 0 2800x2200x24' "$binary"
+screen=${WEAVE_TEST_SCREEN:-2800x2200x24}
+[[ "$screen" =~ ^[0-9]+x[0-9]+x24$ ]] || { echo "Invalid isolated screen size" >&2; exit 2; }
+xvfb-run -a -s "-screen 0 $screen" "$binary"

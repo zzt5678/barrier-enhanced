@@ -20,6 +20,9 @@
 #include "ServerConfig.h"
 #include "HotkeyDialog.h"
 #include "ActionDialog.h"
+#include "DialogPresentation.h"
+#include <QPushButton>
+#include <QStyle>
 
 #include <QtCore>
 #include <QtGui>
@@ -35,7 +38,35 @@ ServerConfigDialog::ServerConfigDialog(QWidget* parent, ServerConfig& config, co
 {
     setupUi(this);
     setObjectName(QStringLiteral("ServerConfigDialogBase"));
-    resize(1040, 700);
+    m_pScreenSetupView->setMinimumHeight(240);
+    m_pScreenSetupView->setMaximumHeight(QWIDGETSIZE_MAX);
+    m_pScreenSetupView->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    QPixmap trash = QIcon(":/res/icons/workspace/trash.png").pixmap(qRound(24 * devicePixelRatioF()), qRound(24 * devicePixelRatioF()));
+    trash.setDevicePixelRatio(devicePixelRatioF());
+    m_pTrashScreenWidget->setPixmap(trash);
+    m_pLabelNewScreenWidget->setPixmap(QIcon(":/res/icons/workspace/devices.png").pixmap(32, 32));
+    auto* screenLayout = qobject_cast<QVBoxLayout*>(m_pTabScreens->layout());
+    screenLayout->setStretch(1, 1);
+    auto* controls = new QHBoxLayout;
+    auto* edit = new QPushButton(this);
+    edit->setObjectName("editScreenButton");
+    edit->setIcon(QIcon(":/res/icons/workspace/settings.png"));
+    auto* remove = new QPushButton(this);
+    remove->setObjectName("removeScreenButton");
+    remove->setIcon(QIcon(":/res/icons/workspace/trash.png"));
+    controls->addWidget(edit);
+    controls->addWidget(remove);
+    controls->addStretch();
+    screenLayout->insertLayout(2, controls);
+    connect(edit, &QPushButton::clicked, this, [this] {
+        QKeyEvent key(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+        QApplication::sendEvent(m_pScreenSetupView, &key);
+    });
+    connect(remove, &QPushButton::clicked, this, [this] {
+        QKeyEvent key(QEvent::KeyPress, Qt::Key_Delete, Qt::NoModifier);
+        QApplication::sendEvent(m_pScreenSetupView, &key);
+    });
+    DialogPresentation::scrollEditor(this, QSize(940, 700));
 
     m_pCheckBoxHeartbeat->setChecked(true);
     m_pCheckBoxHeartbeat->setEnabled(false);
@@ -69,21 +100,38 @@ ServerConfigDialog::ServerConfigDialog(QWidget* parent, ServerConfig& config, co
     }
 
     m_pScreenSetupView->setModel(&m_ScreenSetupModel);
+    m_pScreenSetupView->setCurrentIndex(m_ScreenSetupModel.index(serverConfig().numRows() / 2, serverConfig().numColumns() / 2));
 
     if (serverConfig().numScreens() == 0)
         model().screen(serverConfig().numColumns() / 2, serverConfig().numRows() / 2) = Screen(defaultScreenName);
 
-    label_2->setText(tr("Drag devices into the canvas until moving across the edge feels obvious and calm."));
-    label_3->setText(tr("Double-click a device to refine its settings. Use Automation for hotkeys and actions, or Advanced only when you need to override the default crossing behavior."));
+    retranslateDynamicUi();
+}
+
+void ServerConfigDialog::retranslateDynamicUi()
+{
+    label_2->setText(tr("Arrange devices to match their positions on your desk."));
+    label_3->setText(tr("Drag the device icon into an empty cell to add a screen. Select a cell and press Enter to edit; use Ctrl + arrow keys to move a device."));
+    findChild<QPushButton*>("editScreenButton")->setText(tr("Add / Edit screen"));
+    findChild<QPushButton*>("removeScreenButton")->setText(tr("Remove screen"));
     m_pLabelServerConfigSummary->setText(tr("Configured screens: %1 · Hotkeys: %2 · Clipboard sharing: %3")
         .arg(serverConfig().numScreens())
         .arg(serverConfig().hotkeys().size())
         .arg(serverConfig().clipboardSharing() ? tr("On") : tr("Off")));
 }
 
+void ServerConfigDialog::changeEvent(QEvent* event)
+{
+    if (event->type() == QEvent::LanguageChange) {
+        retranslateUi(this);
+        retranslateDynamicUi();
+    }
+    QDialog::changeEvent(event);
+}
+
 void ServerConfigDialog::showEvent(QShowEvent* event)
 {
-    QDialog::show();
+    QDialog::showEvent(event);
 
     if (!m_Message.isEmpty())
     {

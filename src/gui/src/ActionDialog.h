@@ -37,6 +37,9 @@ class ActionDialog : public QDialog, public Ui::ActionDialogBase
     public:
         ActionDialog(QWidget* parent, ServerConfig& config, Hotkey& hotkey, Action& action);
 
+    protected:
+        void changeEvent(QEvent* event) override;
+
     protected slots:
         void accept();
         void on_m_pKeySequenceWidgetHotkey_keySequenceChanged();

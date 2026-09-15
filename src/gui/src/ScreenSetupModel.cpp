@@ -43,7 +43,7 @@ QVariant ScreenSetupModel::data(const QModelIndex& index, int role) const
             case Qt::DecorationRole:
                 if (screen(index).isNull())
                     break;
-                return QIcon(*screen(index).pixmap());
+                return QIcon(":/res/icons/workspace/devices.png");
 
             case Qt::ToolTipRole:
                 if (screen(index).isNull())

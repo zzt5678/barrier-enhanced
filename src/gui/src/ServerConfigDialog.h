@@ -51,6 +51,8 @@ class ServerConfigDialog : public QDialog, public Ui::ServerConfigDialogBase
         void on_m_pButtonRemoveAction_clicked();
 
     protected:
+        void changeEvent(QEvent* event) override;
+        void retranslateDynamicUi();
         ServerConfig& serverConfig() { return m_ServerConfig; }
         void setOrigServerConfig(const ServerConfig& s) { m_OrigServerConfig = s; }
         ScreenSetupModel& model() { return m_ScreenSetupModel; }

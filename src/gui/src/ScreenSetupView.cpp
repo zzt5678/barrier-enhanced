@@ -35,7 +35,7 @@ ScreenSetupView::ScreenSetupView(QWidget* parent) :
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 
-    setIconSize(QSize(64, 64));
+    setIconSize(QSize(32, 32));
     horizontalHeader()->hide();
     verticalHeader()->hide();
 }
@@ -53,28 +53,31 @@ ScreenSetupModel* ScreenSetupView::model() const
 
 void ScreenSetupView::setTableSize()
 {
+    if (!model()) return;
     for (int i = 0; i < model()->columnCount(); i++)
-        setColumnWidth(i, width() / model()->columnCount());
+        setColumnWidth(i, viewport()->width() / model()->columnCount());
 
     for (int i = 0; i < model()->rowCount(); i++)
-        setRowHeight(i, height() / model()->rowCount());
+        setRowHeight(i, viewport()->height() / model()->rowCount());
 }
 
 void ScreenSetupView::resizeEvent(QResizeEvent* event)
 {
+    QTableView::resizeEvent(event);
     setTableSize();
-    event->ignore();
 }
 
 void ScreenSetupView::enter(const QModelIndex& index)
 {
     if (!index.isValid())
         return;
-    Screen& screen = model()->screen(index);
-    if (screen.isNull())
-        screen = Screen(tr("Unnamed"));
-    ScreenSettingsDialog dlg(this, &screen);
-    dlg.exec();
+    Screen edited = model()->screen(index);
+    if (edited.isNull()) edited = Screen(tr("Unnamed"));
+    ScreenSettingsDialog dlg(this, &edited);
+    if (dlg.exec() == QDialog::Accepted) {
+        model()->screen(index) = edited;
+        emit dataChanged(index, index);
+    }
 }
 
 void ScreenSetupView::remove(const QModelIndex& index)

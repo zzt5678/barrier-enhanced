@@ -17,6 +17,8 @@
  */
 
 #include "HotkeyDialog.h"
+#include "DialogPresentation.h"
+#include <QEvent>
 
 #include <QtCore>
 #include <QtGui>
@@ -27,8 +29,15 @@ HotkeyDialog::HotkeyDialog (QWidget* parent, Hotkey& hotkey) :
     m_Hotkey(hotkey)
 {
     setupUi(this);
+    DialogPresentation::scrollEditor(this, QSize(500, 280));
 
     m_pKeySequenceWidgetHotkey->setText(m_Hotkey.text());
+}
+
+void HotkeyDialog::changeEvent(QEvent* event)
+{
+    if (event->type() == QEvent::LanguageChange) retranslateUi(this);
+    QDialog::changeEvent(event);
 }
 
 void HotkeyDialog::accept()

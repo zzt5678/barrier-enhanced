@@ -17,6 +17,8 @@
  */
 
 #include "ScreenSettingsDialog.h"
+#include "DialogPresentation.h"
+#include <QEvent>
 #include "Screen.h"
 
 #include <QtCore>
@@ -42,6 +44,7 @@ ScreenSettingsDialog::ScreenSettingsDialog(QWidget* parent, Screen* pScreen) :
     m_pScreen(pScreen)
 {
     setupUi(this);
+    DialogPresentation::scrollEditor(this, QSize(560, 680));
 
     m_pLineEditName->setText(check_name_param(m_pScreen->name()));
     m_pLineEditName->setValidator(new QRegExpValidator(ValidScreenName, m_pLineEditName));
@@ -69,6 +72,12 @@ ScreenSettingsDialog::ScreenSettingsDialog(QWidget* parent, Screen* pScreen) :
     m_pCheckBoxScrollLock->setChecked(m_pScreen->fix(Screen::Fix::ScrollLock));
     m_pCheckBoxXTest->setChecked(m_pScreen->fix(Screen::Fix::XTest));
     m_pCheckBoxPreserveFocus->setChecked(m_pScreen->fix(Screen::Fix::PreserveFocus));
+}
+
+void ScreenSettingsDialog::changeEvent(QEvent* event)
+{
+    if (event->type() == QEvent::LanguageChange) retranslateUi(this);
+    QDialog::changeEvent(event);
 }
 
 void ScreenSettingsDialog::accept()

@@ -21,7 +21,9 @@ WorkspaceDashboard::WorkspaceDashboard(QWidget* settings, QWidget* parent): QWid
     auto* sidebar = new QFrame; sidebar->setObjectName("workspaceSidebar"); sidebar->setFixedWidth(180);
     auto* nav = new QVBoxLayout(sidebar); nav->setContentsMargins(12,28,12,20); nav->setSpacing(8);
     auto* brandRow = new QHBoxLayout;
-    auto* brand = new QLabel; brand->setPixmap(QPixmap(":/res/icons/256x256/weave.png").scaled(32,32,Qt::KeepAspectRatio,Qt::SmoothTransformation)); brandRow->addWidget(brand);
+    auto* brand = new QLabel;
+    QPixmap brandImage = QPixmap(":/res/icons/256x256/weave.png").scaled(qRound(32 * devicePixelRatioF()),qRound(32 * devicePixelRatioF()),Qt::KeepAspectRatio,Qt::SmoothTransformation);
+    brandImage.setDevicePixelRatio(devicePixelRatioF()); brand->setPixmap(brandImage); brandRow->addWidget(brand);
     auto* name = new QLabel("Weave"); name->setObjectName("workspaceBrand"); brandRow->addWidget(name); brandRow->addStretch(); nav->addLayout(brandRow); nav->addSpacing(36);
     m_devices = new QPushButton; m_transfers = new QPushButton; m_settings = new QPushButton;
     auto* group = new QButtonGroup(this); group->setExclusive(true);
@@ -71,7 +73,10 @@ void WorkspaceDashboard::setDevices(const QVector<WorkspaceDevice>& devices)
     for (int column = 0; column < m_columns; ++column) grid->setColumnStretch(column, 1);
     for(const auto& device:devices) {
         auto* card = new QWidget; card->setMinimumWidth(64); auto* layout = new QVBoxLayout(card); layout->setContentsMargins(0,0,0,0); layout->setSpacing(8); layout->setAlignment(Qt::AlignCenter);
-        auto* monitor = new QLabel; monitor->setObjectName("deviceIllustration"); QPixmap picture(":/res/image/device-display.png"); if(picture.isNull()) picture=style()->standardPixmap(QStyle::SP_ComputerIcon); const int side=illustrationSide(); monitor->setPixmap(picture.scaled(side,side,Qt::KeepAspectRatio,Qt::SmoothTransformation)); monitor->setFixedSize(side,side); monitor->setAlignment(Qt::AlignCenter); layout->addWidget(monitor,0,Qt::AlignHCenter);
+        auto* monitor = new QLabel; monitor->setObjectName("deviceIllustration"); QPixmap picture(":/res/image/device-display.png"); if(picture.isNull()) picture=style()->standardPixmap(QStyle::SP_ComputerIcon); const int side=illustrationSide();
+        picture = picture.scaled(qRound(side * devicePixelRatioF()),qRound(side * devicePixelRatioF()),Qt::KeepAspectRatio,Qt::SmoothTransformation);
+        picture.setDevicePixelRatio(devicePixelRatioF()); monitor->setPixmap(picture);
+        monitor->setFixedSize(side,side); monitor->setAlignment(Qt::AlignCenter); layout->addWidget(monitor,0,Qt::AlignHCenter);
         auto* name = new ElidingLabel; name->setObjectName("deviceName"); name->setAlignment(Qt::AlignCenter); name->setTextFormat(Qt::PlainText); name->setText(device.name); layout->addWidget(name);
         const QString status=device.local?tr("This computer"):tr("Configured · status unknown");
         auto* detail = new ElidingLabel; detail->setObjectName(device.local?"deviceLocal":"workspaceMuted"); detail->setAlignment(Qt::AlignCenter); detail->setText(status); layout->addWidget(detail);
@@ -102,8 +107,10 @@ void WorkspaceDashboard::resizeEvent(QResizeEvent* event)
     const int side=illustrationSide();
     QPixmap picture(":/res/image/device-display.png");
     if(picture.isNull()) picture=style()->standardPixmap(QStyle::SP_ComputerIcon);
+    picture = picture.scaled(qRound(side * devicePixelRatioF()),qRound(side * devicePixelRatioF()),Qt::KeepAspectRatio,Qt::SmoothTransformation);
+    picture.setDevicePixelRatio(devicePixelRatioF());
     for(auto* label:m_canvas->findChildren<QLabel*>("deviceIllustration")) {
-        label->setPixmap(picture.scaled(side,side,Qt::KeepAspectRatio,Qt::SmoothTransformation)); label->setFixedSize(side,side);
+        label->setPixmap(picture); label->setFixedSize(side,side);
     }
 }
 void WorkspaceDashboard::setConnectionState(const QString& status, bool running, bool canArrange)

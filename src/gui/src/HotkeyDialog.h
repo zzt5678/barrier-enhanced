@@ -32,6 +32,9 @@ class HotkeyDialog : public QDialog, public Ui::HotkeyDialogBase
     public:
         HotkeyDialog(QWidget* parent, Hotkey& hotkey);
 
+    protected:
+        void changeEvent(QEvent* event) override;
+
     public:
         const Hotkey& hotkey() const { return m_Hotkey; }
 

@@ -2,6 +2,7 @@
 
 #include "ActionBus.h"
 #include "WorkflowStore.h"
+#include "DialogPresentation.h"
 
 #include <QDesktopServices>
 #include <QHideEvent>
@@ -37,6 +38,22 @@ CommandPaletteDialog::CommandPaletteDialog(WorkflowStore& store, ActionBus& acti
     connect(m_store, &WorkflowStore::suggestionsChanged, this, &CommandPaletteDialog::refreshCommands);
 
     refreshCommands();
+    DialogPresentation::fit(this, QSize(540, 400));
+}
+
+void CommandPaletteDialog::changeEvent(QEvent* event)
+{
+    if (event->type() == QEvent::LanguageChange) {
+        const QVariant selected = m_commandList->currentItem()
+            ? m_commandList->currentItem()->data(Qt::UserRole) : QVariant();
+        setWindowTitle(tr("Weave Command Palette"));
+        m_filter->setPlaceholderText(tr("Type a command..."));
+        refreshCommands();
+        for (int i = 0; i < m_commandList->count(); ++i)
+            if (m_commandList->item(i)->data(Qt::UserRole) == selected)
+                m_commandList->setCurrentRow(i);
+    }
+    QDialog::changeEvent(event);
 }
 
 void CommandPaletteDialog::showEvent(QShowEvent* event)

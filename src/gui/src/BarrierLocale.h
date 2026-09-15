@@ -38,6 +38,8 @@ class BarrierLocale
 public:
     BarrierLocale();
     void fillLanguageComboBox(QComboBox* comboBox);
+    static QString normalize(QString language);
+    static bool switchLanguage(const QString& language);
 
 private:
     void loadLanguages();

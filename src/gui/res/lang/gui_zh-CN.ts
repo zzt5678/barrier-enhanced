@@ -1392,4 +1392,195 @@ p, li { white-space: pre-wrap; }
     <message><source>&lt;p&gt;Select a history item, suggestion, or receipt.&lt;/p&gt;</source><translation>&lt;p&gt;请选择一条历史内容、操作建议或传输记录。&lt;/p&gt;</translation></message>
     <message><source>Workflow Action Failed</source><translation>操作失败</translation></message>
 </context>
+<context>
+    <name>CommandPaletteDialog</name>
+    <message><source>Weave Command Palette</source><translation>Weave 命令面板</translation></message>
+    <message><source>Type a command...</source><translation>输入命令…</translation></message>
+    <message><source>Open Workflow Hub</source><translation>打开工作流中心</translation></message>
+    <message><source>Save latest item to Inbox</source><translation>将最新项目保存到收件箱</translation></message>
+    <message><source>Open latest item</source><translation>打开最新项目</translation></message>
+    <message><source>Reveal latest item</source><translation>显示最新项目的位置</translation></message>
+    <message><source>Run latest suggestion</source><translation>执行最新建议</translation></message>
+    <message><source>Capture screenshot into workflow history</source><translation>截屏并保存到工作流历史</translation></message>
+    <message><source>Open Workflow Inbox</source><translation>打开工作流收件箱</translation></message>
+    <message><source>Command Failed</source><translation>命令执行失败</translation></message>
+</context>
+<context>
+    <name>ServerConfigDialog</name>
+    <message><source>Heartbeat is always enabled to keep reconnects responsive.</source><translation>心跳检测始终开启，以便及时重新连接。</translation></message>
+    <message><source>Arrange devices to match their positions on your desk.</source><translation>按桌面上的实际位置排列设备。</translation></message>
+    <message><source>Drag the device icon into an empty cell to add a screen. Select a cell and press Enter to edit; use Ctrl + arrow keys to move a device.</source><translation>将设备图标拖到空格中添加屏幕。选中格子后按回车编辑；使用 Ctrl + 方向键移动设备。</translation></message>
+    <message><source>Add / Edit screen</source><translation>添加／编辑屏幕</translation></message>
+    <message><source>Remove screen</source><translation>移除屏幕</translation></message>
+    <message><source>Configured screens: %1 · Hotkeys: %2 · Clipboard sharing: %3</source><translation>已配置屏幕：%1 · 快捷键：%2 · 剪贴板共享：%3</translation></message>
+    <message><source>On</source><translation>开启</translation></message>
+    <message><source>Off</source><translation>关闭</translation></message>
+</context>
+<context>
+    <name>ServerConfigDialogBase</name>
+    <message><source>Server Layout Studio</source><translation>设备布局</translation></message>
+    <message><source>Shape the crossing experience screen by screen. Keep the canvas clean, align edges precisely, and tune advanced behavior only when the defaults are not enough.</source><translation>按实际位置排列屏幕，调整边缘切换方式；需要时可设置高级选项。</translation></message>
+    <message><source>Layout</source><translation>布局</translation></message>
+    <message><source>Configure the layout of your Weave server configuration.</source><translation>配置 Weave 服务端的屏幕布局。</translation></message>
+    <message><source>Automation</source><translation>快捷键与动作</translation></message>
+    <message><source>Advanced</source><translation>高级</translation></message>
+    <message><source>&amp;Crossing Behavior</source><translation>跨屏行为(&amp;C)</translation></message>
+    <message><source>&amp;Server Defaults</source><translation>服务端默认设置(&amp;S)</translation></message>
+    <message><source>&amp;Dead Corners</source><translation>禁止切换的屏幕角落(&amp;D)</translation></message>
+</context>
+<context>
+    <name>SettingsDialog</name>
+    <message><source>Enable lightweight workflow handoff</source><translation>启用轻量工作流接续</translation></message>
+    <message><source>Enable suggestion cards</source><translation>启用建议卡片</translation></message>
+    <message><source>Show desktop notifications</source><translation>显示桌面通知</translation></message>
+    <message><source>Show non-critical tray popups for connection, transfer receipts, and workflow events. Disabled by default.</source><translation>显示连接、传输回执与工作流事件的一般托盘通知。默认关闭。</translation></message>
+    <message><source>Workflow history limit:</source><translation>工作流历史条数：</translation></message>
+    <message><source>Dormant after seconds:</source><translation>空闲等待秒数：</translation></message>
+    <message><source>Platform Readiness</source><translation>平台状态</translation></message>
+    <message><source>Accessibility access is ready</source><translation>辅助功能权限已就绪</translation></message>
+    <message><source>Accessibility access is still required</source><translation>仍需辅助功能权限</translation></message>
+    <message><source>Weave can capture and inject input without any extra setup on this Mac.</source><translation>Weave 已可在此 Mac 上接收和模拟输入，无需额外设置。</translation></message>
+    <message><source>Click below and macOS will open the Accessibility authorization prompt for Weave.</source><translation>点击下方按钮，macOS 将打开 Weave 的辅助功能授权提示。</translation></message>
+    <message><source>Prompt Accessibility Access</source><translation>请求辅助功能权限</translation></message>
+    <message><source>Windows permission flow is handled in-app</source><translation>可在应用内设置 Windows 权限</translation></message>
+    <message><source>Use Service mode with Elevate Always so Weave can keep input working across UAC and desktop switching.</source><translation>使用服务模式并始终提升权限，以支持 UAC 提示和桌面切换期间的输入。</translation></message>
+    <message><source>Wayland session detected</source><translation>检测到 Wayland 会话</translation></message>
+    <message><source>X11 session detected</source><translation>检测到 X11 会话</translation></message>
+    <message><source>Wayland still limits input control. Use an X11 session for full Weave support.</source><translation>Wayland 仍限制输入控制。请使用 X11 会话获得完整的 Weave 支持。</translation></message>
+    <message><source>X11 is ready. Weave does not need extra desktop authorization on this session.</source><translation>X11 已就绪。当前会话无需额外桌面授权。</translation></message>
+    <message><source>Open Compatibility Guide</source><translation>打开兼容性指南</translation></message>
+    <message><source>No additional readiness checks</source><translation>无需额外状态检查</translation></message>
+    <message><source>This platform does not require a separate permission prompt here.</source><translation>此平台无需在这里单独请求权限。</translation></message>
+</context>
+<context>
+    <name>SettingsDialogBase</name>
+    <message><source>Weave Settings</source><translation>Weave 设置</translation></message>
+    <message><source>Control how this device identifies itself, how Weave reaches peers, and how much latency or automation help you want by default.</source><translation>设置设备名称、连接方式，以及输入和工作流偏好。</translation></message>
+    <message><source>Identity</source><translation>设备身份</translation></message>
+    <message><source>Specify when the Weave service should run at an elevated privilege level</source><translation>设置 Weave 服务何时以提升的权限运行</translation></message>
+    <message><source>Start &amp;Weave on startup</source><translation>开机启动 Weave(&amp;W)</translation></message>
+    <message><source>Transport</source><translation>连接与安全</translation></message>
+    <message><source>Require client certificate</source><translation>要求客户端证书</translation></message>
+    <message><source>Input &amp; Workflow</source><translation>输入与工作流</translation></message>
+    <message><source>Enable file and image drag &amp; drop</source><translation>启用文件和图像拖放</translation></message>
+    <message><source>Enable game mode for server use</source><translation>启用服务端游戏模式</translation></message>
+    <message><source>Locks the cursor to the active screen on startup and prefers lower-latency behavior for gaming.</source><translation>启动时将光标锁定到当前屏幕，并优先采用低延迟游戏设置。</translation></message>
+    <message><source>Prefer low-latency mouse delivery</source><translation>优先使用低延迟鼠标传输</translation></message>
+    <message><source>Reduces mouse buffering and desk polling delay without enabling full game mode.</source><translation>减少鼠标缓冲与轮询延迟，无需开启完整游戏模式。</translation></message>
+    <message><source>Optimize for remote-control apps on clients</source><translation>优化客户端远程控制应用</translation></message>
+    <message><source>Tunes Weave for cases where a Windows client is itself running a remote-control tool such as Sunlogin.</source><translation>针对 Windows 客户端同时运行向日葵等远程控制工具的场景优化 Weave。</translation></message>
+    <message><source>Diagnostics</source><translation>诊断</translation></message>
+</context>
+<context>
+    <name>MainWindow</name>
+    <message><source>&amp;Weave</source><translation>Weave(&amp;W)</translation></message>
+    <message><source>Weave</source><translation>Weave</translation></message>
+    <message><source>Share one keyboard, mouse, clipboard, and files across your desk.</source><translation>让桌面上的设备共享键盘、鼠标、剪贴板和文件。</translation></message>
+    <message><source>Recent activity</source><translation>最近活动</translation></message>
+    <message><source>Workflow Hub</source><translation>工作流中心</translation></message>
+    <message><source>Logs</source><translation>日志</translation></message>
+    <message><source>Open clipboard history, transfer receipts, and workflow actions.</source><translation>打开剪贴板历史、传输回执与工作流操作。</translation></message>
+    <message><source>Open the live service log.</source><translation>打开实时服务日志。</translation></message>
+    <message><source>Show fingerprint details</source><translation>显示指纹详情</translation></message>
+    <message><source>Workflow &amp;Hub</source><translation>工作流中心(&amp;H)</translation></message>
+    <message><source>Open clipboard history, task handoff, suggestions, and transfer receipts.</source><translation>打开剪贴板历史、任务接续、建议与传输回执。</translation></message>
+    <message><source>Command &amp;Palette</source><translation>命令面板(&amp;P)</translation></message>
+    <message><source>Run lightweight workflow commands.</source><translation>执行轻量工作流命令。</translation></message>
+    <message><source>Weave is connected and will keep running in the background.</source><translation>Weave 已连接，将继续在后台运行。</translation></message>
+    <message><source>Weave client not found</source><translation>未找到 Weave 客户端</translation></message>
+    <message><source>The executable for the Weave client does not exist.</source><translation>Weave 客户端可执行文件不存在。</translation></message>
+    <message><source>Please fill in a hostname for the Weave client to connect to.</source><translation>请输入 Weave 客户端要连接的主机名。</translation></message>
+    <message><source>The temporary configuration file required to start Weave can not be written.</source><translation>无法写入启动 Weave 所需的临时配置文件。</translation></message>
+    <message><source>You have not filled in a valid configuration file for the Weave server. Do you want to browse for the configuration file now?</source><translation>尚未指定有效的 Weave 服务端配置文件。是否现在选择配置文件？</translation></message>
+    <message><source>Weave server not found</source><translation>未找到 Weave 服务端</translation></message>
+    <message><source>The executable for the Weave server does not exist.</source><translation>Weave 服务端可执行文件不存在。</translation></message>
+    <message><source>The user profile directory required by the Weave service is unavailable.</source><translation>Weave 服务所需的用户配置目录不可用。</translation></message>
+    <message><source>The internal Weave configuration could not be serialized.</source><translation>无法生成 Weave 内部配置。</translation></message>
+    <message><source>Unable to stop Weave</source><translation>无法停止 Weave</translation></message>
+    <message><source>The Weave background service could not be reached. The interface will remain open so the stop command can be retried.</source><translation>无法连接 Weave 后台服务。界面将保持打开，以便重试停止操作。</translation></message>
+    <message><source>The Weave background process did not confirm that it stopped. The interface will remain open so the stop can be retried.</source><translation>Weave 后台进程未确认停止。界面将保持打开，以便重试。</translation></message>
+    <message><source>Browse for a Weave config file</source><translation>选择 Weave 配置文件</translation></message>
+    <message><source>Unable to open Apple's official Bonjour installation page.</source><translation>无法打开 Apple 官方 Bonjour 安装页面。</translation></message>
+    <message><source>Auto config requires Bonjour on Windows.
+
+Weave does not download or install Bonjour automatically. Open Apple's official installation page?</source><translation>Windows 自动配置需要 Bonjour。
+
+Weave 不会自动下载安装 Bonjour。是否打开 Apple 官方安装页面？</translation></message>
+    <message><source>Auto config feature requires Bonjour.
+
+Weave does not install it automatically. Open Apple's official installation page?</source><translation>自动配置需要 Bonjour。
+
+Weave 不会自动安装。是否打开 Apple 官方安装页面？</translation></message>
+    <message><source>Game mode is available because this machine is acting as the server. Drag &amp; drop stays available for supported desktop targets.</source><translation>此设备作为服务端，可使用游戏模式。受支持的桌面目标仍可使用拖放功能。</translation></message>
+    <message><source>Client mode keeps quick connect and tray control active. Switch this machine to server mode to enable game mode.</source><translation>客户端模式支持快速连接与托盘控制。切换到服务端模式即可启用游戏模式。</translation></message>
+    <message><source>No recent transfers yet. Incoming files, screenshots, and workflow actions will appear here.</source><translation>暂无最近传输。接收的文件、截图与工作流活动将显示在这里。</translation></message>
+    <message><source>%1 transfer receipt(s). Latest: %2</source><translation>%1 条传输回执。最新：%2</translation></message>
+    <message><source>remote client</source><translation>远程客户端</translation></message>
+    <message><source>Server</source><translation>服务端</translation></message>
+    <message><source>Client</source><translation>客户端</translation></message>
+    <message><source>Ready to accept a client</source><translation>等待客户端连接</translation></message>
+    <message><source>No server selected</source><translation>尚未选择服务端</translation></message>
+    <message><source>Ready for a remote client</source><translation>等待远程客户端</translation></message>
+    <message><source>Connected server</source><translation>已连接的服务端</translation></message>
+    <message><source>Unavailable</source><translation>不可用</translation></message>
+</context>
+<context>
+    <name>MainWindowBase</name>
+    <message><source>Weave</source><translation>Weave</translation></message>
+    <message><source>Control Center</source><translation>控制中心</translation></message>
+    <message><source>Keep sharing smooth, fix trust and permission prompts fast, and manage transfers without digging through secondary windows.</source><translation>管理共享、信任与权限设置，并查看传输活动。</translation></message>
+    <message><source>Current Role</source><translation>当前角色</translation></message>
+    <message><source>Server</source><translation>服务端</translation></message>
+    <message><source>Peer</source><translation>对端</translation></message>
+    <message><source>Waiting for a device</source><translation>等待设备连接</translation></message>
+    <message><source>Workflow</source><translation>工作流</translation></message>
+    <message><source>Dormant</source><translation>空闲</translation></message>
+    <message><source>Open Workflow Hub</source><translation>打开工作流中心</translation></message>
+    <message><source>Open Live Log</source><translation>打开实时日志</translation></message>
+    <message><source>Ser&amp;ver</source><translation>服务端(&amp;V)</translation></message>
+    <message><source>&amp;Client</source><translation>客户端(&amp;C)</translation></message>
+    <message><source>Experience</source><translation>使用体验</translation></message>
+    <message><source>Locks the cursor to the primary screen on startup and keeps server-side behavior biased toward the fastest crossing and lower input latency.</source><translation>启动时将光标锁定到主屏幕，并优先采用快速跨屏与低输入延迟设置。</translation></message>
+    <message><source>Recent Transfers</source><translation>最近传输</translation></message>
+    <message><source>No recent transfers yet.</source><translation>暂无最近传输。</translation></message>
+    <message><source>...</source><translation>…</translation></message>
+    <message><source>SHA1 (deprecated, compare to old clients and servers only):</source><translation>SHA1（已弃用，仅用于对比旧版客户端和服务端）：</translation></message>
+    <message><source>SHA256:</source><translation>SHA256：</translation></message>
+    <message><source>&amp;About Weave...</source><translation>关于 Weave(&amp;A)…</translation></message>
+    <message><source>&amp;Open Control Center</source><translation>打开控制中心(&amp;O)</translation></message>
+    <message><source>Open Control Center</source><translation>打开控制中心</translation></message>
+</context>
+<context>
+    <name>QObject</name>
+    <message><source>Weave Configurations (*.sgc)</source><translation>Weave 配置文件 (*.sgc)</translation></message>
+    <message><source>Weave Configurations (*.conf)</source><translation>Weave 配置文件 (*.conf)</translation></message>
+</context>
+<context><name>WorkflowDisplayText</name>
+<message><source>Dormant</source><translation>空闲</translation></message>
+<message><source>Active</source><translation>活跃</translation></message>
+<message><source>Burst</source><translation>处理中</translation></message>
+<message><source>Unknown</source><translation>未知</translation></message>
+<message><source>Text</source><translation>文本</translation></message>
+<message><source>Link</source><translation>链接</translation></message>
+<message><source>Image</source><translation>图像</translation></message>
+<message><source>File</source><translation>文件</translation></message>
+<message><source>Folder</source><translation>文件夹</translation></message>
+<message><source>Normal</source><translation>普通</translation></message>
+<message><source>Sensitive</source><translation>敏感</translation></message>
+<message><source>workflow_v1</source><translation>工作流</translation></message>
+<message><source>clipboard_index_v1</source><translation>剪贴板历史</translation></message>
+<message><source>action_bus_v1</source><translation>操作执行</translation></message>
+<message><source>suggestions_v1</source><translation>操作建议</translation></message>
+<message><source>success</source><translation>成功</translation></message>
+<message><source>failed</source><translation>失败</translation></message>
+<message><source>cancelled</source><translation>已取消</translation></message>
+</context>
+<context><name>WorkflowHubDialog</name>
+<message><source>&lt;h3&gt;%1&lt;/h3&gt;&lt;p&gt;&lt;b&gt;Type:&lt;/b&gt; %2&lt;br&gt;&lt;b&gt;Source:&lt;/b&gt; %3&lt;br&gt;&lt;b&gt;Size:&lt;/b&gt; %4 bytes&lt;br&gt;&lt;b&gt;Sensitivity:&lt;/b&gt; %5&lt;br&gt;&lt;b&gt;Created:&lt;/b&gt; %6&lt;br&gt;&lt;b&gt;Actions:&lt;/b&gt; %7&lt;/p&gt;</source><translation>&lt;h3&gt;%1&lt;/h3&gt;&lt;p&gt;&lt;b&gt;类型：&lt;/b&gt; %2&lt;br&gt;&lt;b&gt;来源：&lt;/b&gt; %3&lt;br&gt;&lt;b&gt;大小：&lt;/b&gt; %4 字节&lt;br&gt;&lt;b&gt;敏感级别：&lt;/b&gt; %5&lt;br&gt;&lt;b&gt;创建时间：&lt;/b&gt; %6&lt;br&gt;&lt;b&gt;操作：&lt;/b&gt; %7&lt;/p&gt;</translation></message>
+<message><source>&lt;h3&gt;%1&lt;/h3&gt;&lt;p&gt;&lt;b&gt;Action:&lt;/b&gt; %2&lt;br&gt;&lt;b&gt;Detail:&lt;/b&gt; %3&lt;br&gt;&lt;b&gt;Time:&lt;/b&gt; %4&lt;/p&gt;</source><translation>&lt;h3&gt;%1&lt;/h3&gt;&lt;p&gt;&lt;b&gt;操作：&lt;/b&gt; %2&lt;br&gt;&lt;b&gt;详情：&lt;/b&gt; %3&lt;br&gt;&lt;b&gt;时间：&lt;/b&gt; %4&lt;/p&gt;</translation></message>
+</context>
+<context><name>DialogButtons</name>
+<message><source>OK</source><translation>确定</translation></message>
+<message><source>Cancel</source><translation>取消</translation></message>
+</context>
 </TS>
