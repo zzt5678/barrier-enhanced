@@ -86,7 +86,7 @@ private:
 
 class BufferedPacketInputStream : public barrier::IStream {
 public:
-    explicit BufferedPacketInputStream(size_t frameCount, UInt32 payloadSize)
+    explicit BufferedPacketInputStream(size_t frameCount, UInt32 payloadSize, bool topology = false)
     {
         const UInt8 length[] = {
             static_cast<UInt8>((payloadSize >> 24) & 0xff),
@@ -98,6 +98,9 @@ public:
             input.insert(input.end(), length, length + sizeof(length));
             input.insert(input.end(), payloadSize,
                          static_cast<UInt8>('a' + frame % 26));
+            if (topology && payloadSize >= 4) {
+                std::memcpy(input.data()+input.size()-payloadSize,"DTOP",4);
+            }
         }
     }
 
@@ -131,6 +134,9 @@ public:
     UInt32 getBufferedOutputSize() const override { return 0; }
 
     size_t totalSize() const { return input.size(); }
+    void firstPayloadPrefix(const std::string& prefix) {
+        std::copy(prefix.begin(),prefix.end(),input.begin()+4);
+    }
 
     size_t bytesRead = 0;
 
@@ -456,6 +462,35 @@ TEST(PacketStreamFilterTests, getInputBytesReceivedForwardsToUnderlyingStream)
     PacketStreamFilter filter(&events, &stream, false);
 
     EXPECT_EQ(42u, filter.getInputBytesReceived());
+}
+
+TEST(PacketStreamFilterTests, topologyPacketLimitRejectsBeforeLargePrefetch)
+{
+    NiceMock<MockEventQueue> events; IStreamEvents streamEvents;
+    setupStreamEvents(events,streamEvents);
+    BufferedPacketInputStream stream(1,1024*1024,true);
+    TestPacketStreamFilter filter(&events,&stream);
+    filter.deliverInputReady(streamEvents.inputReady());
+    EXPECT_EQ(0u,filter.getSize());
+    EXPECT_LE(stream.bytesRead,4096u);
+    const auto read=stream.bytesRead;
+    filter.deliverInputReady(streamEvents.inputReady());
+    EXPECT_EQ(read,stream.bytesRead);
+}
+
+TEST(PacketStreamFilterTests, topologyMarkerInsideClipboardPayloadDoesNotPauseInput)
+{
+    NiceMock<MockEventQueue> events; IStreamEvents streamEvents;
+    setupStreamEvents(events,streamEvents);
+    const UInt32 size=1024*1024;
+    BufferedPacketInputStream stream(2,size);
+    stream.firstPayloadPrefix("DCLPDTOP");
+    TestPacketStreamFilter filter(&events,&stream);
+    filter.deliverInputReady(streamEvents.inputReady());
+    ASSERT_EQ(size,filter.getSize());
+    EXPECT_EQ(4u,filter.read(nullptr,4));
+    EXPECT_EQ(size-4,filter.read(nullptr,size-4));
+    EXPECT_EQ(size,filter.getSize());
 }
 
 TEST(PacketStreamFilterTests, inputPauseKeepsMultiFramePrefetchBounded)

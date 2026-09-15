@@ -12,8 +12,11 @@ std::string folded(std::string s) {
     return s;
 }
 bool valid(const Topology& t) {
-    if (t.nodes.empty() || t.nodes.size() > MaxNodes || t.epoch == 0 ||
+    if (t.nodes.size() > MaxNodes || t.epoch == 0 ||
         unsigned(t.layout) > unsigned(Layout::Unavailable)) return false;
+    if (t.nodes.empty()) return (t.layout == Layout::InvalidConfiguration ||
+        t.layout == Layout::Unavailable) &&
+        (t.viewerName.empty() || validName(t.viewerName));
     std::set<std::string> names;
     std::set<std::pair<int,int>> positions;
     unsigned servers = 0;
@@ -76,7 +79,7 @@ bool decodeTopology(const std::string& s, Topology& out) {
     Topology t; t.epoch = r.number(8); t.revision = r.number(8);
     t.viewerName = r.string(MaxNameBytes); t.layout = Layout(r.number(1));
     const auto count = r.number(1);
-    if (!r.good || count == 0 || count > MaxNodes) return false;
+    if (!r.good || count > MaxNodes) return false;
     for (unsigned i = 0; i < count; ++i) {
         Node n; n.name = r.string(MaxNameBytes); n.role = Role(r.number(1));
         const auto online = r.number(1);
@@ -106,7 +109,8 @@ void resolveLayout(Topology& t, const std::vector<Edge>& edges) {
     for (const auto& e : edges) {
         if (!e.whole) { fail(Layout::PartialEdge); return; }
         if (!index.count(e.from) || !index.count(e.to) ||
-            std::abs(e.dx) + std::abs(e.dy) != 1) {
+            !((e.dx == -1 && e.dy == 0) || (e.dx == 1 && e.dy == 0) ||
+              (e.dx == 0 && e.dy == -1) || (e.dx == 0 && e.dy == 1))) {
             fail(Layout::InvalidConfiguration); return;
         }
     }

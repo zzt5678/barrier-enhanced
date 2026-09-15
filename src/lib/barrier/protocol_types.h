@@ -40,8 +40,11 @@
 // 1.11: adds acknowledged source input-lease revocation before handoff commit
 // NOTE: with new version, barrier minor version should increment
 static const SInt16        kProtocolMajorVersion = 1;
-static const SInt16        kProtocolMinorVersion = 12;
+// 1.13 adds read-only device topology only. It does not authorize file tasks;
+// future file-task commands require a separate capability or protocol 1.14.
+static const SInt16        kProtocolMinorVersion = 13;
 static const SInt16        kProtocolMinimumMinorVersion = 12;
+extern const char* kMsgDTopology;
 
 // default contact port number
 static const UInt16        kDefaultPort = 24800;

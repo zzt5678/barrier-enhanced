@@ -4,6 +4,7 @@
 #include <chrono>
 #include <thread>
 #include <filesystem>
+#include <climits>
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/stat.h>
@@ -84,6 +85,15 @@ TEST(DeviceTopologyTests, ResolvesDirectedGraphAndFailsClosedOnContradictions)
     EXPECT_EQ(Layout::Disconnected, t.layout);
 }
 
+TEST(DeviceTopologyTests, InvalidExtremeDirectionsNeverReachCoordinateArithmetic)
+{
+    auto t=trio();
+    resolveLayout(t,{{"Ubuntu","Mac",INT_MIN,INT_MAX,true}});
+    EXPECT_EQ(Layout::InvalidConfiguration,t.layout);
+    resolveLayout(t,{{"Ubuntu","Mac",INT_MAX,INT_MAX,true}});
+    EXPECT_EQ(Layout::InvalidConfiguration,t.layout);
+}
+
 TEST(DeviceTopologyTests, SnapshotFreshnessAndOwnerAreIndependentOfOnlineFlags)
 {
     Snapshot s;
@@ -99,13 +109,15 @@ TEST(DeviceTopologyTests, SnapshotFreshnessAndOwnerAreIndependentOfOnlineFlags)
     EXPECT_EQ(ReadStatus::Stale, classifySnapshot(s, s.identity, 9000));
     s.ready = false;
     EXPECT_EQ(ReadStatus::NotReady, classifySnapshot(s, s.identity, 11000));
+    s.ready = true; s.topology.nodes.clear();
+    EXPECT_EQ(ReadStatus::NotReady, classifySnapshot(s, s.identity, 20000));
 }
 
 TEST(DeviceTopologyTests, PublishedProofRejectsStandbyForeignSessionAndExpiredProof)
 {
     Snapshot s;
     s.identity = {42, 100, "S-1-5-21-1000", 2};
-    PublishedOwner p{s.identity, 3, 10000};
+    PublishedOwner p{s.identity, 3, 10000, "S-1-5-21-1000"};
     EXPECT_TRUE(matchesPublishedOwner(p,s,"S-1-5-21-1000",2,11000));
     s.identity.pid = 43;
     EXPECT_FALSE(matchesPublishedOwner(p,s,"S-1-5-21-1000",2,11000));
@@ -115,6 +127,51 @@ TEST(DeviceTopologyTests, PublishedProofRejectsStandbyForeignSessionAndExpiredPr
     EXPECT_FALSE(matchesPublishedOwner(p,s,"S-1-5-21-1000",2,20000));
     p.generation=0;
     EXPECT_FALSE(matchesPublishedOwner(p,s,"S-1-5-21-1000",2,11000));
+}
+
+TEST(DeviceTopologyTests, RetirementCannotMatchReplacementOrNewLaunchGeneration)
+{
+    PublishedOwner old{{42,100,"S-1-5-21-1000",2},3,10000,"S-1-5-21-1000"};
+    auto replacement=old; replacement.identity.pid=43; replacement.identity.birth=200;
+    EXPECT_FALSE(samePublishedGeneration(old,replacement));
+    replacement=old; replacement.generation=4;
+    EXPECT_FALSE(samePublishedGeneration(old,replacement));
+    replacement=old; replacement.updatedMillis=12000;
+    EXPECT_TRUE(samePublishedGeneration(old,replacement));
+}
+
+TEST(DeviceTopologyTests, PublishedSystemTokenRetainsAuthenticatedDesktopOwner)
+{
+    Snapshot s; s.identity={42,100,"S-1-5-18",2};
+    PublishedOwner p{s.identity,3,10000,"S-1-5-21-1000"};
+    EXPECT_TRUE(matchesPublishedOwner(p,s,"S-1-5-21-1000",2,11000));
+    EXPECT_FALSE(matchesPublishedOwner(p,s,"S-1-5-18",2,11000));
+    auto wrong=p; wrong.launchOwner="S-1-5-21-2000";
+    EXPECT_FALSE(samePublishedGeneration(p,wrong));
+    s.identity.owner="S-1-5-21-1000";
+    EXPECT_FALSE(matchesPublishedOwner(p,s,"S-1-5-21-1000",2,11000));
+}
+
+TEST(DeviceTopologyTests, CombinedRecordBoundsAndBindingPreserveCallerOnMalformedInput)
+{
+    Snapshot s; s.identity={42,100,"S-1-5-18",2}; s.localName="Mac";
+    s.run=2; s.sequence=3; s.updatedMillis=9000; s.ready=true; s.topology=trio();
+    PublishedOwner p{s.identity,4,10000,"S-1-5-21-1000"};
+    std::string bytes; ASSERT_TRUE(encodePublishedRecord(p,s,bytes));
+    PublishedOwner decoded; Snapshot read;
+    ASSERT_TRUE(decodePublishedRecord(bytes,decoded,read));
+    EXPECT_EQ("S-1-5-21-1000",decoded.launchOwner);
+    EXPECT_EQ("S-1-5-18",read.identity.owner);
+    EXPECT_EQ(9000u,read.updatedMillis);
+    for (size_t i=0;i<bytes.size();++i) {
+        EXPECT_FALSE(decodePublishedRecord(bytes.substr(0,i),decoded,read));
+        EXPECT_EQ(4u,decoded.generation); EXPECT_EQ(3u,read.sequence);
+    }
+    EXPECT_FALSE(decodePublishedRecord(bytes+"x",decoded,read));
+    EXPECT_FALSE(decodePublishedRecord(std::string(65537,'x'),decoded,read));
+    p.identity.pid++;
+    const auto previous=bytes;
+    EXPECT_FALSE(encodePublishedRecord(p,s,bytes)); EXPECT_EQ(previous,bytes);
 }
 
 #ifndef _WIN32
@@ -138,6 +195,15 @@ TEST(DeviceTopologyTests, AtomicPrivateSnapshotLifecycleAndDisconnect)
         ASSERT_EQ(0,stat((directory+"/"+snapshotFilename(identity)).c_str(),&st));
         EXPECT_EQ(0600,st.st_mode&0777);
         EXPECT_EQ("Mac",s.localName);
+        const auto pulseTime=s.updatedMillis;
+        const auto pulseSequence=s.sequence;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+        EXPECT_EQ(ReadStatus::Fresh,readSnapshot(directory,identity,monotonicMillis(),s));
+        // A disk worker heartbeat cannot certify that the event thread or the
+        // remote server is still responsive.
+        EXPECT_EQ(pulseTime,s.updatedMillis);
+        EXPECT_EQ(pulseSequence,s.sequence);
+        EXPECT_EQ(ReadStatus::Stale,readSnapshot(directory,identity,pulseTime+6001,s));
         publisher.update(trio(),"Mac",Role::Client,false);
         for (int n=0;n<100 && state!=ReadStatus::NotReady;++n) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));

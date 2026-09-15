@@ -22,6 +22,7 @@
 #include "ipc/Ipc.h"
 #include "platform/MSWindowsSession.h"
 #include "barrier/ServiceLaunchState.h"
+#include "topology/TopologySnapshot.h"
 #include "barrier/XBarrier.h"
 #include "arch/IArchMultithread.h"
 #include "common/basic_types.h"
@@ -205,6 +206,11 @@ private:
 
 private:
     Thread*                m_thread;
+    // Accessed on the watchdog thread, or after that thread has joined.
+    weave::topology::PublishedOwner m_topologyOwner;
+    std::string m_topologyLaunchOwner;
+    void refreshTopologyOwner();
+    void retireTopologyOwner();
     bool                m_autoDetectCommand;
     std::string            m_command;
     std::atomic<bool>   m_monitoring;

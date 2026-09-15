@@ -53,16 +53,24 @@ private:
 struct PublishedOwner {
     ProcessIdentity identity;
     std::uint64_t generation = 0, updatedMillis = 0;
+    // Authenticated launch profile owner; an elevated input core itself may
+    // have the SYSTEM token. This field is never inferred from that token.
+    std::string launchOwner;
 };
+bool encodePublishedRecord(const PublishedOwner&, const Snapshot&, std::string&);
+bool decodePublishedRecord(const std::string&, PublishedOwner&, Snapshot&);
 bool matchesPublishedOwner(const PublishedOwner&, const Snapshot&,
                            const std::string& expectedOwner,
                            std::uint32_t expectedSession, std::uint64_t now);
 // Windows only; directory is a fixed child of the native common application
 // data directory. Writers require SYSTEM. Readers check owner, protected ACL,
 // reparse points, exact process identity, generation and fresh proof twice.
+// The daemon reads the exact core snapshot using its token-derived profile
+// and publishes a single bounded owner+snapshot record, preserving event time.
 std::string publishedOwnerDirectory();
 bool publishOwner(const PublishedOwner&);
-void retirePublishedOwner();
+bool samePublishedGeneration(const PublishedOwner&, const PublishedOwner&);
+bool retirePublishedOwner(const PublishedOwner& expected);
 ReadStatus readPublishedSnapshot(const std::string& expectedOwner,
                                  std::uint32_t expectedSession,
                                  std::uint64_t now, Snapshot& out);

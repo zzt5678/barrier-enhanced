@@ -17,6 +17,7 @@
  */
 
 #include "barrier/protocol_types.h"
+const char* kMsgDTopology = "DTOP%s";
 
 #include <algorithm>
 

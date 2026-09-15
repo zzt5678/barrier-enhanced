@@ -6,6 +6,7 @@
 #include "server/ClientProxy1_10.h"
 #include "server/ClientProxy1_11.h"
 #include "server/ClientProxy1_12.h"
+#include "server/ClientProxy1_13.h"
 
 #include "barrier/Clipboard.h"
 #include "barrier/FileChunk.h"
@@ -35,6 +36,7 @@ using ::testing::Invoke;
 using ::testing::NiceMock;
 using ::testing::Return;
 using ::testing::ReturnRef;
+
 
 namespace {
 
@@ -275,6 +277,33 @@ TEST(ClientProxyLifecycleTests, protocol112OfferUsesStableControlBinding)
     ClientProxy1_12 second("second", secondStream, &server, &events);
     EXPECT_TRUE(isValidConnectionBinding(second.getConnectionBinding()));
     EXPECT_NE(firstBinding, second.getConnectionBinding());
+}
+
+TEST(ClientProxyLifecycleTests, topology113WritesBoundedFrameWhile112WritesNothing)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents; ClipboardEvents clipboardEvents; FileEvents fileEvents;
+    Event::Type nextType=Event::kLast;
+    setClientProxy16EventDefaults(events,streamEvents,clipboardEvents,fileEvents,nextType);
+    NiceMock<MockServer> server;
+    auto* currentStream=new RecordingProtocolStream();
+    ClientProxy1_13 current("client",currentStream,&server,&events);
+    auto* oldStream=new RecordingProtocolStream();
+    ClientProxy1_12 old("client",oldStream,&server,&events);
+    currentStream->clear(); oldStream->clear();
+    weave::topology::Topology t; t.revision=1; t.viewerName="client";
+    t.layout=weave::topology::Layout::Available;
+    t.nodes={{"server",weave::topology::Role::Server,true,0,0},
+             {"client",weave::topology::Role::Client,true,1,0}};
+    old.sendDeviceTopology(t);
+    EXPECT_EQ(0u,oldStream->getSize());
+    current.sendDeviceTopology(t);
+    UInt8 code[4]; ASSERT_EQ(4u,currentStream->read(code,4));
+    EXPECT_EQ(0,std::memcmp(code,"DTOP",4));
+    std::string bytes; ASSERT_TRUE(ProtocolUtil::readf(currentStream,"%s",&bytes));
+    weave::topology::Topology parsed;
+    ASSERT_TRUE(weave::topology::decodeTopology(bytes,parsed));
+    EXPECT_EQ("client",parsed.viewerName); EXPECT_EQ(2u,parsed.nodes.size());
 }
 
 TEST(ClientProxyLifecycleTests, protocol112PostAckCancelUsesControlWhileDataUsesBulk)

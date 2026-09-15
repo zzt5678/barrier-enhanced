@@ -690,6 +690,7 @@ ServerApp::openServer(Config& config, PrimaryClient* primaryClient)
 {
     Server* server = new Server(config, primaryClient, m_serverScreen, m_events, args());
     try {
+        server->enableTopologySnapshot();
         m_events->adoptHandler(
             m_events->forServer().disconnected(), server,
             new TMethodEventJob<ServerApp>(this, &ServerApp::handleNoClients));

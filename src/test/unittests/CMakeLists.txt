@@ -17,6 +17,7 @@
 file(GLOB_RECURSE headers "*.h")
 file(GLOB_RECURSE sources "*.cpp")
 list(REMOVE_ITEM sources "${CMAKE_CURRENT_SOURCE_DIR}/PolicyTestsMain.cpp")
+list(REMOVE_ITEM sources "${CMAKE_CURRENT_SOURCE_DIR}/TopologySnapshotProbe.cpp")
 list(APPEND sources "barrier/PacketStreamFilterTests.cpp")
 list(APPEND sources "barrier/TransferArchiveTests.cpp")
 list(APPEND sources "${CMAKE_CURRENT_SOURCE_DIR}/barrier/SecureRandomTests.cpp")
@@ -75,6 +76,8 @@ if (BARRIER_ADD_HEADERS)
 endif()
 
 add_executable(unittests ${sources})
+add_executable(topologysnapshotprobe TopologySnapshotProbe.cpp)
+target_link_libraries(topologysnapshotprobe weave_topology)
 if (MSVC)
     # Debug information can exceed COFF's default section count in this
     # intentionally broad server state-machine test translation unit.

@@ -249,6 +249,7 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
 
 Client::~Client()
 {
+    m_topologyPublisher.reset();
     if (m_mock) {
         return;
     }
@@ -610,7 +611,39 @@ Client::handshakeComplete()
 {
     m_ready = true;
     m_screen->enable();
+    updateTopologySnapshot();
     sendEvent(m_events->forClient().connected(), NULL);
+}
+
+void Client::enableTopologySnapshot()
+{
+    m_topologyPublisher.reset(new weave::topology::SnapshotPublisher);
+    updateTopologySnapshot();
+}
+
+void Client::updateTopologySnapshot()
+{
+    if (m_topologyPublisher) m_topologyPublisher->update(m_deviceTopology,
+        m_deviceTopology.viewerName.empty() ? m_name : m_deviceTopology.viewerName,
+        weave::topology::Role::Client, m_ready);
+}
+
+bool Client::receiveDeviceTopology(const weave::topology::Topology& t)
+{
+    if (!m_ready || m_protocolMinorVersion < 13 || t.viewerName.empty() || !t.revision) return false;
+    std::string validation;
+    if (!weave::topology::encodeTopology(t, validation)) return false;
+    if (m_deviceTopology.revision &&
+        (t.epoch != m_deviceTopology.epoch || t.revision <= m_deviceTopology.revision)) return false;
+    if (!t.nodes.empty()) {
+        auto self = std::find_if(t.nodes.begin(), t.nodes.end(), [&](const weave::topology::Node& node) {
+            return node.name == t.viewerName && node.role == weave::topology::Role::Client && node.online;
+        });
+        if (self == t.nodes.end()) return false;
+    }
+    m_deviceTopology = t;
+    updateTopologySnapshot();
+    return true;
 }
 
 bool
@@ -2124,6 +2157,11 @@ Client::cleanupConnection()
 void
 Client::cleanupScreen()
 {
+    // Retire roster readiness before screen or transfer cleanup can defer.
+    const bool wasReady = m_ready;
+    m_ready = false;
+    updateTopologySnapshot();
+    m_deviceTopology = weave::topology::Topology();
     // Revoke the logical pointer lease before any cleanup can defer or return.
     // Screen::disable() releases the platform state for a ready connection.
     if (m_server != NULL) {
@@ -2141,7 +2179,7 @@ Client::cleanupScreen()
         clearPendingFileClipboard(id);
     }
     if (m_server != NULL) {
-        if (m_ready) {
+        if (wasReady) {
             m_screen->disable();
             m_ready = false;
         }

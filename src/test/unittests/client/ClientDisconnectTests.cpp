@@ -2790,7 +2790,71 @@ TEST(ClientDisconnectTests, protocolNegotiationRequiresTransactionalInputVersion
     EXPECT_TRUE(Client::negotiateProtocolVersion(1, 12, negotiatedMinor));
     EXPECT_EQ(12, negotiatedMinor);
     EXPECT_TRUE(Client::negotiateProtocolVersion(1, 13, negotiatedMinor));
-    EXPECT_EQ(12, negotiatedMinor);
+    EXPECT_EQ(13, negotiatedMinor);
+}
+
+TEST(ClientDisconnectTests, topologyRequiresCompletedHandshakeAndNewRevision)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents; IScreenEvents screenEvents; FileEvents fileEvents;
+    setClientEventDefaults(events,clientEvents,screenEvents,fileEvents);
+    barrier::Screen screen(new EnterPlatformScreen(),&events);
+    ClientArgs args;
+    Client client(&events,"alias",NetworkAddress(),new DummySocketFactory(),&screen,args);
+    client.testSetProtocolMinorVersion(13);
+    weave::topology::Topology t;
+    t.epoch=22; t.revision=1; t.viewerName="canonical";
+    t.layout=weave::topology::Layout::Available;
+    t.nodes={{"server",weave::topology::Role::Server,true,0,0},
+             {"canonical",weave::topology::Role::Client,true,1,0}};
+    EXPECT_FALSE(client.isHandshakeComplete());
+    EXPECT_FALSE(client.receiveDeviceTopology(t));
+    client.handshakeComplete();
+    EXPECT_TRUE(client.isHandshakeComplete());
+    EXPECT_TRUE(client.receiveDeviceTopology(t));
+    EXPECT_EQ("canonical",client.deviceTopology().viewerName);
+    EXPECT_FALSE(client.receiveDeviceTopology(t));
+    t.revision=2;
+    EXPECT_TRUE(client.receiveDeviceTopology(t));
+    t.epoch=23; t.revision=3;
+    EXPECT_FALSE(client.receiveDeviceTopology(t));
+    client.disconnect("fixture disconnect");
+    EXPECT_FALSE(client.isHandshakeComplete());
+    EXPECT_TRUE(client.deviceTopology().nodes.empty());
+    client.handshakeComplete();
+    EXPECT_TRUE(client.receiveDeviceTopology(t));
+    client.testSetProtocolMinorVersion(12); t.revision=4;
+    EXPECT_FALSE(client.receiveDeviceTopology(t));
+}
+
+TEST(ClientDisconnectTests, topologyWireRejectsHugeDeclaredLengthBeforeReadingBody)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents; IScreenEvents screenEvents; FileEvents fileEvents;
+    IStreamEvents streamEvents; ClipboardEvents clipboardEvents;
+    IDataSocketEvents dataSocketEvents; ISocketEvents socketEvents;
+    setConnectedClientEventDefaults(events,clientEvents,screenEvents,fileEvents,
+        streamEvents,clipboardEvents,dataSocketEvents,socketEvents);
+    barrier::Screen screen(new EnterPlatformScreen(),&events);
+    ClientArgs args;
+    Client client(&events,"client",NetworkAddress(),new DummySocketFactory(),&screen,args);
+    client.testSetProtocolMinorVersion(13); client.handshakeComplete();
+    ScriptedStream stream;
+    ServerProxy proxy(&client,&stream,&events,13);
+    ProtocolUtil::writef(&stream,"%4i",0x7fffffff);
+    EXPECT_EQ(ServerProxy::kDisconnect,proxy.parseMessage(reinterpret_cast<const UInt8*>("DTOP")));
+    EXPECT_TRUE(client.deviceTopology().nodes.empty());
+    stream.clearData();
+    weave::topology::Topology t; t.epoch=5; t.revision=1; t.viewerName="client";
+    t.layout=weave::topology::Layout::Available;
+    t.nodes={{"server",weave::topology::Role::Server,true,0,0},
+             {"client",weave::topology::Role::Client,true,1,0}};
+    std::string bytes; ASSERT_TRUE(weave::topology::encodeTopology(t,bytes));
+    ProtocolUtil::writef(&stream,"%s",&bytes);
+    EXPECT_EQ(ServerProxy::kOkay,proxy.parseMessage(reinterpret_cast<const UInt8*>("DTOP")));
+    EXPECT_EQ(5u,client.deviceTopology().epoch);
+    ServerProxy oldProxy(&client,&stream,&events,12);
+    EXPECT_EQ(ServerProxy::kUnknown,oldProxy.parseMessage(reinterpret_cast<const UInt8*>("DTOP")));
 }
 
 TEST(ClientDisconnectTests, newestFileClipboardSupersedesActivePrefetchWithoutWaiting)

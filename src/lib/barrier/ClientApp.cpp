@@ -339,6 +339,7 @@ ClientApp::openClient(const String& name, const NetworkAddress& address,
         args());
 
     try {
+        client->enableTopologySnapshot();
         m_events->adoptHandler(
             m_events->forClient().connected(),
             client->getEventTarget(),

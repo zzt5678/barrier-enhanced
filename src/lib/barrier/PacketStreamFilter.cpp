@@ -213,8 +213,20 @@ bool PacketStreamFilter::readPacketSize()
                  ((UInt32)buffer[1] << 16) |
                  ((UInt32)buffer[2] <<  8) |
                   (UInt32)buffer[3];
+        m_packetCodeChecked = false;
 
         if (m_size > PROTOCOL_MAX_MESSAGE_LENGTH) {
+            m_events->addEvent(Event(m_events->forIStream().inputFormatError(), getEventTarget()));
+            return false;
+        }
+    }
+    // Topology-only 1.13 frames have a much smaller bound than clipboard
+    // packets. Inspect the code after the first small read, before buffering
+    // the declared payload. Other frame types retain their existing limits.
+    if (!m_packetCodeChecked && m_size >= 4 && m_buffer.getSize() >= 4) {
+        m_packetCodeChecked = true;
+        if (m_size > 65536 && std::memcmp(m_buffer.peek(4), "DTOP", 4) == 0) {
+            m_inputPaused = true;
             m_events->addEvent(Event(m_events->forIStream().inputFormatError(), getEventTarget()));
             return false;
         }

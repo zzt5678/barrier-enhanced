@@ -412,6 +412,22 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
 ServerProxy::EResult
 ServerProxy::parseMessage(const UInt8* code)
 {
+    if (m_protocolMinorVersion >= 13 && memcmp(code, kMsgDTopology, 4) == 0) {
+        // The outer packet and internal length are both checked before allocation.
+        const auto remaining = m_stream->getSize();
+        if (remaining < 4 || remaining > weave::topology::MaxBytes - 4) return kDisconnect;
+        UInt8 length[4];
+        if (m_stream->read(length, 4) != 4) return kDisconnect;
+        const UInt32 size = (UInt32(length[0]) << 24) | (UInt32(length[1]) << 16) |
+            (UInt32(length[2]) << 8) | length[3];
+        if (size != remaining - 4 || size > weave::topology::MaxBytes - 8) return kDisconnect;
+        std::string bytes(size, '\0');
+        if (size && m_stream->read(&bytes[0], size) != size) return kDisconnect;
+        weave::topology::Topology topology;
+        if (!weave::topology::decodeTopology(bytes, topology) ||
+            !m_client->receiveDeviceTopology(topology)) return kDisconnect;
+        return kOkay;
+    }
     if (m_protocolMinorVersion >= 8 &&
         memcmp(code, kMsgDMouseMove1_8, 4) == 0) {
         mouseMove1_8();

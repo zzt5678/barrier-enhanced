@@ -36,6 +36,7 @@
 #include "common/stdset.h"
 #include "common/stdvector.h"
 #include "io/filesystem.h"
+#include "topology/TopologySnapshot.h"
 
 #include <atomic>
 #include <deque>
@@ -66,6 +67,8 @@ This class implements the top-level server algorithms for barrier.
 */
 class Server : public INode {
 public:
+    void enableTopologySnapshot();
+    weave::topology::Topology deviceTopology() const;
 	class FileClipboardReadyInfo : public EventData {
 	public:
 		FileClipboardReadyInfo() : m_publishClipboard(false) { }
@@ -883,6 +886,13 @@ private:
         bool              m_hasClipboardRollback;
     };
 
+    void publishDeviceTopology();
+    void handleTopologyHeartbeat(const Event&, void*);
+    std::uint64_t m_topologyEpoch = weave::topology::newRunId();
+    std::uint64_t m_topologyRevision = 0;
+    std::unique_ptr<weave::topology::SnapshotPublisher> m_topologyPublisher;
+    bool m_topologyRetiring = false;
+    EventQueueTimer* m_topologyTimer = nullptr;
     // the primary screen client
     PrimaryClient*        m_primaryClient;
 

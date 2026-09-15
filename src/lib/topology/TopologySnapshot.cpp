@@ -58,7 +58,7 @@ bool encodeSnapshot(const Snapshot& s, std::string& out) {
     if (!validIdentity(s.identity) || !s.run || !s.sequence ||
         !validName(s.localName) || unsigned(s.localRole) > unsigned(Role::Client)) return false;
     std::string topology;
-    if (!s.topology.nodes.empty() && !encodeTopology(s.topology,topology)) return false;
+    if (!encodeTopology(s.topology,topology)) return false;
     std::string b("WTS1"); putIdentity(b,s.identity);
     detail::number(b,s.run,8); detail::number(b,s.sequence,8);
     detail::number(b,s.updatedMillis,8); detail::string(b,s.localName);
@@ -82,8 +82,10 @@ bool decodeSnapshot(const std::string& b, Snapshot& out) {
 }
 ReadStatus classifySnapshot(const Snapshot& s,const ProcessIdentity& p,std::uint64_t now) {
     if (!(s.identity==p)) return ReadStatus::WrongOwner;
-    if (now<s.updatedMillis || now-s.updatedMillis>FreshnessMillis) return ReadStatus::Stale;
+    // Old protocol peers have no roster pulse. Awaiting topology is not a
+    // claim that the still-running local core has failed.
     if (!s.ready || s.topology.nodes.empty()) return ReadStatus::NotReady;
+    if (now<s.updatedMillis || now-s.updatedMillis>FreshnessMillis) return ReadStatus::Stale;
     return ReadStatus::Fresh;
 }
 std::string snapshotFilename(const ProcessIdentity& p) {
@@ -186,6 +188,33 @@ std::wstring wide(const std::string& s) {
     std::wstring w(n,L'\0');
     MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s.data(),int(s.size()),&w[0],n); return w;
 }
+struct AncestorLocks {
+    std::vector<HANDLE> handles;
+    bool good=false;
+    explicit AncestorLocks(const std::string& path) {
+        auto w=wide(path);
+        for (auto& c:w) if (c==L'/') c=L'\\';
+        // Snapshots are local. UNC/device paths are not a permitted bridge.
+        if (w.size()<3 || w[1]!=L':' || w[2]!=L'\\') return;
+        std::vector<std::wstring> prefixes{w.substr(0,3)};
+        for (std::size_t i=3;i<w.size();++i)
+            if (w[i]==L'\\') prefixes.push_back(w.substr(0,i));
+        for (const auto& prefix:prefixes) {
+            HANDLE h=CreateFileW(prefix.c_str(),FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+            if (h==INVALID_HANDLE_VALUE) return;
+            handles.push_back(h); BY_HANDLE_FILE_INFORMATION info{};
+            if (!GetFileInformationByHandle(h,&info) ||
+                !(info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) ||
+                (info.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)) return;
+        }
+        good=true;
+    }
+    ~AncestorLocks() { for (HANDLE h:handles) CloseHandle(h); }
+    AncestorLocks(const AncestorLocks&)=delete;
+    AncestorLocks& operator=(const AncestorLocks&)=delete;
+};
 std::string utf8(const wchar_t* w) {
     int n=WideCharToMultiByte(CP_UTF8,0,w,-1,nullptr,0,nullptr,nullptr);
     if (!n) return {}; std::string s(n,'\0');
@@ -229,11 +258,14 @@ bool secureHandle(HANDLE h,const std::string& owner,bool service,bool directory)
         const DWORD writes=GENERIC_ALL|GENERIC_WRITE|WRITE_DAC|WRITE_OWNER|DELETE|
             FILE_WRITE_DATA|FILE_APPEND_DATA|FILE_WRITE_EA|FILE_WRITE_ATTRIBUTES|FILE_DELETE_CHILD;
         if ((ace->Mask&writes) && !trustedSid(&ace->SidStart,owner,service)) ok=false;
+        if (service && !directory && !trustedSid(&ace->SidStart,owner,true) &&
+            sidString(&ace->SidStart)!=owner) ok=false;
     }
     LocalFree(sd); return ok;
 }
-HANDLE openDirectory(const std::string& path,bool create,bool service=false) {
-    const auto owner=currentProcessIdentity().owner;
+HANDLE openDirectory(const std::string& path,bool create,bool service=false,
+                     const std::string& expectedOwner={}) {
+    const auto owner=expectedOwner.empty()?currentProcessIdentity().owner:expectedOwner;
     if (create) {
         if (service && owner!="S-1-5-18") return INVALID_HANDLE_VALUE;
         const std::string acl=service ?
@@ -252,24 +284,30 @@ HANDLE openDirectory(const std::string& path,bool create,bool service=false) {
     if (!secureHandle(h,owner,service,true)) { CloseHandle(h); return INVALID_HANDLE_VALUE; }
     return h;
 }
-bool readPrivate(const std::string& dir,const std::string& name,std::string& out,bool service=false) {
-    HANDLE d=openDirectory(dir,false,service); if (d==INVALID_HANDLE_VALUE) return false;
+bool readPrivate(const std::string& dir,const std::string& name,std::string& out,bool service=false,
+                 const std::string& expectedOwner={}) {
+    AncestorLocks ancestors(dir); if (!ancestors.good) return false;
+    HANDLE d=openDirectory(dir,false,service,expectedOwner); if (d==INVALID_HANDLE_VALUE) return false;
     HANDLE f=CreateFileW(wide(dir+"/"+name).c_str(),GENERIC_READ|READ_CONTROL,
         FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
     if (f==INVALID_HANDLE_VALUE) { CloseHandle(d); return false; }
     LARGE_INTEGER size{};
-    bool ok=secureHandle(f,currentProcessIdentity().owner,service,false) &&
+    const auto owner=expectedOwner.empty()?currentProcessIdentity().owner:expectedOwner;
+    bool ok=secureHandle(f,owner,service,false) &&
         GetFileSizeEx(f,&size) && size.QuadPart>=0 && size.QuadPart<=MaxBytes;
     std::string b; if (ok) b.resize(static_cast<size_t>(size.QuadPart));
     DWORD n=0; if (ok) ok=ReadFile(f,b.empty()?nullptr:&b[0],DWORD(b.size()),&n,nullptr) && n==b.size();
     CloseHandle(f); CloseHandle(d); if (ok) out=std::move(b); return ok;
 }
-bool writePrivate(const std::string& dir,const std::string& name,const std::string& b,bool service=false) {
+bool writePrivate(const std::string& dir,const std::string& name,const std::string& b,bool service=false,
+                  const std::string& reader={}) {
+    AncestorLocks ancestors(dir); if (!ancestors.good) return false;
     HANDLE d=openDirectory(dir,true,service); if (d==INVALID_HANDLE_VALUE) return false;
     const auto owner=currentProcessIdentity().owner;
+    if (service && reader.empty()) { CloseHandle(d); return false; }
     const std::string acl=service ?
-        "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;AU)" :
+        "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;"+reader+")" :
         "D:P(A;;FA;;;SY)(A;;FA;;;"+owner+")";
     PSECURITY_DESCRIPTOR sd=nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(acl.c_str(),SDDL_REVISION_1,&sd,nullptr)) {
@@ -285,9 +323,32 @@ bool writePrivate(const std::string& dir,const std::string& name,const std::stri
     if (!ok) DeleteFileW(temp.c_str()); CloseHandle(d); return ok;
 }
 void removePrivate(const std::string& dir,const std::string& name,bool service=false) {
+    AncestorLocks ancestors(dir); if (!ancestors.good) return;
     if (service && currentProcessIdentity().owner!="S-1-5-18") return;
     HANDLE d=openDirectory(dir,false,service); if (d==INVALID_HANDLE_VALUE) return;
     DeleteFileW(wide(dir+"/"+name).c_str()); CloseHandle(d);
+}
+std::string processSnapshotDirectory(std::uint64_t pid) {
+    if (!pid || pid>MAXDWORD) return {};
+    HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,DWORD(pid));
+    if (!process) return {};
+    HANDLE token=nullptr;
+    const bool opened=OpenProcessToken(process,TOKEN_QUERY|TOKEN_IMPERSONATE,&token)!=FALSE;
+    CloseHandle(process); if (!opened) return {};
+    wchar_t path[MAX_PATH]{};
+    const auto result=SHGetFolderPathW(nullptr,CSIDL_LOCAL_APPDATA,token,SHGFP_TYPE_CURRENT,path);
+    CloseHandle(token); return result==S_OK ? utf8(path)+"/WeaveTopology" : std::string();
+}
+bool livePublishedIdentity(const ProcessIdentity& p) {
+    if (!validIdentity(p)) return false;
+    HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,DWORD(p.pid));
+    if (!process) return false;
+    FILETIME birth{},exit{},kernel{},user{}; DWORD code=0,session=0;
+    bool ok=GetProcessTimes(process,&birth,&exit,&kernel,&user) &&
+        GetExitCodeProcess(process,&code) && code==STILL_ACTIVE &&
+        ProcessIdToSessionId(DWORD(p.pid),&session) && session==p.session &&
+        ((std::uint64_t(birth.dwHighDateTime)<<32)|birth.dwLowDateTime)==p.birth;
+    CloseHandle(process); return ok;
 }
 }
 bool processIdentity(std::uint64_t pid, ProcessIdentity& out) {
@@ -319,8 +380,15 @@ ReadStatus readSnapshot(const std::string& directory,const ProcessIdentity& expe
     ProcessIdentity live;
     if (!processIdentity(expected.pid,live) || !(live==expected)) return ReadStatus::WrongOwner;
     std::string b;
+#ifdef _WIN32
+    if (!readPrivate(directory,snapshotFilename(expected),b,false,expected.owner)) return ReadStatus::Missing;
+#else
     if (!readPrivate(directory,snapshotFilename(expected),b)) return ReadStatus::Missing;
+#endif
     Snapshot s; if (!decodeSnapshot(b,s)) return ReadStatus::Invalid;
+    if (out.run && out.identity==expected &&
+        (s.updatedMillis<out.updatedMillis ||
+         (s.run==out.run && s.sequence<out.sequence))) return ReadStatus::Invalid;
     const auto status=classifySnapshot(s,expected,now);
     if (status==ReadStatus::WrongOwner) return status;
     if (!processIdentity(expected.pid,live) || !(live==expected)) return ReadStatus::WrongOwner;
@@ -342,7 +410,6 @@ struct SnapshotPublisher::State {
                 changed.wait_for(lock,std::chrono::seconds(2),[this]{return stop||dirty;});
                 if (stop) break;
                 dirty=false;
-                snapshot.updatedMillis=monotonicMillis(); ++snapshot.sequence;
                 Snapshot copy=snapshot;
                 lock.unlock();
                 std::string b;
@@ -365,14 +432,37 @@ void SnapshotPublisher::update(const Topology& t,const std::string& name,Role ro
     if (!t.nodes.empty() && !encodeTopology(t,validation)) return;
     { std::lock_guard<std::mutex> lock(m_state->mutex);
       m_state->snapshot.topology=t; m_state->snapshot.localName=name;
-      m_state->snapshot.localRole=role; m_state->snapshot.ready=ready; m_state->dirty=true; }
+      m_state->snapshot.localRole=role; m_state->snapshot.ready=ready;
+      m_state->snapshot.updatedMillis=monotonicMillis(); ++m_state->snapshot.sequence;
+      m_state->dirty=true; }
     m_state->changed.notify_one();
 }
 bool matchesPublishedOwner(const PublishedOwner& p,const Snapshot& s,
     const std::string& owner,std::uint32_t session,std::uint64_t now) {
     return validIdentity(p.identity) && p.generation && p.identity==s.identity &&
-        p.identity.owner==owner && p.identity.session==session &&
+        validName(p.launchOwner) && p.launchOwner==owner && p.identity.session==session &&
         now>=p.updatedMillis && now-p.updatedMillis<=FreshnessMillis;
+}
+bool encodePublishedRecord(const PublishedOwner& p,const Snapshot& s,std::string& out) {
+    if (!validIdentity(p.identity) || !p.generation || !validName(p.launchOwner) ||
+        !(p.identity==s.identity) || p.updatedMillis<s.updatedMillis) return false;
+    std::string payload; if (!encodeSnapshot(s,payload)) return false;
+    std::string b("WTO2"); putIdentity(b,p.identity); detail::string(b,p.launchOwner);
+    detail::number(b,p.generation,8); detail::number(b,p.updatedMillis,8);
+    detail::number(b,payload.size(),4); b+=payload;
+    if (b.size()>MaxBytes) return false;
+    out=std::move(b); return true;
+}
+bool decodePublishedRecord(const std::string& b,PublishedOwner& owner,Snapshot& snapshot) {
+    if (b.size()>MaxBytes || b.size()<4 || b.compare(0,4,"WTO2")) return false;
+    detail::Reader r{b}; r.p=4; PublishedOwner p;
+    p.identity=getIdentity(r); p.launchOwner=r.string(256);
+    p.generation=r.number(8); p.updatedMillis=r.number(8);
+    const auto size=r.number(4);
+    if (!r.good || size!=b.size()-r.p) return false;
+    Snapshot s; if (!decodeSnapshot(b.substr(r.p),s)) return false;
+    std::string checked; if (!encodePublishedRecord(p,s,checked)) return false;
+    owner=std::move(p); snapshot=std::move(s); return true;
 }
 std::string publishedOwnerDirectory() {
 #ifdef _WIN32
@@ -385,35 +475,80 @@ std::string publishedOwnerDirectory() {
 }
 bool publishOwner(const PublishedOwner& p) {
 #ifdef _WIN32
-    if (!validIdentity(p.identity) || !p.generation) return false;
-    std::string b("WTO1"); putIdentity(b,p.identity);
-    detail::number(b,p.generation,8); detail::number(b,p.updatedMillis,8);
-    return writePrivate(publishedOwnerDirectory(),"published.owner",b,true);
+    if (!validIdentity(p.identity) || !p.generation || !validName(p.launchOwner) ||
+        currentProcessIdentity().owner!="S-1-5-18") return false;
+    PSID ownerSid=nullptr;
+    if (!ConvertStringSidToSidA(p.launchOwner.c_str(),&ownerSid)) return false;
+    const bool canonicalSid=IsValidSid(ownerSid) && sidString(ownerSid)==p.launchOwner;
+    LocalFree(ownerSid); if (!canonicalSid) return false;
+    // The directory comes from the exact published process token, never a
+    // caller-controlled path or a standby snapshot search.
+    const auto directory=processSnapshotDirectory(p.identity.pid);
+    if (directory.empty()) return false;
+    Snapshot snapshot;
+    const auto status=readSnapshot(directory,p.identity,p.updatedMillis,snapshot);
+    if (status!=ReadStatus::Fresh && status!=ReadStatus::Stale && status!=ReadStatus::NotReady)
+        return false;
+    std::string b; if (!encodePublishedRecord(p,snapshot,b)) return false;
+    return writePrivate(publishedOwnerDirectory(),"published.owner",b,true,p.launchOwner);
 #else
     (void)p; return false;
 #endif
 }
-void retirePublishedOwner() {
+bool samePublishedGeneration(const PublishedOwner& a,const PublishedOwner& b) {
+    return a.generation && a.generation==b.generation && a.identity==b.identity &&
+        !a.launchOwner.empty() && a.launchOwner==b.launchOwner;
+}
+bool retirePublishedOwner(const PublishedOwner& expected) {
 #ifdef _WIN32
-    removePrivate(publishedOwnerDirectory(),"published.owner",true);
+    if (!validIdentity(expected.identity) || !expected.generation ||
+        currentProcessIdentity().owner!="S-1-5-18") return false;
+    const auto directory=publishedOwnerDirectory();
+    AncestorLocks ancestors(directory); if (!ancestors.good) return false;
+    HANDLE dir=openDirectory(directory,false,true);
+    if (dir==INVALID_HANDLE_VALUE) return false;
+    // No FILE_SHARE_DELETE: a replacement cannot rename over this identity
+    // between the comparison and delete-by-handle. A concurrent publisher
+    // simply retries on its next heartbeat.
+    HANDLE file=CreateFileW(wide(directory+"/published.owner").c_str(),
+        GENERIC_READ|READ_CONTROL|DELETE,FILE_SHARE_READ,nullptr,OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    if (file==INVALID_HANDLE_VALUE) { CloseHandle(dir); return false; }
+    LARGE_INTEGER size{};
+    bool ok=secureHandle(file,expected.launchOwner,true,false) && GetFileSizeEx(file,&size) &&
+        size.QuadPart>=4 && size.QuadPart<=MaxBytes;
+    std::string b; if (ok) b.resize(static_cast<size_t>(size.QuadPart));
+    DWORD n=0; if (ok) ok=ReadFile(file,&b[0],DWORD(b.size()),&n,nullptr) && n==b.size();
+    if (ok) {
+        PublishedOwner current; Snapshot snapshot;
+        ok=decodePublishedRecord(b,current,snapshot) && samePublishedGeneration(current,expected);
+    }
+    if (ok) {
+        FILE_DISPOSITION_INFO disposition{TRUE};
+        ok=SetFileInformationByHandle(file,FileDispositionInfo,&disposition,sizeof(disposition))!=FALSE;
+    }
+    CloseHandle(file); CloseHandle(dir); return ok;
+#else
+    (void)expected; return false;
 #endif
 }
 ReadStatus readPublishedSnapshot(const std::string& owner,std::uint32_t session,
                                  std::uint64_t now,Snapshot& out) {
 #ifdef _WIN32
     std::string first;
-    if (!readPrivate(publishedOwnerDirectory(),"published.owner",first,true)) return ReadStatus::Missing;
-    if (first.compare(0,4,"WTO1")) return ReadStatus::Invalid;
-    detail::Reader r{first}; r.p=4; PublishedOwner p;
-    p.identity=getIdentity(r); p.generation=r.number(8); p.updatedMillis=r.number(8);
-    if (!r.done() || !validIdentity(p.identity)) return ReadStatus::Invalid;
-    Snapshot s;
-    const auto status=readSnapshot(privateSnapshotDirectory(),p.identity,now,s);
-    if (status!=ReadStatus::Fresh && status!=ReadStatus::Stale && status!=ReadStatus::NotReady) return status;
+    if (!readPrivate(publishedOwnerDirectory(),"published.owner",first,true,owner)) return ReadStatus::Missing;
+    PublishedOwner p; Snapshot s;
+    if (!decodePublishedRecord(first,p,s)) return ReadStatus::Invalid;
     if (!matchesPublishedOwner(p,s,owner,session,now)) return ReadStatus::WrongOwner;
+    if (!livePublishedIdentity(p.identity)) return ReadStatus::WrongOwner;
+    const auto status=classifySnapshot(s,p.identity,now);
+    if (out.run && out.identity==p.identity &&
+        (s.updatedMillis<out.updatedMillis || (s.run==out.run && s.sequence<out.sequence) ||
+         p.generation<out.ownerGeneration)) return ReadStatus::Invalid;
     std::string second;
-    if (!readPrivate(publishedOwnerDirectory(),"published.owner",second,true) || first!=second)
+    if (!readPrivate(publishedOwnerDirectory(),"published.owner",second,true,owner) || first!=second)
         return ReadStatus::WrongOwner;
+    if (!livePublishedIdentity(p.identity)) return ReadStatus::WrongOwner;
     s.ownerGeneration=p.generation; out=std::move(s); return status;
 #else
     (void)owner; (void)session; (void)now; (void)out; return ReadStatus::Missing;

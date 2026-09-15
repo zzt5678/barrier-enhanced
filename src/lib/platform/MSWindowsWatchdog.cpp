@@ -613,6 +613,7 @@ MSWindowsWatchdog::stop()
     // Idempotent fallback for partial startup or an exceptional main-loop
     // exit. Closing the job first guarantees contained descendants are being
     // terminated before their individual ownership handles are released.
+    retireTopologyOwner();
     closeManagedProcessJob();
     const bool pendingStopped = shutdownOwnedProcessBeforeDeadline(
         m_pendingProcessInfo, stopDeadline);
@@ -1238,6 +1239,7 @@ void MSWindowsWatchdog::main_loop()
 
     while (m_monitoring.load()) {
         try {
+            refreshTopologyOwner();
             CommandState state = commandState();
 
             if (state.command.empty() &&
@@ -1761,6 +1763,7 @@ MSWindowsWatchdog::startProcess()
         }
 
         if (isValidHandle(m_processInfo.hProcess)) {
+            retireTopologyOwner();
             LOG((CLOG_INFO
                 "fencing previous process %lu before publishing ready replacement %lu",
                 m_processInfo.dwProcessId, newProcessInfo.dwProcessId));
@@ -2019,6 +2022,7 @@ MSWindowsWatchdog::startProcess()
                 // ready, but never publish B after a proven stop or owner swap.
                 m_processInfo = newProcessInfo;
                 m_runningCommandGeneration = state.generation;
+                m_topologyLaunchOwner = state.launchProfile.userSid;
                 ZeroMemory(&m_pendingProcessInfo,
                            sizeof(PROCESS_INFORMATION));
                 durableCandidateCommitted = false;
@@ -2055,6 +2059,7 @@ MSWindowsWatchdog::startProcess()
             return false;
         }
 
+        refreshTopologyOwner();
         LOG((CLOG_INFO "published locally ready process, pid=%lu, session=%i, desktop=%s, "
             "generation=%llu, elevated=%s, command=%s",
             m_processInfo.dwProcessId, expectedSessionId, desktopName.c_str(),
@@ -2080,12 +2085,42 @@ MSWindowsWatchdog::startProcess()
 void
 MSWindowsWatchdog::closeProcessInfoHandles()
 {
+    retireTopologyOwner();
     closeProcessInfo(m_processInfo);
+}
+
+void MSWindowsWatchdog::refreshTopologyOwner()
+{
+    if (!m_daemonized || !m_processRunning.load() || !m_runningCommandGeneration ||
+        !isProcessHandleActive(m_processInfo.hProcess)) {
+        retireTopologyOwner();
+        return;
+    }
+    weave::topology::PublishedOwner next;
+    if (!weave::topology::processIdentity(m_processInfo.dwProcessId,next.identity)) {
+        retireTopologyOwner();
+        return;
+    }
+    next.generation=m_runningCommandGeneration;
+    next.launchOwner=m_topologyLaunchOwner;
+    next.updatedMillis=weave::topology::monotonicMillis();
+    // Candidate/probe handles are never consulted. Only the fully activated,
+    // watchdog-published process is exposed to the read-only desktop reader.
+    if (weave::topology::publishOwner(next)) m_topologyOwner=std::move(next);
+}
+
+void MSWindowsWatchdog::retireTopologyOwner()
+{
+    if (m_topologyOwner.generation) {
+        weave::topology::retirePublishedOwner(m_topologyOwner);
+        m_topologyOwner=weave::topology::PublishedOwner();
+    }
 }
 
 bool
 MSWindowsWatchdog::shutdownManagedProcess(int timeout)
 {
+    retireTopologyOwner();
     if (!isValidHandle(m_processInfo.hProcess)) {
         closeProcessInfoHandles();
         m_processRunning.store(false);

@@ -950,6 +950,32 @@ Clipboard makeTextClipboard(const std::string& text)
 
 }
 
+TEST(ServerReconnectTests, deviceRosterTracksRealAdmissionRemovalAndReconnect)
+{
+    Config config;
+    config.addScreen("primary"); config.addScreen("client"); config.addScreen("offline");
+    config.connect("primary",kRight,0,1,"client",0,1);
+    config.connect("primary",kLeft,0,1,"offline",0,1);
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents; IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents; ServerEvents serverEvents;
+    setEventTypeDefaults(events,clientProxyEvents,screenEvents,clipboardEvents,serverEvents);
+    barrier::Screen screen(new DragPlatformScreen(),&events);
+    ClipboardPrimaryClient primary(&screen);
+    RecordingClient client("client");
+    Server server;
+    initializeServer(server,config,primary,events,client);
+    auto t=server.deviceTopology();
+    ASSERT_EQ(3u,t.nodes.size()); EXPECT_TRUE(t.nodes[0].online);
+    EXPECT_FALSE(t.nodes[1].online); EXPECT_TRUE(t.nodes[2].online);
+    ASSERT_TRUE(server.removeClient(&client));
+    t=server.deviceTopology(); EXPECT_FALSE(t.nodes[0].online);
+    const auto revision=t.revision;
+    server.finishAdoptingClient(&client,false,false);
+    t=server.deviceTopology(); EXPECT_TRUE(t.nodes[0].online);
+    EXPECT_GT(t.revision,revision);
+}
+
 TEST(ServerReconnectTests, emergencyReturnAcceptsF12AndLegacyPauseWithAllModifiers)
 {
     for (KeyID key : {kKeyF12, kKeyPause}) {

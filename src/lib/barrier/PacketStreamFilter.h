@@ -58,6 +58,7 @@ private:
 private:
     Mutex                m_mutex;
     UInt32                m_size;
+    bool                  m_packetCodeChecked = false;
     StreamBuffer        m_buffer;
     bool                m_inputShutdown;
     bool                m_inputPaused;

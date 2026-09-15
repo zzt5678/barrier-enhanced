@@ -33,6 +33,7 @@
 #include "base/EventTypes.h"
 #include "mt/CondVar.h"
 #include "io/filesystem.h"
+#include "topology/TopologySnapshot.h"
 
 #include <deque>
 #include <memory>
@@ -127,6 +128,10 @@ public:
     Notifies the client that the connection handshake has completed.
     */
     virtual void        handshakeComplete();
+    void enableTopologySnapshot();
+    bool receiveDeviceTopology(const weave::topology::Topology&);
+    const weave::topology::Topology& deviceTopology() const { return m_deviceTopology; }
+    bool isHandshakeComplete() const { return m_ready; }
 
     //! Received drag information
     void dragInfoReceived(UInt32 fileNum, std::string data);
@@ -742,6 +747,9 @@ public:
 #endif
 private:
     std::string                m_name;
+    weave::topology::Topology m_deviceTopology;
+    std::unique_ptr<weave::topology::SnapshotPublisher> m_topologyPublisher;
+    void updateTopologySnapshot();
     NetworkAddress        m_serverAddress;
     ISocketFactory*        m_socketFactory;
     barrier::Screen*    m_screen;

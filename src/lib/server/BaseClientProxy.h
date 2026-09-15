@@ -20,6 +20,7 @@
 
 #include "barrier/IClient.h"
 #include "base/Event.h"
+#include "topology/DeviceTopology.h"
 
 #include <memory>
 
@@ -70,6 +71,8 @@ public:
     Return if this proxy is for client or primary.
     */
     virtual bool        isPrimary() const { return false; }
+    // Legacy peers never receive topology frames.
+    virtual void sendDeviceTopology(const weave::topology::Topology&) {}
 
     //@}
 

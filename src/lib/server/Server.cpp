@@ -17,6 +17,7 @@
  */
 
 #include "server/Server.h"
+#include "server/DeviceTopologyConfig.h"
 #include "server/ClientProxy1_12.h"
 
 #include "server/ClientProxy.h"
@@ -495,6 +496,13 @@ Server::Server(
 
 Server::~Server()
 {
+    m_topologyRetiring = true;
+    if (m_topologyTimer) {
+        m_events->removeHandler(Event::kTimer, m_topologyTimer);
+        m_events->deleteTimer(m_topologyTimer);
+        m_topologyTimer = nullptr;
+    }
+    m_topologyPublisher.reset();
 	if (m_mock) {
 		return;
 	}
@@ -640,7 +648,49 @@ Server::setConfig(const Config& config)
 		sendOptions(client);
 	}
 
+	publishDeviceTopology();
 	return true;
+}
+
+weave::topology::Topology Server::deviceTopology() const
+{
+    std::set<std::string> admitted;
+    for (const auto& client : m_clients) admitted.insert(client.first);
+    return weave::topology::topologyFromConfig(*m_config,
+        m_primaryClient->getName(), admitted, m_topologyEpoch, m_topologyRevision);
+}
+
+void Server::enableTopologySnapshot()
+{
+    m_topologyPublisher.reset(new weave::topology::SnapshotPublisher);
+    if (!m_topologyTimer) {
+        m_topologyTimer = m_events->newTimer(2.0, nullptr);
+        m_events->adoptHandler(Event::kTimer, m_topologyTimer,
+            new TMethodEventJob<Server>(this, &Server::handleTopologyHeartbeat));
+    }
+    publishDeviceTopology();
+}
+
+void Server::handleTopologyHeartbeat(const Event&, void*)
+{
+    publishDeviceTopology();
+}
+
+void Server::publishDeviceTopology()
+{
+    if (m_topologyRetiring) return;
+    ++m_topologyRevision;
+    auto topology = deviceTopology();
+    if (m_topologyPublisher) m_topologyPublisher->update(topology,
+        topology.viewerName, weave::topology::Role::Server, true);
+    for (const auto& client : m_clients) {
+        topology.viewerName = getName(client.second);
+        try {
+            client.second->sendDeviceTopology(topology);
+        } catch (const std::exception& error) {
+            LOG((CLOG_DEBUG "could not publish device topology: %s", error.what()));
+        }
+    }
 }
 
 void
@@ -720,6 +770,7 @@ Server::finishAdoptingClient(BaseClientProxy* client, bool replaceActive,
 	// send configuration options to client
 	sendOptions(client);
 	renewBulkChannel(client);
+	publishDeviceTopology();
 
 	// activate screen saver on new client if active on the primary screen
 	if (m_activeSaver != NULL) {
@@ -5688,6 +5739,7 @@ Server::removeClient(BaseClientProxy* client)
 	// remove from list
 	m_clients.erase(getName(client));
 	m_clientSet.erase(i);
+	publishDeviceTopology();
 
 	return true;
 }
