@@ -35,6 +35,8 @@ Ownership: QBarrierApplication, BarrierLocale, SettingsDialog, ServerConfigDialo
 
 Specific verified integration risks: SettingsDialog selects language using exact itemData comparison (normalize this too), previews the translator before save and must restore the original language on cancel. GUI test main uses QApplication, not QBarrierApplication; put normalization/load logic in a testable helper or use a dedicated executable rather than constructing a second application. WorkflowTypes contextKindText and sensitivityText are also used in API summaries and clipboard signatures; retain those stable functions and add separate translated display labels. ServerConfigDialog has a fixed 273-pixel canvas height and showEvent calls QDialog::show() instead of base showEvent; preserve edits while fixing lifecycle and adaptive geometry. Avoid whole-resource translation churn unrelated to supported Chinese/English surfaces.
 
+Task 2 visual follow-through also owns WorkspaceDashboard.cpp and its focused tests for device-pixel-ratio-aware brand/monitor pixmaps: retain logical layout bounds while using adequate physical pixel resolution at 2x. Use existing assets, not new hand-drawn icons. Where explicit screen creation uses ScreenSetupView::enter, cancelling must not leave a newly inserted unnamed screen behind.
+
 ### Task 3: Explicit file task transport and final-save semantics
 
 Ownership: focused GUI/core command bridge, transfer task data and protocol/core integration with tests. Before implementation record concrete interfaces after reading existing IPC and file receive lifecycle.
