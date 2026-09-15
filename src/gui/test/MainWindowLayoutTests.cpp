@@ -363,10 +363,22 @@ TEST(DialogLayoutTests, EditorsStayInsideScreenWithReachableActionsInBothLanguag
                 }
             }
             const QString out = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
+            if (item.first == "preferences") {
+                dialog->activateWindow(); dialog->raise();
+                preferences.m_pLineEditScreenName->setFocus(Qt::TabFocusReason);
+                QApplication::processEvents(); QApplication::processEvents();
+                ASSERT_TRUE(dialog->isActiveWindow());
+                ASSERT_TRUE(preferences.m_pLineEditScreenName->hasFocus());
+            }
             if (!out.isEmpty()) EXPECT_TRUE(dialog->grab().save(out + "/" + language + "-" + item.first + ".png"));
             if (item.first == "preferences") {
                 auto* check = preferences.m_pCheckBoxEnableCrypto;
+                ASSERT_FALSE(check->hasFocus());
+                const QImage unfocused = check->grab().toImage();
                 check->setFocus(Qt::TabFocusReason); QApplication::processEvents();
+                ASSERT_TRUE(check->hasFocus());
+                EXPECT_FALSE(unfocused == check->grab().toImage())
+                    << "Keyboard focus must visibly change the checkbox, not just its internal state";
                 if (!out.isEmpty()) EXPECT_TRUE(dialog->grab().save(out + "/" + language + "-preferences-focus.png"));
             }
             if (item.first == "history") {
