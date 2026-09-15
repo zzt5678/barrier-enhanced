@@ -27,6 +27,7 @@
 
 #include <bitset>
 #include <mutex>
+#include <chrono>
 #include <Carbon/Carbon.h>
 #include <mach/mach_port.h>
 #include <mach/mach_interface.h>
@@ -112,8 +113,9 @@ protected:
 
 private:
     friend class OSXScreenCursorTestAccess;
+    friend class OSXScreenShapeTestAccess;
     void                updateScreenShape();
-    void                updateScreenShape(const CGDirectDisplayID, const CGDisplayChangeSummaryFlags);
+    void                handleDisplayChange(const Event&, void*);
     void                postMouseEvent(CGPoint&) const;
 
     // convenience function to send events
@@ -259,9 +261,15 @@ private:
     CGDirectDisplayID    m_displayID;
 
     // screen shape stuff
-    SInt32                m_x, m_y;
-    SInt32                m_w, m_h;
-    SInt32                m_xCenter, m_yCenter;
+    mutable std::mutex    m_shapeMutex;
+    SInt32                m_x = 0, m_y = 0;
+    SInt32                m_w = 0, m_h = 0;
+    SInt32                m_xCenter = 0, m_yCenter = 0;
+    bool                  m_displayConfiguring = false;
+    bool                  m_shapeNeedsNotify = false;
+    std::chrono::steady_clock::time_point m_displayConfigurationStarted;
+    UInt64                m_displayGeneration = 0;
+    Event::Type           m_displayChangeEvent = Event::kUnknown;
 
     // mouse state
     mutable SInt32        m_xCursor, m_yCursor;

@@ -43,6 +43,8 @@
 #include "io/filesystem.h"
 
 #include <math.h>
+#include <cmath>
+#include <limits>
 #include <unistd.h>
 #include <mach-o/dyld.h>
 #include <AvailabilityMacros.h>
@@ -115,7 +117,7 @@ OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCurso
 {
 	try {
 		m_displayID   = CGMainDisplayID();
-		updateScreenShape(m_displayID, 0);
+		updateScreenShape();
 		m_screensaver = new OSXScreenSaver(m_events, getEventTarget());
 		m_keyState	  = new OSXKeyState(m_events);
 
@@ -136,6 +138,9 @@ OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCurso
 		}
 
 		// install display manager notification handler
+		m_events->registerTypeOnce(m_displayChangeEvent, "OSXScreen::displayChange");
+		m_events->adoptHandler(m_displayChangeEvent, this,
+			new TMethodEventJob<OSXScreen>(this, &OSXScreen::handleDisplayChange));
 		CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, this);
 
 		// install fast user switching event handler
@@ -175,6 +180,7 @@ OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCurso
 		}
 
 		CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, this);
+		m_events->removeHandler(m_displayChangeEvent, this);
 
 		delete m_keyState;
 		delete m_screensaver;
@@ -255,6 +261,7 @@ OSXScreen::~OSXScreen()
 	RemoveEventHandler(m_switchEventHandlerRef);
 
 	CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, this);
+	m_events->removeHandler(m_displayChangeEvent, this);
 
 	delete m_keyState;
 	delete m_screensaver;
@@ -280,6 +287,8 @@ OSXScreen::getClipboard(ClipboardID, IClipboard* dst) const
 void
 OSXScreen::getShape(SInt32& x, SInt32& y, SInt32& w, SInt32& h) const
 {
+	std::lock_guard<std::mutex> lock(m_shapeMutex);
+	if (m_displayConfiguring) { x = y = w = h = 0; return; }
 	x = m_x;
 	y = m_y;
 	w = m_w;
@@ -352,6 +361,8 @@ OSXScreen::isAnyMouseButtonDown(UInt32& buttonID) const
 void
 OSXScreen::getCursorCenter(SInt32& x, SInt32& y) const
 {
+	std::lock_guard<std::mutex> lock(m_shapeMutex);
+	if (m_displayConfiguring) { x = y = 0; return; }
 	x = m_xCenter;
 	y = m_yCenter;
 }
@@ -831,6 +842,8 @@ OSXScreen::hideCursor()
 void
 OSXScreen::enable()
 {
+	// Reconnect/resume can occur without a display callback.
+	updateScreenShape();
 	// watch the clipboard
 	m_clipboardTimer = m_events->newTimer(1.0, NULL);
 	m_events->adoptHandler(Event::kTimer, m_clipboardTimer,
@@ -854,7 +867,10 @@ OSXScreen::enable()
 		}
 
 		// warp the mouse to the cursor center
-		fakeMouseMove(m_xCenter, m_yCenter);
+		SInt32 x, y, w, h, cx, cy;
+		getShape(x, y, w, h);
+		getCursorCenter(cx, cy);
+		if (w > 0 && h > 0) fakeMouseMove(cx, cy);
 
                 // there may be a better way to do this, but we register an event handler even if we're
                 // not on the primary display (acting as a client). This way, if a local event comes in
@@ -1167,12 +1183,18 @@ OSXScreen::handleSystemEvent(const Event& event, void*)
 bool
 OSXScreen::onMouseMove(CGFloat mx, CGFloat my)
 {
+	SInt32 sx, sy, sw, sh, cx, cy;
+	{
+		std::lock_guard<std::mutex> lock(m_shapeMutex);
+		if (m_displayConfiguring || m_w <= 0 || m_h <= 0) return true;
+		sx = m_x; sy = m_y; sw = m_w; sh = m_h; cx = m_xCenter; cy = m_yCenter;
+	}
 	LOG((CLOG_DEBUG2 "mouse move %+f,%+f", mx, my));
 
 	CGFloat x = mx - m_xCursor;
 	CGFloat y = my - m_yCursor;
 
-	if ((x == 0 && y == 0) || (mx == m_xCenter && mx == m_yCenter)) {
+	if ((x == 0 && y == 0) || (mx == cx && mx == cy)) {
 		return true;
 	}
 
@@ -1191,7 +1213,7 @@ OSXScreen::onMouseMove(CGFloat mx, CGFloat my)
 	else {
 		// motion on secondary screen.  warp mouse back to
 		// center.
-		warpCursor(m_xCenter, m_yCenter);
+		warpCursor(cx, cy);
 
 		// examine the motion.  if it's about the distance
 		// from the center of the screen to an edge then
@@ -1199,10 +1221,10 @@ OSXScreen::onMouseMove(CGFloat mx, CGFloat my)
 		// ignore (see warpCursorNoFlush() for a further
 		// description).
 		static SInt32 bogusZoneSize = 10;
-		if (-x + bogusZoneSize > m_xCenter - m_x ||
-			 x + bogusZoneSize > m_x + m_w - m_xCenter ||
-			-y + bogusZoneSize > m_yCenter - m_y ||
-			 y + bogusZoneSize > m_y + m_h - m_yCenter) {
+		if (-x + bogusZoneSize > cx - sx ||
+			 x + bogusZoneSize > sx + sw - cx ||
+			-y + bogusZoneSize > cy - sy ||
+			 y + bogusZoneSize > sy + sh - cy) {
 			LOG((CLOG_DEBUG "dropped bogus motion %+d,%+d", x, y));
 		}
 		else {
@@ -1295,29 +1317,32 @@ OSXScreen::onMouseWheel(SInt32 xDelta, SInt32 yDelta) const
 void
 OSXScreen::handleClipboardCheck(const Event&, void*)
 {
+	SInt32 x, y, w, h;
+	getShape(x, y, w, h);
+	// Reuse the existing one-second timer, only while geometry is unavailable.
+	if (w <= 0 || h <= 0) updateScreenShape();
 	checkClipboards();
 }
 
 void
-OSXScreen::displayReconfigurationCallback(CGDirectDisplayID displayID, CGDisplayChangeSummaryFlags flags, void* inUserData)
+OSXScreen::displayReconfigurationCallback(CGDirectDisplayID, CGDisplayChangeSummaryFlags flags, void* inUserData)
 {
 	OSXScreen* screen = (OSXScreen*)inUserData;
-
-	// Closing or opening the lid when an external monitor is
-    // connected causes an kCGDisplayBeginConfigurationFlag event
-	CGDisplayChangeSummaryFlags mask = kCGDisplayBeginConfigurationFlag | kCGDisplayMovedFlag |
-		kCGDisplaySetModeFlag | kCGDisplayAddFlag | kCGDisplayRemoveFlag |
-		kCGDisplayEnabledFlag | kCGDisplayDisabledFlag |
-		kCGDisplayMirrorFlag | kCGDisplayUnMirrorFlag |
-		kCGDisplayDesktopShapeChangedFlag;
-
-	LOG((CLOG_DEBUG1 "event: display was reconfigured: %x %x %x", flags, mask, flags & mask));
-
-	if (flags & mask) { /* Something actually did change */
-
-		LOG((CLOG_DEBUG1 "event: screen changed shape; refreshing dimensions"));
-		screen->updateScreenShape(displayID, flags);
+	{
+		std::lock_guard<std::mutex> lock(screen->m_shapeMutex);
+		// Apple guarantees display state only AFTER configuration, not at Begin.
+		screen->m_displayConfiguring = (flags & kCGDisplayBeginConfigurationFlag) != 0;
+		// getShape may already have returned unavailable before this event drains.
+		// Even a same-size completion must then notify the peer of recovery.
+		if (screen->m_displayConfiguring) {
+			screen->m_shapeNeedsNotify = true;
+			screen->m_displayConfigurationStarted = std::chrono::steady_clock::now();
+		}
+		++screen->m_displayGeneration;
 	}
+	// The native callback may run off-thread. Sample and notify on our event queue.
+	// Completion with flags == 0 (or only SetMain) must also refresh geometry.
+	screen->m_events->addEvent(Event(screen->m_displayChangeEvent, screen));
 }
 
 bool
@@ -1608,7 +1633,7 @@ OSXScreen::getKeyState() const
 }
 
 void
-OSXScreen::updateScreenShape(const CGDirectDisplayID, const CGDisplayChangeSummaryFlags flags)
+OSXScreen::handleDisplayChange(const Event&, void*)
 {
 	updateScreenShape();
 }
@@ -1616,54 +1641,70 @@ OSXScreen::updateScreenShape(const CGDirectDisplayID, const CGDisplayChangeSumma
 void
 OSXScreen::updateScreenShape()
 {
-	// get info for each display
-	CGDisplayCount displayCount = 0;
-
-	if (CGGetActiveDisplayList(0, NULL, &displayCount) != CGDisplayNoErr) {
-		return;
+	UInt64 generation;
+	bool configuring;
+	{
+		std::lock_guard<std::mutex> lock(m_shapeMutex);
+		// Completion notifications can be lost. After a short settling interval,
+		// let the existing invalid-only timer re-query, never reuse the old shape.
+		if (m_displayConfiguring && std::chrono::steady_clock::now() -
+			m_displayConfigurationStarted >= std::chrono::seconds(2)) {
+			m_displayConfiguring = false;
+		}
+		generation = m_displayGeneration;
+		configuring = m_displayConfiguring;
 	}
-
-	if (displayCount == 0) {
-		return;
+	constexpr CGDisplayCount maxDisplays = 64;
+	CGDirectDisplayID displays[maxDisplays];
+	CGDisplayCount count = 0;
+	CGRect total = CGRectNull, mainBounds = CGRectNull;
+	auto valid = [](CGRect r) {
+		// Match Server.cpp's minimum usable screen dimension: smaller transient
+		// shapes cannot accept crossing and must not stop the recovery timer.
+		constexpr double minUsableDimension = 64;
+		const double min = std::numeric_limits<SInt32>::min();
+		const double max = std::numeric_limits<SInt32>::max();
+		return std::isfinite(r.origin.x) && std::isfinite(r.origin.y) &&
+			std::isfinite(r.size.width) && std::isfinite(r.size.height) &&
+			r.origin.x >= min && r.origin.y >= min &&
+			r.size.width >= minUsableDimension && r.size.height >= minUsableDimension &&
+			r.size.width <= max && r.size.height <= max &&
+			r.origin.x + r.size.width <= max && r.origin.y + r.size.height <= max;
+	};
+	bool available = !configuring &&
+		CGGetActiveDisplayList(0, nullptr, &count) == kCGErrorSuccess && count > 0 && count <= maxDisplays;
+	if (available) {
+		available = CGGetActiveDisplayList(maxDisplays, displays, &count) == kCGErrorSuccess &&
+			count > 0 && count <= maxDisplays;
 	}
-
-	CGDirectDisplayID* displays = new CGDirectDisplayID[displayCount];
-	if (displays == NULL) {
-		return;
+	if (available) {
+		const auto main = CGMainDisplayID();
+		for (CGDisplayCount i = 0; i < count; ++i) {
+			const CGRect rect = CGDisplayBounds(displays[i]);
+			if (!valid(rect)) { available = false; break; }
+			total = CGRectUnion(total, rect);
+			if (displays[i] == main) mainBounds = rect;
+		}
+		available = available && valid(total) && valid(mainBounds);
 	}
-
-	if (CGGetActiveDisplayList(displayCount,
-							displays, &displayCount) != CGDisplayNoErr) {
-		delete[] displays;
-		return;
+	bool changed;
+	SInt32 x = 0, y = 0, w = 0, h = 0, cx = 0, cy = 0;
+	{
+		std::lock_guard<std::mutex> lock(m_shapeMutex);
+		// Do not publish a sample taken across a native configuration transition.
+		if (available && generation == m_displayGeneration && !m_displayConfiguring) {
+			x = total.origin.x; y = total.origin.y; w = total.size.width; h = total.size.height;
+			cx = mainBounds.origin.x + mainBounds.size.width / 2;
+			cy = mainBounds.origin.y + mainBounds.size.height / 2;
+		}
+		changed = m_shapeNeedsNotify || x != m_x || y != m_y || w != m_w || h != m_h || cx != m_xCenter || cy != m_yCenter;
+		m_shapeNeedsNotify = false;
+		m_x = x; m_y = y; m_w = w; m_h = h; m_xCenter = cx; m_yCenter = cy;
 	}
-
-	// get smallest rect enclosing all display rects
-	CGRect totalBounds = CGRectZero;
-	for (CGDisplayCount i = 0; i < displayCount; ++i) {
-		CGRect bounds = CGDisplayBounds(displays[i]);
-		totalBounds   = CGRectUnion(totalBounds, bounds);
+	if (changed) {
+		sendEvent(m_events->forIScreen().shapeChanged());
+		LOG((CLOG_DEBUG "screen shape: origin=%d,%d size=%dx%d", x, y, w, h));
 	}
-
-	// get shape of default screen
-	m_x = (SInt32)totalBounds.origin.x;
-	m_y = (SInt32)totalBounds.origin.y;
-	m_w = (SInt32)totalBounds.size.width;
-	m_h = (SInt32)totalBounds.size.height;
-
-	// get center of default screen
-  CGDirectDisplayID main = CGMainDisplayID();
-  const CGRect rect = CGDisplayBounds(main);
-  m_xCenter = (rect.origin.x + rect.size.width) / 2;
-  m_yCenter = (rect.origin.y + rect.size.height) / 2;
-
-	delete[] displays;
-	// We want to notify the peer screen whether we are primary screen or not
-	sendEvent(m_events->forIScreen().shapeChanged());
-
-	LOG((CLOG_DEBUG "screen shape: center=%d,%d size=%dx%d on %u %s",
-         m_x, m_y, m_w, m_h, displayCount,
-         (displayCount == 1) ? "display" : "displays"));
 }
 
 #pragma mark -
