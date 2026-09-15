@@ -6,6 +6,17 @@
 #include <QListWidget>
 #include <QFile>
 #include <QTranslator>
+TEST(WorkspaceDashboardTests, NarrowHomeActionsFitTheirViewport) {
+    QFile style(":/res/styles/dark.qss"); ASSERT_TRUE(style.open(QIODevice::ReadOnly));
+    WorkspaceDashboard view(new QWidget);
+    view.setStyleSheet(QString::fromUtf8(style.readAll()));
+    view.resize(560, 600); view.show(); QApplication::processEvents();
+    auto* home = view.findChild<QWidget*>("workspaceHome");
+    EXPECT_LE(home->width(), home->parentWidget()->width());
+    auto* arrange = view.findChild<QPushButton*>("arrangeButton");
+    auto* sharing = view.findChild<QPushButton*>("sharingButton");
+    EXPECT_FALSE(arrange->geometry().intersects(sharing->geometry()));
+}
 TEST(WorkspaceDashboardTests, UnknownRemoteNeverClaimsOnline) {
     WorkspaceDashboard view(new QWidget);
     view.setDevices({{"workstation", {0,0}, true}, {"peer", {1,0}, false}});
@@ -90,5 +101,6 @@ TEST(WorkspaceDashboardTests, LongNamesDoNotOverlapIllustrationsInSmallWindow) {
         auto* name = image->parentWidget()->findChild<QLabel*>("deviceName");
         ASSERT_NE(nullptr, name);
         EXPECT_GT(name->y(), image->geometry().bottom());
+        EXPECT_TRUE(image->parentWidget()->rect().contains(image->geometry()));
     }
 }

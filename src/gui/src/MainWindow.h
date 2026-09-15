@@ -141,6 +141,7 @@ public slots:
         void updateWorkflowIndicators();
 
     protected:
+        bool eventFilter(QObject* watched, QEvent* event) override;
         QSettings& settings() { return m_Settings; }
         AppConfig& appConfig() { return *m_AppConfig; }
         QProcess* barrierProcess() { return m_pBarrier; }
@@ -172,7 +173,7 @@ public slots:
         bool event(QEvent* event);
         void retranslateMenuBar();
         void retranslateDashboard();
-        void updateDashboardLayout(int windowWidth);
+        void updateDashboardLayout(int viewportWidth);
         void updateControlBarMargins();
 #if defined(Q_OS_WIN)
         bool isServiceRunning(QString name);

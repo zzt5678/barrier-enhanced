@@ -183,6 +183,14 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
 
     gridLayout_dashboard->setColumnStretch(0, 1);
     gridLayout_dashboard->setColumnStretch(1, 1);
+    gridLayout_dashboard->setContentsMargins(8, 12, 8, 12);
+    // Long fingerprint captions must wrap instead of forcing the settings canvas wider.
+    for (auto* label : footerCard->findChildren<QLabel*>()) {
+        label->setWordWrap(true);
+        label->setMinimumWidth(0);
+        label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    }
+    formLayout_3->setRowWrapPolicy(QFormLayout::WrapLongRows);
     gridLayout_overview->setHorizontalSpacing(18);
     gridLayout_overview->setColumnStretch(0, 1);
     gridLayout_overview->setColumnStretch(1, 1);
@@ -210,10 +218,12 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     dashboard->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     dashboard->adjustSize();
     scrollArea->setWidget(dashboard);
+    scrollArea->viewport()->installEventFilter(this);
 
     verticalLayout_footerCard->removeItem(horizontalLayout);
     QFrame* controlBar = new QFrame(this);
     controlBar->setObjectName(QStringLiteral("fixedControlBar"));
+    controlBar->installEventFilter(this);
     QVBoxLayout* controlBarLayout = new QVBoxLayout(controlBar);
     controlBarLayout->setContentsMargins(18, 10, 18, 10);
     spacer->changeSize(0, 0, QSizePolicy::Minimum, QSizePolicy::Minimum);
@@ -339,7 +349,7 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
         qMax(availableGeometry.height() - 80, minimumHeight()))));
     updateWorkflowPeerHint();
     updateWorkflowIndicators();
-    updateDashboardLayout(width());
+    updateDashboardLayout(scrollArea->viewport()->width());
     updateControlBarMargins();
     refreshDashboardScrollArea(this);
 }
@@ -466,9 +476,9 @@ void MainWindow::retranslateDashboard()
     }
 }
 
-void MainWindow::updateDashboardLayout(int windowWidth)
+void MainWindow::updateDashboardLayout(int viewportWidth)
 {
-    const bool singleColumn = windowWidth < 760;
+    const bool singleColumn = viewportWidth < 760;
     if (singleColumn == m_DashboardSingleColumn) {
         return;
     }
@@ -524,6 +534,14 @@ void MainWindow::updateControlBarMargins()
     }
 
     const int centeredInset = qMax(0, (controlBar->width() - 1040) / 2);
+    auto* layout = qobject_cast<QVBoxLayout*>(controlBar->layout());
+    if (controlBar->width() < 450 && horizontalLayout->indexOf(m_pStatusLabel) >= 0) {
+        horizontalLayout->removeWidget(m_pStatusLabel);
+        layout->insertWidget(0, m_pStatusLabel);
+    } else if (controlBar->width() >= 450 && layout->indexOf(m_pStatusLabel) >= 0) {
+        layout->removeWidget(m_pStatusLabel);
+        horizontalLayout->insertWidget(1, m_pStatusLabel);
+    }
     controlBar->layout()->setContentsMargins(
         centeredInset + 18, 10, centeredInset + 18, 10);
 }
@@ -1689,8 +1707,19 @@ void MainWindow::closeEvent(QCloseEvent* event)
 void MainWindow::resizeEvent(QResizeEvent* event)
 {
     QMainWindow::resizeEvent(event);
-    updateDashboardLayout(event->size().width());
     updateControlBarMargins();
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event)
+{
+    if (event->type() == QEvent::Resize) {
+        auto* scroll = findChild<QScrollArea*>(QStringLiteral("m_pMainScrollArea"));
+        if (scroll && watched == scroll->viewport())
+            updateDashboardLayout(scroll->viewport()->width());
+        if (watched->objectName() == QStringLiteral("fixedControlBar"))
+            updateControlBarMargins();
+    }
+    return QMainWindow::eventFilter(watched, event);
 }
 
 bool MainWindow::event(QEvent* event)

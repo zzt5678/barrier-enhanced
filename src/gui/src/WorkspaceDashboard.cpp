@@ -19,9 +19,9 @@ WorkspaceDashboard::WorkspaceDashboard(QWidget* settings, QWidget* parent): QWid
     setObjectName("workspaceDashboard");
     auto* shell = new QHBoxLayout(this); shell->setContentsMargins(0,0,0,0); shell->setSpacing(0);
     auto* sidebar = new QFrame; sidebar->setObjectName("workspaceSidebar"); sidebar->setFixedWidth(180);
-    auto* nav = new QVBoxLayout(sidebar); nav->setContentsMargins(20,64,20,24); nav->setSpacing(16);
+    auto* nav = new QVBoxLayout(sidebar); nav->setContentsMargins(12,28,12,20); nav->setSpacing(8);
     auto* brandRow = new QHBoxLayout;
-    auto* brand = new QLabel; brand->setPixmap(QPixmap(":/res/icons/256x256/weave.png").scaled(56,56,Qt::KeepAspectRatio,Qt::SmoothTransformation)); brandRow->addWidget(brand);
+    auto* brand = new QLabel; brand->setPixmap(QPixmap(":/res/icons/256x256/weave.png").scaled(32,32,Qt::KeepAspectRatio,Qt::SmoothTransformation)); brandRow->addWidget(brand);
     auto* name = new QLabel("Weave"); name->setObjectName("workspaceBrand"); brandRow->addWidget(name); brandRow->addStretch(); nav->addLayout(brandRow); nav->addSpacing(36);
     m_devices = new QPushButton; m_transfers = new QPushButton; m_settings = new QPushButton;
     auto* group = new QButtonGroup(this); group->setExclusive(true);
@@ -63,10 +63,12 @@ void WorkspaceDashboard::setDevices(const QVector<WorkspaceDevice>& devices)
     m_deviceSignature = signature;
     auto* grid = qobject_cast<QGridLayout*>(m_canvas->layout());
     while(auto* item=grid->takeAt(0)) { delete item->widget(); delete item; }
+    for (int column = 0; column < grid->columnCount(); ++column) grid->setColumnStretch(column, 0);
     QStringList accessible; QList<int> columns,rows;
     for(const auto& device:devices) { if(!columns.contains(device.position.x())) columns.append(device.position.x()); if(!rows.contains(device.position.y())) rows.append(device.position.y()); }
     std::sort(columns.begin(),columns.end()); std::sort(rows.begin(),rows.end());
     m_columns = qMax(1, columns.size());
+    for (int column = 0; column < m_columns; ++column) grid->setColumnStretch(column, 1);
     for(const auto& device:devices) {
         auto* card = new QWidget; card->setMinimumWidth(64); auto* layout = new QVBoxLayout(card); layout->setContentsMargins(0,0,0,0); layout->setSpacing(8); layout->setAlignment(Qt::AlignCenter);
         auto* monitor = new QLabel; monitor->setObjectName("deviceIllustration"); QPixmap picture(":/res/image/device-display.png"); if(picture.isNull()) picture=style()->standardPixmap(QStyle::SP_ComputerIcon); const int side=illustrationSide(); monitor->setPixmap(picture.scaled(side,side,Qt::KeepAspectRatio,Qt::SmoothTransformation)); monitor->setFixedSize(side,side); monitor->setAlignment(Qt::AlignCenter); layout->addWidget(monitor,0,Qt::AlignHCenter);
@@ -80,20 +82,20 @@ void WorkspaceDashboard::setDevices(const QVector<WorkspaceDevice>& devices)
 }
 int WorkspaceDashboard::illustrationSide() const
 {
-    const int sidebarWidth = qBound(180, width() / 5, 280);
-    const int margin = width() < 760 ? 18 : 48;
-    return qBound(64, (width()-sidebarWidth-2*margin-32)/m_columns-32, 220);
+    const int sidebarWidth = width() < 760 ? 136 : 180;
+    const int margin = width() < 760 ? 16 : 28;
+    return qBound(64, (width()-sidebarWidth-2*margin-32)/m_columns-32, 160);
 }
 void WorkspaceDashboard::resizeEvent(QResizeEvent* event)
 {
     QWidget::resizeEvent(event);
     const int width = event->size().width();
     auto* sidebar = findChild<QFrame*>("workspaceSidebar");
-    const int sidebarWidth = qBound(180, width / 5, 280);
+    const int sidebarWidth = width < 760 ? 136 : 180;
     sidebar->setFixedWidth(sidebarWidth);
     auto* home = findChild<QWidget*>("workspaceHome");
-    const int margin = width < 760 ? 18 : 48;
-    home->layout()->setContentsMargins(margin, width < 760 ? 24 : 64, margin, 24);
+    const int margin = width < 760 ? 16 : 28;
+    home->layout()->setContentsMargins(margin, 28, margin, 24);
     m_arrange->setMinimumWidth(width < 760 ? 0 : 150);
     m_sharing->setMinimumWidth(width < 760 ? 0 : 150);
     // Reserve the scroll bar and cell gaps before choosing an illustration size.

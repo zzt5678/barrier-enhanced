@@ -438,18 +438,18 @@ QWidget#workspaceDashboard QStackedWidget, QWidget#deviceCanvas {
     border: none;
 }
 QFrame#workspaceSidebar { background: #f0efeb; border-right: 1px solid #e1e3df; }
-QLabel#workspaceBrand { font-size: 25px; font-weight: 600; color: #152526; }
-QLabel#workspaceTitle { font-size: 38px; font-weight: 600; color: #152526; }
+QLabel#workspaceBrand { font-size: 20px; font-weight: 600; color: #152526; }
+QLabel#workspaceTitle { font-size: 28px; font-weight: 600; color: #152526; }
 QLabel#workspaceStatus { font-size: 16px; color: #546664; }
-QLabel#workspaceSection { font-size: 21px; font-weight: 600; color: #203735; }
+QLabel#workspaceSection { font-size: 18px; font-weight: 600; color: #203735; }
 QLabel#workspaceMuted, QLabel#emptyTransfers { color: #66716e; font-size: 13px; }
-QLabel#deviceName { font-size: 17px; font-weight: 600; color: #203735; }
+QLabel#deviceName { font-size: 14px; font-weight: 600; color: #203735; }
 QLabel#deviceLocal { color: #087e77; font-size: 13px; }
-QPushButton[navigation="true"] { text-align: left; padding: 14px 14px; border: none; background: transparent; color: #263a38; font-size: 18px; border-radius: 10px; }
+QPushButton[navigation="true"] { text-align: left; padding: 8px 6px; min-width: 0; border: none; background: transparent; color: #263a38; font-size: 14px; border-radius: 8px; }
 QPushButton[navigation="true"]:hover { background: #e3eae5; }
 QPushButton[navigation="true"]:checked { background: #d6e8e2; color: #08665f; font-weight: 600; }
 QWidget#workspaceDashboard QPushButton { border-radius: 9px; }
-QPushButton#arrangeButton, QPushButton#sharingButton { min-height: 26px; padding: 14px 18px; font-size: 16px; }
+QPushButton#arrangeButton, QPushButton#sharingButton { min-height: 22px; padding: 9px 12px; font-size: 14px; }
 QPushButton[primary="true"] { background: #087e77; border: 1px solid #087e77; color: #ffffff; }
 QPushButton[primary="true"]:hover { background: #096b66; }
 QPushButton[primary="true"]:disabled { background: #dfe6e1; border-color: #dfe6e1; color: #7b8783; }
