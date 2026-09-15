@@ -2,7 +2,7 @@
 
 Goal: implement the user-approved spacious, coherent bilingual desktop experience and useful real file transfer center.
 Architecture: retain Qt Widgets, existing authenticated Weave transport and isolated candidate deployment. Adapt layouts to actual viewport sizes; centralize translation loading and display text. Transfer tasks must carry stable identity, explicit destination and final publication acknowledgement.
-Tech stack: C++14, Qt 5, CMake, GoogleTest, existing TLS/bulk transfer.
+Tech stack: C++17, Qt 5, CMake, GoogleTest, existing TLS/bulk transfer.
 Spec: user screenshots and ../weave-ui-redesign-2026-09-15/audit/FINDINGS.md (relative to repository parent); user approved implementation on 2026-09-15.
 
 ## Global Constraints
