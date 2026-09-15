@@ -6,6 +6,8 @@
 #include "DialogPresentation.h"
 #include "WorkflowDisplayText.h"
 #include <QEvent>
+#include <QMenu>
+#include <QAction>
 
 #include <QDateTime>
 #include <QDesktopServices>
@@ -55,10 +57,10 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     m_suggestionList(new QListWidget(this)),
     m_receiptList(new QListWidget(this)),
     m_detail(new QTextBrowser(this)),
-    m_executeSuggestionButton(new QPushButton(tr("Execute Suggestion"), this)),
-    m_openButton(new QPushButton(tr("Open"), this)),
-    m_saveButton(new QPushButton(tr("Save to Inbox"), this)),
-    m_revealButton(new QPushButton(tr("Reveal"), this))
+    m_executeSuggestionButton(new QAction(tr("Execute Suggestion"), this)),
+    m_openButton(new QAction(tr("Open"), this)),
+    m_saveButton(new QAction(tr("Save to Inbox"), this)),
+    m_revealButton(new QAction(tr("Reveal"), this))
 {
     setWindowTitle(tr("Weave Workflow Hub"));
     resize(860, 620);
@@ -127,16 +129,24 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     rightCard->setLayout(detailLayout);
     contentLayout->addWidget(rightCard, 3);
 
-    auto* actionLayout = new QGridLayout;
+    auto* actionLayout = new QHBoxLayout;
     actionLayout->setObjectName("historyActionsLayout");
-    actionLayout->setProperty("columns", 4);
-    auto* screenshotButton = new QPushButton(tr("Capture Screenshot"), this);
-    auto* inboxButton = new QPushButton(tr("Open Inbox"), this);
+    auto* screenshotButton = new QAction(tr("Capture Screenshot"), this);
+    auto* inboxButton = new QAction(tr("Open Inbox"), this);
+    auto* moreButton = new QPushButton(tr("Actions"), this);
+    moreButton->setObjectName("historyActionsButton");
+    auto* menu = new QMenu(moreButton);
+    menu->addActions({m_executeSuggestionButton, m_openButton, m_saveButton, m_revealButton});
+    menu->addSeparator();
+    menu->addActions({screenshotButton, inboxButton});
+    moreButton->setMenu(menu);
     auto* cancelSaveButton = new QPushButton(tr("Cancel Save"), this);
+    cancelSaveButton->setObjectName("cancelInboxSaveButton");
+    cancelSaveButton->setVisible(m_actionBus->inboxSaveRunning());
     cancelSaveButton->setToolTip(tr("Cancel the active inbox save; completed files are kept."));
     connect(cancelSaveButton, &QPushButton::clicked, m_actionBus, &ActionBus::cancelInboxSave);
     auto* closeButton = new QPushButton(tr("Close"), this);
-    const QList<QPair<QWidget*, const char*>> translatedWidgets {
+    const QList<QPair<QObject*, const char*>> translatedWidgets {
         {titleLabel, "Workflow Hub"},
         {subtitleLabel, "Review transferred context, suggested follow-up actions, and every receipt Weave records while you move content between devices."},
         {leftTitle, "Collected Context"},
@@ -146,17 +156,14 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
         {m_executeSuggestionButton, "Execute Suggestion"}, {m_openButton, "Open"},
         {m_saveButton, "Save to Inbox"}, {m_revealButton, "Reveal"},
         {screenshotButton, "Capture Screenshot"}, {inboxButton, "Open Inbox"},
-        {cancelSaveButton, "Cancel Save"}, {closeButton, "Close"}
+        {cancelSaveButton, "Cancel Save"}, {closeButton, "Close"}, {moreButton, "Actions"}
     };
     for (const auto& entry : translatedWidgets) entry.first->setProperty("translationSource", entry.second);
-    const QList<QPushButton*> actions{m_executeSuggestionButton, m_openButton,
-        m_saveButton, m_revealButton, screenshotButton, inboxButton, cancelSaveButton, closeButton};
-    for (int index = 0; index < actions.size(); ++index) {
-        actions[index]->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
-        actionLayout->addWidget(actions[index], index / 4, index % 4);
-    }
-    actionLayout->setHorizontalSpacing(10);
-    actionLayout->setVerticalSpacing(10);
+    actionLayout->addWidget(moreButton);
+    actionLayout->addWidget(cancelSaveButton);
+    actionLayout->addStretch();
+    actionLayout->addWidget(closeButton);
+    actionLayout->setSpacing(10);
 
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(20, 20, 20, 20);
@@ -183,18 +190,19 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     connect(m_receiptList, &QListWidget::currentItemChanged, this, &WorkflowHubDialog::updateDetails);
     connect(m_suggestionList, &QListWidget::itemDoubleClicked, this, &WorkflowHubDialog::executeSuggestion);
     connect(m_historyList, &QListWidget::itemDoubleClicked, this, &WorkflowHubDialog::openSelected);
-    connect(m_executeSuggestionButton, &QPushButton::clicked, this, &WorkflowHubDialog::executeSuggestion);
-    connect(m_openButton, &QPushButton::clicked, this, &WorkflowHubDialog::openSelected);
-    connect(m_saveButton, &QPushButton::clicked, this, &WorkflowHubDialog::saveSelected);
-    connect(m_revealButton, &QPushButton::clicked, this, &WorkflowHubDialog::revealSelected);
-    connect(screenshotButton, &QPushButton::clicked, this, &WorkflowHubDialog::captureScreenshot);
-    connect(inboxButton, &QPushButton::clicked, this, &WorkflowHubDialog::openInbox);
+    connect(m_executeSuggestionButton, &QAction::triggered, this, &WorkflowHubDialog::executeSuggestion);
+    connect(m_openButton, &QAction::triggered, this, &WorkflowHubDialog::openSelected);
+    connect(m_saveButton, &QAction::triggered, this, &WorkflowHubDialog::saveSelected);
+    connect(m_revealButton, &QAction::triggered, this, &WorkflowHubDialog::revealSelected);
+    connect(screenshotButton, &QAction::triggered, this, &WorkflowHubDialog::captureScreenshot);
+    connect(inboxButton, &QAction::triggered, this, &WorkflowHubDialog::openInbox);
     connect(closeButton, &QPushButton::clicked, this, &QDialog::accept);
 
     connect(m_store, &WorkflowStore::historyChanged, this, &WorkflowHubDialog::refreshAll);
     connect(m_store, &WorkflowStore::suggestionsChanged, this, &WorkflowHubDialog::refreshAll);
     connect(m_store, &WorkflowStore::receiptsChanged, this, &WorkflowHubDialog::refreshAll);
     connect(m_store, &WorkflowStore::runtimeModeChanged, this, &WorkflowHubDialog::refreshAll);
+    connect(m_actionBus, &ActionBus::inboxSaveFinished, this, &WorkflowHubDialog::refreshAll);
 
     refreshAll();
     DialogPresentation::fit(this, QSize(920, 700));
@@ -207,11 +215,12 @@ void WorkflowHubDialog::changeEvent(QEvent* event)
         m_tabs->setTabText(0, tr("History"));
         m_tabs->setTabText(1, tr("Suggestions"));
         m_tabs->setTabText(2, tr("Receipts"));
-        for (auto* widget : findChildren<QWidget*>()) {
+        for (auto* widget : findChildren<QObject*>()) {
             const QByteArray source = widget->property("translationSource").toByteArray();
             if (source.isEmpty()) continue;
             if (auto* label = qobject_cast<QLabel*>(widget)) label->setText(tr(source.constData()));
             if (auto* button = qobject_cast<QPushButton*>(widget)) button->setText(tr(source.constData()));
+            if (auto* action = qobject_cast<QAction*>(widget)) action->setText(tr(source.constData()));
         }
         refreshAll();
     }
@@ -222,14 +231,6 @@ void WorkflowHubDialog::resizeEvent(QResizeEvent* event)
 {
     auto* content = findChild<QHBoxLayout*>("historyContentLayout");
     if (content) content->setDirection(width() < 720 ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
-    auto* actions = findChild<QGridLayout*>("historyActionsLayout");
-    const int columns = width() < 720 ? 2 : 4;
-    if (actions && actions->property("columns").toInt() != columns) {
-        QList<QWidget*> buttons;
-        while (auto* item = actions->takeAt(0)) { buttons.append(item->widget()); delete item; }
-        for (int i = 0; i < buttons.size(); ++i) actions->addWidget(buttons[i], i / columns, i % columns);
-        actions->setProperty("columns", columns);
-    }
     QDialog::resizeEvent(event);
 }
 
@@ -359,6 +360,10 @@ void WorkflowHubDialog::updateDetails()
     m_revealButton->setEnabled(hasContext);
     m_executeSuggestionButton->setEnabled(m_tabs->currentWidget() == m_suggestionList &&
                                           m_suggestionList->currentItem() != nullptr);
+    for (auto* action : {m_openButton, m_saveButton, m_revealButton}) action->setVisible(hasContext);
+    m_executeSuggestionButton->setVisible(m_tabs->currentWidget() == m_suggestionList &&
+                                         m_suggestionList->currentItem() != nullptr);
+    findChild<QPushButton*>("cancelInboxSaveButton")->setVisible(m_actionBus->inboxSaveRunning());
 }
 
 void WorkflowHubDialog::executeSuggestion()

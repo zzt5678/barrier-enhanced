@@ -80,7 +80,11 @@ ActionDialog::ActionDialog(QWidget* parent, ServerConfig& config, Hotkey& hotkey
 
 void ActionDialog::changeEvent(QEvent* event)
 {
-    if (event->type() == QEvent::LanguageChange) retranslateUi(this);
+    if (event->type() == QEvent::LanguageChange) {
+        const QString sequenceText = m_pKeySequenceWidgetHotkey->text();
+        retranslateUi(this);
+        m_pKeySequenceWidgetHotkey->setText(sequenceText);
+    }
     QDialog::changeEvent(event);
 }
 

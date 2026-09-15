@@ -29,6 +29,12 @@ NewScreenWidget::NewScreenWidget(QWidget* parent) :
 
 void NewScreenWidget::mousePressEvent(QMouseEvent* event)
 {
+    const QPixmap* image = pixmap();
+    if (image == nullptr || image->isNull()) {
+        event->ignore();
+        return;
+    }
+    const QPixmap dragImage = *image;
     Screen newScreen(tr("Unnamed"));
 
     QByteArray itemData;
@@ -40,7 +46,7 @@ void NewScreenWidget::mousePressEvent(QMouseEvent* event)
 
     QDrag* pDrag = new QDrag(this);
     pDrag->setMimeData(pMimeData);
-    pDrag->setPixmap(QPixmap(*pixmap()));
+    pDrag->setPixmap(dragImage);
     pDrag->setHotSpot(event->pos());
 
     pDrag->exec(Qt::CopyAction, Qt::CopyAction);

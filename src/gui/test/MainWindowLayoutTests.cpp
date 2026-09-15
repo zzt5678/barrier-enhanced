@@ -28,6 +28,64 @@
 #include <QTimer>
 #include <QTextBrowser>
 #include <QTabWidget>
+#include <QMouseEvent>
+#include <QDrag>
+#include <QMessageBox>
+
+TEST(DialogLanguageTests, AppConfirmationButtonsFollowSelectedLanguage) {
+    QMessageBox box(QMessageBox::Question, "Test", "Test", QMessageBox::Yes | QMessageBox::No | QMessageBox::Retry | QMessageBox::Cancel);
+    BarrierLocale::switchLanguage("zh-CN"); QApplication::processEvents();
+    EXPECT_TRUE(box.button(QMessageBox::Yes)->text().contains(QString::fromUtf8("是")));
+    EXPECT_TRUE(box.button(QMessageBox::No)->text().contains(QString::fromUtf8("否")));
+    EXPECT_TRUE(box.button(QMessageBox::Retry)->text().contains(QString::fromUtf8("重试")));
+    EXPECT_TRUE(box.button(QMessageBox::Cancel)->text().contains(QString::fromUtf8("取消")));
+    BarrierLocale::switchLanguage("en"); QApplication::processEvents();
+    EXPECT_TRUE(box.button(QMessageBox::Yes)->text().contains("Yes"));
+}
+
+TEST(DialogLanguageTests, KeepsDeviceDragIconsAndEditedKeySequenceAcrossSwitches) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    QTemporaryDir dir; QSettings settings(dir.filePath("retranslate.ini"), QSettings::IniFormat);
+    ServerConfig server(&settings, 5, 3, "device", nullptr);
+    ServerConfigDialog layout(nullptr, server, "device");
+    Hotkey hotkey; Action action; ActionDialog editor(nullptr, server, hotkey, action);
+    KeySequence edited; ASSERT_TRUE(edited.appendKey(Qt::Key_K, Qt::ControlModifier));
+    editor.m_pKeySequenceWidgetHotkey->setKeySequence(edited);
+    const QString text = editor.m_pKeySequenceWidgetHotkey->text();
+    ASSERT_FALSE(text.isEmpty());
+    for (const QString& language : {QString("zh-CN"), QString("en"), QString("zh-CN"), QString("en")}) {
+        BarrierLocale::switchLanguage(language); QApplication::processEvents(); QApplication::processEvents();
+        EXPECT_FALSE(layout.m_pLabelNewScreenWidget->pixmap(Qt::ReturnByValue).isNull());
+        EXPECT_FALSE(layout.m_pTrashScreenWidget->pixmap(Qt::ReturnByValue).isNull());
+        EXPECT_EQ(text, editor.m_pKeySequenceWidgetHotkey->text());
+        EXPECT_EQ(edited.toString(), static_cast<const KeySequenceWidget*>(editor.m_pKeySequenceWidgetHotkey)->keySequence().toString());
+    }
+    layout.show(); QApplication::processEvents();
+    QTimer::singleShot(50, [] { QDrag::cancel(); });
+    QMouseEvent dragPress(QEvent::MouseButtonPress, QPointF(4, 4), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(layout.m_pLabelNewScreenWidget, &dragPress);
+    EXPECT_FALSE(layout.m_pLabelNewScreenWidget->pixmap(Qt::ReturnByValue).isNull());
+    layout.m_pLabelNewScreenWidget->clear();
+    QMouseEvent missingImagePress(QEvent::MouseButtonPress, QPointF(4, 4), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(layout.m_pLabelNewScreenWidget, &missingImagePress);
+    EXPECT_FALSE(missingImagePress.isAccepted());
+
+    editor.show(); QApplication::processEvents();
+    auto* recording = editor.m_pKeySequenceWidgetHotkey;
+    QMouseEvent recordPress(QEvent::MouseButtonPress, QPointF(4, 4), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(recording, &recordPress);
+    QKeyEvent control(QEvent::KeyPress, Qt::Key_Control, Qt::ControlModifier);
+    QApplication::sendEvent(recording, &control);
+    const QString inProgress = recording->text();
+    ASSERT_TRUE(recording->isDown());
+    BarrierLocale::switchLanguage("zh-CN"); QApplication::processEvents();
+    EXPECT_EQ(inProgress, recording->text()); EXPECT_TRUE(recording->isDown());
+    QKeyEvent finish(QEvent::KeyPress, Qt::Key_J, Qt::ControlModifier);
+    QApplication::sendEvent(recording, &finish);
+    EXPECT_FALSE(recording->isDown());
+    EXPECT_TRUE(recording->text().contains("j", Qt::CaseInsensitive));
+    BarrierLocale::switchLanguage("en"); QApplication::processEvents();
+}
 
 TEST(DialogLanguageTests, PreviewCancelRestoresLanguageWithoutSavingEdits) {
     ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
@@ -169,10 +227,11 @@ TEST(DialogLayoutTests, EditorsStayInsideScreenWithReachableActionsInBothLanguag
             if (!out.isEmpty()) EXPECT_TRUE(dialog->grab().save(out + "/" + language + "-" + item.first + ".png"));
             if (item.first == "history") {
                 for (auto* button : dialog->findChildren<QPushButton*>())
-                    EXPECT_TRUE(dialog->rect().contains(QRect(button->mapTo(dialog, QPoint()), button->size())));
+                    if (button->isVisible()) EXPECT_TRUE(dialog->rect().contains(QRect(button->mapTo(dialog, QPoint()), button->size())));
                 dialog->resize(620, 500); QApplication::processEvents(); QApplication::processEvents();
                 for (auto* button : dialog->findChildren<QPushButton*>())
-                    EXPECT_TRUE(dialog->rect().contains(QRect(button->mapTo(dialog, QPoint()), button->size())));
+                    if (button->isVisible()) EXPECT_TRUE(dialog->rect().contains(QRect(button->mapTo(dialog, QPoint()), button->size())));
+                EXPECT_GE(dialog->findChild<QScrollArea*>("historyBodyScroll")->height(), dialog->height() * 0.75);
                 if (!out.isEmpty()) EXPECT_TRUE(dialog->grab().save(out + "/" + language + "-history-narrow.png"));
             }
             if (item.first == "layout") {

@@ -12,6 +12,7 @@ class QTabWidget;
 class QTextBrowser;
 class WorkflowStore;
 class ElidingLabel;
+class QAction;
 
 class WorkflowHubDialog : public QDialog
 {
@@ -53,8 +54,8 @@ private:
     QListWidget* m_suggestionList;
     QListWidget* m_receiptList;
     QTextBrowser* m_detail;
-    QPushButton* m_executeSuggestionButton;
-    QPushButton* m_openButton;
-    QPushButton* m_saveButton;
-    QPushButton* m_revealButton;
+    QAction* m_executeSuggestionButton;
+    QAction* m_openButton;
+    QAction* m_saveButton;
+    QAction* m_revealButton;
 };

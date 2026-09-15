@@ -36,7 +36,11 @@ HotkeyDialog::HotkeyDialog (QWidget* parent, Hotkey& hotkey) :
 
 void HotkeyDialog::changeEvent(QEvent* event)
 {
-    if (event->type() == QEvent::LanguageChange) retranslateUi(this);
+    if (event->type() == QEvent::LanguageChange) {
+        const QString sequenceText = m_pKeySequenceWidgetHotkey->text();
+        retranslateUi(this);
+        m_pKeySequenceWidgetHotkey->setText(sequenceText);
+    }
     QDialog::changeEvent(event);
 }
 

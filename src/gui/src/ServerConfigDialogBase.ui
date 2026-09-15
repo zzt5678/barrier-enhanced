@@ -69,9 +69,6 @@
            <property name="frameShadow">
             <enum>QFrame::Raised</enum>
            </property>
-           <property name="text">
-            <string/>
-           </property>
            <property name="pixmap">
             <pixmap resource="Barrier.qrc">:/res/icons/64x64/user-trash.png</pixmap>
            </property>
@@ -106,9 +103,6 @@
            </property>
            <property name="frameShadow">
             <enum>QFrame::Raised</enum>
-           </property>
-           <property name="text">
-            <string/>
            </property>
            <property name="pixmap">
             <pixmap resource="Barrier.qrc">:/res/icons/64x64/video-display.png</pixmap>

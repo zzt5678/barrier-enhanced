@@ -11,8 +11,17 @@
 #include <QTimer>
 #include <QPushButton>
 #include <QGroupBox>
+#include <QWindow>
 
 namespace DialogPresentation {
+inline QScreen* screenFor(const QWidget* widget)
+{
+    if (widget->windowHandle() && widget->windowHandle()->screen()) return widget->windowHandle()->screen();
+    const QWidget* reference = widget->parentWidget() ? widget->parentWidget()->window() : widget;
+    if (reference->windowHandle() && reference->windowHandle()->screen()) return reference->windowHandle()->screen();
+    if (auto* screen = QGuiApplication::screenAt(reference->frameGeometry().center())) return screen;
+    return QGuiApplication::primaryScreen();
+}
 inline void reflowPanels(QDialog* dialog)
 {
     for (auto* row : dialog->findChildren<QHBoxLayout*>()) {
@@ -50,7 +59,9 @@ protected:
         if (event->type() == QEvent::Show && !m_shown) {
             m_shown = true;
             QTimer::singleShot(0, m_dialog, [this] {
-                const QRect available = m_dialog->screen()->availableGeometry();
+                const QScreen* screen = screenFor(m_dialog);
+                if (!screen) return;
+                const QRect available = screen->availableGeometry();
                 const QRect frame = m_dialog->frameGeometry();
                 const QPoint target(qBound(available.left(), frame.left(), qMax(available.left(), available.right() - frame.width() + 1)),
                                     qBound(available.top(), frame.top(), qMax(available.top(), available.bottom() - frame.height() + 1)));
@@ -68,7 +79,7 @@ private:
 
 inline void fit(QDialog* dialog, QSize preferred)
 {
-    const QScreen* screen = dialog->screen();
+    const QScreen* screen = screenFor(dialog);
     const QSize available = screen ? screen->availableGeometry().size() - QSize(40, 60) : QSize(800, 600);
     dialog->resize(preferred.boundedTo(available));
     if (!dialog->property("initialPlacementInstalled").toBool()) {
