@@ -50,7 +50,9 @@ void CommandPaletteDialog::changeEvent(QEvent* event)
         m_filter->setPlaceholderText(tr("Type a command..."));
         refreshCommands();
         for (int i = 0; i < m_commandList->count(); ++i)
-            if (m_commandList->item(i)->data(Qt::UserRole) == selected)
+            if (m_commandList->item(i)->data(Qt::UserRole) == selected &&
+                !m_commandList->item(i)->isHidden() &&
+                m_commandList->item(i)->flags().testFlag(Qt::ItemIsEnabled))
                 m_commandList->setCurrentRow(i);
     }
     QDialog::changeEvent(event);
@@ -87,9 +89,6 @@ void CommandPaletteDialog::refreshCommands()
     addCommand(QStringLiteral("open_inbox"), tr("Open Workflow Inbox"), true);
 
     filterCommands(m_filter->text());
-    if (m_commandList->currentRow() < 0 && m_commandList->count() > 0) {
-        m_commandList->setCurrentRow(0);
-    }
 }
 
 void CommandPaletteDialog::filterCommands(const QString& query)
@@ -100,12 +99,22 @@ void CommandPaletteDialog::filterCommands(const QString& query)
         const bool matches = needle.isEmpty() || item->text().toLower().contains(needle);
         item->setHidden(!matches);
     }
+    const auto* selected = m_commandList->currentItem();
+    if (selected && !selected->isHidden() && selected->flags().testFlag(Qt::ItemIsEnabled)) return;
+    m_commandList->setCurrentRow(-1);
+    for (int i = 0; i < m_commandList->count(); ++i) {
+        const auto* item = m_commandList->item(i);
+        if (!item->isHidden() && item->flags().testFlag(Qt::ItemIsEnabled)) {
+            m_commandList->setCurrentRow(i);
+            break;
+        }
+    }
 }
 
 void CommandPaletteDialog::executeSelected()
 {
     QListWidgetItem* item = m_commandList->currentItem();
-    if (item == nullptr || item->flags().testFlag(Qt::ItemIsEnabled) == false) {
+    if (item == nullptr || item->isHidden() || item->flags().testFlag(Qt::ItemIsEnabled) == false) {
         return;
     }
 

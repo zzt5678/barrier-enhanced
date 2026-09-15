@@ -147,6 +147,39 @@ TEST(DialogLanguageTests, PaletteAndHistoryRetainSelectionAndTranslateWhileOpen)
     EXPECT_EQ(paletteTitle, palette.windowTitle());
 }
 
+TEST(DialogLanguageTests, PaletteNeverExecutesACommandHiddenByLiveTranslation) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    BarrierLocale::switchLanguage("en"); QApplication::processEvents();
+    QTemporaryDir dir; QSettings settings(dir.filePath("palette-filter.ini"), QSettings::IniFormat);
+    settings.setValue("workflowEnabled", false);
+    AppConfig config(&settings); WorkflowStore store(config); ActionBus bus(store);
+    CommandPaletteDialog palette(store, bus);
+    int opened = 0;
+    QObject::connect(&palette, &CommandPaletteDialog::workflowHubRequested, [&] { ++opened; });
+    palette.show(); QApplication::processEvents();
+    auto* filter = palette.findChild<QLineEdit*>();
+    auto* list = palette.findChild<QListWidget*>();
+    filter->setText("hub"); list->setCurrentRow(0);
+    ASSERT_FALSE(list->currentItem()->isHidden());
+    BarrierLocale::switchLanguage("zh-CN"); QApplication::processEvents();
+    EXPECT_EQ(QString("hub"), filter->text());
+    EXPECT_EQ(nullptr, list->currentItem());
+    QKeyEvent enter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+    QApplication::sendEvent(filter, &enter);
+    EXPECT_EQ(0, opened);
+    // Defend the execution boundary even if a stale selection is injected.
+    list->setCurrentRow(0);
+    ASSERT_TRUE(list->currentItem()->isHidden());
+    QApplication::sendEvent(filter, &enter);
+    EXPECT_EQ(0, opened);
+    filter->setText(QString::fromUtf8("工作流中心"));
+    ASSERT_NE(nullptr, list->currentItem());
+    EXPECT_FALSE(list->currentItem()->isHidden());
+    QApplication::sendEvent(filter, &enter);
+    EXPECT_EQ(1, opened);
+    BarrierLocale::switchLanguage("en"); QApplication::processEvents();
+}
+
 TEST(DialogLanguageTests, NormalizesSavedLocaleAndRetainsEditsAcrossLiveSwitches) {
     ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
     QTemporaryDir dir;
