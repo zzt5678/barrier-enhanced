@@ -79,6 +79,11 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     m_tabs->addTab(m_suggestionList, tr("Suggestions"));
     m_tabs->addTab(m_receiptList, tr("Local actions"));
     m_tabs->setObjectName(QStringLiteral("m_pWorkflowTabs"));
+    m_receiptList->setWordWrap(true); m_receiptList->setTextElideMode(Qt::ElideNone);
+    m_receiptList->setItemDelegate(new WorkflowReceiptDelegate(m_receiptList));
+    m_receiptList->setResizeMode(QListView::Adjust); m_receiptList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_receiptList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_detail->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
 
     auto* titleLabel = new QLabel(tr("Local history"), this);
     titleLabel->setObjectName(QStringLiteral("m_pLabelWorkflowSectionTitle"));
@@ -302,8 +307,10 @@ void WorkflowHubDialog::refreshAll()
     m_receiptList->clear();
     for (const TransferReceipt& receipt : m_store->receipts()) {
         auto* listItem = new QListWidgetItem(
-            QStringLiteral("[%1] %2").arg(workflowDisplayText(receipt.status), receipt.detail),
+            QStringLiteral("[%1] %2").arg(workflowReceiptStatus(receipt), workflowReceiptDetail(receipt)),
             m_receiptList);
+        listItem->setToolTip(Qt::convertFromPlainText(listItem->text()));
+        listItem->setData(Qt::AccessibleDescriptionRole, listItem->text());
         listItem->setData(Qt::UserRole, receipt.id);
         if (receipt.id == selectedReceiptId) m_receiptList->setCurrentItem(listItem);
     }
@@ -347,9 +354,9 @@ void WorkflowHubDialog::updateDetails()
             if (receipt.id == receiptId) {
                 html = tr(
                     "<h3>%1</h3><p><b>Action:</b> %2<br><b>Detail:</b> %3<br><b>Time:</b> %4</p>")
-                    .arg(htmlEscape(workflowDisplayText(receipt.status)),
+                    .arg(htmlEscape(workflowReceiptStatus(receipt)),
                          htmlEscape(receipt.actionId),
-                         htmlEscape(receipt.detail),
+                         htmlEscape(workflowReceiptDetail(receipt)),
                          formatDateTime(receipt.createdAt));
                 break;
             }

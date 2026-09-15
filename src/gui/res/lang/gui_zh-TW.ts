@@ -1552,4 +1552,45 @@ Server response:
 <context><name>WorkspaceDashboard</name>
 <message><source>Device list · %1</source><translation>裝置清單 · %1</translation></message>
 </context>
+<context><name>WorkflowDisplayText</name>
+<message><source>Prefetching</source><translation>正在預取</translation></message>
+<message><source>Prepared</source><translation>已準備</translation></message>
+<message><source>Received</source><translation>已在本機接收</translation></message>
+<message><source>Materialized</source><translation>本機檔案已備妥</translation></message>
+<message><source>Published locally</source><translation>已發佈到本機剪貼簿</translation></message>
+<message><source>Completed</source><translation>操作完成</translation></message>
+<message><source>Saved</source><translation>已儲存到本機</translation></message>
+<message><source>Failed</source><translation>失敗</translation></message>
+<message><source>Cancelled</source><translation>已取消</translation></message>
+<message><source>Queued</source><translation>排隊中</translation></message>
+<message><source>Captured</source><translation>已擷取螢幕</translation></message>
+<message><source>Skipped</source><translation>已略過</translation></message>
+<message><source>Reported</source><translation>核心回報</translation></message>
+<message><source>Remote clipboard prepared for %1 item(s).</source><translation>已為 %1 個項目準備遠端剪貼簿內容。</translation></message>
+<message><source>Remote clipboard prefetch started for %1 item(s).</source><translation>開始預取 %1 個遠端剪貼簿項目。</translation></message>
+<message><source>Target: %1</source><translation>目標：%1</translation></message>
+<message><source>Remote files materialized (%1 item(s)); clipboard publication is pending.</source><translation>已在本機準備 %1 個檔案項目；尚待發佈到剪貼簿。</translation></message>
+<message><source>Remote clipboard published locally with %1 item(s).</source><translation>已將 %1 個遠端項目發佈到本機剪貼簿。</translation></message>
+<message><source>Remote clipboard package received locally.</source><translation>已在本機收到遠端剪貼簿資料包。</translation></message>
+<message><source>Remote clipboard could not be published locally.</source><translation>無法發佈到本機剪貼簿。</translation></message>
+<message><source>Core reported a finished transfer; destination publication is not verified by this log.</source><translation>核心回報傳輸結束；這筆記錄未驗證目標裝置是否已發佈內容。</translation></message>
+<message><source>Saving selected context to inbox…</source><translation>正在儲存選取內容到接收資料夾…</translation></message>
+<message><source>Inbox save cancelled.</source><translation>已取消儲存到接收資料夾。</translation></message>
+<message><source>Encoding screenshot…</source><translation>正在編碼螢幕截圖…</translation></message>
+<message><source>Saved screenshot to workflow history.</source><translation>已將螢幕截圖儲存到本機歷史。</translation></message>
+<message><source>Saved a screenshot to the workflow history.</source><translation>已將螢幕截圖儲存到本機歷史。</translation></message>
+<message><source>Screenshot encoding or storage failed.</source><translation>螢幕截圖編碼或儲存失敗。</translation></message>
+</context>
+<context><name>MainWindow</name>
+<message><source>Local history</source><translation>本機歷史</translation></message>
+<message><source>Local &amp;history</source><translation>本機歷史(&amp;H)</translation></message>
+<message><source>Open clipboard history, suggestions, and local action records.</source><translation>開啟剪貼簿歷史、操作建議和本機操作記錄。</translation></message>
+<message><source>Weave
+Local history: %1
+%2 item(s), %3 suggestion(s)</source><translation>Weave
+本機歷史：%1
+%2 個項目，%3 則建議</translation></message>
+<message><source>No local action records yet.</source><translation>尚無本機操作記錄。</translation></message>
+<message><source>%1 local action record(s). Latest: %2</source><translation>%1 筆本機操作記錄。最新：%2</translation></message>
+</context>
 </TS>

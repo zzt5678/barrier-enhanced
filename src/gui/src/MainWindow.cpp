@@ -39,6 +39,7 @@
 #include "WorkflowHubDialog.h"
 #include "WindowLifecyclePolicy.h"
 #include "WorkflowStore.h"
+#include "WorkflowDisplayText.h"
 #include "base/String.h"
 #include "common/DataDirectories.h"
 #include "net/FingerprintDatabase.h"
@@ -463,17 +464,17 @@ void MainWindow::retranslateDashboard()
     m_pLabelWorkflowSectionTitle->setText(tr("Recent activity"));
     m_pLineEditHostname->setPlaceholderText(tr("Server name or IP address"));
     m_pLineEditConfigFile->setPlaceholderText(tr("Choose a .conf file"));
-    m_pButtonWorkflowHub->setText(tr("Workflow Hub"));
+    m_pButtonWorkflowHub->setText(tr("Local history"));
     m_pButtonShowLog->setText(tr("Logs"));
-    m_pButtonWorkflowHub->setToolTip(tr("Open clipboard history, transfer receipts, and workflow actions."));
+    m_pButtonWorkflowHub->setToolTip(tr("Open clipboard history, suggestions, and local action records."));
     m_pButtonShowLog->setToolTip(tr("Open the live service log."));
     toolbutton_show_fingerprint->setToolTip(tr("Show fingerprint details"));
     toolbutton_show_fingerprint->setAccessibleName(tr("Show fingerprint details"));
 
     if (m_pActionWorkflowHub != NULL) {
-        m_pActionWorkflowHub->setText(tr("Workflow &Hub"));
+        m_pActionWorkflowHub->setText(tr("Local &history"));
         m_pActionWorkflowHub->setToolTip(
-            tr("Open clipboard history, task handoff, suggestions, and transfer receipts."));
+            tr("Open clipboard history, suggestions, and local action records."));
     }
     if (m_pActionCommandPalette != NULL) {
         m_pActionCommandPalette->setText(tr("Command &Palette"));
@@ -1682,6 +1683,7 @@ void MainWindow::changeEvent(QEvent* event)
             retranslateUi(this);
             retranslateMenuBar();
             retranslateDashboard();
+            updateWorkflowIndicators();
 
             proofreadInfo();
 
@@ -2143,31 +2145,31 @@ void MainWindow::updateWorkflowIndicators()
     }
 
     if (m_pTrayIcon) {
-        m_pTrayIcon->setToolTip(QStringLiteral("Weave\nWorkflow %1\n%2 history item(s), %3 suggestion(s)")
-            .arg(m_pWorkflowStore->runtimeModeText())
+        m_pTrayIcon->setToolTip(tr("Weave\nLocal history: %1\n%2 item(s), %3 suggestion(s)")
+            .arg(workflowDisplayText(m_pWorkflowStore->runtimeModeText()))
             .arg(m_pWorkflowStore->history().size())
             .arg(m_pWorkflowStore->suggestions().size()));
     }
 
-    m_pLabelWorkflowRuntimeValue->setText(m_pWorkflowStore->runtimeModeText());
+    m_pLabelWorkflowRuntimeValue->setText(workflowDisplayText(m_pWorkflowStore->runtimeModeText()));
 
     m_pListRecentReceipts->clear();
     const QList<TransferReceipt>& receipts = m_pWorkflowStore->receipts();
     if (receipts.isEmpty()) {
-        m_pLabelReceiptSummary->setText(tr("No recent transfers yet. Incoming files, screenshots, and workflow actions will appear here."));
+        m_pLabelReceiptSummary->setText(tr("No local action records yet."));
     }
     else {
         const TransferReceipt& latest = receipts.first();
-        m_pLabelReceiptSummary->setText(tr("%1 transfer receipt(s). Latest: %2")
+        m_pLabelReceiptSummary->setText(tr("%1 local action record(s). Latest: %2")
             .arg(receipts.size())
-            .arg(latest.status));
+            .arg(workflowReceiptStatus(latest)));
         const int count = qMin(5, receipts.size());
         for (int i = 0; i < count; ++i) {
             const TransferReceipt& receipt = receipts.at(i);
             const QString line = QStringLiteral("%1  %2")
-                .arg(receipt.status, receipt.detail.isEmpty() ? receipt.actionId : receipt.detail);
+                .arg(workflowReceiptStatus(receipt), receipt.detail.isEmpty() ? receipt.actionId : workflowReceiptDetail(receipt));
             auto* item = new QListWidgetItem(line, m_pListRecentReceipts);
-            item->setToolTip(receipt.createdAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
+            item->setToolTip(Qt::convertFromPlainText(line + "\n" + receipt.createdAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))));
         }
     }
 
@@ -2330,7 +2332,7 @@ void MainWindow::updateWorkspaceDashboard()
         for (int i = 0; i < qMin(3, receipts.size()); ++i) {
             const auto& receipt = receipts[i];
             transfers.append(QStringLiteral("%1  ·  %2\n%3")
-                .arg(receipt.status, receipt.detail.isEmpty() ? receipt.actionId : receipt.detail,
+                .arg(workflowReceiptStatus(receipt), receipt.detail.isEmpty() ? receipt.actionId : workflowReceiptDetail(receipt),
                      receipt.createdAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm"))));
         }
     }

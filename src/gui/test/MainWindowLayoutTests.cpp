@@ -25,6 +25,7 @@
 #include "../src/ActionDialog.h"
 #include "../src/WorkspaceDashboard.h"
 #include "../src/RuntimeTopologyAdapter.h"
+#include "../src/WorkflowDisplayText.h"
 #include <QListWidget>
 #include <QScreen>
 #include <QTimer>
@@ -33,6 +34,83 @@
 #include <QMouseEvent>
 #include <QDrag>
 #include <QMessageBox>
+#include <QTextDocument>
+
+TEST(ReceiptPresentationTests, MainAndHistoryTranslateOnlyInternalMessagesAndKeepFullLiteralDetails) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    QTemporaryDir directory; QSettings settings(directory.filePath("receipts.ini"), QSettings::IniFormat);
+    settings.setValue("autoStart", false); settings.setValue("autoConfig", false);
+    settings.setValue("autoConfigPrompted", true); settings.setValue("workflowEnabled", false);
+    settings.setValue("wizardLastRun", 999);
+    class ReceiptWindow : public MainWindow {
+    public:
+        using MainWindow::MainWindow;
+        using MainWindow::createTrayIcon;
+    };
+    AppConfig config(&settings); ReceiptWindow window(settings, config);
+    window.createTrayIcon(); // Do not call open(): it may start a configured core.
+    auto* store = window.findChild<WorkflowStore*>(); ASSERT_NE(nullptr, store);
+    ActionBus bus(*store); WorkflowHubDialog history(*store, bus);
+    const QString target = "macbook-air-" + QString(150, 'x') + " <b>user & label</b>";
+    const QString rawDetail = "Remote clipboard prefetch started for 1 item(s). Target: " + target;
+    store->recordReceipt("", "remote_clipboard", "Prefetching", rawDetail, false);
+    auto* tabs = history.findChild<QTabWidget*>(); tabs->setCurrentIndex(2);
+    auto* receipts = qobject_cast<QListWidget*>(tabs->widget(2));
+    QFile style(":/res/styles/dark.qss"); ASSERT_TRUE(style.open(QIODevice::ReadOnly));
+    const QString theme = QString::fromUtf8(style.readAll());
+    window.setStyleSheet(theme); history.setStyleSheet(theme);
+    const QString out = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
+    for (const QString& language : {QString("en"), QString("zh-CN")}) {
+        BarrierLocale::switchLanguage(language); QApplication::processEvents(); QApplication::processEvents();
+        window.resize(620,760); window.show(); history.resize(620,540); history.show();
+        QApplication::processEvents(); QApplication::processEvents();
+        const auto* recent = window.findChild<QListWidget*>("recentTransfers");
+        ASSERT_NE(nullptr, recent); ASSERT_EQ(1, recent->count());
+        EXPECT_TRUE(recent->wordWrap());
+        EXPECT_EQ(Qt::ElideNone, recent->textElideMode());
+        EXPECT_TRUE(receipts->wordWrap());
+        EXPECT_TRUE(recent->item(0)->text().contains(target));
+        QTextDocument tip; tip.setHtml(recent->item(0)->toolTip());
+        EXPECT_TRUE(tip.toPlainText().contains(target));
+        EXPECT_TRUE(history.findChild<QTextBrowser*>()->toPlainText().contains(target));
+        if (language == "zh-CN") {
+            EXPECT_TRUE(recent->item(0)->text().contains(QString::fromUtf8("正在预取")));
+            EXPECT_FALSE(recent->item(0)->text().contains("Remote clipboard"));
+            EXPECT_FALSE(receipts->item(0)->text().contains("Remote clipboard"));
+            EXPECT_FALSE(history.findChild<QTextBrowser*>()->toPlainText().contains("Remote clipboard"));
+        }
+        bool localHistoryAction = false;
+        for (const auto* action : window.findChildren<QAction*>())
+            if (action->text() == (language == "en" ? QString("Local &history") : QString::fromUtf8("本地历史(&H)"))) {
+                localHistoryAction = true;
+                EXPECT_FALSE(action->toolTip().contains("transfer"));
+            }
+        EXPECT_TRUE(localHistoryAction);
+        auto* tray = window.findChild<QSystemTrayIcon*>();
+        ASSERT_NE(nullptr, tray);
+        EXPECT_TRUE(tray->toolTip().contains(language == "en" ? QString("Local history") : QString::fromUtf8("本地历史")));
+        if (!out.isEmpty()) {
+            EXPECT_TRUE(window.grab().save(out + "/" + language + "-recent-local-activity.png"));
+            EXPECT_TRUE(history.grab().save(out + "/" + language + "-local-action-details.png"));
+        }
+        EXPECT_EQ(QString("Prefetching"), store->receipts().front().status);
+        EXPECT_EQ(rawDetail, store->receipts().front().detail);
+    }
+    store->recordReceipt("", "show_notification", "Completed", rawDetail, false);
+    QApplication::processEvents();
+    EXPECT_TRUE(receipts->item(0)->text().contains(rawDetail)); // User content resembling an internal template remains literal.
+    TransferReceipt stage;
+    stage.actionId = "remote_clipboard"; stage.status = "Ready";
+    stage.detail = "Remote clipboard published locally with 1 item(s).";
+    EXPECT_EQ(QString::fromUtf8("已发布到本机剪贴板"), workflowReceiptStatus(stage));
+    EXPECT_TRUE(workflowReceiptDetail(stage).contains(QString::fromUtf8("本机剪贴板")));
+    stage.status = "Materialized";
+    stage.detail = "Remote files materialized (1 item(s)); clipboard publication is pending.";
+    EXPECT_TRUE(workflowReceiptDetail(stage).contains(QString::fromUtf8("尚待")));
+    stage.status = "Failed"; stage.detail = rawDetail;
+    EXPECT_EQ(rawDetail, workflowReceiptDetail(stage)); // An arbitrary failure detail is not a prefetch event.
+    BarrierLocale::switchLanguage("en"); QApplication::processEvents();
+}
 
 TEST(RuntimeTopologyLayoutTests, SnapshotAdapterRendersThreeViewersAndHistoricalListInBothLanguages) {
     using namespace weave::topology;

@@ -1682,4 +1682,45 @@ Weave 不会自动安装。是否打开 Apple 官方安装页面？</translation
 <context><name>WorkspaceDashboard</name>
 <message><source>Device list · %1</source><translation>设备列表 · %1</translation></message>
 </context>
+<context><name>WorkflowDisplayText</name>
+<message><source>Prefetching</source><translation>正在预取</translation></message>
+<message><source>Prepared</source><translation>已准备</translation></message>
+<message><source>Received</source><translation>已在本机接收</translation></message>
+<message><source>Materialized</source><translation>本机文件已备妥</translation></message>
+<message><source>Published locally</source><translation>已发布到本机剪贴板</translation></message>
+<message><source>Completed</source><translation>操作完成</translation></message>
+<message><source>Saved</source><translation>已保存到本机</translation></message>
+<message><source>Failed</source><translation>失败</translation></message>
+<message><source>Cancelled</source><translation>已取消</translation></message>
+<message><source>Queued</source><translation>排队中</translation></message>
+<message><source>Captured</source><translation>已截屏</translation></message>
+<message><source>Skipped</source><translation>已跳过</translation></message>
+<message><source>Reported</source><translation>核心报告</translation></message>
+<message><source>Remote clipboard prepared for %1 item(s).</source><translation>已为 %1 个项目准备远端剪贴板内容。</translation></message>
+<message><source>Remote clipboard prefetch started for %1 item(s).</source><translation>开始预取 %1 个远端剪贴板项目。</translation></message>
+<message><source>Target: %1</source><translation>目标：%1</translation></message>
+<message><source>Remote files materialized (%1 item(s)); clipboard publication is pending.</source><translation>已在本机准备 %1 个文件项目；尚待发布到剪贴板。</translation></message>
+<message><source>Remote clipboard published locally with %1 item(s).</source><translation>已将 %1 个远端项目发布到本机剪贴板。</translation></message>
+<message><source>Remote clipboard package received locally.</source><translation>已在本机收到远端剪贴板数据包。</translation></message>
+<message><source>Remote clipboard could not be published locally.</source><translation>无法发布到本机剪贴板。</translation></message>
+<message><source>Core reported a finished transfer; destination publication is not verified by this log.</source><translation>核心报告传输结束；这条日志未验证目标设备是否已发布内容。</translation></message>
+<message><source>Saving selected context to inbox…</source><translation>正在保存选中内容到接收文件夹…</translation></message>
+<message><source>Inbox save cancelled.</source><translation>已取消保存到接收文件夹。</translation></message>
+<message><source>Encoding screenshot…</source><translation>正在编码截图…</translation></message>
+<message><source>Saved screenshot to workflow history.</source><translation>已将截图保存到本地历史。</translation></message>
+<message><source>Saved a screenshot to the workflow history.</source><translation>已将截图保存到本地历史。</translation></message>
+<message><source>Screenshot encoding or storage failed.</source><translation>截图编码或保存失败。</translation></message>
+</context>
+<context><name>MainWindow</name>
+<message><source>Local history</source><translation>本地历史</translation></message>
+<message><source>Local &amp;history</source><translation>本地历史(&amp;H)</translation></message>
+<message><source>Open clipboard history, suggestions, and local action records.</source><translation>打开剪贴板历史、操作建议和本地操作记录。</translation></message>
+<message><source>Weave
+Local history: %1
+%2 item(s), %3 suggestion(s)</source><translation>Weave
+本地历史：%1
+%2 个项目，%3 条建议</translation></message>
+<message><source>No local action records yet.</source><translation>暂无本地操作记录。</translation></message>
+<message><source>%1 local action record(s). Latest: %2</source><translation>%1 条本地操作记录。最新：%2</translation></message>
+</context>
 </TS>

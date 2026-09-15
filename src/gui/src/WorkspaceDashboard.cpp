@@ -1,5 +1,6 @@
 #include "WorkspaceDashboard.h"
 #include "ElidingLabel.h"
+#include "WorkflowDisplayText.h"
 #include <QApplication>
 #include <QButtonGroup>
 #include <QFrame>
@@ -11,6 +12,7 @@
 #include <QStackedWidget>
 #include <QStyle>
 #include <QResizeEvent>
+#include <QTextDocument>
 #include <QVBoxLayout>
 #include <algorithm>
 
@@ -49,6 +51,10 @@ WorkspaceDashboard::WorkspaceDashboard(QWidget* settings, QWidget* parent): QWid
     auto* recentHeader = new QHBoxLayout; m_recentTitle = new QLabel; m_recentTitle->setObjectName("workspaceSection"); recentHeader->addWidget(m_recentTitle); recentHeader->addStretch(); m_inbox = new QPushButton; m_inbox->setProperty("quiet",true); m_inbox->setIcon(QIcon(":/res/icons/workspace/folder.png")); recentHeader->addWidget(m_inbox); content->addLayout(recentHeader);
     m_empty = new QLabel; m_empty->setObjectName("emptyTransfers"); m_empty->setWordWrap(true); content->addWidget(m_empty);
     m_recent = new QListWidget; m_recent->setObjectName("recentTransfers"); m_recent->setMinimumHeight(120); m_recent->setMaximumHeight(200); m_recent->setFrameShape(QFrame::NoFrame); content->addWidget(m_recent); m_recent->hide(); content->addStretch();
+    m_recent->setWordWrap(true); m_recent->setTextElideMode(Qt::ElideNone);
+    m_recent->setItemDelegate(new WorkflowReceiptDelegate(m_recent));
+    m_recent->setResizeMode(QListView::Adjust); m_recent->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_recent->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     auto* scroll = new QScrollArea; scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame); scroll->setWidget(home); m_pages->addWidget(scroll);
     auto* configuration = new QWidget; auto* configLayout = new QVBoxLayout(configuration); configLayout->setContentsMargins(12,12,12,12);
     m_preferences = new QPushButton; m_preferences->setProperty("primary",true); configLayout->addWidget(m_preferences,0,Qt::AlignRight); configLayout->addWidget(settings); m_pages->addWidget(configuration);
@@ -149,7 +155,15 @@ void WorkspaceDashboard::setRecentTransfers(const QStringList& transfers)
 {
     QStringList current;
     for (int i = 0; i < m_recent->count(); ++i) current.append(m_recent->item(i)->text());
-    if (current != transfers) { m_recent->clear(); m_recent->addItems(transfers); }
+    if (current != transfers) {
+        const int selected = m_recent->currentRow();
+        m_recent->clear(); m_recent->addItems(transfers);
+        for (int i = 0; i < m_recent->count(); ++i) {
+            m_recent->item(i)->setToolTip(Qt::convertFromPlainText(transfers[i]));
+            m_recent->item(i)->setData(Qt::AccessibleDescriptionRole, transfers[i]);
+        }
+        if (selected >= 0) m_recent->setCurrentRow(qMin(selected, m_recent->count() - 1));
+    }
     m_recent->setVisible(!transfers.isEmpty()); m_empty->setVisible(transfers.isEmpty());
 }
 void WorkspaceDashboard::retranslate()
