@@ -154,6 +154,9 @@ void WorkspaceDashboard::resizeEvent(QResizeEvent* event)
     auto* sidebar = findChild<QFrame*>("workspaceSidebar");
     const int sidebarWidth = width < 760 ? 160 : 180;
     sidebar->setFixedWidth(sidebarWidth);
+    // Keep the settings viewport wide enough after reserving the readable sidebar.
+    const int settingsMargin = width < 760 ? 6 : 12;
+    m_pages->widget(1)->layout()->setContentsMargins(settingsMargin, 12, settingsMargin, 12);
     auto* home = findChild<QWidget*>("workspaceHome");
     const int margin = width < 760 ? 16 : 28;
     home->layout()->setContentsMargins(margin, 28, margin, 24);
