@@ -8,6 +8,7 @@ set (CMAKE_INCLUDE_CURRENT_DIR ON)
 
 # files that are used both in tests and the app
 set(GUI_COMMON_SOURCE_FILES
+    src/DevicePlatformCatalog.cpp
     src/RuntimeTopologyAdapter.cpp
     src/ExternalScreenLayout.cpp
     src/WorkspaceDashboard.cpp
@@ -22,6 +23,7 @@ set(GUI_COMMON_SOURCE_FILES
 )
 
 set(GUI_COMMON_HEADER_FILES
+    src/DevicePlatformCatalog.h
     src/RuntimeTopologyAdapter.h
     src/ExternalScreenLayout.h
     src/WorkspaceDashboard.h
@@ -248,6 +250,7 @@ endif()
 if (BARRIER_BUILD_TESTS)
     set(GUI_TEST_SOURCE_FILES
         test/RuntimeTopologyAdapterTests.cpp
+        test/DevicePlatformCatalogTests.cpp
         test/WorkflowHubDialogTests.cpp
         src/WorkflowHubDialog.cpp
         test/ExternalScreenLayoutTests.cpp
