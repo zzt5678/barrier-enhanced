@@ -35,6 +35,124 @@
 #include <QDrag>
 #include <QMessageBox>
 #include <QTextDocument>
+#include <QEventLoop>
+#if defined(Q_OS_LINUX)
+#include <sys/inotify.h>
+#include <unistd.h>
+#endif
+
+namespace {
+class EnglishLocaleScope {
+public:
+    EnglishLocaleScope() { BarrierLocale::switchLanguage("en"); QApplication::processEvents(); }
+    ~EnglishLocaleScope() { BarrierLocale::switchLanguage("en"); QApplication::processEvents(); }
+};
+class IdleTopologyWindow : public MainWindow {
+public:
+    using MainWindow::MainWindow;
+    using MainWindow::pollRuntimeTopology;
+    using MainWindow::configuredTopologyFallback;
+};
+void prepareIdleTopologySettings(QSettings& settings) {
+    settings.setValue("autoStart", false); settings.setValue("autoConfig", false);
+    settings.setValue("autoConfigPrompted", true); settings.setValue("workflowEnabled", false);
+    settings.setValue("wizardLastRun", 999); settings.setValue("screenName", "local");
+    settings.setValue("groupServerChecked", true); settings.setValue("groupClientChecked", false);
+}
+void waitForGui(int milliseconds) {
+    QEventLoop loop;
+    QTimer::singleShot(milliseconds, &loop, &QEventLoop::quit);
+    loop.exec();
+}
+bool writeIdleLayout(const QString& path, const QString& peer) {
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+    const QByteArray data = QString("section: screens\n local:\n %1:\nend\nsection: links\n local:\n right = %1\nend\n").arg(peer).toUtf8();
+    return file.write(data) == data.size();
+}
+bool dashboardContainsDevice(const MainWindow& window, const QString& name) {
+    for (auto* label : window.findChildren<QLabel*>("deviceName"))
+        if (label->accessibleName() == name) return true;
+    return false;
+}
+}
+
+TEST(IdleTopologyTests, HiddenPollingIsReducedButContinuesAndShowingRefreshesImmediately) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    QTemporaryDir dir; QSettings settings(dir.filePath("idle.ini"), QSettings::IniFormat);
+    prepareIdleTopologySettings(settings);
+    AppConfig config(&settings); IdleTopologyWindow window(settings, config);
+    const QString layoutPath = dir.filePath("layout.conf");
+    ASSERT_TRUE(writeIdleLayout(layoutPath, "initial"));
+    window.m_pRadioExternalConfig->setChecked(true);
+    window.m_pLineEditConfigFile->setText(layoutPath);
+    window.show(); window.pollRuntimeTopology();
+    ASSERT_TRUE(dashboardContainsDevice(window, "initial"));
+    ASSERT_TRUE(writeIdleLayout(layoutPath, "visible-update"));
+    waitForGui(1400);
+    EXPECT_TRUE(dashboardContainsDevice(window, "visible-update")); // Visible polling must remain responsive.
+    window.hide();
+    ASSERT_TRUE(writeIdleLayout(layoutPath, "hidden-update"));
+    waitForGui(1400);
+    EXPECT_FALSE(dashboardContainsDevice(window, "hidden-update")); // Catches retaining the visible poll cadence.
+    waitForGui(4300);
+    EXPECT_TRUE(dashboardContainsDevice(window, "hidden-update")); // Catches stopping hidden polling entirely.
+    ASSERT_TRUE(writeIdleLayout(layoutPath, "shown-update"));
+    window.show(); QApplication::processEvents();
+    EXPECT_TRUE(dashboardContainsDevice(window, "shown-update")); // Catches waiting for the next timer after showing.
+    for (auto* label : window.findChildren<QLabel*>("deviceState"))
+        EXPECT_EQ(QString("Configured"), label->text()); // Missing runtime evidence must not become connected.
+}
+
+TEST(IdleTopologyTests, RestoringMinimizedWindowRefreshesImmediately) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    QTemporaryDir dir; QSettings settings(dir.filePath("idle.ini"), QSettings::IniFormat);
+    prepareIdleTopologySettings(settings);
+    AppConfig config(&settings); IdleTopologyWindow window(settings, config);
+    const QString layoutPath = dir.filePath("layout.conf");
+    ASSERT_TRUE(writeIdleLayout(layoutPath, "initial"));
+    window.m_pRadioExternalConfig->setChecked(true); window.m_pLineEditConfigFile->setText(layoutPath);
+    window.show(); window.pollRuntimeTopology(); window.showMinimized(); QApplication::processEvents();
+    ASSERT_TRUE(writeIdleLayout(layoutPath, "restored-update"));
+    waitForGui(1400);
+    EXPECT_FALSE(dashboardContainsDevice(window, "restored-update"));
+    ASSERT_TRUE(writeIdleLayout(layoutPath, "restore-immediate"));
+    window.showNormal(); QApplication::processEvents();
+    EXPECT_TRUE(dashboardContainsDevice(window, "restore-immediate"));
+}
+
+#if defined(Q_OS_LINUX)
+TEST(IdleTopologyTests, LaunchedFallbackAvoidsOpeningPendingExternalConfiguration) {
+    ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    QTemporaryDir dir; QSettings settings(dir.filePath("idle.ini"), QSettings::IniFormat);
+    prepareIdleTopologySettings(settings);
+    AppConfig config(&settings); IdleTopologyWindow window(settings, config);
+    const QString layoutPath = dir.filePath("layout.conf");
+    ASSERT_TRUE(writeIdleLayout(layoutPath, "pending-peer"));
+    window.m_pRadioExternalConfig->setChecked(true); window.m_pLineEditConfigFile->setText(layoutPath);
+    const int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    QFile watcher; ASSERT_TRUE(watcher.open(fd, QIODevice::ReadOnly, QFileDevice::AutoCloseHandle));
+    ASSERT_GE(inotify_add_watch(fd, layoutPath.toLocal8Bit().constData(), IN_OPEN), 0);
+    char events[4096];
+    const auto configured = window.configuredTopologyFallback();
+    ASSERT_EQ(2, configured.devices.size());
+    EXPECT_EQ(QString("pending-peer"), configured.devices[1].name);
+    EXPECT_GT(::read(fd, events, sizeof(events)), 0); // The observer sees a real uncached file open.
+    RuntimeTopologyFallback launched;
+    launched.localName = "launched-local"; launched.server = true; launched.spatial = true;
+    launched.editable = true;
+    launched.devices = {{"launched-local", {}, true, WorkspaceDeviceRole::Server}};
+    const auto selected = window.configuredTopologyFallback(&launched);
+    EXPECT_EQ(-1, ::read(fd, events, sizeof(events))); // Cached rendering must do no pending-config I/O.
+    EXPECT_EQ(QString("launched-local"), selected.localName);
+    ASSERT_EQ(1, selected.devices.size());
+    EXPECT_EQ(QString("launched-local"), selected.devices[0].name);
+    EXPECT_FALSE(selected.editable); // Current external-config controls remain read-only.
+    window.m_pRadioInternalConfig->setChecked(true);
+    EXPECT_TRUE(window.configuredTopologyFallback(&launched).editable);
+}
+#endif
 
 TEST(ReceiptPresentationTests, MainAndHistoryTranslateOnlyInternalMessagesAndKeepFullLiteralDetails) {
     ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
@@ -499,6 +617,7 @@ TEST(DialogLanguageTests, NormalizesSavedLocaleAndRetainsEditsAcrossLiveSwitches
 
 TEST(DialogLayoutTests, EditorsStayInsideScreenWithReachableActionsInBothLanguages) {
     ASSERT_EQ(QString("1"), qEnvironmentVariable("WEAVE_ISOLATED_UI_TEST"));
+    EnglishLocaleScope locale; // Fatal assertions must not leave the next fixture in Chinese.
     QTemporaryDir dir;
     QSettings settings(dir.filePath("dialogs.ini"), QSettings::IniFormat);
     settings.setValue("language", "en"); settings.setValue("workflowEnabled", false);
@@ -539,6 +658,11 @@ TEST(DialogLayoutTests, EditorsStayInsideScreenWithReachableActionsInBothLanguag
             const QString out = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
             if (item.first == "preferences") {
                 dialog->activateWindow(); dialog->raise();
+                QGuiApplication::sync();
+                // This fixture verifies native widget focus rendering, not a
+                // window manager. Bare Xvfb can focus the X window on remap yet
+                // leave Qt's activeWindow null; establish toolkit activation.
+                QApplication::setActiveWindow(dialog);
                 preferences.m_pLineEditScreenName->setFocus(Qt::TabFocusReason);
                 QApplication::processEvents(); QApplication::processEvents();
                 ASSERT_TRUE(dialog->isActiveWindow());

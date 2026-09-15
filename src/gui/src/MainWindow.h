@@ -199,8 +199,9 @@ public slots:
         void updateWorkflowPeerHint();
         void updateOverviewCards();
         void updateWorkspaceDashboard();
-        RuntimeTopologyFallback configuredTopologyFallback();
+        RuntimeTopologyFallback configuredTopologyFallback(const RuntimeTopologyFallback* launched = nullptr);
         void pollRuntimeTopology();
+        void updateTopologyPolling();
         void clearRuntimeTopology();
 
     private:

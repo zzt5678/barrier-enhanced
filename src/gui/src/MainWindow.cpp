@@ -348,7 +348,7 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
     });
     m_RestartTimer.setSingleShot(true);
     connect(&m_RestartTimer, &QTimer::timeout, this, &MainWindow::startBarrier);
-    m_TopologyTimer.setInterval(1000);
+    m_TopologyTimer.setInterval(5000);
     connect(&m_TopologyTimer, &QTimer::timeout, this, &MainWindow::pollRuntimeTopology);
     m_TopologyTimer.start();
 
@@ -1562,6 +1562,7 @@ void MainWindow::handleServiceStopTimeout()
 void MainWindow::setVisible(bool visible)
 {
     QMainWindow::setVisible(visible);
+    updateTopologyPolling();
     m_pActionMinimize->setEnabled(visible);
     m_pActionRestore->setEnabled(!visible);
 
@@ -1698,6 +1699,7 @@ void MainWindow::changeEvent(QEvent* event)
         case QEvent::WindowStateChange:
         {
             windowStateChanged();
+            updateTopologyPolling();
             break;
         }
         default:
@@ -2231,16 +2233,24 @@ void MainWindow::updateOverviewCards()
     }
 }
 
-RuntimeTopologyFallback MainWindow::configuredTopologyFallback()
+RuntimeTopologyFallback MainWindow::configuredTopologyFallback(const RuntimeTopologyFallback* launched)
 {
-    RuntimeTopologyFallback fallback;
     const bool serverMode = barrier_type() == BarrierType::Server;
+    const bool editable = serverMode && !m_pRadioExternalConfig->isChecked();
+    if (launched) {
+        // Pending edits cannot rename a running core. Only edit availability is
+        // current; do not open an external configuration that will be discarded.
+        auto fallback = *launched;
+        fallback.editable = editable;
+        return fallback;
+    }
+    RuntimeTopologyFallback fallback;
     auto& devices = fallback.devices;
     const QString localName = getScreenName();
     fallback.localName = localName;
     fallback.serverAddress = hostname();
     fallback.server = serverMode;
-    fallback.editable = serverMode && !m_pRadioExternalConfig->isChecked();
+    fallback.editable = editable;
     fallback.spatial = fallback.editable;
     if (serverMode && !m_pRadioExternalConfig->isChecked()) {
         const ServerConfig& config = m_ServerConfig;
@@ -2283,6 +2293,17 @@ void MainWindow::clearRuntimeTopology()
     m_launchClipboardSharing = -1;
 }
 
+void MainWindow::updateTopologyPolling()
+{
+    if (!m_TopologyTimer.isActive()) return;
+    const int interval = isVisible() && !isMinimized() ? 1000 : 5000;
+    if (m_TopologyTimer.interval() == interval) return;
+    // Hidden windows still reselect the current publisher periodically. Restore
+    // reads current evidence before displaying it, never reusing a stale status.
+    if (interval == 1000) pollRuntimeTopology();
+    m_TopologyTimer.setInterval(interval);
+}
+
 void MainWindow::pollRuntimeTopology()
 {
     using namespace weave::topology;
@@ -2320,13 +2341,7 @@ void MainWindow::updateWorkspaceDashboard()
 {
     if (!m_workspaceDashboard) return;
     using namespace weave::topology;
-    auto fallback = configuredTopologyFallback();
-    if (m_hasLaunchTopologyFallback) {
-        // Unapplied settings cannot rename an already launched, older core.
-        const bool editable = fallback.editable;
-        fallback = m_launchTopologyFallback;
-        fallback.editable = editable;
-    }
+    auto fallback = configuredTopologyFallback(m_hasLaunchTopologyFallback ? &m_launchTopologyFallback : nullptr);
     const bool readable = m_topologyReadStatus == ReadStatus::Fresh ||
         m_topologyReadStatus == ReadStatus::Stale || m_topologyReadStatus == ReadStatus::NotReady;
     auto view = m_runtimeTopology.apply(m_topologyReadStatus,
