@@ -6,7 +6,15 @@ class QLabel;
 class QPushButton;
 class QStackedWidget;
 class QListWidget;
-struct WorkspaceDevice { QString name; QPoint position; bool local = false; };
+enum class WorkspaceDeviceRole { Unknown, Server, Client };
+enum class WorkspaceDeviceState { Configured, AwaitingSync, Connected, Disconnected, Stale };
+struct WorkspaceDevice {
+    QString name;
+    QPoint position;
+    bool local = false;
+    WorkspaceDeviceRole role = WorkspaceDeviceRole::Unknown;
+    WorkspaceDeviceState state = WorkspaceDeviceState::Configured;
+};
 class WorkspaceDashboard : public QWidget {
     Q_OBJECT
 public:
@@ -30,6 +38,7 @@ private:
     QLabel* m_status = nullptr;
     QLabel* m_recentTitle = nullptr;
     QLabel* m_empty = nullptr;
+    QLabel* m_layoutNotice = nullptr;
     QPushButton* m_devices = nullptr;
     QPushButton* m_transfers = nullptr;
     QPushButton* m_settings = nullptr;
@@ -40,6 +49,8 @@ private:
     QStackedWidget* m_pages = nullptr;
     QListWidget* m_recent = nullptr;
     bool m_running = false;
+    bool m_canArrange = true;
+    QVector<WorkspaceDevice> m_deviceData;
     QStringList m_deviceSignature;
     int m_columns = 1;
 };

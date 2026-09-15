@@ -1618,4 +1618,53 @@ Weave 不会自动安装。是否打开 Apple 官方安装页面？</translation
 <message><source>Yes to &amp;All</source><translation>全部是(&amp;A)</translation></message>
 <message><source>N&amp;o to All</source><translation>全部否(&amp;O)</translation></message>
 </context>
+<context>
+    <name>WorkspaceDashboard</name>
+    <message><source>Role unknown</source><translation>角色未知</translation></message>
+    <message><source>Configured</source><translation>已配置</translation></message>
+    <message><source>Connected</source><translation>已连接</translation></message>
+    <message><source>Disconnected</source><translation>已断开</translation></message>
+    <message><source>Out of date</source><translation>已过期</translation></message>
+    <message><source>Awaiting sync</source><translation>等待同步</translation></message>
+    <message><source>Local history</source><translation>本地历史</translation></message>
+    <message><source>Recent local activity</source><translation>最近本地操作</translation></message>
+    <message><source>No local activity yet. Open history to review clipboard items and local action records.</source><translation>暂无本地操作。打开历史可查看剪贴板内容与本地操作记录。</translation></message>
+    <message><source>Read-only layout · managed by Server</source><translation>只读布局 · 由 Server 管理</translation></message>
+</context>
+<context>
+    <name>KeySequenceWidget</name>
+    <message><source>Click to record shortcut</source><translation>点击录制快捷键</translation></message>
+    <message><source>Press keys… Esc to cancel</source><translation>按下快捷键… Esc 取消</translation></message>
+    <message><source>Mouse button %1</source><translation>鼠标按键 %1</translation></message>
+    <message><source>Click or press Space to record. Press Esc to keep the previous shortcut.</source><translation>点击或按空格开始录制；按 Esc 保留原快捷键。</translation></message>
+</context>
+<context>
+    <name>ScreenSettingsDialog</name>
+    <message><source>Optional alternate names for this device.</source><translation>此设备可选的其他名称。</translation></message>
+</context>
+<context>
+    <name>CommandPaletteDialog</name>
+    <message><source>No available commands match. Clear the search or add an item to local history.</source><translation>没有可用的匹配命令。请清空搜索，或先在本地历史中添加内容。</translation></message>
+    <message><source>No suggestions available yet</source><translation>暂无建议</translation></message>
+    <message><source>No item in local history yet</source><translation>本地历史暂无内容</translation></message>
+</context>
+<context>
+    <name>WorkflowHubDialog</name>
+    <message><source>Weave Local History</source><translation>Weave 本地历史</translation></message>
+    <message><source>Local history</source><translation>本地历史</translation></message>
+    <message><source>Local actions</source><translation>本地操作</translation></message>
+    <message><source>Clipboard items and local action records. Records do not confirm delivery to another device.</source><translation>查看剪贴板内容和本地操作记录；这些记录不代表已送达其他设备。</translation></message>
+    <message><source>&lt;p&gt;No clipboard history yet. When history is enabled, copied items appear here. You can also capture a screenshot from Actions.&lt;/p&gt;</source><translation>&lt;p&gt;暂无剪贴板历史。启用历史后，复制的内容会显示在这里，也可从“操作”菜单截屏。&lt;/p&gt;</translation></message>
+    <message><source>&lt;p&gt;No suggestions yet. Suggestions appear for supported items in local history.&lt;/p&gt;</source><translation>&lt;p&gt;暂无建议。本地历史中有支持的内容时，会显示操作建议。&lt;/p&gt;</translation></message>
+    <message><source>&lt;p&gt;No local action records yet. These records describe actions on this computer, not delivery confirmation.&lt;/p&gt;</source><translation>&lt;p&gt;暂无本地操作记录。这些记录描述本机上的操作，不是送达确认。&lt;/p&gt;</translation></message>
+</context>
+<context><name>CommandPaletteDialog</name>
+<message><source>Open local history</source><translation>打开本地历史</translation></message>
+<message><source>Save latest item to inbox</source><translation>将最新项目保存到接收文件夹</translation></message>
+<message><source>Capture screenshot into local history</source><translation>截屏并保存到本地历史</translation></message>
+<message><source>Open inbox folder</source><translation>打开接收文件夹</translation></message>
+</context>
+<context><name>WorkspaceDashboard</name>
+<message><source>Double-click a record or press Enter to open local history.</source><translation>双击记录或按 Enter 打开本地历史。</translation></message>
+</context>
 </TS>

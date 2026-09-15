@@ -6,6 +6,7 @@ class ActionBus;
 class QHideEvent;
 class QListWidget;
 class QLineEdit;
+class QLabel;
 class QShowEvent;
 class WorkflowStore;
 
@@ -37,4 +38,5 @@ private:
     ActionBus* m_actionBus;
     QLineEdit* m_filter;
     QListWidget* m_commandList;
+    QLabel* m_empty;
 };

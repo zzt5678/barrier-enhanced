@@ -1488,4 +1488,53 @@ Server response:
     <message><source>&lt;p&gt;Select a history item, suggestion, or receipt.&lt;/p&gt;</source><translation>&lt;p&gt;請選擇一條歷史內容、操作建議或傳輸記錄。&lt;/p&gt;</translation></message>
     <message><source>Workflow Action Failed</source><translation>操作失敗</translation></message>
 </context>
+<context>
+    <name>WorkspaceDashboard</name>
+    <message><source>Role unknown</source><translation>角色未知</translation></message>
+    <message><source>Configured</source><translation>已設定</translation></message>
+    <message><source>Connected</source><translation>已連線</translation></message>
+    <message><source>Disconnected</source><translation>已中斷</translation></message>
+    <message><source>Out of date</source><translation>已過期</translation></message>
+    <message><source>Awaiting sync</source><translation>等待同步</translation></message>
+    <message><source>Local history</source><translation>本機歷史</translation></message>
+    <message><source>Recent local activity</source><translation>最近本機操作</translation></message>
+    <message><source>No local activity yet. Open history to review clipboard items and local action records.</source><translation>尚無本機操作。開啟歷史可查看剪貼簿內容與本機操作記錄。</translation></message>
+    <message><source>Read-only layout · managed by Server</source><translation>唯讀配置 · 由 Server 管理</translation></message>
+</context>
+<context>
+    <name>KeySequenceWidget</name>
+    <message><source>Click to record shortcut</source><translation>點擊錄製快捷鍵</translation></message>
+    <message><source>Press keys… Esc to cancel</source><translation>按下快捷鍵… Esc 取消</translation></message>
+    <message><source>Mouse button %1</source><translation>滑鼠按鍵 %1</translation></message>
+    <message><source>Click or press Space to record. Press Esc to keep the previous shortcut.</source><translation>點擊或按空白鍵開始錄製；按 Esc 保留原快捷鍵。</translation></message>
+</context>
+<context>
+    <name>ScreenSettingsDialog</name>
+    <message><source>Optional alternate names for this device.</source><translation>此裝置可選的其他名稱。</translation></message>
+</context>
+<context>
+    <name>CommandPaletteDialog</name>
+    <message><source>No available commands match. Clear the search or add an item to local history.</source><translation>沒有可用的符合命令。請清空搜尋，或先在本機歷史中加入內容。</translation></message>
+    <message><source>No suggestions available yet</source><translation>尚無建議</translation></message>
+    <message><source>No item in local history yet</source><translation>本機歷史尚無內容</translation></message>
+</context>
+<context>
+    <name>WorkflowHubDialog</name>
+    <message><source>Weave Local History</source><translation>Weave 本機歷史</translation></message>
+    <message><source>Local history</source><translation>本機歷史</translation></message>
+    <message><source>Local actions</source><translation>本機操作</translation></message>
+    <message><source>Clipboard items and local action records. Records do not confirm delivery to another device.</source><translation>查看剪貼簿內容和本機操作記錄；這些記錄不代表已送達其他裝置。</translation></message>
+    <message><source>&lt;p&gt;No clipboard history yet. When history is enabled, copied items appear here. You can also capture a screenshot from Actions.&lt;/p&gt;</source><translation>&lt;p&gt;尚無剪貼簿歷史。啟用歷史後，複製的內容會顯示在這裡，也可從「操作」選單擷取螢幕。&lt;/p&gt;</translation></message>
+    <message><source>&lt;p&gt;No suggestions yet. Suggestions appear for supported items in local history.&lt;/p&gt;</source><translation>&lt;p&gt;尚無建議。本機歷史中有支援的內容時，會顯示操作建議。&lt;/p&gt;</translation></message>
+    <message><source>&lt;p&gt;No local action records yet. These records describe actions on this computer, not delivery confirmation.&lt;/p&gt;</source><translation>&lt;p&gt;尚無本機操作記錄。這些記錄描述本機上的操作，並非送達確認。&lt;/p&gt;</translation></message>
+</context>
+<context><name>CommandPaletteDialog</name>
+<message><source>Open local history</source><translation>開啟本機歷史</translation></message>
+<message><source>Save latest item to inbox</source><translation>將最新項目儲存到接收資料夾</translation></message>
+<message><source>Capture screenshot into local history</source><translation>擷取螢幕並儲存到本機歷史</translation></message>
+<message><source>Open inbox folder</source><translation>開啟接收資料夾</translation></message>
+</context>
+<context><name>WorkspaceDashboard</name>
+<message><source>Double-click a record or press Enter to open local history.</source><translation>按兩下記錄或按 Enter 開啟本機歷史。</translation></message>
+</context>
 </TS>

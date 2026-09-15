@@ -31,7 +31,10 @@ KeySequenceWidget::KeySequenceWidget(QWidget* parent, const KeySequence& seq) :
     m_KeyPrefix("keystroke("),
     m_KeyPostfix(")")
 {
-    setFocusPolicy(Qt::NoFocus);
+    setFocusPolicy(Qt::StrongFocus);
+    connect(this, &QPushButton::clicked, this, [this] {
+        if (status() == Stopped) startRecording();
+    });
     updateOutput();
 }
 
@@ -62,11 +65,13 @@ void KeySequenceWidget::mousePressEvent(QMouseEvent* event)
 
 void KeySequenceWidget::startRecording()
 {
+    backupSequence() = keySequence();
     keySequence() = KeySequence();
     setDown(true);
     setFocus();
     grabKeyboard();
     setStatus(Recording);
+    updateOutput();
 }
 
 void KeySequenceWidget::stopRecording()
@@ -81,11 +86,13 @@ void KeySequenceWidget::stopRecording()
     focusNextChild();
     releaseKeyboard();
     setStatus(Stopped);
+    updateOutput();
     emit keySequenceChanged();
 }
 
 bool KeySequenceWidget::event(QEvent* event)
 {
+    if (event->type() == QEvent::LanguageChange && status() == Stopped) updateOutput();
     if (status() == Recording)
     {
         switch(event->type())
@@ -123,8 +130,17 @@ void KeySequenceWidget::keyPressEvent(QKeyEvent* event)
 {
     event->accept();
 
-    if (status() == Stopped)
+    if (status() == Stopped) {
+        if (event->key() == Qt::Key_Space || event->key() == Qt::Key_Return) startRecording();
+        else QPushButton::keyPressEvent(event);
         return;
+    }
+
+    if (event->key() == Qt::Key_Escape && event->modifiers() == Qt::NoModifier) {
+        keySequence() = backupSequence();
+        stopRecording();
+        return;
+    }
 
     if (m_KeySequence.appendKey(event->key(), event->modifiers()))
         stopRecording();
@@ -134,12 +150,12 @@ void KeySequenceWidget::keyPressEvent(QKeyEvent* event)
 
 void KeySequenceWidget::updateOutput()
 {
-    QString s;
-
-    if (m_KeySequence.isMouseButton())
-        s = mousePrefix() + m_KeySequence.toString() + mousePostfix();
-    else
-        s = keyPrefix() + m_KeySequence.toString() + keyPostfix();
-
+    QString s = m_KeySequence.toString();
+    if (s.isEmpty()) s = status() == Recording
+        ? tr("Press keys… Esc to cancel") : tr("Click to record shortcut");
+    else if (m_KeySequence.isMouseButton()) s = tr("Mouse button %1").arg(s);
+    else s.replace('+', " + ");
     setText(s);
+    setAccessibleName(s);
+    setToolTip(tr("Click or press Space to record. Press Esc to keep the previous shortcut."));
 }

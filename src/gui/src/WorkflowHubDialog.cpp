@@ -62,7 +62,7 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     m_saveButton(new QAction(tr("Save to Inbox"), this)),
     m_revealButton(new QAction(tr("Reveal"), this))
 {
-    setWindowTitle(tr("Weave Workflow Hub"));
+    setWindowTitle(tr("Weave Local History"));
     resize(860, 620);
     setObjectName(QStringLiteral("WorkflowHubDialog"));
     m_runtimeLabel->setObjectName(QStringLiteral("workflowRuntime"));
@@ -77,13 +77,13 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
 
     m_tabs->addTab(m_historyList, tr("History"));
     m_tabs->addTab(m_suggestionList, tr("Suggestions"));
-    m_tabs->addTab(m_receiptList, tr("Receipts"));
+    m_tabs->addTab(m_receiptList, tr("Local actions"));
     m_tabs->setObjectName(QStringLiteral("m_pWorkflowTabs"));
 
-    auto* titleLabel = new QLabel(tr("Workflow Hub"), this);
+    auto* titleLabel = new QLabel(tr("Local history"), this);
     titleLabel->setObjectName(QStringLiteral("m_pLabelWorkflowSectionTitle"));
     auto* subtitleLabel = new QLabel(
-        tr("Review transferred context, suggested follow-up actions, and every receipt Weave records while you move content between devices."),
+        tr("Clipboard items and local action records. Records do not confirm delivery to another device."),
         this);
     subtitleLabel->setObjectName(QStringLiteral("m_pLabelReceiptSummary"));
     subtitleLabel->setWordWrap(true);
@@ -93,6 +93,8 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     headerLayout->addWidget(subtitleLabel);
     headerLayout->addWidget(m_runtimeLabel);
     headerLayout->addWidget(m_capabilityLabel);
+    // Technical diagnostics remain available through the header tooltip.
+    m_runtimeLabel->hide(); m_capabilityLabel->hide();
 
     auto* contentLayout = new QHBoxLayout;
     contentLayout->setObjectName("historyContentLayout");
@@ -109,6 +111,7 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     leftSubtitle->setWordWrap(true);
     leftLayout->addWidget(leftTitle);
     leftLayout->addWidget(leftSubtitle);
+    leftTitle->hide(); leftSubtitle->hide();
     leftLayout->addWidget(m_tabs, 1);
     contentLayout->addWidget(leftCard, 2);
 
@@ -124,6 +127,7 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     detailSubtitle->setWordWrap(true);
     detailLayout->addWidget(detailTitle);
     detailLayout->addWidget(detailSubtitle);
+    detailSubtitle->hide();
     detailLayout->addWidget(m_previewLabel);
     detailLayout->addWidget(m_detail, 1);
     rightCard->setLayout(detailLayout);
@@ -147,8 +151,8 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
     connect(cancelSaveButton, &QPushButton::clicked, m_actionBus, &ActionBus::cancelInboxSave);
     auto* closeButton = new QPushButton(tr("Close"), this);
     const QList<QPair<QObject*, const char*>> translatedWidgets {
-        {titleLabel, "Workflow Hub"},
-        {subtitleLabel, "Review transferred context, suggested follow-up actions, and every receipt Weave records while you move content between devices."},
+        {titleLabel, "Local history"},
+        {subtitleLabel, "Clipboard items and local action records. Records do not confirm delivery to another device."},
         {leftTitle, "Collected Context"},
         {leftSubtitle, "Switch between history, suggestions, and receipts without leaving the desktop."},
         {detailTitle, "Inspector"},
@@ -211,10 +215,10 @@ WorkflowHubDialog::WorkflowHubDialog(WorkflowStore& store, ActionBus& actionBus,
 void WorkflowHubDialog::changeEvent(QEvent* event)
 {
     if (event->type() == QEvent::LanguageChange) {
-        setWindowTitle(tr("Weave Workflow Hub"));
+        setWindowTitle(tr("Weave Local History"));
         m_tabs->setTabText(0, tr("History"));
         m_tabs->setTabText(1, tr("Suggestions"));
-        m_tabs->setTabText(2, tr("Receipts"));
+        m_tabs->setTabText(2, tr("Local actions"));
         for (auto* widget : findChildren<QObject*>()) {
             const QByteArray source = widget->property("translationSource").toByteArray();
             if (source.isEmpty()) continue;
@@ -231,6 +235,7 @@ void WorkflowHubDialog::resizeEvent(QResizeEvent* event)
 {
     auto* content = findChild<QHBoxLayout*>("historyContentLayout");
     if (content) content->setDirection(width() < 720 ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+    m_tabs->setMaximumHeight(width() < 720 ? 140 : QWIDGETSIZE_MAX);
     QDialog::resizeEvent(event);
 }
 
@@ -264,6 +269,7 @@ void WorkflowHubDialog::refreshAll()
     for (const auto& capability : m_store->capabilities()) capabilities << workflowDisplayText(capability);
     m_capabilityLabel->setText(tr("Capabilities: %1").arg(capabilities.join(QStringLiteral(", "))));
     m_capabilityLabel->setToolTip(m_store->capabilities().join(QStringLiteral(", ")));
+    findChild<QLabel*>("m_pLabelReceiptSummary")->setToolTip(m_runtimeLabel->text() + "\n" + m_capabilityLabel->text());
 
     m_historyList->clear();
     for (const ContextItem& item : m_store->history()) {
@@ -302,6 +308,8 @@ void WorkflowHubDialog::refreshAll()
         if (receipt.id == selectedReceiptId) m_receiptList->setCurrentItem(listItem);
     }
 
+    for (auto* list : {m_historyList, m_suggestionList, m_receiptList})
+        if (list->currentRow() < 0 && list->count() > 0) list->setCurrentRow(0);
     updateDetails();
 }
 
@@ -349,7 +357,13 @@ void WorkflowHubDialog::updateDetails()
     }
 
     if (html.isEmpty()) {
-        html = tr("<p>Select a history item, suggestion, or receipt.</p>");
+        if (m_tabs->currentWidget() == m_historyList && m_historyList->count() == 0)
+            html = tr("<p>No clipboard history yet. When history is enabled, copied items appear here. You can also capture a screenshot from Actions.</p>");
+        else if (m_tabs->currentWidget() == m_suggestionList && m_suggestionList->count() == 0)
+            html = tr("<p>No suggestions yet. Suggestions appear for supported items in local history.</p>");
+        else if (m_tabs->currentWidget() == m_receiptList && m_receiptList->count() == 0)
+            html = tr("<p>No local action records yet. These records describe actions on this computer, not delivery confirmation.</p>");
+        else html = tr("<p>Select a history item, suggestion, or receipt.</p>");
     }
 
     setDetailHtml(html, previewPath);
@@ -453,6 +467,7 @@ QString WorkflowHubDialog::selectedSuggestionActionId() const
 void WorkflowHubDialog::setDetailHtml(const QString& html, const QString& previewPath)
 {
     m_detail->setHtml(html);
+    m_previewLabel->setVisible(!previewPath.isEmpty() && QFileInfo::exists(previewPath));
     if (!previewPath.isEmpty() && QFileInfo::exists(previewPath)) {
         QPixmap preview(previewPath);
         m_previewLabel->setPixmap(preview.scaled(

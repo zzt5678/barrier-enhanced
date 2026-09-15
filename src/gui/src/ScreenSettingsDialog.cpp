@@ -55,6 +55,16 @@ ScreenSettingsDialog::ScreenSettingsDialog(QWidget* parent, Screen* pScreen) :
     for (int i = 0; i < m_pScreen->aliases().count(); i++)
         new QListWidgetItem(m_pScreen->aliases()[i], m_pListAliases);
 
+    auto resizeAliases = [this] {
+        const int row = qMax(28, m_pListAliases->sizeHintForRow(0));
+        m_pListAliases->setFixedHeight(qBound(40, row * m_pListAliases->count() + 8, 140));
+    };
+    connect(m_pListAliases->model(), &QAbstractItemModel::rowsInserted, this, resizeAliases);
+    connect(m_pListAliases->model(), &QAbstractItemModel::rowsRemoved, this, resizeAliases);
+    resizeAliases();
+    m_pGroupAliases->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+    m_pListAliases->setToolTip(tr("Optional alternate names for this device."));
+
     m_pComboBoxShift->setCurrentIndex(static_cast<int>(m_pScreen->modifier(Screen::Modifier::Shift)));
     m_pComboBoxCtrl->setCurrentIndex(static_cast<int>(m_pScreen->modifier(Screen::Modifier::Ctrl)));
     m_pComboBoxAlt->setCurrentIndex(static_cast<int>(m_pScreen->modifier(Screen::Modifier::Alt)));

@@ -6,6 +6,27 @@
 #include <QListWidget>
 #include <QFile>
 #include <QTranslator>
+TEST(WorkspaceDashboardTests, RolesLocalBadgeAndFreshnessAreIndependentAcrossViewers) {
+    WorkspaceDashboard view(new QWidget);
+    const QVector<WorkspaceDevice> devices{
+        {"windows", {0,0}, false, WorkspaceDeviceRole::Server, WorkspaceDeviceState::Connected},
+        {"ubuntu", {1,0}, true, WorkspaceDeviceRole::Client, WorkspaceDeviceState::AwaitingSync},
+        {"mac", {2,0}, false, WorkspaceDeviceRole::Client, WorkspaceDeviceState::Stale}};
+    view.setDevices(devices);
+    const auto description = view.findChild<QWidget*>("deviceCanvas")->accessibleDescription();
+    EXPECT_TRUE(description.contains("windows: Server · Connected"));
+    EXPECT_TRUE(description.contains("ubuntu: Client · This computer · Awaiting sync"));
+    EXPECT_TRUE(description.contains("mac: Client · Out of date"));
+    const auto names = view.findChildren<QLabel*>("deviceName");
+    ASSERT_EQ(3, names.size());
+    EXPECT_EQ(QString("windows"), names[0]->accessibleName());
+    auto alternate = devices;
+    alternate[0].local = true; alternate[1].local = false;
+    view.setDevices(alternate);
+    const auto updated = view.findChild<QWidget*>("deviceCanvas")->accessibleDescription();
+    EXPECT_TRUE(updated.contains("windows: Server · This computer · Connected"));
+    EXPECT_TRUE(updated.contains("ubuntu: Client · Awaiting sync"));
+}
 TEST(WorkspaceDashboardTests, NarrowHomeActionsFitTheirViewport) {
     QFile style(":/res/styles/dark.qss"); ASSERT_TRUE(style.open(QIODevice::ReadOnly));
     WorkspaceDashboard view(new QWidget);
@@ -22,7 +43,7 @@ TEST(WorkspaceDashboardTests, UnknownRemoteNeverClaimsOnline) {
     view.setDevices({{"workstation", {0,0}, true}, {"peer", {1,0}, false}});
     auto* canvas = view.findChild<QWidget*>("deviceCanvas");
     ASSERT_NE(nullptr, canvas);
-    EXPECT_TRUE(canvas->accessibleDescription().contains("peer: Configured"));
+    EXPECT_TRUE(canvas->accessibleDescription().contains("peer: Role unknown · Configured"));
     EXPECT_FALSE(canvas->accessibleDescription().contains("Online"));
 }
 TEST(WorkspaceDashboardTests, SharingAndLayoutActionsRespectAvailability) {
@@ -34,9 +55,15 @@ TEST(WorkspaceDashboardTests, SharingAndLayoutActionsRespectAvailability) {
     ASSERT_NE(nullptr, sharing); ASSERT_NE(nullptr, arrange);
     view.setConnectionState("Stopped", false, false);
     EXPECT_FALSE(arrange->isEnabled());
+    EXPECT_TRUE(arrange->isHidden());
+    auto* notice = view.findChild<QLabel*>("layoutReadOnlyNotice");
+    ASSERT_NE(nullptr, notice);
+    EXPECT_FALSE(notice->isHidden());
     sharing->click(); EXPECT_EQ(1, calls);
     view.setConnectionState("Running", true, true);
     EXPECT_TRUE(arrange->isEnabled());
+    EXPECT_FALSE(arrange->isHidden());
+    EXPECT_TRUE(notice->isHidden());
     EXPECT_EQ(QString("Pause sharing"), sharing->text());
 }
 TEST(WorkspaceDashboardTests, EmptyReceiptsAndNarrowWindowRemainUsable) {
@@ -77,8 +104,9 @@ TEST(WorkspaceDashboardTests, DeviceIllustrationsAreNotCroppedAtDesktopWidth) {
     view.setDevices({{"left", {0,0}, false}, {"local", {1,0}, true}, {"right", {2,0}, false}});
     view.resize(1488,1056); view.show(); QApplication::processEvents();
     for (auto* label : view.findChildren<QLabel*>("deviceIllustration")) {
-        ASSERT_NE(nullptr, label->pixmap());
-        EXPECT_GE(label->width(), label->pixmap()->width());
+        const QPixmap picture = label->pixmap(Qt::ReturnByValue);
+        ASSERT_FALSE(picture.isNull());
+        EXPECT_GE(label->width(), picture.width() / picture.devicePixelRatioF());
     }
 }
 TEST(WorkspaceDashboardTests, UnchangedReceiptsPreserveUserSelection) {

@@ -40,6 +40,9 @@ WorkspaceDashboard::WorkspaceDashboard(QWidget* settings, QWidget* parent): QWid
     m_arrange = new QPushButton; m_arrange->setObjectName("arrangeButton"); m_arrange->setProperty("primary",true);
     m_sharing = new QPushButton; m_sharing->setObjectName("sharingButton");
     actions->addStretch(); actions->addWidget(m_arrange); actions->addWidget(m_sharing); actions->addStretch(); content->addLayout(actions);
+    m_layoutNotice = new QLabel; m_layoutNotice->setObjectName("layoutReadOnlyNotice");
+    m_layoutNotice->setWordWrap(true); m_layoutNotice->setAlignment(Qt::AlignCenter);
+    content->addWidget(m_layoutNotice); m_layoutNotice->hide();
     auto* separator = new QFrame; separator->setFrameShape(QFrame::HLine); separator->setObjectName("workspaceSeparator"); content->addSpacing(10); content->addWidget(separator);
     auto* recentHeader = new QHBoxLayout; m_recentTitle = new QLabel; m_recentTitle->setObjectName("workspaceSection"); recentHeader->addWidget(m_recentTitle); recentHeader->addStretch(); m_inbox = new QPushButton; m_inbox->setProperty("quiet",true); m_inbox->setIcon(QIcon(":/res/icons/workspace/folder.png")); recentHeader->addWidget(m_inbox); content->addLayout(recentHeader);
     m_empty = new QLabel; m_empty->setObjectName("emptyTransfers"); m_empty->setWordWrap(true); content->addWidget(m_empty);
@@ -59,8 +62,9 @@ WorkspaceDashboard::WorkspaceDashboard(QWidget* settings, QWidget* parent): QWid
 }
 void WorkspaceDashboard::setDevices(const QVector<WorkspaceDevice>& devices)
 {
-    QStringList signature{tr("This computer"), tr("Configured · status unknown")};
-    for (const auto& device : devices) signature.append(QStringLiteral("%1\n%2,%3,%4").arg(device.name).arg(device.position.x()).arg(device.position.y()).arg(device.local));
+    m_deviceData = devices;
+    QStringList signature{tr("This computer"), tr("Configured"), tr("Connected"), tr("Awaiting sync")};
+    for (const auto& device : devices) signature.append(QStringLiteral("%1\n%2,%3,%4,%5,%6").arg(device.name).arg(device.position.x()).arg(device.position.y()).arg(device.local).arg(static_cast<int>(device.role)).arg(static_cast<int>(device.state)));
     if (signature == m_deviceSignature) return;
     m_deviceSignature = signature;
     auto* grid = qobject_cast<QGridLayout*>(m_canvas->layout());
@@ -78,9 +82,26 @@ void WorkspaceDashboard::setDevices(const QVector<WorkspaceDevice>& devices)
         picture.setDevicePixelRatio(devicePixelRatioF()); monitor->setPixmap(picture);
         monitor->setFixedSize(side,side); monitor->setAlignment(Qt::AlignCenter); layout->addWidget(monitor,0,Qt::AlignHCenter);
         auto* name = new ElidingLabel; name->setObjectName("deviceName"); name->setAlignment(Qt::AlignCenter); name->setTextFormat(Qt::PlainText); name->setText(device.name); layout->addWidget(name);
-        const QString status=device.local?tr("This computer"):tr("Configured · status unknown");
-        auto* detail = new ElidingLabel; detail->setObjectName(device.local?"deviceLocal":"workspaceMuted"); detail->setAlignment(Qt::AlignCenter); detail->setText(status); layout->addWidget(detail);
-        grid->addWidget(card,rows.indexOf(device.position.y()),columns.indexOf(device.position.x())); accessible.append(device.name+": "+status);
+        const QString role = device.role == WorkspaceDeviceRole::Server ? QStringLiteral("Server")
+            : device.role == WorkspaceDeviceRole::Client ? QStringLiteral("Client") : tr("Role unknown");
+        QString status;
+        switch (device.state) {
+        case WorkspaceDeviceState::Connected: status = tr("Connected"); break;
+        case WorkspaceDeviceState::Disconnected: status = tr("Disconnected"); break;
+        case WorkspaceDeviceState::Stale: status = tr("Out of date"); break;
+        case WorkspaceDeviceState::AwaitingSync: status = tr("Awaiting sync"); break;
+        default: status = tr("Configured"); break;
+        }
+        auto* roleLabel = new QLabel(role); roleLabel->setObjectName("deviceRole");
+        roleLabel->setAlignment(Qt::AlignCenter); layout->addWidget(roleLabel);
+        auto* local = new QLabel(device.local ? tr("This computer") : QString());
+        local->setObjectName("deviceLocal"); local->setAlignment(Qt::AlignCenter);
+        local->setMinimumHeight(local->fontMetrics().height() + 6); layout->addWidget(local);
+        auto* detail = new QLabel(status); detail->setObjectName("deviceState");
+        detail->setAlignment(Qt::AlignCenter); detail->setWordWrap(true); layout->addWidget(detail);
+        const QString description = role + (device.local ? " · " + tr("This computer") : QString()) + " · " + status;
+        name->setAccessibleDescription(description); card->setAccessibleName(device.name); card->setAccessibleDescription(description);
+        grid->addWidget(card,rows.indexOf(device.position.y()),columns.indexOf(device.position.x())); accessible.append(device.name+": "+description);
     }
     if(devices.isEmpty()) { auto* empty=new QLabel(tr("Your configured computers will appear here.")); empty->setWordWrap(true); grid->addWidget(empty,0,0); }
     m_canvas->setAccessibleDescription(accessible.join("\n"));
@@ -114,7 +135,7 @@ void WorkspaceDashboard::resizeEvent(QResizeEvent* event)
     }
 }
 void WorkspaceDashboard::setConnectionState(const QString& status, bool running, bool canArrange)
-{ m_status->setText(status); m_running=running; m_arrange->setEnabled(canArrange); m_arrange->setToolTip(canArrange ? tr("Arrange your configured computers.") : tr("Layout is managed by the server configuration. View it in Settings.")); m_sharing->setText(running?tr("Pause sharing"):tr("Start sharing")); }
+{ m_status->setText(status); m_running=running; m_canArrange=canArrange; m_arrange->setEnabled(canArrange); m_arrange->setVisible(canArrange); m_layoutNotice->setVisible(!canArrange); m_arrange->setToolTip(tr("Arrange your configured computers.")); m_sharing->setText(running?tr("Pause sharing"):tr("Start sharing")); }
 void WorkspaceDashboard::setRecentTransfers(const QStringList& transfers)
 {
     QStringList current;
@@ -124,6 +145,9 @@ void WorkspaceDashboard::setRecentTransfers(const QStringList& transfers)
 }
 void WorkspaceDashboard::retranslate()
 {
-    m_recent->setToolTip(tr("Double-click a record or press Enter to open transfer history."));
-    m_title->setText(tr("My devices")); m_devices->setText(tr("Devices")); m_transfers->setText(tr("Transfers")); m_settings->setText(tr("Settings")); m_arrange->setText(tr("Arrange layout")); m_sharing->setText(m_running?tr("Pause sharing"):tr("Start sharing")); m_recentTitle->setText(tr("Recent transfers")); m_inbox->setText(tr("Open inbox")); m_preferences->setText(tr("Application preferences")); m_empty->setText(tr("No transfers yet. Received files and transfer activity will appear here."));
+    m_recent->setToolTip(tr("Double-click a record or press Enter to open local history."));
+    m_title->setText(tr("My devices")); m_devices->setText(tr("Devices")); m_transfers->setText(tr("Local history")); m_settings->setText(tr("Settings")); m_arrange->setText(tr("Arrange layout")); m_sharing->setText(m_running?tr("Pause sharing"):tr("Start sharing")); m_recentTitle->setText(tr("Recent local activity")); m_inbox->setText(tr("Open inbox")); m_preferences->setText(tr("Application preferences")); m_empty->setText(tr("No local activity yet. Open history to review clipboard items and local action records."));
+    m_layoutNotice->setText(tr("Read-only layout · managed by Server"));
+    m_deviceSignature.clear();
+    setDevices(m_deviceData);
 }

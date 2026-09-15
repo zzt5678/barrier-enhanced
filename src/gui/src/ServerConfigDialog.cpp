@@ -44,7 +44,9 @@ ServerConfigDialog::ServerConfigDialog(QWidget* parent, ServerConfig& config, co
     QPixmap trash = QIcon(":/res/icons/workspace/trash.png").pixmap(qRound(24 * devicePixelRatioF()), qRound(24 * devicePixelRatioF()));
     trash.setDevicePixelRatio(devicePixelRatioF());
     m_pTrashScreenWidget->setPixmap(trash);
-    m_pLabelNewScreenWidget->setPixmap(QIcon(":/res/icons/workspace/devices.png").pixmap(32, 32));
+    QPixmap device = QIcon(":/res/icons/workspace/devices.png").pixmap(qRound(32 * devicePixelRatioF()), qRound(32 * devicePixelRatioF()));
+    device.setDevicePixelRatio(devicePixelRatioF());
+    m_pLabelNewScreenWidget->setPixmap(device);
     auto* screenLayout = qobject_cast<QVBoxLayout*>(m_pTabScreens->layout());
     screenLayout->setStretch(1, 1);
     auto* controls = new QHBoxLayout;

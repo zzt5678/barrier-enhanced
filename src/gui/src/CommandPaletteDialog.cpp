@@ -8,6 +8,7 @@
 #include <QHideEvent>
 #include <QKeyEvent>
 #include <QLineEdit>
+#include <QLabel>
 #include <QListWidget>
 #include <QMessageBox>
 #include <QPushButton>
@@ -20,7 +21,8 @@ CommandPaletteDialog::CommandPaletteDialog(WorkflowStore& store, ActionBus& acti
     m_store(&store),
     m_actionBus(&actionBus),
     m_filter(new QLineEdit(this)),
-    m_commandList(new QListWidget(this))
+    m_commandList(new QListWidget(this)),
+    m_empty(new QLabel(this))
 {
     setWindowTitle(tr("Weave Command Palette"));
     resize(520, 360);
@@ -30,6 +32,9 @@ CommandPaletteDialog::CommandPaletteDialog(WorkflowStore& store, ActionBus& acti
     auto* root = new QVBoxLayout(this);
     root->addWidget(m_filter);
     root->addWidget(m_commandList, 1);
+    m_empty->setObjectName("paletteEmptyState");
+    m_empty->setWordWrap(true);
+    root->addWidget(m_empty);
 
     connect(m_filter, &QLineEdit::textChanged, this, &CommandPaletteDialog::filterCommands);
     connect(m_filter, &QLineEdit::returnPressed, this, &CommandPaletteDialog::executeSelected);
@@ -80,13 +85,13 @@ void CommandPaletteDialog::refreshCommands()
     const bool hasHistory = !m_store->history().isEmpty();
     const bool hasSuggestions = !m_store->suggestions().isEmpty();
 
-    addCommand(QStringLiteral("open_workflow_hub"), tr("Open Workflow Hub"), true);
-    addCommand(QStringLiteral("save_latest_to_inbox"), tr("Save latest item to Inbox"), hasHistory);
+    addCommand(QStringLiteral("open_workflow_hub"), tr("Open local history"), true);
+    addCommand(QStringLiteral("save_latest_to_inbox"), tr("Save latest item to inbox"), hasHistory);
     addCommand(QStringLiteral("open_latest"), tr("Open latest item"), hasHistory);
     addCommand(QStringLiteral("reveal_latest"), tr("Reveal latest item"), hasHistory);
     addCommand(QStringLiteral("show_latest_suggestion"), tr("Run latest suggestion"), hasSuggestions);
-    addCommand(QStringLiteral("capture_screenshot"), tr("Capture screenshot into workflow history"), true);
-    addCommand(QStringLiteral("open_inbox"), tr("Open Workflow Inbox"), true);
+    addCommand(QStringLiteral("capture_screenshot"), tr("Capture screenshot into local history"), true);
+    addCommand(QStringLiteral("open_inbox"), tr("Open inbox folder"), true);
 
     filterCommands(m_filter->text());
 }
@@ -94,11 +99,15 @@ void CommandPaletteDialog::refreshCommands()
 void CommandPaletteDialog::filterCommands(const QString& query)
 {
     const QString needle = query.trimmed().toLower();
+    bool hasAvailable = false;
     for (int i = 0; i < m_commandList->count(); ++i) {
         QListWidgetItem* item = m_commandList->item(i);
         const bool matches = needle.isEmpty() || item->text().toLower().contains(needle);
         item->setHidden(!matches);
+        hasAvailable |= matches && item->flags().testFlag(Qt::ItemIsEnabled);
     }
+    m_empty->setText(tr("No available commands match. Clear the search or add an item to local history."));
+    m_empty->setVisible(!hasAvailable);
     const auto* selected = m_commandList->currentItem();
     if (selected && !selected->isHidden() && selected->flags().testFlag(Qt::ItemIsEnabled)) return;
     m_commandList->setCurrentRow(-1);
@@ -146,5 +155,9 @@ void CommandPaletteDialog::addCommand(const QString& id, const QString& label, b
     item->setData(Qt::UserRole, id);
     if (!enabled) {
         item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+        const QString reason = id == "show_latest_suggestion"
+            ? tr("No suggestions available yet") : tr("No item in local history yet");
+        item->setText(label + " · " + reason);
+        item->setToolTip(reason);
     }
 }

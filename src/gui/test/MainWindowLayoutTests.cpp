@@ -23,6 +23,7 @@
 #include "../src/ActionBus.h"
 #include "../src/HotkeyDialog.h"
 #include "../src/ActionDialog.h"
+#include "../src/WorkspaceDashboard.h"
 #include <QListWidget>
 #include <QScreen>
 #include <QTimer>
@@ -31,6 +32,111 @@
 #include <QMouseEvent>
 #include <QDrag>
 #include <QMessageBox>
+
+TEST(DialogPolishTests, HotkeyEditorLoadsExistingSequenceAndCancelPreservesIt) {
+    Hotkey hotkey; KeySequence sequence;
+    sequence.appendKey(Qt::Key_Control, Qt::ControlModifier);
+    ASSERT_TRUE(sequence.appendKey(Qt::Key_K, Qt::ControlModifier));
+    hotkey.setKeySequence(sequence);
+    HotkeyDialog editor(nullptr, hotkey);
+    const auto* capture = static_cast<const KeySequenceWidget*>(editor.m_pKeySequenceWidgetHotkey);
+    EXPECT_EQ(sequence.toString(), capture->keySequence().toString());
+    EXPECT_FALSE(capture->text().contains("keystroke("));
+    EXPECT_NE(Qt::NoFocus, capture->focusPolicy());
+    editor.reject();
+    EXPECT_EQ(sequence.toString(), hotkey.keySequence().toString());
+    HotkeyDialog accepted(nullptr, hotkey);
+    accepted.buttonBox->button(QDialogButtonBox::Ok)->click();
+    EXPECT_EQ(QDialog::Accepted, accepted.result());
+    EXPECT_EQ(sequence.toString(), hotkey.keySequence().toString());
+}
+
+TEST(DialogPolishTests, KeyboardCaptureEscapeRestoresTheLastAcceptedSequence) {
+    Hotkey hotkey; KeySequence sequence;
+    ASSERT_TRUE(sequence.appendKey(Qt::Key_K, Qt::NoModifier));
+    hotkey.setKeySequence(sequence);
+    HotkeyDialog editor(nullptr, hotkey); editor.show(); QApplication::processEvents();
+    auto* capture = editor.m_pKeySequenceWidgetHotkey;
+    QKeyEvent start(QEvent::KeyPress, Qt::Key_Space, Qt::NoModifier);
+    QApplication::sendEvent(capture, &start);
+    EXPECT_TRUE(capture->isDown());
+    QKeyEvent finish(QEvent::KeyPress, Qt::Key_J, Qt::NoModifier);
+    QApplication::sendEvent(capture, &finish);
+    EXPECT_EQ(QString("j"), static_cast<const KeySequenceWidget*>(capture)->keySequence().toString());
+    QApplication::sendEvent(capture, &start);
+    QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+    QApplication::sendEvent(capture, &escape);
+    EXPECT_FALSE(capture->isDown());
+    EXPECT_EQ(QString("j"), static_cast<const KeySequenceWidget*>(capture)->keySequence().toString());
+    editor.reject();
+    EXPECT_EQ(QString("k"), hotkey.keySequence().toString());
+}
+
+TEST(DialogPolishTests, ThreeViewerRoleLocalAndStaleFixturesKeepPhysicalOrder) {
+    QFile style(":/res/styles/dark.qss"); ASSERT_TRUE(style.open(QIODevice::ReadOnly));
+    WorkspaceDashboard view(new QWidget); view.setStyleSheet(QString::fromUtf8(style.readAll()));
+    const QString output = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
+    const QStringList names{"zyt", "zyt-System-Product-Name", "macbook-air"};
+    for (const QString& language : {QString("en"), QString("zh-CN")}) {
+        BarrierLocale::switchLanguage(language); QApplication::processEvents(); view.retranslate();
+        for (int local = 0; local < 3; ++local) {
+            QVector<WorkspaceDevice> devices;
+            for (int i = 0; i < 3; ++i) devices.append({names[i], {i,0}, i == local,
+                i == 1 ? WorkspaceDeviceRole::Server : WorkspaceDeviceRole::Client,
+                i == 2 ? WorkspaceDeviceState::Stale : WorkspaceDeviceState::Configured});
+            view.setDevices(devices);
+            view.setConnectionState(language == "en" ? "Presentation fixture · configured layout" : QString::fromUtf8("界面测试样本 · 已配置布局"), false, local == 1);
+            view.resize(760,640); view.show(); QApplication::processEvents();
+            const auto labels = view.findChildren<QLabel*>("deviceName");
+            ASSERT_EQ(3, labels.size());
+            for (int i = 0; i < 3; ++i) EXPECT_EQ(names[i], labels[i]->accessibleName());
+            EXPECT_EQ(QString("Server"), view.findChildren<QLabel*>("deviceRole")[1]->text());
+            EXPECT_EQ(local != 1, view.findChild<QPushButton*>("arrangeButton")->isHidden());
+            if (!output.isEmpty()) EXPECT_TRUE(view.grab().save(output + "/" + language + "-viewer-" + QString::number(local) + ".png"));
+        }
+    }
+    BarrierLocale::switchLanguage("en"); QApplication::processEvents();
+}
+
+TEST(DialogPolishTests, SmallAliasListsAndConditionalActionsDoNotWasteViewport) {
+    Screen screen("device"); ScreenSettingsDialog editor(nullptr, &screen);
+    QFile style(":/res/styles/dark.qss"); ASSERT_TRUE(style.open(QIODevice::ReadOnly));
+    editor.setStyleSheet(QString::fromUtf8(style.readAll())); editor.resize(420,540);
+    editor.show(); QApplication::processEvents();
+    EXPECT_LE(editor.m_pListAliases->height(), 100);
+    EXPECT_LE(editor.m_pGroupAliases->height(), 180);
+    QTemporaryDir dir; QSettings settings(dir.filePath("actions.ini"), QSettings::IniFormat);
+    ServerConfig server(&settings, 5, 3, "device", nullptr);
+    Hotkey hotkey; Action action; ActionDialog actions(nullptr, server, hotkey, action);
+    EXPECT_TRUE(actions.m_pComboSwitchToScreen->isHidden());
+    EXPECT_TRUE(actions.m_pComboSwitchInDirection->isHidden());
+    actions.m_pRadioSwitchInDirection->setChecked(true);
+    EXPECT_FALSE(actions.m_pComboSwitchInDirection->isHidden());
+    EXPECT_TRUE(actions.m_pKeySequenceWidgetHotkey->isHidden());
+    actions.reject();
+    EXPECT_EQ(Action::keystroke, action.type());
+}
+
+TEST(DialogPolishTests, EmptyHistoryExplainsNextStepAndUnavailableCommandsExplainWhy) {
+    QTemporaryDir dir; QSettings settings(dir.filePath("empty.ini"), QSettings::IniFormat);
+    settings.setValue("workflowEnabled", false);
+    AppConfig config(&settings); WorkflowStore store(config); ActionBus bus(store);
+    WorkflowHubDialog history(store, bus); history.resize(620,500); history.show();
+    CommandPaletteDialog palette(store, bus); palette.show(); QApplication::processEvents();
+    auto* preview = history.findChild<QLabel*>("m_pWorkflowPreview");
+    EXPECT_TRUE(preview->isHidden());
+    EXPECT_TRUE(history.findChild<QTextBrowser*>()->toPlainText().contains("No clipboard history"));
+    auto* tabs = history.findChild<QTabWidget*>();
+    EXPECT_LE(tabs->height(), 150);
+    auto* list = palette.findChild<QListWidget*>();
+    for (int i : {1,2,3,4}) {
+        EXPECT_FALSE(list->item(i)->flags().testFlag(Qt::ItemIsEnabled));
+        EXPECT_FALSE(list->item(i)->toolTip().isEmpty());
+    }
+    palette.findChild<QLineEdit*>()->setText("no matching command 123");
+    auto* empty = palette.findChild<QLabel*>("paletteEmptyState");
+    ASSERT_NE(nullptr, empty); EXPECT_TRUE(empty->isVisible());
+}
 
 TEST(DialogLanguageTests, AppConfirmationButtonsFollowSelectedLanguage) {
     QMessageBox box(QMessageBox::Question, "Test", "Test", QMessageBox::Yes | QMessageBox::No | QMessageBox::Retry | QMessageBox::Cancel);
@@ -159,10 +265,10 @@ TEST(DialogLanguageTests, PaletteNeverExecutesACommandHiddenByLiveTranslation) {
     palette.show(); QApplication::processEvents();
     auto* filter = palette.findChild<QLineEdit*>();
     auto* list = palette.findChild<QListWidget*>();
-    filter->setText("hub"); list->setCurrentRow(0);
+    filter->setText("Open local history"); list->setCurrentRow(0);
     ASSERT_FALSE(list->currentItem()->isHidden());
     BarrierLocale::switchLanguage("zh-CN"); QApplication::processEvents();
-    EXPECT_EQ(QString("hub"), filter->text());
+    EXPECT_EQ(QString("Open local history"), filter->text());
     EXPECT_EQ(nullptr, list->currentItem());
     QKeyEvent enter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
     QApplication::sendEvent(filter, &enter);
@@ -172,7 +278,7 @@ TEST(DialogLanguageTests, PaletteNeverExecutesACommandHiddenByLiveTranslation) {
     ASSERT_TRUE(list->currentItem()->isHidden());
     QApplication::sendEvent(filter, &enter);
     EXPECT_EQ(0, opened);
-    filter->setText(QString::fromUtf8("工作流中心"));
+    filter->setText(QString::fromUtf8("打开本地历史"));
     ASSERT_NE(nullptr, list->currentItem());
     EXPECT_FALSE(list->currentItem()->isHidden());
     QApplication::sendEvent(filter, &enter);
@@ -258,6 +364,11 @@ TEST(DialogLayoutTests, EditorsStayInsideScreenWithReachableActionsInBothLanguag
             }
             const QString out = qEnvironmentVariable("WEAVE_LAYOUT_PREVIEW");
             if (!out.isEmpty()) EXPECT_TRUE(dialog->grab().save(out + "/" + language + "-" + item.first + ".png"));
+            if (item.first == "preferences") {
+                auto* check = preferences.m_pCheckBoxEnableCrypto;
+                check->setFocus(Qt::TabFocusReason); QApplication::processEvents();
+                if (!out.isEmpty()) EXPECT_TRUE(dialog->grab().save(out + "/" + language + "-preferences-focus.png"));
+            }
             if (item.first == "history") {
                 for (auto* button : dialog->findChildren<QPushButton*>())
                     if (button->isVisible()) EXPECT_TRUE(dialog->rect().contains(QRect(button->mapTo(dialog, QPoint()), button->size())));

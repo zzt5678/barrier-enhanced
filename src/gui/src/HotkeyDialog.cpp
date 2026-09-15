@@ -29,9 +29,11 @@ HotkeyDialog::HotkeyDialog (QWidget* parent, Hotkey& hotkey) :
     m_Hotkey(hotkey)
 {
     setupUi(this);
-    DialogPresentation::scrollEditor(this, QSize(500, 280));
+    DialogPresentation::fit(this, QSize(500, 170));
+    layout()->setContentsMargins(20, 20, 20, 20);
+    layout()->setSpacing(12);
 
-    m_pKeySequenceWidgetHotkey->setText(m_Hotkey.text());
+    m_pKeySequenceWidgetHotkey->setKeySequence(m_Hotkey.keySequence());
 }
 
 void HotkeyDialog::changeEvent(QEvent* event)

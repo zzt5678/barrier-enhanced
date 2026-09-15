@@ -9,6 +9,8 @@ QWidget {
     color: #111827;
     font-family: "SF Pro Text", "Helvetica Neue", "PingFang SC", "Segoe UI Variable", sans-serif;
     font-size: 10pt;
+    selection-background-color: #dcece5;
+    selection-color: #153c37;
 }
 
 QScrollArea#m_pMainScrollArea {
@@ -100,14 +102,6 @@ QGroupBox::title {
 QGroupBox::indicator {
     width: 14px;
     height: 14px;
-    border-radius: 7px;
-    border: 1px solid #94a3b8;
-    background: #ffffff;
-}
-
-QGroupBox::indicator:checked {
-    background: #087e77;
-    border: 1px solid #087e77;
 }
 
 QLabel {
@@ -193,7 +187,8 @@ QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
     border-radius: 7px;
     padding: 6px 9px;
     min-height: 20px;
-    selection-background-color: #bfdbfe;
+    selection-background-color: #dcece5;
+    selection-color: #153c37;
 }
 
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QComboBox:focus {
@@ -202,7 +197,7 @@ QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QComboBo
 
 QPushButton:focus, QToolButton:focus {
     border: 1px solid #087e77;
-    background: #eef2ff;
+    background: #edf4ef;
 }
 
 QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {
@@ -287,28 +282,14 @@ QCheckBox, QRadioButton {
 QCheckBox:focus,
 QRadioButton:focus {
     color: #096b66;
+    outline: 1px solid #087e77;
 }
 
+/* Keep native check marks and radio dots: colored squares alone are ambiguous. */
 QCheckBox::indicator,
 QRadioButton::indicator {
     width: 17px;
     height: 17px;
-    border: 1px solid #94a3b8;
-    background: #ffffff;
-}
-
-QCheckBox::indicator {
-    border-radius: 5px;
-}
-
-QRadioButton::indicator {
-    border-radius: 9px;
-}
-
-QCheckBox::indicator:checked,
-QRadioButton::indicator:checked {
-    background: #087e77;
-    border: 1px solid #087e77;
 }
 
 QToolButton {
@@ -344,9 +325,16 @@ QListWidget::item {
 }
 
 QListWidget::item:hover {
-    background: #eef2ff;
-    border: 1px solid #bfdbfe;
+    background: #edf4ef;
+    border: 1px solid #a8c9be;
 }
+
+QListWidget::item:selected, QTableView::item:selected {
+    background: #dcece5;
+    color: #153c37;
+    border: 1px solid #087e77;
+}
+QListWidget::item:disabled { color: #75807c; background: #f3f4f0; }
 
 QWizard, QDialog#ServerConfigDialogBase, QDialog#SettingsDialogBase {
     background: #faf9f6;
@@ -443,6 +431,8 @@ QLabel#workspaceTitle { font-size: 28px; font-weight: 600; color: #152526; }
 QLabel#workspaceStatus { font-size: 16px; color: #546664; }
 QLabel#workspaceSection { font-size: 18px; font-weight: 600; color: #203735; }
 QLabel#workspaceMuted, QLabel#emptyTransfers { color: #66716e; font-size: 13px; }
+QLabel#deviceRole { color: #153c37; font-size: 13px; font-weight: 600; }
+QLabel#deviceState, QLabel#layoutReadOnlyNotice { color: #66716e; font-size: 12px; }
 QLabel#deviceName { font-size: 14px; font-weight: 600; color: #203735; }
 QLabel#deviceLocal { color: #087e77; font-size: 13px; }
 QPushButton[navigation="true"] { text-align: left; padding: 8px 6px; min-width: 0; border: none; background: transparent; color: #263a38; font-size: 14px; border-radius: 8px; }

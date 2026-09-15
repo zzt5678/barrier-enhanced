@@ -250,6 +250,8 @@ MainWindow::MainWindow(QSettings& settings, AppConfig& appConfig) :
             this, &MainWindow::showWorkflowHub);
     connect(m_workspaceDashboard, &WorkspaceDashboard::preferencesRequested,
             this, &MainWindow::on_m_pActionSettings_triggered);
+    // Keep the settings header entry; the footer opens the same preferences dialog.
+    m_pButtonSettings->hide();
     connect(m_workspaceDashboard, &WorkspaceDashboard::inboxRequested, this, [this]{
         if (m_pWorkflowStore) QDesktopServices::openUrl(QUrl::fromLocalFile(m_pWorkflowStore->inboxDir()));
     });

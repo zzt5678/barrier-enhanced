@@ -38,7 +38,7 @@ ActionDialog::ActionDialog(QWidget* parent, ServerConfig& config, Hotkey& hotkey
     m_pButtonGroupType(new QButtonGroup(this))
 {
     setupUi(this);
-    DialogPresentation::scrollEditor(this, QSize(600, 600));
+    DialogPresentation::scrollEditor(this, QSize(560, 560));
 
     // work around Qt Designer's lack of a QButtonGroup; we need it to get
     // at the button id of the checked radio button
@@ -46,6 +46,22 @@ ActionDialog::ActionDialog(QWidget* parent, ServerConfig& config, Hotkey& hotkey
 
     for (unsigned int i = 0; i < sizeof(typeButtons) / sizeof(typeButtons[0]); i++)
         m_pButtonGroupType->addButton(typeButtons[i], i);
+
+    auto updateControls = [this] {
+        const int type = m_pButtonGroupType->checkedId();
+        const bool keys = type >= 0 && type < 3;
+        m_pKeySequenceWidgetHotkey->setVisible(keys);
+        m_pGroupBoxScreens->setVisible(keys);
+        m_pListScreens->setVisible(keys && m_pGroupBoxScreens->isChecked());
+        m_pComboSwitchToScreen->setVisible(type == Action::switchToScreen);
+        m_pComboSwitchInDirection->setVisible(type == Action::switchInDirection);
+        m_pComboLockCursorToScreen->setVisible(type == Action::lockCursorToScreen);
+    };
+    for (auto* button : typeButtons)
+        connect(button, &QRadioButton::toggled, this, updateControls);
+    connect(m_pGroupBoxScreens, &QGroupBox::toggled, this, updateControls);
+    m_pListScreens->setMaximumHeight(110);
+    m_pGroupBoxScreens->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
 
     m_pKeySequenceWidgetHotkey->setText(m_Action.keySequence().toString());
     m_pKeySequenceWidgetHotkey->setKeySequence(m_Action.keySequence());
@@ -76,6 +92,7 @@ ActionDialog::ActionDialog(QWidget* parent, ServerConfig& config, Hotkey& hotkey
             idx++;
         }
     }
+    updateControls();
 }
 
 void ActionDialog::changeEvent(QEvent* event)
