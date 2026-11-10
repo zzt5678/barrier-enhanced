@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "kind": "native-input-candidate-validation",
+  "source_commit": "6b21605cf69bbee20c5f5903039f44330039ca52",
+  "build_id": "2.4.0-release+6b21605c.20261110",
+  "protocol": "1.13",
+  "date": "2026-11-10",
+  "components": [
+    {
+      "platform": "Darwin",
+      "source_commit": "6b21605cf69bbee20c5f5903039f44330039ca52",
+      "ok": true,
+      "errors": [],
+      "files": [
+        {
+          "file": "weave",
+          "sha256": "39716b7a3d49a5dd9bd4d606d9e31974419ff87ebc9e34604cc36cab03bdbde0",
+          "size_bytes": 2360592,
+          "platform": "Darwin",
+          "architecture": "arm64",
+          "build_id": "2.4.0-release+6b21605c.20261110",
+          "protocol": "1.13"
+        },
+        {
+          "file": "weavec",
+          "sha256": "f47eb1df0a9381bb201fc66d1a5d35b8efa7fa42332294e295fe544c526c0309",
+          "size_bytes": 1496336,
+          "platform": "Darwin",
+          "architecture": "arm64",
+          "build_id": "2.4.0-release+6b21605c.20261110",
+          "protocol": "1.13"
+        },
+        {
+          "file": "weaves",
+          "sha256": "26052a11e1353a109dca89d002c76343507eecaef1b8952bf53af9a68759fc98",
+          "size_bytes": 1976896,
+          "platform": "Darwin",
+          "architecture": "arm64",
+          "build_id": "2.4.0-release+6b21605c.20261110",
+          "protocol": "1.13"
+        }
+      ]
+    },
+    {
+      "platform": "Linux",
+      "source_commit": "6b21605cf69bbee20c5f5903039f44330039ca52",
+      "ok": true,
+      "errors": [],
+      "files": [
+        {
+          "file": "weave",
+          "sha256": "1e22b1fb2349e782479111b5648340a0f0686a0e9bbe45ca7924009387fde5b3",
+          "size_bytes": 2679592,
+          "platform": "Linux",
+          "architecture": "x86_64",
+          "build_id": "2.4.0-release+6b21605c.20261110",
+          "protocol": "1.13"
+        },
+        {
+          "file": "weavec",
+          "sha256": "3b1dae0367111a9295130151d9d42167161fb87a1f4d3bcb83afddad5ed0693f",
+          "size_bytes": 1948728,
+          "platform": "Linux",
+          "architecture": "x86_64",
+          "build_id": "2.4.0-release+6b21605c.20261110",
+          "protocol": "1.13"
+        },
+        {
+          "file": "weaves",
+          "sha256": "5e9e1349c5c359c269dd3fac91964e2326021220c6f6f25f2f66a30ea10419c6",
+          "size_bytes": 2368112,
+          "platform": "Linux",
+          "architecture": "x86_64",
+          "build_id": "2.4.0-release+6b21605c.20261110",
+          "protocol": "1.13"
+        }
+      ]
+    }
+  ],
+  "checks": {
+    "mac_unit": 1213,
+    "mac_gui": 172,
+    "ubuntu_unit": 1115,
+    "ubuntu_gui": 172,
+    "ubuntu_native_virtual_display": 26,
+    "isolated_crossing_cycles": 100,
+    "mac_cocoa_lifecycle": {
+      "background": true,
+      "no_key_window": true,
+      "no_visible_windows": true
+    }
+  },
+  "physical_validation": {
+    "mac_server_ubuntu_client": {
+      "observed_entries_after_fix": 15,
+      "large_initial_jumps_after_fix": 0,
+      "user_report": "No center jump on retest",
+      "scope": "Same input changes before the final version-identity rebuild"
+    },
+    "ubuntu_server_mac_client": {
+      "tls_and_bulk_connected": true,
+      "physical_input_retest": "deferred by user: no mouse directly connected to Ubuntu"
+    }
+  },
+  "deployment": {
+    "mac_gui_server_client_same_build": true,
+    "ubuntu_gui_server_client_same_build": true,
+    "active_role": "Mac server, Ubuntu client"
+  },
+  "limits": [
+    "No claim of zero defects or long-duration/cold-boot acceptance.",
+    "No new native Windows build or physical Windows acceptance in this run.",
+    "The Git branch is a reproducible candidate, not a notarized cross-platform public release."
+  ]
+}
