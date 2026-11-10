@@ -490,6 +490,41 @@ KeyState::updateKeyMap()
     addAliasEntries();
 }
 
+bool
+KeyState::hasSyntheticKeyBindings() const
+{
+    return std::any_of(std::begin(m_serverKeys), std::end(m_serverKeys),
+                       [](KeyButton button) { return button != 0; });
+}
+
+KeyButton
+KeyState::syntheticKeyButton(KeyButton serverButton) const
+{
+    return m_serverKeys[serverButton & kButtonMask];
+}
+
+IKeyState::KeyButtonSet
+KeyState::retireSyntheticKeyBindings(KeyButton localButton)
+{
+    KeyButtonSet retired;
+    localButton &= kButtonMask;
+    if (localButton == 0) return retired;
+    for (KeyButton serverButton = 0; serverButton < kNumButtons; ++serverButton) {
+        if (m_serverKeys[serverButton] == localButton) {
+            retired.insert(serverButton);
+            m_serverKeys[serverButton] = 0;
+        }
+    }
+    if (!retired.empty()) {
+        for (auto i = m_activeModifiers.begin(); i != m_activeModifiers.end();) {
+            if (i->second.m_button == localButton && !i->second.m_lock)
+                i = m_activeModifiers.erase(i);
+            else ++i;
+        }
+    }
+    return retired;
+}
+
 void
 KeyState::updateKeyState()
 {
@@ -675,8 +710,12 @@ KeyState::fakeKeyUp(KeyButton serverID)
     keys.push_back(Keystroke(localID, false, false, m_keyClientData[localID]));
 
     // note keys down
-    --m_keys[localID];
-    --m_syntheticKeys[localID];
+    // A primary physical key-up can arrive before cleanup of its replayed
+    // fakeKeyDown mapping. onKey already cleared the shadow counts, but the
+    // mapping still owes one native release. Deliver it without underflowing
+    // the counters and poisoning the next press of this key.
+    if (m_keys[localID] > 0) --m_keys[localID];
+    if (m_syntheticKeys[localID] > 0) --m_syntheticKeys[localID];
     m_serverKeys[serverID] = 0;
 
     // check if this is a modifier

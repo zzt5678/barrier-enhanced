@@ -73,6 +73,7 @@ public:
 
 protected:
     virtual int secureReadForInput(void* buffer, int size, int& read);
+    bool hasPendingInputNoLock() override;
 
 private:
     // SSL
@@ -98,6 +99,7 @@ private:
 
     MultiplexerJobStatus serviceConnect(ISocketMultiplexerJob*, bool, bool, bool);
     MultiplexerJobStatus serviceAccept(ISocketMultiplexerJob*, bool, bool, bool);
+    std::unique_ptr<ISocketMultiplexerJob> newHandshakeJob(bool accepting);
 
     void showSecureConnectInfo(); // may only be called with ssl_mutex_ acquired
     void showSecureLibInfo();
@@ -129,6 +131,8 @@ private:
     int secure_connect_retry_ = 0; // used only in secureConnect()
     int secure_read_retry_ = 0; // used only in secureRead()
     int secure_write_retry_ = 0; // used only in secureWrite()
+    double handshake_deadline_ = -1.0;
+    bool handshake_wants_write_ = false;
 
     // The following are used only from doWrite()
     // FIXME: using std::vector would simplify logic significantly.

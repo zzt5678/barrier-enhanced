@@ -2654,9 +2654,18 @@ XWindowsScreen::handleSystemEvent(const Event& event, void*)
 		break;
 
 	case LeaveNotify:
-		if (!m_isPrimary) {
-			// mouse moved out of hider window somehow.  hide the window.
-            m_impl->XUnmapWindow(m_display, m_window);
+		if (!m_isPrimary && xevent->xcrossing.window == m_window) {
+			// Crossing events can outlive enter/leave and arrive after the
+			// pointer has been parked in the newly mapped 1x1 cursor hider.
+			// Only reveal the local cursor if it is actually outside now.
+			Window root, child;
+			int rootX, rootY, windowX, windowY;
+			unsigned int mask;
+			if (m_impl->XQueryPointer(m_display, m_window, &root, &child,
+					&rootX, &rootY, &windowX, &windowY, &mask) &&
+				(windowX != 0 || windowY != 0)) {
+				m_impl->XUnmapWindow(m_display, m_window);
+			}
 		}
 		break;
 

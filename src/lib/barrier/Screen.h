@@ -72,7 +72,7 @@ public:
     virtual void        enable();
 
     //! Prepare the platform input backend without enabling clipboard/network state.
-    bool                prepareInputBackend();
+    virtual bool        prepareInputBackend();
 
     //! Probe platform input access without activating hooks or cursor capture.
     bool                probeInputBackend(std::string& desktopName) const;
@@ -90,6 +90,9 @@ public:
     toggle keys that should be turned on on the secondary screen.
     */
     bool                enter(KeyModifierMask toggleMask);
+
+    //! Enter at a position through one platform ownership operation.
+    bool                enterAt(KeyModifierMask toggleMask, SInt32 x, SInt32 y);
 
     //! Leave screen
     /*!
@@ -357,6 +360,7 @@ protected:
     void                disableSecondary();
 
     void                enterPrimary();
+    void                finishEnter(KeyModifierMask toggleMask);
     void                enterSecondary(KeyModifierMask toggleMask);
     void                leavePrimary();
     void                leaveSecondary();

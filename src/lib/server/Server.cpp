@@ -77,9 +77,11 @@ const int kMaxBulkTokenGenerationAttempts = 8;
 
 const SInt32 kMinUsableScreenDimension = 64;
 const SInt32 kSwitchEdgeHysteresisInset = 16;
-const double kInputHandoffTimeoutSeconds = 0.5;
+const double kInputHandoffTimeoutSeconds = 2.0;
 const double kInputHandoffCommitAckTimeoutSeconds = 1.5;
 const double kInputHandoffSourceRevokeTimeoutSeconds = 1.5;
+const std::size_t kMaxHandoffInputEvents = 256;
+const double kMaxHandoffInputAgeSeconds = 2.0;
 const int kClipboardReadAttempts = 8;
 const double kClipboardReadRetrySeconds = 0.025;
 const double kClipboardSyncDelaySeconds = 0.01;
@@ -472,7 +474,34 @@ Server::Server(
 	setConfig(config);
 
 	// enable primary client
-	m_primaryClient->enable();
+	try {
+		m_primaryClient->enable();
+	}
+	catch (...) {
+		// A failed constructor has no destructor. Retire callbacks/timers that
+		// already point at this object before App closes the failed screen.
+		m_events->removeHandlers(this);
+		m_events->removeHandlers(m_inputFilter);
+		for (auto type : {
+			m_events->forIPrimaryScreen().motionOnPrimary(),
+			m_events->forIPrimaryScreen().motionOnSecondary(),
+			m_events->forIPrimaryScreen().wheel(),
+			m_events->forIPrimaryScreen().screensaverActivated(),
+			m_events->forIPrimaryScreen().screensaverDeactivated(),
+			m_events->forIScreen().shapeChanged(),
+			m_events->forClipboard().clipboardGrabbed(),
+			m_events->forClipboard().clipboardChanged(),
+			m_events->forClipboard().clipboardPublished()}) {
+			m_events->removeHandler(type, m_primaryClient->getEventTarget());
+		}
+		for (auto* timer : {m_primaryKeyStateTimer, m_clipboardSyncTimer, m_topologyTimer}) {
+			if (timer != NULL) {
+				m_events->removeHandlers(timer);
+				m_events->deleteTimer(timer);
+			}
+		}
+		throw;
+	}
 	m_inputFilter->setPrimaryClient(m_primaryClient);
 
 	// Determine if scroll lock is already set. If so, lock the cursor to the primary screen
@@ -1247,6 +1276,9 @@ Server::attachBulkStream(const std::string& name, const std::string& token,
 void
 Server::disconnect()
 {
+	// Stop/force-reconnect must retire presses reconstructed on the primary,
+	// even if their physical release has not arrived yet.
+	releaseLocalHandoffInput();
 	// close all secondary clients
 	if (m_clients.size() > 1 || !m_oldClients.empty()) {
 		Config emptyConfig(m_events);
@@ -1360,6 +1392,17 @@ Server::switchScreen(BaseClientProxy* dst,
 	if (m_inputHandoffPending &&
 		m_inputHandoffSource == m_active &&
 		m_inputHandoffTarget == dst) {
+		if (clampToClientShape(dst, x, y)) {
+			m_inputHandoffX = x;
+			m_inputHandoffY = y;
+			if (m_handoffInputBuffering) {
+				m_handoffInputX = x;
+				m_handoffInputY = y;
+				HandoffInput input(HandoffInputKind::Move);
+				input.x = x; input.y = y;
+				bufferHandoffInput(input);
+			}
+		}
 		stopSwitch();
 		return true;
 	}
@@ -1371,7 +1414,13 @@ Server::switchScreen(BaseClientProxy* dst,
 			getName(m_active).c_str(), getName(dst).c_str()));
 		rollbackCommittedInputHandoff(
 			"superseded before commit acknowledgment");
-		if (dst == confirmedSource && m_active == dst) {
+		// Rollback may have accepted a new handoff that still awaits prepare
+		// or revoke ACK. Do not misreport it as failure and let the caller
+		// reanchor the old target outside the handoff input buffer.
+		if (dst == confirmedSource &&
+			(m_active == dst ||
+			 (m_inputHandoffPending && m_inputHandoffSource == m_active &&
+			  m_inputHandoffTarget == dst))) {
 			return true;
 		}
 		stopSwitch();
@@ -1394,7 +1443,11 @@ Server::switchScreen(BaseClientProxy* dst,
 	}
 
 	if (dst == m_primaryClient && m_active != NULL &&
-		m_active != m_primaryClient) {
+		m_active != m_primaryClient && !m_inputHandoffCommitReady) {
+		// Normalize the return edge once, before requesting the source
+		// revoke. During that wait, movement is already accumulated in
+		// primary coordinates. Reanchoring at commit would visibly jump
+		// to the edge and then replay the same captured movement.
 		adjustPrimaryReturnPoint(m_active, x, y);
 	}
 
@@ -1478,9 +1531,20 @@ Server::switchScreen(BaseClientProxy* dst,
 				finishCommittedInputHandoff();
 			}
 
+			// A synchronous leave can fail with its original keys still down.
+			// Begin only after it succeeds, before entering the target lease.
+			if (!m_handoffInputBuffering && dst != m_primaryClient &&
+				dst->supportsInputHandoffCommitAck()) {
+				m_inputHandoffX = x; m_inputHandoffY = y;
+				startHandoffInputBuffer();
+			}
+
 		m_primaryLeaveFailedRecently = false;
+
+		m_primaryPrepareNeedsRetreat = false;
 		m_primaryLeaveFailureDir = kNoDirection;
 		if (oldActive == m_primaryClient) {
+			releaseLocalHandoffInput();
 			m_screen->fakeAllKeysUp();
 		}
 
@@ -1503,6 +1567,10 @@ Server::switchScreen(BaseClientProxy* dst,
 		}
 
 		// enter new screen
+		if (m_handoffInputBuffering) {
+			m_handoffInputEnterX = x;
+			m_handoffInputEnterY = y;
+		}
 		m_active->enter(x, y, m_seqNum,
 								m_inputHandoffCommitReady ? m_inputHandoffMask :
 									m_primaryClient->getToggleMask(),
@@ -1606,6 +1674,8 @@ Server::requestInputHandoffSourceRevoke()
 	}
 
 	cleanupInputHandoffTimer();
+	flushPendingMouseMove();
+	startHandoffInputBuffer();
 	m_inputHandoffSourceRevokePending = true;
 	m_inputHandoffSourceRevoked = false;
 	m_inputHandoffPhaseTimer.reset();
@@ -1658,6 +1728,7 @@ Server::commitPreparedInputHandoff()
 	m_inputHandoffForScreensaver = false;
 	m_inputHandoffGuardDir = kNoDirection;
 	if (!committed) {
+		discardHandoffInputBuffer();
 		m_inputHandoffCommitted = false;
 		m_inputHandoffCommitAckPending = false;
 		m_inputHandoffSource = NULL;
@@ -1678,12 +1749,223 @@ Server::commitPreparedInputHandoff()
 	}
 
 	if (target == m_primaryClient) {
+		replayHandoffInputBuffer(target);
 		finishCommittedInputHandoff();
 	}
 	else {
 		trackCommittedInputHandoff(source, target, seqNum,
 			sourceX, sourceY, guardDir);
+		if (!m_inputHandoffCommitAckPending) {
+			replayHandoffInputBuffer(target);
+		}
 	}
+}
+
+void
+Server::startHandoffInputBuffer()
+{
+	if (m_handoffInputBuffering) return;
+	m_handoffInputBuffering = true;
+	m_handoffInputDropped = false;
+	m_handoffHeldOverflow = false;
+	m_handoffInputAge.reset();
+	m_handoffInputX = m_inputHandoffX;
+	m_handoffInputY = m_inputHandoffY;
+	m_handoffInputStartX = m_handoffInputX;
+	m_handoffInputStartY = m_handoffInputY;
+	m_handoffInput.clear();
+	m_handoffHeldInput.clear();
+	if (m_heldInputKeys.size() + m_heldInputButtons.size() > kMaxHandoffInputEvents) {
+		m_handoffHeldOverflow = true;
+		invalidateHandoffInputBuffer("held input count limit exceeded");
+		return;
+	}
+	for (const auto& key : m_heldInputKeys) m_handoffHeldInput.push_back(key.second);
+	for (const auto& button : m_heldInputButtons) m_handoffHeldInput.push_back(button.second);
+	std::sort(m_handoffHeldInput.begin(), m_handoffHeldInput.end(),
+		[](const HandoffInput& a, const HandoffInput& b) { return a.order < b.order; });
+}
+
+bool
+Server::bufferHandoffInput(const HandoffInput& input)
+{
+	if (!m_handoffInputBuffering) return false;
+	if (m_handoffInputDropped) return true;
+	// Each protocol phase has its own deadline. The stricter whole-buffer
+	// age cap also covers delayed timer dispatch across the two phases.
+	const bool coalescingMove = m_heldInputButtons.empty() &&
+		input.kind == HandoffInputKind::Move &&
+		!m_handoffInput.empty() && m_handoffInput.back().kind == HandoffInputKind::Move;
+	if (m_handoffInputAge.getTime() >= kMaxHandoffInputAgeSeconds ||
+		(!coalescingMove && m_handoffInput.size() + m_handoffHeldInput.size() >= kMaxHandoffInputEvents)) {
+		invalidateHandoffInputBuffer("input count or age limit exceeded");
+		return true;
+	}
+	// Coalesce only adjacent absolute motion. A click/key/wheel is an ordering
+	// barrier, and relative motion must retain every delta.
+	if (coalescingMove) {
+		m_handoffInput.back() = input;
+	}
+	else m_handoffInput.push_back(input);
+	return true;
+}
+
+void
+Server::invalidateHandoffInputBuffer(const char* reason)
+{
+	if (!m_handoffInputBuffering || m_handoffInputDropped) return;
+	LOG((CLOG_WARN "discarding handoff input: seq=%u count=%u age=%.3fs reason=%s",
+		m_inputHandoffSeqNum, static_cast<unsigned>(m_handoffInput.size()),
+		m_handoffInputAge.getTime(), reason));
+	m_handoffInputDropped = true;
+	m_handoffInput.clear();
+}
+
+void
+Server::discardHandoffInputBuffer()
+{
+	if (!m_handoffInputBuffering) return;
+	invalidateHandoffInputBuffer("transaction did not commit to its intended owner");
+	for (const auto& key : m_heldInputKeys) m_suppressedInputKeys.insert(key.first);
+	for (const auto& button : m_heldInputButtons) m_suppressedInputButtons.insert(button.first);
+	m_heldInputKeys.clear();
+	m_heldInputButtons.clear();
+	m_handoffInput.clear();
+	m_handoffHeldInput.clear();
+	m_handoffInputBuffering = false;
+}
+
+void
+Server::releaseLocalHandoffInput()
+{
+	if (m_localHandoffKeys.empty() && m_localHandoffButtons.empty()) return;
+	m_primaryClient->fakeInputBegin();
+	auto* platform = m_screen->getPlatformScreen();
+	for (const auto& key : m_localHandoffKeys) platform->fakeKeyUpForHandoff(key.first, key.second);
+	for (const auto& button : m_localHandoffButtons) platform->fakeMouseButtonForHandoff(button.first, false, button.second);
+	m_localHandoffKeys.clear();
+	m_localHandoffButtons.clear();
+	m_primaryClient->fakeInputEnd();
+}
+
+void
+Server::deliverHandoffInput(BaseClientProxy* target, const HandoffInput& input)
+{
+	if (target == m_primaryClient) {
+		// PrimaryClient deliberately ignores ordinary forwarded input. These
+		// events were captured while the primary was off-screen, so inject only
+		// this bounded replay under the platform's fake-input suppression.
+		auto* platform = m_screen->getPlatformScreen();
+		switch (input.kind) {
+		case HandoffInputKind::KeyDown: {
+			// Keep the physical press identity across repeated reconstruction.
+			// A new injection of the same held press still owes its queued up.
+			const auto generation = input.order != 0 ? input.order : ++m_heldInputOrder;
+			platform->fakeKeyDownForHandoff(input.key, input.mask, input.button, generation);
+			m_localHandoffKeys[input.button] = generation;
+			break;
+		}
+		case HandoffInputKind::KeyUp: {
+			auto held = m_localHandoffKeys.find(input.button);
+			if (held != m_localHandoffKeys.end()) {
+				platform->fakeKeyUpForHandoff(input.button, held->second);
+				m_localHandoffKeys.erase(held);
+			}
+			else
+				platform->fakeKeyUp(input.button);
+			break;
+		}
+		case HandoffInputKind::KeyRepeat:
+			platform->fakeKeyRepeat(input.key, input.mask, input.count, input.button); break;
+		case HandoffInputKind::ButtonDown: {
+			const auto generation = input.order != 0 ? input.order : ++m_heldInputOrder;
+			platform->fakeMouseButtonForHandoff(input.button, true, generation);
+			m_localHandoffButtons[input.button] = generation;
+			break;
+		}
+		case HandoffInputKind::ButtonUp: {
+			auto held = m_localHandoffButtons.find(input.button);
+			if (held != m_localHandoffButtons.end()) {
+				platform->fakeMouseButtonForHandoff(input.button, false, held->second);
+				m_localHandoffButtons.erase(held);
+			}
+			else
+				platform->fakeMouseButton(input.button, false);
+			break;
+		}
+		case HandoffInputKind::Move: m_primaryClient->mouseMove(input.x, input.y); break;
+		case HandoffInputKind::RelativeMove: platform->fakeMouseRelativeMove(input.x, input.y); break;
+		case HandoffInputKind::Wheel: platform->fakeMouseWheel(input.x, input.y); break;
+		}
+		return;
+	}
+	switch (input.kind) {
+	case HandoffInputKind::KeyDown: target->keyDown(input.key, input.mask, input.button); break;
+	case HandoffInputKind::KeyUp: target->keyUp(input.key, input.mask, input.button); break;
+	case HandoffInputKind::KeyRepeat: target->keyRepeat(input.key, input.mask, input.count, input.button); break;
+	case HandoffInputKind::ButtonDown: target->mouseDown(input.button); break;
+	case HandoffInputKind::ButtonUp: target->mouseUp(input.button); break;
+	case HandoffInputKind::Move: target->mouseMove(input.x, input.y); break;
+	case HandoffInputKind::RelativeMove: target->mouseRelativeMove(input.x, input.y); break;
+	case HandoffInputKind::Wheel: target->mouseWheel(input.x, input.y); break;
+	}
+}
+
+void
+Server::rejectHandoffInputBuffer(BaseClientProxy* source)
+{
+	if (!m_handoffInputBuffering) return;
+	invalidateHandoffInputBuffer("source rejected revoke");
+	if (m_handoffHeldOverflow && source != m_primaryClient &&
+		m_clientSet.count(source) != 0) {
+		// A synthetic source can exceed the held-state bound. Its original
+		// presses were not snapshotted, so fence the connection for epoch-wide
+		// release rather than leave untracked keys held on a rejected revoke.
+		closeClient(source, kMsgCClose, true);
+		return;
+	}
+	// Only the matching negative revoke ACK confirms this original lease is
+	// still live. Release its previously held inputs, never the queued actions.
+	if (source == m_active && m_clientSet.count(source) != 0) {
+		for (auto input : m_handoffHeldInput) {
+			input.kind = input.kind == HandoffInputKind::KeyDown ?
+				HandoffInputKind::KeyUp : HandoffInputKind::ButtonUp;
+			deliverHandoffInput(source, input);
+		}
+	}
+	discardHandoffInputBuffer();
+}
+
+void
+Server::replayHandoffInputBuffer(BaseClientProxy* target)
+{
+	if (!m_handoffInputBuffering) return;
+	if (m_handoffInputAge.getTime() >= kMaxHandoffInputAgeSeconds)
+		invalidateHandoffInputBuffer("input age limit exceeded");
+	if (m_handoffInputDropped || target != m_active || m_clientSet.count(target) == 0) {
+		discardHandoffInputBuffer();
+		return;
+	}
+	if (target == m_primaryClient) m_primaryClient->fakeInputBegin();
+	// Enter uses the freshest coordinate. Earlier clicks/wheels (and held
+	// buttons reconstructed for this lease) must first regain their capture
+	// origin, otherwise a click-before-motion lands at the final position.
+	const bool firstInputNeedsOrigin = !m_handoffHeldInput.empty() ||
+		(!m_handoffInput.empty() && m_handoffInput.front().kind != HandoffInputKind::Move);
+	if (firstInputNeedsOrigin &&
+		(m_handoffInputEnterX != m_handoffInputStartX ||
+		 m_handoffInputEnterY != m_handoffInputStartY)) {
+		HandoffInput origin(HandoffInputKind::Move);
+		origin.x = m_handoffInputStartX; origin.y = m_handoffInputStartY;
+		deliverHandoffInput(target, origin);
+	}
+	for (const auto& input : m_handoffHeldInput) deliverHandoffInput(target, input);
+	for (const auto& input : m_handoffInput) deliverHandoffInput(target, input);
+	if (target == m_primaryClient) m_primaryClient->fakeInputEnd();
+	m_x = m_handoffInputX; m_y = m_handoffInputY;
+	m_handoffInput.clear();
+	m_handoffHeldInput.clear();
+	m_handoffInputBuffering = false;
 }
 
 void
@@ -1702,6 +1984,7 @@ Server::cancelInputHandoff(const char* reason, bool reanchor, bool notifyTarget)
 	if (!m_inputHandoffPending) {
 		return;
 	}
+	discardHandoffInputBuffer();
 
 	BaseClientProxy* source = m_inputHandoffSource;
 	BaseClientProxy* target = m_inputHandoffTarget;
@@ -1710,6 +1993,8 @@ Server::cancelInputHandoff(const char* reason, bool reanchor, bool notifyTarget)
 	LOG((CLOG_WARN "canceling input handoff to \"%s\", seq=%u: %s",
 		target != NULL ? getName(target).c_str() : "unknown", seqNum, reason));
 
+	const bool localPreparation = source == m_primaryClient &&
+		!m_inputHandoffCommitReady && !m_inputHandoffSourceRevokePending;
 	cleanupInputHandoffTimer();
 	m_inputHandoffPending = false;
 	m_inputHandoffCommitReady = false;
@@ -1728,7 +2013,15 @@ Server::cancelInputHandoff(const char* reason, bool reanchor, bool notifyTarget)
 	}
 
 	if (reanchor && source != NULL && m_active == source) {
-		if (source == m_primaryClient) {
+		if (localPreparation) {
+			// Readiness failed before local input was released. Leave the
+			// hardware pointer alone and require a new approach to this edge.
+			m_primaryLeaveFailedRecently = guardDir != kNoDirection;
+			m_primaryLeaveFailureDir = guardDir;
+			m_primaryPrepareNeedsRetreat = m_primaryLeaveFailedRecently;
+			stopSwitch();
+		}
+		else if (source == m_primaryClient) {
 			recoverPrimaryAfterSwitchFailure(m_x, m_y, guardDir);
 		}
 		else {
@@ -1782,6 +2075,7 @@ Server::startInputHandoffCommitAckTimer()
 void
 Server::finishCommittedInputHandoff()
 {
+	discardHandoffInputBuffer();
 	cleanupInputHandoffTimer();
 	m_inputHandoffCommitted = false;
 	m_inputHandoffCommitAckPending = false;
@@ -1880,6 +2174,7 @@ Server::handleInputHandoffReady(const Event& event, void* vclient)
 			LOG((CLOG_INFO
 				"target acknowledged committed input handoff, seq=%u",
 				info->m_seqNum));
+			replayHandoffInputBuffer(client);
 			finishCommittedInputHandoff();
 			return;
 		}
@@ -1892,6 +2187,9 @@ Server::handleInputHandoffReady(const Event& event, void* vclient)
 		cleanupInputHandoffTimer();
 		m_inputHandoffSourceRevokePending = false;
 		if (!info->m_ready) {
+			// A negative revoke ACK confirms the original lease is still valid.
+			// Release its held inputs; target-directed actions must not run here.
+			rejectHandoffInputBuffer(client);
 			cancelInputHandoff("source rejected lease revoke", true);
 			return;
 		}
@@ -2006,12 +2304,18 @@ Server::canLeavePrimaryNow(const char* reason, EDirection dir)
 		return true;
 	}
 
+	if (m_primaryPrepareNeedsRetreat) {
+		stopSwitch();
+		return false;
+	}
+
 	LOG((CLOG_WARN "suppressing one synthetic %s event on failed %s edge",
 		reason, Config::dirName(dir)));
 	// The platform warp used for recovery is drained before the server can
 	// observe an inward motion. Consume exactly one same-edge event instead of
 	// requiring the user to move away from the edge before retrying.
 	m_primaryLeaveFailedRecently = false;
+	m_primaryPrepareNeedsRetreat = false;
 	m_primaryLeaveFailureDir = kNoDirection;
 	stopSwitch();
 	return false;
@@ -2056,6 +2360,7 @@ Server::clearPrimaryLeaveFailureIfMovedAway(SInt32 x, SInt32 y)
 		LOG((CLOG_DEBUG1 "clearing failed %s edge gate after pointer moved to %d,%d",
 			Config::dirName(m_primaryLeaveFailureDir), x, y));
 		m_primaryLeaveFailedRecently = false;
+		m_primaryPrepareNeedsRetreat = false;
 		m_primaryLeaveFailureDir = kNoDirection;
 	}
 }
@@ -2070,6 +2375,7 @@ Server::recoverPrimaryAfterSwitchFailure(SInt32 x, SInt32 y,
 		LOG((CLOG_WARN "cannot reanchor primary after failed leave; unusable primary shape %d,%d %dx%d",
 			ax, ay, aw, ah));
 		m_primaryLeaveFailedRecently = false;
+		m_primaryPrepareNeedsRetreat = false;
 		m_primaryLeaveFailureDir = kNoDirection;
 		return;
 	}
@@ -2363,6 +2669,8 @@ Server::recoverToPrimaryFromActive(const char* reason)
 	}
 
 	m_primaryLeaveFailedRecently = false;
+
+	m_primaryPrepareNeedsRetreat = false;
 	m_primaryLeaveFailureDir = kNoDirection;
 }
 
@@ -2878,17 +3186,17 @@ Server::isSwitchOkay(BaseClientProxy* newScreen,
 		stopSwitch();
 	}
 
-	// check for optional needed modifiers
-	KeyModifierMask mods = this->m_primaryClient->getToggleMask();
-
-	if (!preventSwitch && (
-			(this->m_switchNeedsShift && ((mods & KeyModifierShift) != KeyModifierShift)) ||
-			(this->m_switchNeedsControl && ((mods & KeyModifierControl) != KeyModifierControl)) ||
-			(this->m_switchNeedsAlt && ((mods & KeyModifierAlt) != KeyModifierAlt))
-		)) {
-		LOG((CLOG_DEBUG1 "need modifiers to switch"));
-		preventSwitch = true;
-		stopSwitch();
+	// Query modifiers only when an enabled requirement can affect the switch.
+	if (!preventSwitch &&
+			(m_switchNeedsShift || m_switchNeedsControl || m_switchNeedsAlt)) {
+		const KeyModifierMask mods = m_primaryClient->getToggleMask();
+		if ((m_switchNeedsShift && !(mods & KeyModifierShift)) ||
+				(m_switchNeedsControl && !(mods & KeyModifierControl)) ||
+				(m_switchNeedsAlt && !(mods & KeyModifierAlt))) {
+			LOG((CLOG_DEBUG1 "need modifiers to switch"));
+			preventSwitch = true;
+			stopSwitch();
+		}
 	}
 
 	return !preventSwitch;
@@ -4301,6 +4609,12 @@ Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button,
 
 	// relay
 	if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
+		if (m_suppressedInputKeys.count(button) != 0) return;
+		HandoffInput input(HandoffInputKind::KeyDown);
+		input.key = id; input.mask = mask; input.button = button;
+		input.order = ++m_heldInputOrder;
+		m_heldInputKeys.insert_or_assign(button, input);
+		if (bufferHandoffInput(input)) return;
 		// If localShortcutMode is enabled and we're on primary screen,
 		// intercept modifier keys locally to prevent conflicts with remote
 		// screen shortcuts that use the same key combinations
@@ -4362,6 +4676,17 @@ Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button,
 
 	// relay
 	if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
+		m_heldInputKeys.erase(button);
+		if (m_suppressedInputKeys.erase(button) != 0) return;
+		HandoffInput input(HandoffInputKind::KeyUp);
+		input.key = id; input.mask = mask; input.button = button;
+		if (bufferHandoffInput(input)) return;
+		if (m_active == m_primaryClient && m_localHandoffKeys.count(button) != 0) {
+			m_primaryClient->fakeInputBegin();
+			deliverHandoffInput(m_active, input);
+			m_primaryClient->fakeInputEnd();
+			return;
+		}
 		// Match the local shortcut mode logic from onKeyDown
 		if (m_localShortcutMode && m_active == m_primaryClient) {
 			bool shouldHandleLocally = false;
@@ -4406,6 +4731,10 @@ Server::onKeyRepeat(KeyID id, KeyModifierMask mask,
 	LOG((CLOG_DEBUG1 "onKeyRepeat id=%d mask=0x%04x count=%d button=0x%04x", id, mask, count, button));
 	assert(m_active != NULL);
 	flushPendingMouseMove();
+	if (m_suppressedInputKeys.count(button) != 0) return;
+	HandoffInput input(HandoffInputKind::KeyRepeat);
+	input.key = id; input.mask = mask; input.button = button; input.count = count;
+	if (bufferHandoffInput(input)) return;
 
 	// relay
 	m_active->keyRepeat(id, mask, count, button);
@@ -4417,6 +4746,12 @@ Server::onMouseDown(ButtonID id)
 	LOG((CLOG_DEBUG1 "onMouseDown id=%d", id));
 	assert(m_active != NULL);
 	flushPendingMouseMove();
+	if (m_suppressedInputButtons.count(id) != 0) return;
+	HandoffInput input(HandoffInputKind::ButtonDown);
+	input.button = id;
+	input.order = ++m_heldInputOrder;
+	m_heldInputButtons.insert_or_assign(id, input);
+	if (bufferHandoffInput(input)) return;
 
 	// relay
 	m_active->mouseDown(id);
@@ -4428,6 +4763,17 @@ Server::onMouseUp(ButtonID id)
 	LOG((CLOG_DEBUG1 "onMouseUp id=%d", id));
 	assert(m_active != NULL);
 	flushPendingMouseMove();
+	m_heldInputButtons.erase(id);
+	if (m_suppressedInputButtons.erase(id) != 0) return;
+	HandoffInput input(HandoffInputKind::ButtonUp);
+	input.button = id;
+	if (bufferHandoffInput(input)) return;
+	if (m_active == m_primaryClient && m_localHandoffButtons.count(id) != 0) {
+		m_primaryClient->fakeInputBegin();
+		deliverHandoffInput(m_active, input);
+		m_primaryClient->fakeInputEnd();
+		return;
+	}
 
 	// relay
 	m_active->mouseUp(id);
@@ -4611,6 +4957,26 @@ void
 Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 {
 	LOG((CLOG_DEBUG2 "onMouseMoveSecondary %+d,%+d", dx, dy));
+	if (m_handoffInputBuffering && m_inputHandoffPending) {
+		HandoffInput input(m_relativeMoves && isLockedToScreenServer() ?
+			HandoffInputKind::RelativeMove : HandoffInputKind::Move);
+		if (input.kind == HandoffInputKind::RelativeMove) {
+			input.x = dx; input.y = dy;
+		}
+		else {
+			// Input is already in the destination coordinate space during revoke.
+			// Do not route it back through the old owner's edge mapping.
+			m_handoffInputX += dx; m_handoffInputY += dy;
+			if (m_inputHandoffTarget != NULL)
+				clampToClientShape(m_inputHandoffTarget, m_handoffInputX, m_handoffInputY);
+			input.x = m_handoffInputX; input.y = m_handoffInputY;
+			if (m_inputHandoffPending) {
+				m_inputHandoffX = input.x; m_inputHandoffY = input.y;
+			}
+		}
+		bufferHandoffInput(input);
+		return;
+	}
 
 	// mouse move on secondary (client's) screen
 	assert(m_active != NULL);
@@ -4628,6 +4994,9 @@ Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 	if (m_relativeMoves && isLockedToScreenServer()) {
 		LOG((CLOG_DEBUG2 "relative move on %s by %d,%d", getName(m_active).c_str(), dx, dy));
 		flushPendingMouseMove();
+		HandoffInput input(HandoffInputKind::RelativeMove);
+		input.x = dx; input.y = dy;
+		if (bufferHandoffInput(input)) return;
 		m_active->mouseRelativeMove(dx, dy);
 		return;
 	}
@@ -4801,6 +5170,13 @@ Server::queueMouseMove(BaseClientProxy* target, SInt32 x, SInt32 y)
 	if (target == NULL) {
 		return;
 	}
+	if (m_handoffInputBuffering) {
+		HandoffInput input(HandoffInputKind::Move);
+		input.x = x; input.y = y;
+		m_handoffInputX = x; m_handoffInputY = y;
+		bufferHandoffInput(input);
+		return;
+	}
 
 	if (m_pendingMouseMove && m_pendingMouseMoveTarget != target) {
 		flushPendingMouseMove();
@@ -4875,6 +5251,9 @@ Server::onMouseWheel(SInt32 xDelta, SInt32 yDelta)
 	LOG((CLOG_DEBUG1 "onMouseWheel %+d,%+d", xDelta, yDelta));
 	assert(m_active != NULL);
 	flushPendingMouseMove();
+	HandoffInput input(HandoffInputKind::Wheel);
+	input.x = xDelta; input.y = yDelta;
+	if (bufferHandoffInput(input)) return;
 
 	// relay
 	m_active->mouseWheel(xDelta, yDelta);
@@ -5666,6 +6045,7 @@ Server::removeClient(BaseClientProxy* client)
 	}
 	if (m_inputHandoffPending && client == m_inputHandoffTarget) {
 		if (m_inputHandoffSourceRevokePending) {
+			invalidateHandoffInputBuffer("intended target disconnected");
 			// CIRV is irreversible.  The source may become inactive after this
 			// target disappears, so retain the transaction and redirect a
 			// successful revoke to the always-local primary lease.
@@ -5848,6 +6228,13 @@ Server::removeOldClient(BaseClientProxy* client)
 void
 Server::forceLeaveClient(BaseClientProxy* client)
 {
+	if (m_inputHandoffPending &&
+		(client == m_inputHandoffSource || client == m_inputHandoffTarget)) {
+		cancelInputHandoff("forced local recovery", false);
+	}
+	if (m_inputHandoffCommitted && client == m_inputHandoffTarget) {
+		finishCommittedInputHandoff();
+	}
 	if (m_switchScreen == client) {
 		stopSwitch();
 	}
@@ -5875,6 +6262,13 @@ Server::forceLeaveClient(BaseClientProxy* client)
 			m_yDelta = 0;
 			m_xDelta2 = 0;
 			m_yDelta2 = 0;
+			if (m_activeSaver == NULL) {
+				// Release native capture even while return coordinates are
+				// unavailable. The screensaver flag skips only the warp;
+				// Screen::enter still checks the platform's tryEnter result.
+				m_primaryClient->enter(m_x, m_y, m_seqNum,
+					m_primaryClient->getToggleMask(), true);
+			}
 			replayClipboardsToActive();
 		}
 		else {
@@ -5899,6 +6293,7 @@ Server::forceLeaveClient(BaseClientProxy* client)
 			m_events->addEvent(Event(m_events->forServer().screenSwitched(), this, info));
 		}
 		m_primaryLeaveFailedRecently = false;
+		m_primaryPrepareNeedsRetreat = false;
 		m_primaryLeaveFailureDir = kNoDirection;
 	}
 

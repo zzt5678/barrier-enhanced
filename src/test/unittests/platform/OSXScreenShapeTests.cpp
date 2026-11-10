@@ -1,9 +1,16 @@
 #include "platform/OSXScreen.h"
+#include "barrier/XScreen.h"
 #include "base/EventQueue.h"
 #include "test/global/gtest.h"
 #include <dlfcn.h>
 #include <limits>
 #include <thread>
+#include <vector>
+#include <functional>
+#include <mach/mach_time.h>
+
+void configureCursorModelForTapTest(CGPoint, CGError, std::function<void()>);
+void resetCursorModelForTapTest();
 
 namespace {
 bool scripted = false;
@@ -14,7 +21,21 @@ CGRect bounds = CGRectMake(0, 0, 1710, 1107);
 CGDisplayReconfigurationCallBack callback = nullptr;
 void* callbackContext = nullptr;
 bool beginDuringBounds = false;
+bool denyAccessibility = false, failTap = false, failTapSource = false;
+int tapCalls = 0, sourceCalls = 0, failTapAt = 0, failSourceAt = 0;
+struct TapState {
+    CFMachPortRef port;
+    CGEventTapOptions options;
+    bool enabled;
+    CGEventTapCallBack callback;
+    void* context;
+};
+std::vector<TapState> taps;
 template<class T> T native(const char* name) { return reinterpret_cast<T>(dlsym(RTLD_NEXT, name)); }
+}
+extern "C" Boolean AXIsProcessTrusted()
+{
+    return scripted ? !denyAccessibility : native<decltype(&AXIsProcessTrusted)>("AXIsProcessTrusted")();
 }
 
 extern "C" CGError CGGetActiveDisplayList(uint32_t max, CGDirectDisplayID* ids, uint32_t* out)
@@ -54,16 +75,39 @@ extern "C" CFMachPortRef CGEventTapCreate(CGEventTapLocation location, CGEventTa
     CGEventTapOptions options, CGEventMask mask, CGEventTapCallBack cb, void* context)
 {
     if (!scripted) return native<decltype(&CGEventTapCreate)>("CGEventTapCreate")(location, placement, options, mask, cb, context);
+    if (failTap || ++tapCalls == failTapAt) return nullptr;
     // A private inert port exercises enable/disable without installing an input tap.
-    return CFMachPortCreate(nullptr, [](CFMachPortRef, void*, CFIndex, void*) {}, nullptr, nullptr);
+    auto port = CFMachPortCreate(nullptr, [](CFMachPortRef, void*, CFIndex, void*) {}, nullptr, nullptr);
+    taps.push_back({port, options, true, cb, context});
+    return port;
+}
+extern "C" CFRunLoopSourceRef CFMachPortCreateRunLoopSource(CFAllocatorRef allocator, CFMachPortRef port, CFIndex order)
+{
+    if (scripted && (failTapSource || ++sourceCalls == failSourceAt)) return nullptr;
+    return native<decltype(&CFMachPortCreateRunLoopSource)>("CFMachPortCreateRunLoopSource")(allocator, port, order);
 }
 extern "C" void CGEventTapEnable(CFMachPortRef port, bool enabled)
 {
     if (!scripted) native<decltype(&CGEventTapEnable)>("CGEventTapEnable")(port, enabled);
+    else for (auto& tap : taps) if (tap.port == port) tap.enabled = enabled;
 }
 
 class OSXScreenShapeTestAccess {
 public:
+    static void primary(OSXScreen& screen) { screen.m_isPrimary = true; screen.m_isOnScreen = true; }
+    static void onOwner(OSXScreen& screen, std::function<void()> operation) {
+        ASSERT_TRUE(screen.m_inputLoop->invoke(std::move(operation)));
+    }
+    static void capture(OSXScreen& screen, bool remote) {
+        screen.m_inputLoop->invoke([&screen, remote] {
+            screen.m_isOnScreen = !remote;
+            screen.setInputCapture(remote);
+        });
+    }
+    static bool hasInputResources(const OSXScreen& screen) {
+        return screen.m_inputLoop || screen.m_eventTapPort ||
+            screen.m_eventTapRLSR || screen.m_localEventTapPort || screen.m_localEventTapSource || screen.m_clipboardTimer;
+    }
     static void tick(OSXScreen& screen) { screen.handleClipboardCheck(Event(), nullptr); }
     static void refresh(OSXScreen& screen) { screen.updateScreenShape(); }
     static void expireConfiguration(OSXScreen& screen) {
@@ -79,6 +123,7 @@ public:
         events.loop();
     }
     void checkClipboards() override {} // Never touch the native test host clipboard.
+    bool isDraggingStarted() override { return false; }
     void fakeMouseMove(SInt32, SInt32) override { ++warps; }
     int warps = 0;
 };
@@ -88,8 +133,10 @@ protected:
         scripted = true; queries = 0; queryResult = kCGErrorSuccess;
         count = returnedCount = 1; bounds = CGRectMake(0, 0, 1710, 1107);
         beginDuringBounds = false;
+        denyAccessibility = failTap = failTapSource = false;
+        tapCalls = sourceCalls = failTapAt = failSourceAt = 0; taps.clear();
     }
-    void TearDown() override { scripted = false; }
+    void TearDown() override { resetCursorModelForTapTest(); scripted = false; }
     static void shape(OSXScreen& screen, int width, int height) {
         SInt32 x, y, w, h; screen.getShape(x, y, w, h);
         EXPECT_EQ(width, w); EXPECT_EQ(height, h);
@@ -103,6 +150,152 @@ protected:
         return changed;
     }
 };
+
+TEST_F(OSXScreenShapeTests, deniedAccessibilityIsPermanentInputFailureWithReason)
+{
+    EventQueue events; denyAccessibility = true;
+    try {
+        OSXScreen screen(&events, true, false);
+        FAIL() << "permission denial must reject primary startup";
+    }
+    catch (const XInputUnavailable& error) {
+        EXPECT_NE(std::string::npos, std::string(error.what()).find("system settings"));
+    }
+    catch (const std::exception& error) {
+        ADD_FAILURE() << "wrong startup classification: " << error.what();
+    }
+}
+
+TEST_F(OSXScreenShapeTests, failedPrimaryTapCreationReleasesOwnerAndTimerBeforeThrow)
+{
+    EventQueue events; ShapeScreen screen(events);
+    OSXScreenShapeTestAccess::primary(screen); failTap = true;
+    EXPECT_THROW(screen.enable(), XInputUnavailable);
+    EXPECT_FALSE(OSXScreenShapeTestAccess::hasInputResources(screen));
+}
+
+TEST_F(OSXScreenShapeTests, failedPrimaryTapSourceReleasesOwnerPortAndTimerBeforeThrow)
+{
+    EventQueue events; ShapeScreen screen(events);
+    OSXScreenShapeTestAccess::primary(screen); failTapSource = true;
+    EXPECT_THROW(screen.enable(), XInputUnavailable);
+    EXPECT_FALSE(OSXScreenShapeTestAccess::hasInputResources(screen));
+}
+
+TEST_F(OSXScreenShapeTests, localInputBypassesFilterAndRemoteOwnershipEnablesIt)
+{
+    EventQueue events; ShapeScreen screen(events);
+    OSXScreenShapeTestAccess::primary(screen);
+    screen.enable();
+    ASSERT_EQ(2u, taps.size());
+    EXPECT_EQ(kCGEventTapOptionDefault, taps[0].options);
+    EXPECT_FALSE(taps[0].enabled);
+    EXPECT_EQ(kCGEventTapOptionListenOnly, taps[1].options);
+    EXPECT_TRUE(taps[1].enabled);
+    OSXScreenShapeTestAccess::capture(screen, true);
+    EXPECT_TRUE(taps[0].enabled);
+    EXPECT_FALSE(taps[1].enabled);
+    OSXScreenShapeTestAccess::capture(screen, false);
+    EXPECT_FALSE(taps[0].enabled);
+    EXPECT_TRUE(taps[1].enabled);
+    screen.disable();
+    EXPECT_FALSE(OSXScreenShapeTestAccess::hasInputResources(screen));
+}
+
+TEST_F(OSXScreenShapeTests, firstWarpBearingMotionSurvivesLocalToRemoteTapCutover)
+{
+    // Physical capture, 2026-11-10: the first event contains the -1279,+32
+    // parking offset. Losing it turns the following +1 into a +1280 jump.
+    bounds = CGRectMake(0, 0, 2560, 1440);
+    configureCursorModelForTapTest(CGPointMake(2559, 688), kCGErrorSuccess, {});
+    EventQueue events;
+    ShapeScreen screen(events);
+    OSXScreenShapeTestAccess::primary(screen);
+    screen.enable();
+    ASSERT_EQ(2u, taps.size());
+    CGEventRef parkedMotion = nullptr;
+    std::vector<TapState> recipients;
+    configureCursorModelForTapTest(CGPointMake(2559, 688), kCGErrorSuccess, [&] {
+        if (parkedMotion) return;
+        parkedMotion = CGEventCreateMouseEvent(nullptr, kCGEventMouseMoved,
+            CGPointMake(1280, 720), kCGMouseButtonLeft);
+        CGEventSetIntegerValueField(parkedMotion, kCGEventSourceStateID, kCGEventSourceStateHIDSystemState);
+        CGEventSetIntegerValueField(parkedMotion, kCGEventSourceUnixProcessID, 0);
+        CGEventSetIntegerValueField(parkedMotion, kCGMouseEventDeltaX, -1278);
+        CGEventSetIntegerValueField(parkedMotion, kCGMouseEventDeltaY, 32);
+        CGEventSetTimestamp(parkedMotion, mach_absolute_time());
+        for (const auto& tap : taps) if (tap.enabled) recipients.push_back(tap);
+    });
+    const bool left = screen.leave();
+    configureCursorModelForTapTest(CGPointMake(1280, 720), kCGErrorSuccess, {});
+    ASSERT_TRUE(left);
+    ASSERT_NE(nullptr, parkedMotion);
+    OSXScreenShapeTestAccess::onOwner(screen, [&] {
+        // Native delivery selected its recipients before leave returned.
+        for (const auto& tap : recipients)
+            tap.callback(nullptr, kCGEventMouseMoved, parkedMotion, tap.context);
+    });
+    CFRelease(parkedMotion);
+    CGEventRef next = CGEventCreateMouseEvent(nullptr, kCGEventMouseMoved,
+        CGPointMake(1280, 720), kCGMouseButtonLeft);
+    CGEventSetIntegerValueField(next, kCGEventSourceStateID, kCGEventSourceStateHIDSystemState);
+    CGEventSetIntegerValueField(next, kCGEventSourceUnixProcessID, 0);
+    CGEventSetIntegerValueField(next, kCGMouseEventDeltaX, 1);
+    CGEventSetTimestamp(next, mach_absolute_time());
+    OSXScreenShapeTestAccess::onOwner(screen, [&] {
+        for (const auto& tap : taps) if (tap.enabled)
+            tap.callback(nullptr, kCGEventMouseMoved, next, tap.context);
+    });
+    CFRelease(next);
+    std::vector<std::pair<SInt32, SInt32>> motion;
+    Event event;
+    while (events.getEvent(event, 0)) {
+        if (event.getType() == events.forIPrimaryScreen().motionOnSecondary()) {
+            const auto* point = static_cast<const IPrimaryScreen::MotionInfo*>(event.getData());
+            motion.emplace_back(point->m_x, point->m_y);
+        }
+        Event::deleteData(event);
+    }
+    EXPECT_EQ((std::vector<std::pair<SInt32, SInt32>>{{1, 0}, {1, 0}}), motion);
+    screen.disable();
+}
+
+TEST_F(OSXScreenShapeTests, failedInitialParkRestoresPassiveLocalTap)
+{
+    configureCursorModelForTapTest(CGPointMake(2559, 688), kCGErrorFailure, {});
+    EventQueue events;
+    ShapeScreen screen(events);
+    OSXScreenShapeTestAccess::primary(screen);
+    screen.enable();
+    ASSERT_FALSE(screen.leave());
+    ASSERT_EQ(2u, taps.size());
+    EXPECT_FALSE(taps[0].enabled);
+    EXPECT_TRUE(taps[1].enabled);
+    screen.disable();
+}
+
+TEST_F(OSXScreenShapeTests, failedLocalObserverCreationReleasesActiveTapAndOwner)
+{
+    EventQueue events; ShapeScreen screen(events);
+    OSXScreenShapeTestAccess::primary(screen); failTapAt = 2;
+    EXPECT_THROW(screen.enable(), XInputUnavailable);
+    EXPECT_FALSE(OSXScreenShapeTestAccess::hasInputResources(screen));
+}
+
+TEST_F(OSXScreenShapeTests, failedLocalObserverSourceReleasesBothTapsAndOwner)
+{
+    EventQueue events; ShapeScreen screen(events);
+    OSXScreenShapeTestAccess::primary(screen); failSourceAt = 2;
+    EXPECT_THROW(screen.enable(), XInputUnavailable);
+    EXPECT_FALSE(OSXScreenShapeTestAccess::hasInputResources(screen));
+}
+
+TEST_F(OSXScreenShapeTests, failedSecondaryTapCreationReleasesTimerBeforeThrow)
+{
+    EventQueue events; ShapeScreen screen(events); failTap = true;
+    EXPECT_THROW(screen.enable(), XInputUnavailable);
+    EXPECT_FALSE(OSXScreenShapeTestAccess::hasInputResources(screen));
+}
 
 TEST_F(OSXScreenShapeTests, failedInitialQueryIsUnavailableAndExistingTickRecovers)
 {

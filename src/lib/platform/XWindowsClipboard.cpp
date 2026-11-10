@@ -585,6 +585,15 @@ XWindowsClipboard::checkCache() const
     }
     m_checkCache = false;
 
+    // We already hold the authoritative bytes while owning the selection.
+    // Requesting TIMESTAMP/data from our own window blocks this same event
+    // thread, which is also responsible for answering SelectionRequest.
+    // Recheck ownership because SelectionClear may still be queued.
+    if (m_owner &&
+        m_impl->XGetSelectionOwner(m_display, m_selection) == m_window) {
+        return;
+    }
+
     // get the time the clipboard ownership was taken by the current
     // owner.
     if (m_motif) {

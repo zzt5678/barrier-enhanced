@@ -186,6 +186,7 @@ Visit our website for help and info (symless.com).
     <message><source>Weave is not running.</source><translation>共享服務尚未啟動</translation></message>
     <message><source>Transferring data...</source><translation>正在傳輸資料…</translation></message>
     <message><source>Incompatible peer version. Update Weave on both computers, then press Start.</source><translation>對端版本不相容。請更新兩台電腦上的 Weave，然後開始共享。</translation></message>
+    <message><source>Input unavailable. Sharing stopped to protect local control. Check input permissions, then press Start.</source><translation>輸入無法使用，已停止共享以保護本機操作。請檢查輸入權限後再開始共享。</translation></message>
     <message><source>Weave stopped unexpectedly. Retrying in %1 second(s).</source><translation>共享服務意外停止，將在 %1 秒後重試。</translation></message>
     <message><source>Stopping the Weave background service...</source><translation>正在停止共享服務…</translation></message>
     <message><source>Server: %1</source><translation>伺服器：%1</translation></message>

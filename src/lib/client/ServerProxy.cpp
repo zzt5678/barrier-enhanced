@@ -1063,7 +1063,8 @@ ServerProxy::shouldCompressMouseMoves() const
     // after input is already backlogged prevents motion floods from delaying
     // control messages in normal mode. Immediate-delivery modes already apply
     // their own pacing and must not lose another set of coordinates here.
-    return !m_lowLatencyMode && !m_nestedRemoteMode;
+    return !m_lowLatencyMode && !m_nestedRemoteMode &&
+        m_epochPressedButtons.empty() && m_legacyPressedButtons.empty();
 }
 
 void
@@ -1258,6 +1259,7 @@ ServerProxy::enter()
 
     // discard old compressed mouse motion, if any
     discardCompressedMouse();
+    m_legacyPressedButtons.clear();
     m_seqNum                = seqNum;
     m_hasEnterSequence      = true;
     m_ignoreMouse           = false;
@@ -1361,6 +1363,7 @@ ServerProxy::revokeInputLeaseRequest()
         releaseEpochPressedInput();
         if (m_client->leave()) {
             m_inputActive = false;
+            m_legacyPressedButtons.clear();
             m_hasPreparedEnter = false;
             m_preparedEnterReady = false;
             m_preparedInputGeneration = 0;
@@ -1408,6 +1411,7 @@ ServerProxy::leave()
         return;
     }
     m_inputActive = false;
+    m_legacyPressedButtons.clear();
     m_hasPreparedEnter = false;
     m_preparedEnterReady = false;
     m_preparedInputGeneration = 0;
@@ -1570,6 +1574,9 @@ ServerProxy::mouseDown()
         if (m_inputFrameHasEpoch) {
             m_epochPressedButtons.insert(static_cast<ButtonID>(id));
         }
+        else {
+            m_legacyPressedButtons.insert(static_cast<ButtonID>(id));
+        }
     }
 }
 
@@ -1590,6 +1597,9 @@ ServerProxy::mouseUp()
         if (m_inputFrameHasEpoch) {
             m_epochPressedButtons.erase(static_cast<ButtonID>(id));
         }
+        else {
+            m_legacyPressedButtons.erase(static_cast<ButtonID>(id));
+        }
     }
 }
 
@@ -1605,6 +1615,12 @@ ServerProxy::mouseMove()
     clearStaleInfoAckGate();
     ignore = m_ignoreMouse || !m_inputFrameAccepted ||
         !hasActivePointerLease("mouse move");
+
+    // A coordinate-mode change is an order boundary, not a replacement of
+    // accumulated relative displacement.
+    if (!ignore && m_compressMouseRelative) {
+        flushCompressedMouse();
+    }
 
     // compress mouse motion events if more input follows
     if (!ignore && shouldCompressMouseMoves() &&
@@ -1641,6 +1657,10 @@ ServerProxy::mouseRelativeMove()
     clearStaleInfoAckGate();
     ignore = m_ignoreMouse || !m_inputFrameAccepted ||
         !hasActivePointerLease("relative mouse move");
+
+    if (!ignore && m_compressMouse) {
+        flushCompressedMouse();
+    }
 
     // compress mouse motion events if more input follows
     if (!ignore && shouldCompressMouseMoves() &&
@@ -1770,6 +1790,7 @@ void
 ServerProxy::revokeInputLease()
 {
     discardCompressedMouse();
+    m_legacyPressedButtons.clear();
     releaseEpochPressedInput();
     m_inputActive = false;
     m_hasPreparedEnter = false;

@@ -25,6 +25,7 @@
 
 #include <stdarg.h>
 #include <mutex>
+#include <atomic>
 #include <ctime>
 
 #define CLOG (Log::getInstance())
@@ -138,7 +139,8 @@ private:
     OutputterList        m_outputters;
     OutputterList        m_alwaysOutputters;
     int                    m_maxNewlineLength;
-    int                    m_maxPriority;
+    // Reject disabled diagnostics without waiting for a slow output sink.
+    std::atomic<int>       m_maxPriority;
     mutable struct tm     tmBuffer;  // Thread-safe time buffer
 };
 

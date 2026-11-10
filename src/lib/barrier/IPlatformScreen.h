@@ -47,6 +47,26 @@ public:
 
     IPlatformScreen(IEventQueue* events) : IKeyState(events) { }
 
+    // Local handoff reconstruction has explicit ownership generations.
+    // Platforms without native release acknowledgement keep their existing
+    // synthesis behavior. These generations never cross the wire.
+    virtual void fakeKeyDownForHandoff(KeyID id, KeyModifierMask mask,
+                                      KeyButton button, std::uint64_t generation)
+    {
+        (void)generation;
+        fakeKeyDown(id, mask, button);
+    }
+    virtual bool fakeKeyUpForHandoff(KeyButton button, std::uint64_t generation)
+    {
+        (void)generation;
+        return fakeKeyUp(button);
+    }
+    virtual void fakeMouseButtonForHandoff(ButtonID button, bool press, std::uint64_t generation)
+    {
+        (void)generation;
+        fakeMouseButton(button, press);
+    }
+
     // Platforms with an asynchronous clipboard reader can expose its already
     // validated wire snapshot. The default keeps existing platform behavior.
     virtual bool getClipboardSnapshot(
@@ -115,6 +135,18 @@ public:
     {
         enter();
         return true;
+    }
+
+    //! Apply the return position and input ownership as one platform operation.
+    /*!
+    Platforms with a serialized input owner override this to prevent remote
+    pointer parking between the return warp and ownership change. Existing
+    platforms retain their warp-then-enter behavior.
+    */
+    virtual bool        tryEnterAt(SInt32 x, SInt32 y)
+    {
+        warpCursor(x, y);
+        return tryEnter();
     }
 
     //! Leave screen

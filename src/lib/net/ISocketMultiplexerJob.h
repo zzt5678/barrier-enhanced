@@ -84,6 +84,13 @@ public:
     */
     virtual bool        isWritable() const = 0;
 
+    // Absolute ARCH->time() deadline; negative means no timer. A due job runs
+    // even without socket readiness, so an idle peer cannot defeat timeouts.
+    virtual double getDeadline() const { return -1.0; }
+
+    // Plaintext buffered above the kernel needs another fair dispatch pass.
+    virtual bool hasPendingRead() const { return false; }
+
     virtual bool isCursor() const { return false; }
     //@}
 };

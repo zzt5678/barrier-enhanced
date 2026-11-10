@@ -30,8 +30,15 @@ void
 runCocoaApp()
 {
 	NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+	// A windowless helper still owns live input/network threads. AppKit's
+	// automatic termination must not call exit() while those threads run.
+	NSString* terminationReason = @"Weave input sharing helper";
+	[[NSProcessInfo processInfo] disableAutomaticTermination:terminationReason];
 
 	[NSApplication sharedApplication];
+	// The input/drag helper is not the Weave GUI. Register it as an accessory
+	// before starting AppKit so reconnects cannot create foreground Dock apps.
+	[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
     NSWindow* window = [[NSWindow alloc]
 						initWithContentRect: NSMakeRect(0, 0, 3, 3)
@@ -40,7 +47,9 @@ runCocoaApp()
 						defer: NO];
     [window setTitle: @""];
 	[window setAlphaValue:0.1];
-	[window makeKeyAndOrderFront:nil];
+	// Only fakeDragging() should expose this window. Starting or reconnecting
+	// the helper must not steal focus from the user's current application.
+	[window orderOut:nil];
 
 	OSXDragView* dragView = [[OSXDragView alloc] initWithFrame:NSMakeRect(0, 0, 3, 3)];
 
@@ -52,13 +61,22 @@ runCocoaApp()
 	[NSApp run];
 
 	NSLog(@"cocoa: release");
+	[[NSProcessInfo processInfo] enableAutomaticTermination:terminationReason];
 	[pool release];
 }
 
 void
 stopCocoaLoop()
 {
-	[NSApp stop: g_dragWindow];
+	// Shutdown originates on the input thread. AppKit must stop on its main
+	// thread, and -stop alone does not wake an idle nextEvent wait.
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[NSApp stop:nil];
+		NSEvent* wake = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+			location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0
+			context:nil subtype:0 data1:0 data2:0];
+		[NSApp postEvent:wake atStart:NO];
+	});
 }
 
 void

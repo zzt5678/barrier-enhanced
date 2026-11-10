@@ -23,6 +23,7 @@
 #include "barrier/key_types.h"
 #include "barrier/mouse_types.h"
 #include "barrier/option_types.h"
+#include "barrier/MotionBacklogPolicy.h"
 #include "mt/CondVar.h"
 #include "mt/Mutex.h"
 #include "common/stdmap.h"
@@ -347,6 +348,8 @@ private:
         WPARAM          wParam;
         LPARAM          lParam;
         std::uint64_t   sequence;
+        barrier::QueuedMotion motion;
+        DeskCommand*    nextMotion = nullptr;
     };
 
     class Desk {
@@ -375,6 +378,14 @@ private:
         std::uint64_t   m_failedCommandSequence;
         std::uint64_t   m_lastMotionCommandSequence;
         DeskCommand*    m_pendingMotionCommand;
+        DeskCommand*    m_motionTail = nullptr;
+        std::uint64_t   m_motionSegment = 0;
+        DWORD           m_motionButtons = 0;
+        std::uint64_t   m_compactedMotion = 0;
+        std::uint64_t   m_commandDepth = 0;
+        std::uint64_t   m_motionDepthHighWater = 0;
+        double          m_motionAgeHighWaterMs = 0;
+        barrier::QueuedMotion::Clock::time_point m_lastMotionReport;
     };
 
     struct DeskReadinessSnapshot {

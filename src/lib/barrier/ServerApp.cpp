@@ -474,6 +474,13 @@ bool ServerApp::initServer()
         updateStatus();
         return true;
     }
+    catch (const XInputUnavailable& e) {
+        LOG((CLOG_CRIT "native input unavailable: %s", e.what()));
+        m_inputFailure = true;
+        closePrimaryClient(primaryClient);
+        closeServerScreen(serverScreen);
+        return false;
+    }
     catch (XScreenUnavailable& e) {
         LOG((CLOG_WARN "primary screen unavailable: %s", e.what()));
         closePrimaryClient(primaryClient);
@@ -589,6 +596,13 @@ ServerApp::startServer()
         updateStatus(String("cannot listen for clients: ") + e.what());
         retryTime = 1.0;
     }
+    catch (const XInputUnavailable& e) {
+        LOG((CLOG_CRIT "native input unavailable: %s", e.what()));
+        m_inputFailure = true;
+        closeClientListener(listener);
+        cleanupServer();
+        return false;
+    }
     catch (XBase& e) {
         LOG((CLOG_CRIT "failed to start server: %s", e.what()));
         closeClientListener(listener);
@@ -637,7 +651,8 @@ ServerApp::openPrimaryClient(const String& name, barrier::Screen* screen)
 void
 ServerApp::handleScreenError(const Event&, void*)
 {
-    LOG((CLOG_CRIT "error on screen"));
+    m_inputFailure = true;
+    LOG((CLOG_CRIT "native input unavailable; stopping sharing until explicitly started"));
     m_events->addEvent(Event(Event::kQuit));
 }
 
@@ -743,6 +758,7 @@ ServerApp::handleScreenSwitched(const Event& e, void*)
 int
 ServerApp::mainLoop()
 {
+    m_inputFailure = false;
     // create socket multiplexer.  this must happen after daemonization
     // on unix because threads evaporate across a fork().
     setSocketMultiplexer(std::make_unique<SocketMultiplexer>());
@@ -776,7 +792,7 @@ ServerApp::mainLoop()
         if (!initServer() || m_serverState != kInitialized ||
             m_serverScreen == NULL || m_primaryClient == NULL) {
             cleanupServer();
-            return kExitFailed;
+            return m_inputFailure ? kExitInputUnavailable : kExitFailed;
         }
     }
     else {
@@ -864,9 +880,9 @@ ServerApp::mainLoop()
     }
 
 #if defined(MAC_OS_X_VERSION_10_7)
-    return kExitSuccess;
+    return m_inputFailure ? kExitInputUnavailable : kExitSuccess;
 #else
-    return result;
+    return m_inputFailure ? kExitInputUnavailable : result;
 #endif
 }
 
@@ -887,6 +903,7 @@ ServerApp::runInner(int argc, char** argv, ILogOutputter* outputter, StartupFunc
     m_barrierAddress = barrierAddress.get();
     args().m_config = config.get();
     const auto releaseRunState = barrier::finally([this]() {
+        cleanupServer();
         delete m_taskBarReceiver;
         m_taskBarReceiver = NULL;
         args().m_config = NULL;
@@ -957,7 +974,8 @@ ServerApp::startNode()
     // we shouldn't retry.
     LOG((CLOG_DEBUG1 "starting server"));
     if (!startServer()) {
-        m_bye(kExitFailed);
+        cleanupServer();
+        m_bye(m_inputFailure ? kExitInputUnavailable : kExitFailed);
     }
 }
 

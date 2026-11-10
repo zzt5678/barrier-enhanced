@@ -492,6 +492,26 @@ private:
     void                finishCommittedInputHandoff();
     void                rollbackCommittedInputHandoff(const char* reason);
     void                cleanupInputHandoffTimer();
+    enum class HandoffInputKind { KeyDown, KeyUp, KeyRepeat, ButtonDown,
+                                  ButtonUp, Move, RelativeMove, Wheel };
+    struct HandoffInput {
+        HandoffInputKind kind;
+        SInt32 x = 0, y = 0;
+        KeyID key = 0;
+        KeyModifierMask mask = 0;
+        KeyButton button = 0;
+        SInt32 count = 0;
+        std::uint64_t order = 0;
+        explicit HandoffInput(HandoffInputKind value) : kind(value) { }
+    };
+    void                startHandoffInputBuffer();
+    bool                bufferHandoffInput(const HandoffInput&);
+    void                invalidateHandoffInputBuffer(const char* reason);
+    void                discardHandoffInputBuffer();
+    void                replayHandoffInputBuffer(BaseClientProxy*);
+    void                rejectHandoffInputBuffer(BaseClientProxy* source);
+    void                deliverHandoffInput(BaseClientProxy*, const HandoffInput&);
+    void                releaseLocalHandoffInput();
     bool                beginActiveClientReplacement(
                             BaseClientProxy* source,
                             BaseClientProxy* target);
@@ -949,6 +969,24 @@ private:
     EDirection            m_inputHandoffGuardDir;
     EventQueueTimer*      m_inputHandoffTimer;
     Stopwatch             m_inputHandoffPhaseTimer;
+    // Input captured after revoke belongs only to this transaction. Never
+    // carry it into a rollback/replacement lease. Limits include held inputs.
+    bool                  m_handoffInputBuffering = false;
+    bool                  m_handoffInputDropped = false;
+    bool                  m_handoffHeldOverflow = false;
+    Stopwatch             m_handoffInputAge;
+    std::deque<HandoffInput> m_handoffInput;
+    std::vector<HandoffInput> m_handoffHeldInput;
+    std::map<KeyButton, HandoffInput> m_heldInputKeys;
+    std::map<ButtonID, HandoffInput> m_heldInputButtons;
+    std::uint64_t         m_heldInputOrder = 0;
+    std::set<KeyButton>    m_suppressedInputKeys;
+    std::set<ButtonID>     m_suppressedInputButtons;
+    std::map<KeyButton, std::uint64_t> m_localHandoffKeys;
+    std::map<ButtonID, std::uint64_t> m_localHandoffButtons;
+    SInt32                m_handoffInputX = 0, m_handoffInputY = 0;
+    SInt32                m_handoffInputStartX = 0, m_handoffInputStartY = 0;
+    SInt32                m_handoffInputEnterX = 0, m_handoffInputEnterY = 0;
     BaseClientProxy*      m_activeReplacementSource;
     BaseClientProxy*      m_activeReplacementTarget;
     UInt32                m_activeReplacementSeqNum;
@@ -1097,6 +1135,7 @@ private:
     bool                m_lowLatencyMode;
     bool                m_nestedRemoteMode;
     bool                m_primaryLeaveFailedRecently;
+    bool                m_primaryPrepareNeedsRetreat = false;
     EDirection          m_primaryLeaveFailureDir;
 
     ClientListener*        m_clientListener;

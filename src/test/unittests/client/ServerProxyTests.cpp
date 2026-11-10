@@ -15,6 +15,7 @@
 #include "barrier/option_types.h"
 #include "barrier/protocol_types.h"
 #include "barrier/Screen.h"
+#include "barrier/MotionBacklogPolicy.h"
 #include "arch/Arch.h"
 #include "base/Stopwatch.h"
 #include "mt/Thread.h"
@@ -44,6 +45,67 @@ using ::testing::Mock;
 using ::testing::NiceMock;
 using ::testing::Return;
 using ::testing::ReturnRef;
+
+TEST(MotionBacklogTests, halfSecondPauseCompactsExpiredPrefixAndPreservesRecentTail)
+{
+    using M = barrier::QueuedMotion;
+    const auto start = M::Clock::time_point();
+    const auto now = start + std::chrono::milliseconds(500);
+    std::vector<M> delivered;
+    for (int i = 0; i <= 120; ++i) {
+        M next{M::Absolute, 100 + i, 200 + i,
+            start + std::chrono::microseconds(i * 4167), 7, false};
+        if (delivered.empty() ||
+            !barrier::compactStaleMotion(delivered.back(), next, now)) {
+            delivered.push_back(next);
+        }
+    }
+    ASSERT_EQ(26u, delivered.size());
+    EXPECT_EQ(195, delivered.front().x);
+    EXPECT_EQ(196, delivered[1].x);
+    EXPECT_EQ(220, delivered.back().x);
+}
+
+TEST(MotionBacklogTests, preservesFreshDragEpochAndOrderBoundaries)
+{
+    using M = barrier::QueuedMotion;
+    const auto start = M::Clock::time_point();
+    const auto now = start + std::chrono::milliseconds(500);
+    const M original{M::Absolute, 10, 20, start, 1, false};
+    const M candidates[] = {
+        {M::Absolute, 30, 40, now, 1, false},
+        {M::Absolute, 30, 40, start, 2, false},
+        {M::Absolute, 30, 40, start, 1, true},
+        {M::Relative, 30, 40, start, 1, false}
+    };
+    for (const auto& next : candidates) {
+        M pending = original;
+        EXPECT_FALSE(barrier::compactStaleMotion(pending, next, now));
+        EXPECT_EQ(10, pending.x);
+    }
+    M drag = original;
+    drag.protectedPath = true;
+    EXPECT_FALSE(barrier::compactStaleMotion(drag, original, now));
+    M fresh = original;
+    EXPECT_FALSE(barrier::compactStaleMotion(fresh, original,
+        start + std::chrono::milliseconds(10)));
+}
+
+TEST(MotionBacklogTests, relativeRecoveryPreservesDisplacementAndRefusesOverflow)
+{
+    using M = barrier::QueuedMotion;
+    const auto start = M::Clock::time_point();
+    const auto now = start + std::chrono::milliseconds(500);
+    M pending{M::Relative, 8, -3, start, 1, false};
+    EXPECT_TRUE(barrier::compactStaleMotion(pending,
+        M{M::Relative, -5, 9, start, 1, false}, now));
+    EXPECT_EQ(3, pending.x);
+    EXPECT_EQ(6, pending.y);
+    EXPECT_FALSE(barrier::compactStaleMotion(pending,
+        M{M::Relative, (std::numeric_limits<std::int32_t>::max)(), 0,
+            start, 1, false}, now));
+    EXPECT_EQ(3, pending.x);
+}
 
 namespace {
 
@@ -298,9 +360,21 @@ public:
     void mouseMove(SInt32 x, SInt32 y) override
     {
         moves.push_back(std::make_pair(x, y));
+        motionKinds.push_back('A');
     }
 
+    void mouseRelativeMove(SInt32 x, SInt32 y) override
+    {
+        relativeMoves.push_back(std::make_pair(x, y));
+        motionKinds.push_back('R');
+    }
+
+    void mouseDown(ButtonID) override { motionKinds.push_back('D'); }
+    void mouseUp(ButtonID) override { motionKinds.push_back('U'); }
+
     std::vector<std::pair<SInt32, SInt32> > moves;
+    std::vector<std::pair<SInt32, SInt32> > relativeMoves;
+    std::string motionKinds;
 };
 
 class CountingClipboard : public IClipboard {
@@ -548,6 +622,10 @@ TEST(ServerProxyTests, mouseMoveCompressionIsDisabledForImmediateDeliveryModes)
 
     EXPECT_TRUE(proxy.shouldCompressMouseMoves());
 
+    proxy.m_epochPressedButtons.insert(kButtonLeft);
+    EXPECT_FALSE(proxy.shouldCompressMouseMoves());
+    proxy.m_epochPressedButtons.clear();
+
     proxy.m_lowLatencyMode = true;
     EXPECT_FALSE(proxy.shouldCompressMouseMoves());
 
@@ -604,6 +682,64 @@ TEST(ServerProxyTests, lowLatencyMouseMovesDeliverEveryCoordinateInBackloggedBat
     EXPECT_EQ(20, client.moves[0].second);
     EXPECT_EQ(11, client.moves[1].first);
     EXPECT_EQ(21, client.moves[1].second);
+}
+
+TEST(ServerProxyTests, dragRetainsEveryCoordinateAcrossLegacyAndEpochButtons)
+{
+    for (bool epoch : {false, true}) {
+        NiceMock<MockEventQueue> events;
+        IStreamEvents streamEvents;
+        ClipboardEvents clipboardEvents;
+        FileEvents fileEvents;
+        ClientEvents clientEvents;
+        IScreenEvents screenEvents;
+        setServerProxyClientEventDefaults(
+            events, streamEvents, clipboardEvents, fileEvents, clientEvents, screenEvents);
+        TestScreen screen;
+        RecordingMouseClient client(&events, &screen);
+        DuplexMemoryStream stream;
+        stream.queueInput({1, 0, 10, 0, 20, 0, 11, 0, 21, 1});
+        ServerProxy proxy(&client, &stream, &events);
+        proxy.m_inputActive = true;
+        proxy.m_inputFrameHasEpoch = epoch;
+        proxy.mouseDown();
+        proxy.mouseMove();
+        proxy.mouseMove();
+        proxy.mouseUp();
+        EXPECT_EQ("DAAU", client.motionKinds);
+        ASSERT_EQ(2u, client.moves.size());
+        EXPECT_EQ(10, client.moves[0].first);
+        EXPECT_EQ(11, client.moves[1].first);
+        EXPECT_TRUE(proxy.shouldCompressMouseMoves());
+    }
+}
+
+TEST(ServerProxyTests, relativeToAbsoluteBoundaryRetainsDisplacementAndOrder)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents;
+    ClipboardEvents clipboardEvents;
+    FileEvents fileEvents;
+    ClientEvents clientEvents;
+    IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(
+        events, streamEvents, clipboardEvents, fileEvents, clientEvents, screenEvents);
+    TestScreen screen;
+    RecordingMouseClient client(&events, &screen);
+    DuplexMemoryStream stream;
+    stream.queueInput({0, 8, 255, 253, 255, 251, 0, 9, 0, 10, 0, 20});
+    ServerProxy proxy(&client, &stream, &events);
+    proxy.m_inputActive = true;
+    proxy.mouseRelativeMove();
+    proxy.mouseRelativeMove();
+    proxy.mouseMove();
+    proxy.flushCompressedMouse();
+    ASSERT_EQ(1u, client.relativeMoves.size());
+    EXPECT_EQ(3, client.relativeMoves[0].first);
+    EXPECT_EQ(6, client.relativeMoves[0].second);
+    ASSERT_EQ(1u, client.moves.size());
+    EXPECT_EQ(10, client.moves[0].first);
+    EXPECT_EQ("RA", client.motionKinds);
 }
 
 TEST(ServerProxyTests, protocol19DefersLargeClipboardWithoutControlFallback)

@@ -1337,7 +1337,8 @@ void MSWindowsWatchdog::main_loop()
                     barrier::coreExitRequiresCorrection(static_cast<int>(exitCode))) {
                     m_hasPermanentFailure = true;
                     m_permanentFailureGeneration = m_runningCommandGeneration;
-                    LOG((CLOG_ERR "peer protocol mismatch; automatic restart suspended; correct peer versions, then Stop and Start Weave"));
+                    LOG((CLOG_ERR "%s; automatic restart suspended; correct the problem, then Stop and Start Weave",
+                        exitCode == kExitInputUnavailable ? "native input unavailable" : "peer protocol mismatch"));
                 }
                 else {
                     incrementProcessFailures();
@@ -1844,7 +1845,8 @@ MSWindowsWatchdog::startProcess()
                         barrier::coreExitRequiresCorrection(static_cast<int>(exitCode))) {
                         m_hasPermanentFailure = true;
                         m_permanentFailureGeneration = state.generation;
-                        LOG((CLOG_ERR "peer protocol mismatch during activation; automatic restart suspended; correct peer versions, then Stop and Start Weave"));
+                        LOG((CLOG_ERR "%s during activation; automatic restart suspended; correct the problem, then Stop and Start Weave",
+                            exitCode == kExitInputUnavailable ? "native input unavailable" : "peer protocol mismatch"));
                     }
                     discardPendingProcessOrFailFast(
                         discardFailureReason, 3, true);

@@ -31,13 +31,26 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+#include <chrono>
 
 namespace {
+
+// Pasteboard.h explicitly marks Carbon Pasteboard APIs not thread safe.
+// All instances, including private staging boards, serialize their native
+// access. OSXScreen never acquires this mutex: it only queues worker jobs.
+std::recursive_mutex pasteboardMutex;
 
 struct CFDataDeleter {
     void operator()(const __CFData* value) const { CFRelease(value); }
 };
 using OwnedCFData = std::unique_ptr<const __CFData, CFDataDeleter>;
+
+using ClipboardClock = std::chrono::steady_clock;
+double elapsedMilliseconds(ClipboardClock::time_point began)
+{
+    return std::chrono::duration<double, std::milli>(ClipboardClock::now() - began).count();
+}
 
 CFStringRef kFileUrlFlavor()
 {
@@ -165,6 +178,7 @@ OSXClipboard::OSXClipboard(CFStringRef pasteboardName) :
     m_time(0),
     m_pboard(NULL)
 {
+    std::lock_guard<std::recursive_mutex> lock(pasteboardMutex);
     m_converters.push_back(std::make_unique<OSXClipboardHTMLConverter>());
     m_converters.push_back(std::make_unique<OSXClipboardBMPConverter>());
     m_converters.push_back(std::make_unique<OSXClipboardPNGConverter>());
@@ -191,6 +205,7 @@ OSXClipboard::OSXClipboard(CFStringRef pasteboardName) :
 
 OSXClipboard::~OSXClipboard()
 {
+    std::lock_guard<std::recursive_mutex> lock(pasteboardMutex);
     clearConverters();
     if (m_pboard != NULL) {
         CFRelease(m_pboard);
@@ -200,6 +215,8 @@ OSXClipboard::~OSXClipboard()
 bool
 OSXClipboard::copyTo(IClipboard* dst) const
 {
+    std::lock_guard<std::recursive_mutex> lock(pasteboardMutex);
+    m_readTimings = {};
     assert(dst != NULL);
     const Time time = getTime();
     if (!open(time)) {
@@ -242,6 +259,9 @@ OSXClipboard::copyTo(IClipboard* dst) const
     bool
 OSXClipboard::empty()
 {
+    std::lock_guard<std::recursive_mutex> lock(pasteboardMutex);
+    m_writeFailed = false;
+    m_writtenFormats.fill(false);
     LOG((CLOG_DEBUG "emptying clipboard"));
     if (m_pboard == NULL)
         return false;
@@ -258,11 +278,11 @@ OSXClipboard::empty()
     bool
 OSXClipboard::synchronize()
 {
+    std::lock_guard<std::recursive_mutex> lock(pasteboardMutex);
     if (m_pboard == NULL)
         return false;
 
     PasteboardSyncFlags flags = PasteboardSynchronize(m_pboard);
-    LOG((CLOG_DEBUG2 "flags: %x", flags));
 
     if (flags & kPasteboardModified) {
         return true;
@@ -272,14 +292,22 @@ OSXClipboard::synchronize()
 
 void OSXClipboard::add(EFormat format, const std::string& data)
 {
-    if (m_pboard == NULL)
+    std::lock_guard<std::recursive_mutex> lock(pasteboardMutex);
+    if (m_pboard == NULL) {
+        m_writeFailed = true;
         return;
+    }
 
     if (format == IClipboard::kFileList) {
         RemoteFileClipboard::Data payload;
         if (RemoteFileClipboard::parse(data, payload) &&
             payload.mode == RemoteFileClipboard::Mode::MaterializedPaths) {
-            writeFileUrls(m_pboard, payload.paths);
+            const bool written = writeFileUrls(m_pboard, payload.paths);
+            m_writeFailed = !written || m_writeFailed;
+            m_writtenFormats[kFileList] = written;
+        }
+        else {
+            m_writeFailed = true;
         }
         return;
     }
@@ -306,10 +334,15 @@ void OSXClipboard::add(EFormat format, const std::string& data)
         // skip converters for other formats
         if (converter->getFormat() == format) {
             std::string osXData = converter->fromIClipboard(data);
+            if (osXData.empty() && !data.empty()) {
+                m_writeFailed = true;
+                continue;
+            }
             CFStringRef flavorType = converter->getOSXFormat();
             OwnedCFData dataRef(CFDataCreate(kCFAllocatorDefault,
                 reinterpret_cast<const UInt8*>(osXData.data()), osXData.size()));
             if (!dataRef) {
+                m_writeFailed = true;
                 LOG((CLOG_WARN "could not allocate clipboard flavor data"));
                 continue;
             }
@@ -322,9 +355,11 @@ void OSXClipboard::add(EFormat format, const std::string& data)
                 dataRef.get(),
                 kPasteboardFlavorNoFlags);
             if (status != noErr) {
+                m_writeFailed = true;
                 LOG((CLOG_WARN "could not publish clipboard flavor: error %i", status));
                 continue;
             }
+            m_writtenFormats[format] = true;
 
             LOG((CLOG_DEBUG "added %d bytes to clipboard format: %d", data.size(), format));
         }
@@ -335,6 +370,7 @@ void OSXClipboard::add(EFormat format, const std::string& data)
 bool
 OSXClipboard::open(Time time) const
 {
+    std::lock_guard<std::recursive_mutex> lock(pasteboardMutex);
     if (m_pboard == NULL)
         return false;
 
@@ -359,11 +395,15 @@ OSXClipboard::getTime() const
 bool
 OSXClipboard::has(EFormat format) const
 {
+    std::lock_guard<std::recursive_mutex> lock(pasteboardMutex);
     if (m_pboard == NULL)
         return false;
 
     if (format == IClipboard::kFileList) {
-        return !readFileUrls(m_pboard).empty();
+        const auto began = ClipboardClock::now();
+        const bool result = !readFileUrls(m_pboard).empty();
+        m_readTimings.nativeReadMilliseconds += elapsedMilliseconds(began);
+        return result;
     }
 
     PasteboardItemID item = nullptr;
@@ -391,6 +431,7 @@ OSXClipboard::has(EFormat format) const
 
 std::string OSXClipboard::get(EFormat format) const
 {
+    std::lock_guard<std::recursive_mutex> lock(pasteboardMutex);
     CFStringRef type;
     PasteboardItemID item = nullptr;
     std::string result;
@@ -399,9 +440,11 @@ std::string OSXClipboard::get(EFormat format) const
         return result;
 
     if (format == IClipboard::kFileList) {
+        const auto began = ClipboardClock::now();
         RemoteFileClipboard::Data payload;
         payload.mode = RemoteFileClipboard::Mode::SourcePaths;
         payload.paths = readFileUrls(m_pboard);
+        m_readTimings.nativeReadMilliseconds += elapsedMilliseconds(began);
         return payload.paths.empty() ? std::string() : RemoteFileClipboard::serialize(payload);
     }
 
@@ -434,7 +477,9 @@ std::string OSXClipboard::get(EFormat format) const
 
     // get the clipboard data.
     CFDataRef buffer = NULL;
+    const auto readBegan = ClipboardClock::now();
     const OSStatus status = PasteboardCopyItemFlavorData(m_pboard, item, type, &buffer);
+    m_readTimings.nativeReadMilliseconds += elapsedMilliseconds(readBegan);
     OwnedCFData ownedBuffer(buffer);
     if (status != noErr || !ownedBuffer) {
         LOG((CLOG_DEBUG "could not read clipboard flavor: error %i", status));
@@ -452,7 +497,99 @@ std::string OSXClipboard::get(EFormat format) const
         RETHROW_XTHREAD
     }
 
-    return converter->toIClipboard(result);
+    const auto conversionBegan = ClipboardClock::now();
+    auto converted = converter->toIClipboard(result);
+    m_readTimings.conversionMilliseconds += elapsedMilliseconds(conversionBegan);
+    return converted;
+}
+
+OSXClipboard::PublishResult
+OSXClipboard::publish(const IClipboard* src, const std::function<bool()>& stillCurrent,
+                      PublishTimings* timings, bool* observedLocalChange)
+{
+    std::lock_guard<std::recursive_mutex> lock(pasteboardMutex);
+    if (timings) *timings = {};
+    if (observedLocalChange) *observedLocalChange = false;
+    const auto preparationBegan = ClipboardClock::now();
+    const auto changed = [&] {
+        const bool result = synchronize();
+        if (result && observedLocalChange) *observedLocalChange = true;
+        return result;
+    };
+    if (m_pboard == nullptr) return PublishResult::Failed;
+    // Preserve a local copy made while the remote publication was queued.
+    if (changed() || !stillCurrent()) return PublishResult::Superseded;
+
+    OSXClipboard staged(kPasteboardUniqueName);
+    if (!Clipboard::copy(&staged, src) || staged.m_writeFailed) {
+        LOG((CLOG_WARN "macOS clipboard preparation failed while converting source formats"));
+        return PublishResult::Failed;
+    }
+    struct Flavor {
+        PasteboardItemID item;
+        std::shared_ptr<const __CFString> type;
+        OwnedCFData data;
+    };
+    std::vector<Flavor> flavors;
+    ItemCount count = 0;
+    if (PasteboardGetItemCount(staged.m_pboard, &count) != noErr) return PublishResult::Failed;
+    for (ItemCount i = 1; i <= count; ++i) {
+        PasteboardItemID item;
+        CFArrayRef types = nullptr;
+        if (PasteboardGetItemIdentifier(staged.m_pboard, i, &item) != noErr ||
+            PasteboardCopyItemFlavors(staged.m_pboard, item, &types) != noErr || !types) {
+            if (types) CFRelease(types);
+            return PublishResult::Failed;
+        }
+        std::unique_ptr<const __CFArray, decltype(&CFRelease)> ownedTypes(types, CFRelease);
+        for (CFIndex j = 0; j < CFArrayGetCount(types); ++j) {
+            const auto type = static_cast<CFStringRef>(CFArrayGetValueAtIndex(types, j));
+            // Carbon lists synthesized flavors too (for example public.pvr
+            // for a PNG), some of which cannot actually be rendered. Only
+            // transfer representations explicitly written during preparation.
+            bool written = staged.m_writtenFormats[kFileList] && CFEqual(type, kFileUrlFlavor());
+            for (const auto& converter : staged.m_converters) {
+                if (staged.m_writtenFormats[converter->getFormat()] && CFEqual(type, converter->getOSXFormat())) {
+                    written = true;
+                    break;
+                }
+            }
+            if (!written) continue;
+            CFDataRef data = nullptr;
+            const auto status = PasteboardCopyItemFlavorData(staged.m_pboard, item, type, &data);
+            OwnedCFData ownedData(data);
+            if (status != noErr || !ownedData) {
+                LOG((CLOG_WARN "macOS clipboard preparation could not read staged flavor %s: error=%d",
+                    utf8FromCFString(type).c_str(), status));
+                return PublishResult::Failed;
+            }
+            CFRetain(type);
+            flavors.push_back({item, {type, CFRelease}, std::move(ownedData)});
+        }
+    }
+    // This final check admits an indivisible native commit. Cancellation after
+    // admission suppresses its completion but cannot interrupt it safely after
+    // Clear. New remote publications remain ordered by the single worker.
+    // Neither conversions nor large allocations occur after this check.
+    // Carbon has no compare-and-swap operation; native errors below are still
+    // checked if another process takes ownership during the final writes.
+    if (timings) timings->preparationMilliseconds = elapsedMilliseconds(preparationBegan);
+    if (changed() || !stillCurrent()) return PublishResult::Superseded;
+    struct CommitTiming {
+        PublishTimings* timings;
+        ClipboardClock::time_point began;
+        ~CommitTiming() { if (timings) timings->commitMilliseconds = elapsedMilliseconds(began); }
+    } commitTiming{timings, ClipboardClock::now()};
+    if (!empty()) return PublishResult::Failed;
+    for (const auto& flavor : flavors) {
+        if (PasteboardPutItemFlavor(m_pboard, flavor.item, flavor.type.get(),
+                flavor.data.get(), kPasteboardFlavorNoFlags) != noErr) {
+            // Consume our partial write without mistaking it for a fresh local
+            // copy. A real external change still wins and must be exported.
+            return changed() ? PublishResult::Superseded : PublishResult::FailedAfterCommit;
+        }
+    }
+    return changed() ? PublishResult::Superseded : PublishResult::Succeeded;
 }
 
     void

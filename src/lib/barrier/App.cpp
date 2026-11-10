@@ -24,6 +24,7 @@
 #include "base/XBase.h"
 #include "base/log_outputters.h"
 #include "barrier/XBarrier.h"
+#include "barrier/XScreen.h"
 #include "barrier/ArgsBase.h"
 #include "barrier/ServiceLaunchState.h"
 #include "ipc/IpcServerProxy.h"
@@ -160,6 +161,10 @@ App::run(int argc, char** argv)
         // not sure if i like this behaviour, but it's probably better than
         // using the exit(int) function!
         result = e.getCode();
+    }
+    catch (const XInputUnavailable& e) {
+        LOG((CLOG_CRIT "native input unavailable: %s", e.what()));
+        result = kExitInputUnavailable;
     }
     catch (std::exception& e) {
         LOG((CLOG_CRIT "An error occurred: %s\n", e.what()));

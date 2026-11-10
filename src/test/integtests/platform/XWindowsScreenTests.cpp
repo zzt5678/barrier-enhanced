@@ -19,6 +19,7 @@
 #include "test/mock/barrier/MockEventQueue.h"
 #include "barrier/XScreen.h"
 #include "base/EventTypes.h"
+#include "base/EventQueue.h"
 #include "base/IEventJob.h"
 #include "base/IEventQueueBuffer.h"
 #include "platform/XWindowsScreen.h"
@@ -32,6 +33,56 @@
 using ::testing::_;
 using ::testing::Invoke;
 using ::testing::ReturnRef;
+
+namespace {
+class CursorHiderProbeImpl : public XWindowsImpl {
+public:
+    Display* display = nullptr;
+    Window hider = None;
+    int XMapRaised(Display* d, Window w) override {
+        display = d; hider = w;
+        return XWindowsImpl::XMapRaised(d, w);
+    }
+    int mapState() {
+        XSync(display, False);
+        XWindowAttributes attributes{};
+        XGetWindowAttributes(display, hider, &attributes);
+        return attributes.map_state;
+    }
+};
+class CursorHiderProbeScreen : public XWindowsScreen {
+public:
+    CursorHiderProbeScreen(CursorHiderProbeImpl* impl, EventQueue* queue) :
+        XWindowsScreen(impl, std::getenv("DISPLAY"), false, false, 0, queue) {}
+    void crossing(XEvent& crossing) {
+        handleSystemEvent(Event(Event::kSystem, nullptr, &crossing, Event::kDontFreeData), nullptr);
+    }
+};
+}
+
+TEST(CXWindowsScreenTests, staleLeaveEventCannotExposeParkedRemoteCursor)
+{
+    // Run under Xvfb only: no real desktop or user clipboard is involved.
+    EventQueue events;
+    auto* impl = new CursorHiderProbeImpl;
+    CursorHiderProbeScreen screen(impl, &events);
+    screen.enter();
+    ASSERT_TRUE(screen.leave());
+    ASSERT_EQ(IsViewable, impl->mapState());
+    XEvent oldLeave{};
+    oldLeave.type = LeaveNotify;
+    oldLeave.xcrossing.window = impl->hider;
+    oldLeave.xcrossing.mode = NotifyNormal;
+    oldLeave.xcrossing.detail = NotifyNonlinear;
+    // The event was queued by an earlier hide/unmap, but the cursor is now
+    // parked in the newly mapped hider after returning to the server.
+    screen.crossing(oldLeave);
+    EXPECT_EQ(IsViewable, impl->mapState());
+    // Moving the client's own physical pointer away must still reveal it.
+    screen.fakeMouseMove(20, 20);
+    screen.crossing(oldLeave);
+    EXPECT_EQ(IsUnmapped, impl->mapState());
+}
 
 namespace {
 

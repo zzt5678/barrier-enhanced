@@ -31,11 +31,14 @@ public:
 
     //! run() invokes \c object->method(arg)
     TSocketMultiplexerMethodJob(const RunFunction& func,
-                                ArchSocket socket, bool readable, bool writable) :
+                                ArchSocket socket, bool readable, bool writable,
+                                double deadline = -1.0, bool pendingRead = false) :
         func_{func},
         m_socket(ARCH->copySocket(socket)),
         m_readable(readable),
-        m_writable(writable)
+        m_writable(writable),
+        m_deadline(deadline),
+        m_pendingRead(pendingRead)
     {
     }
 
@@ -56,12 +59,15 @@ public:
     virtual ArchSocket getSocket() const override { return m_socket; }
     virtual bool isReadable() const override { return m_readable; }
     virtual bool isWritable() const override { return m_writable; }
+    double getDeadline() const override { return m_deadline; }
+    bool hasPendingRead() const override { return m_pendingRead; }
 
 private:
     RunFunction func_;
     ArchSocket            m_socket;
     bool                m_readable;
     bool                m_writable;
+    double              m_deadline;
+    bool                m_pendingRead;
 };
-
 

@@ -94,6 +94,10 @@ protected:
     virtual EJobResult    doRead();
     virtual EJobResult    doWrite();
     virtual size_t        readSocketNoLock(void* buffer, size_t size);
+    virtual bool hasPendingInputNoLock() { return false; }
+
+    static constexpr size_t kReadCallbackByteBudget = 64 * 1024;
+    static constexpr double kReadCallbackTimeBudget = 0.002;
 
     void removeJob();
     void setJob(std::unique_ptr<ISocketMultiplexerJob>&& job);

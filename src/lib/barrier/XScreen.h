@@ -29,6 +29,9 @@ Thrown when a screen cannot be opened or initialized.
 */
 XBASE_SUBCLASS_WHAT(XScreenOpenFailure, XScreen);
 
+//! Native input cannot start without user/system correction; do not auto-retry.
+XBASE_SUBCLASS(XInputUnavailable, XScreenOpenFailure);
+
 //! XInput exception
 /*!
 Thrown when an XInput error occurs

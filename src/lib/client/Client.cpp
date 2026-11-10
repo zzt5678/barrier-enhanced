@@ -29,6 +29,7 @@
 #include "barrier/RemoteFileClipboard.h"
 #include "barrier/protocol_types.h"
 #include "barrier/XBarrier.h"
+#include "barrier/XScreen.h"
 #include "barrier/StreamChunker.h"
 #include "barrier/TransferArchive.h"
 #include "barrier/IPlatformScreen.h"
@@ -609,8 +610,20 @@ Client::handleClipboardSendRouteFailure(ClipboardID id)
 void
 Client::handshakeComplete()
 {
+    try {
+        m_screen->enable();
+    }
+    catch (const XInputUnavailable& e) {
+        // On macOS this runs on the business event thread, not App::run's
+        // stack. Keep that loop alive to deliver the permanent screen error
+        // and perform the ordinary Cocoa-loop shutdown and screen cleanup.
+        LOG((CLOG_CRIT "native input unavailable: %s", e.what()));
+        m_ready = false;
+        m_events->addEvent(Event(m_events->forIScreen().error(),
+                                m_screen->getEventTarget()));
+        return;
+    }
     m_ready = true;
-    m_screen->enable();
     updateTopologySnapshot();
     sendEvent(m_events->forClient().connected(), NULL);
 }

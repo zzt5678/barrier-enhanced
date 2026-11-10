@@ -30,6 +30,7 @@
 #include "common/DataDirectories.h"
 #include "io/filesystem.h"
 #include "net/FingerprintDatabase.h"
+#include "net/XSocket.h"
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -46,9 +47,9 @@ static const int kSecureWriteWindowSize = 128 * 1024;
 
 #define MAX_ERROR_SIZE 65535
 
-static const float s_retryDelay = 0.01f;
-static const int kMaxSecureAcceptRetries = 500;
-static const int kMaxSecureConnectRetries = 1500;
+// Preserve the old 500/1500 x 10ms retry windows as elapsed deadlines.
+static constexpr double kSecureAcceptTimeout = 5.0;
+static constexpr double kSecureConnectTimeout = 15.0;
 
 enum {
     kMsgSize = 128
@@ -171,17 +172,32 @@ std::unique_ptr<ISocketMultiplexerJob> SecureSocket::newJob()
 void
 SecureSocket::secureConnect()
 {
-    setJob(std::make_unique<TSocketMultiplexerMethodJob>([this](auto j, auto r, auto w, auto e)
-                                                         { return serviceConnect(j, r, w, e); },
-                                                         getSocket(), isReadable(), isWritable()));
+    handshake_deadline_ = ARCH->time() + kSecureConnectTimeout;
+    handshake_wants_write_ = true;
+    setJob(newHandshakeJob(false));
 }
 
 void
 SecureSocket::secureAccept()
 {
-    setJob(std::make_unique<TSocketMultiplexerMethodJob>([this](auto j, auto r, auto w, auto e)
-                                                         { return serviceAccept(j, r, w, e); },
-                                                         getSocket(), isReadable(), isWritable()));
+    handshake_deadline_ = ARCH->time() + kSecureAcceptTimeout;
+    handshake_wants_write_ = false;
+    setJob(newHandshakeJob(true));
+}
+
+std::unique_ptr<ISocketMultiplexerJob> SecureSocket::newHandshakeJob(bool accepting)
+{
+    return std::make_unique<TSocketMultiplexerMethodJob>(
+        [this, accepting](auto j, auto r, auto w, auto e) {
+            return accepting ? serviceAccept(j, r, w, e) : serviceConnect(j, r, w, e);
+        }, getSocket(), !handshake_wants_write_, handshake_wants_write_,
+        handshake_deadline_);
+}
+
+bool SecureSocket::hasPendingInputNoLock()
+{
+    std::lock_guard<std::mutex> ssl_lock{ssl_mutex_};
+    return m_secureReady && m_ssl && m_ssl->m_ssl && SSL_pending(m_ssl->m_ssl) > 0;
 }
 
 TCPSocket::EJobResult
@@ -196,6 +212,8 @@ SecureSocket::doRead()
     int bytesRead = 0;
     int status = 0;
     const bool inputWasEmpty = (m_inputBuffer.getSize() == 0);
+    size_t servicedBytes = 0;
+    const double readStarted = ARCH->time();
 
     if (isSecureReady()) {
         const size_t readSize = getInputReadSizeNoLock(sizeof(buffer));
@@ -223,14 +241,17 @@ SecureSocket::doRead()
             if (!queueInputOrDisconnectNoLock(buffer, static_cast<UInt32>(bytesRead))) {
                 return kNew;
             }
-            if (!canReadInputNoLock()) {
+            servicedBytes += bytesRead;
+            if (!canReadInputNoLock() || servicedBytes >= kReadCallbackByteBudget ||
+                ARCH->time() - readStarted >= kReadCallbackTimeBudget) {
                 if (inputWasEmpty) {
                     sendEvent(m_events->forIStream().inputReady());
                 }
                 return kNew;
             }
 
-            const size_t readSize = getInputReadSizeNoLock(sizeof(buffer));
+            const size_t readSize = getInputReadSizeNoLock(
+                (std::min)(sizeof(buffer), kReadCallbackByteBudget - servicedBytes));
             if (readSize == 0) {
                 if (inputWasEmpty) {
                     sendEvent(m_events->forIStream().inputReady());
@@ -263,7 +284,8 @@ SecureSocket::doRead()
         return kNew;
     }
 
-    return kRetry;
+    // Refresh pending-plaintext scheduling after every pass, including EAGAIN.
+    return kNew;
 }
 
 TCPSocket::EJobResult
@@ -558,6 +580,10 @@ SecureSocket::initContext(bool server)
     // create new context from method
     SSL_METHOD* m = const_cast<SSL_METHOD*>(method);
     m_ssl->m_context = SSL_CTX_new(m);
+    if (m_ssl->m_context == nullptr) {
+        showError("could not create TLS context");
+        throw XSocketCreate("could not create TLS context");
+    }
 
     // Drop weak protocols. SSLv3 always, then TLSv1.0/1.1 if we lack the
     // modern min-version API (OpenSSL < 1.1.1).
@@ -574,10 +600,6 @@ SecureSocket::initContext(bool server)
              "fingerprint verification will be unavailable (found %s)", OPENSSL_VERSION_TEXT));
     }
 #endif
-
-    if (m_ssl->m_context == NULL) {
-        showError("");
-    }
 
     if (security_level_ == ConnectionSecurityLevel::ENCRYPTED_AUTHENTICATED) {
         // Request peer certificate and verify its fingerprint against the user's
@@ -621,12 +643,6 @@ SecureSocket::secureAccept(int socket)
 
     checkResult(r, secure_accept_retry_);
 
-    if (!isFatal() && secure_accept_retry_ > kMaxSecureAcceptRetries) {
-        LOG((CLOG_WARN "timed out accepting secure socket after %d retries",
-            secure_accept_retry_));
-        isFatal(true);
-    }
-
     if (isFatal()) {
         LOG((CLOG_ERR "failed to accept secure socket"));
         LOG((CLOG_INFO "client connection may not be secure"));
@@ -668,7 +684,6 @@ SecureSocket::secureAccept(int socket)
     if (secure_accept_retry_ > 0) {
         LOG((CLOG_DEBUG2 "retry accepting secure socket"));
         m_secureReady = false;
-        ARCH->sleep(s_retryDelay);
         return 0;
     }
 
@@ -704,12 +719,6 @@ SecureSocket::secureConnect(int socket)
 
     checkResult(r, secure_connect_retry_);
 
-    if (!isFatal() && secure_connect_retry_ > kMaxSecureConnectRetries) {
-        LOG((CLOG_WARN "timed out connecting secure socket after %d retries",
-            secure_connect_retry_));
-        handleSecureConnectRetryExhaustion();
-    }
-
     if (isFatal()) {
         LOG((CLOG_ERR "failed to connect secure socket"));
         m_secureReady = false;
@@ -721,7 +730,6 @@ SecureSocket::secureConnect(int socket)
     if (secure_connect_retry_ > 0) {
         LOG((CLOG_DEBUG2 "retry connect secure socket"));
         m_secureReady = false;
-        ARCH->sleep(s_retryDelay);
         return 0;
     }
 
@@ -803,11 +811,13 @@ SecureSocket::checkResult(int status, int& retry, bool disconnectOnFatal)
         break;
 
     case SSL_ERROR_WANT_READ:
+        handshake_wants_write_ = false;
         retry++;
         LOG((CLOG_DEBUG2 "want to read, error=%d, attempt=%d", errorCode, retry));
         break;
 
     case SSL_ERROR_WANT_WRITE:
+        handshake_wants_write_ = true;
         // Need to make sure the socket is known to be writable so the impending
         // select action actually triggers on a write. This isn't necessary for
         // m_readable because the socket logic is always readable
@@ -817,11 +827,13 @@ SecureSocket::checkResult(int status, int& retry, bool disconnectOnFatal)
         break;
 
     case SSL_ERROR_WANT_CONNECT:
+        handshake_wants_write_ = true;
         retry++;
         LOG((CLOG_DEBUG2 "want to connect, error=%d, attempt=%d", errorCode, retry));
         break;
 
     case SSL_ERROR_WANT_ACCEPT:
+        handshake_wants_write_ = false;
         retry++;
         LOG((CLOG_DEBUG2 "want to accept, error=%d, attempt=%d", errorCode, retry));
         break;
@@ -971,9 +983,14 @@ bool SecureSocket::verify_cert_fingerprint(const barrier::fs::path& fingerprint_
 MultiplexerJobStatus SecureSocket::serviceConnect(ISocketMultiplexerJob* job,
                                                   bool read, bool write, bool error)
 {
-    (void) read;
-
     Lock lock(&getMutex());
+
+    if (ARCH->time() >= handshake_deadline_) {
+        LOG((CLOG_WARN "timed out connecting secure socket"));
+        handleSecureConnectRetryExhaustion();
+        sendTLSConnectionFailedEvent("TLS handshake timed out");
+        return {false, {}};
+    }
 
     int status = 0;
 #ifdef SYSAPI_WIN32
@@ -1001,19 +1018,20 @@ MultiplexerJobStatus SecureSocket::serviceConnect(ISocketMultiplexerJob* job,
     }
 
     // Retry case
-    return {
-        true,
-        std::make_unique<TSocketMultiplexerMethodJob>([this](auto j, auto r, auto w, auto e)
-                                                      { return serviceConnect(j, r, w, e); },
-                                                      getSocket(), isReadable(), isWritable())
-    };
+    return {true, newHandshakeJob(false)};
 }
 
 MultiplexerJobStatus SecureSocket::serviceAccept(ISocketMultiplexerJob* job,
                                                  bool read, bool write, bool error)
 {
-    (void) read;
     Lock lock(&getMutex());
+
+    if (ARCH->time() >= handshake_deadline_) {
+        LOG((CLOG_WARN "timed out accepting secure socket"));
+        isFatal(true);
+        disconnect(false);
+        return {false, {}};
+    }
 
     int status = 0;
 #ifdef SYSAPI_WIN32
@@ -1036,12 +1054,7 @@ MultiplexerJobStatus SecureSocket::serviceAccept(ISocketMultiplexerJob* job,
     }
 
     // Retry case
-    return {
-        true,
-        std::make_unique<TSocketMultiplexerMethodJob>([this](auto j, auto r, auto w, auto e)
-                                                      { return serviceAccept(j, r, w, e); },
-                                                      getSocket(), isReadable(), isWritable())
-    };
+    return {true, newHandshakeJob(true)};
 }
 
 void

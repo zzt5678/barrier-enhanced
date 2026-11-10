@@ -216,6 +216,7 @@ Barrier GUI 基于 Volker Lanz 制作的 QSynergy.
     <message><source>Weave is not running.</source><translation>共享服务未启动</translation></message>
     <message><source>Transferring data...</source><translation>正在传输数据…</translation></message>
     <message><source>Incompatible peer version. Update Weave on both computers, then press Start.</source><translation>对端版本不兼容。请更新两台电脑上的 Weave，然后开始共享。</translation></message>
+    <message><source>Input unavailable. Sharing stopped to protect local control. Check input permissions, then press Start.</source><translation>输入不可用，已停止共享以保护本机操作。请检查输入权限后再开始共享。</translation></message>
     <message><source>Weave stopped unexpectedly. Retrying in %1 second(s).</source><translation>共享服务意外停止，将在 %1 秒后重试。</translation></message>
     <message><source>Stopping the Weave background service...</source><translation>正在停止共享服务…</translation></message>
     <message><source>Server: %1</source><translation>服务器：%1</translation></message>

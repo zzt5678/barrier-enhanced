@@ -99,10 +99,23 @@ public:
     virtual void        pollPressedKeys(KeyButtonSet& pressedKeys) const;
 
     CGEventFlags getModifierStateAsOSXFlags();
+    // A physical release already reached the OS; retire only the native
+    // synthesis cache, without posting a duplicate flags/key-up event.
+    void completeNativeKeyRelease(KeyButton button);
+    // Only the primary tap owner may maintain this snapshot. A remote event
+    // suppressed by the tap is newer than Carbon's locally delivered state.
+    void setObservedPrimaryModifiers(KeyModifierMask mask, CGEventFlags flags = 0);
+    void clearObservedPrimaryModifiers();
+    void completeSuppressedModifierReleases(KeyModifierMask released);
 protected:
+    virtual KeyModifierMask pollNativeModifiers() const;
     // KeyState overrides
     virtual void        getKeyMap(barrier::KeyMap& keyMap);
     virtual void        fakeKey(const Keystroke& keystroke);
+    // Native output boundary; keeping state construction separate permits
+    // isolated verification without opening an IOHID connection.
+    virtual void        postNativeKeyEvent(UInt32 type, UInt8 virtualKey,
+                                           UInt32 modifiers, bool updateModifiers);
 
 private:
     class KeyResource;
@@ -155,6 +168,7 @@ private:
     // CGEventPost
     void                postHIDVirtualKey(const UInt8 virtualKeyCode,
                             const bool postDown);
+    bool                updateNativeModifierState(UInt8 virtualKey, bool down);
 
 private:
     // OS X uses a physical key if 0 for the 'A' key.  barrier reserves
@@ -177,4 +191,8 @@ private:
     bool                m_altPressed;
     bool                m_superPressed;
     bool                m_capsPressed;
+    UInt32              m_nativeModifiers = 0;
+    bool                m_observedPrimaryModifiersValid = false;
+    KeyModifierMask     m_observedPrimaryModifiers = 0;
+    UInt32              m_observedPrimaryNativeFlags = 0;
 };

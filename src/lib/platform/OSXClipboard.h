@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <functional>
+#include <array>
 
 class IOSXClipboardConverter;
 
@@ -48,6 +50,22 @@ public:
     bool                synchronize();
     //! Copy a stable snapshot, preferring successfully read PNG over BMP.
     bool                copyTo(IClipboard* dst) const;
+    struct ReadTimings {
+        double nativeReadMilliseconds = 0;
+        double conversionMilliseconds = 0;
+    };
+    struct PublishTimings {
+        double preparationMilliseconds = 0;
+        double commitMilliseconds = 0;
+    };
+    ReadTimings         lastReadTimings() const { return m_readTimings; }
+    enum class PublishResult { Succeeded, Failed, FailedAfterCommit, Superseded };
+    // Convert into an isolated board before clearing the destination. The
+    // callback must not call Carbon or wait for the worker thread.
+    PublishResult       publish(const IClipboard* src,
+                                const std::function<bool()>& stillCurrent,
+                                PublishTimings* timings = nullptr,
+                                bool* observedLocalChange = nullptr);
 private:
     void                clearConverters();
 
@@ -57,6 +75,9 @@ private:
     mutable Time        m_time;
     ConverterList        m_converters;
     PasteboardRef        m_pboard;
+    bool                m_writeFailed = false;
+    mutable ReadTimings m_readTimings;
+    std::array<bool, kNumFormats> m_writtenFormats{};
 };
 
 //! Clipboard format converter interface

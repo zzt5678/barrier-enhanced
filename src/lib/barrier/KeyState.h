@@ -85,6 +85,18 @@ public:
 
     SInt32 getKeyState(KeyButton keyButton) { return m_keys[keyButton]; }
 
+    // Explicit fakeKeyDown mappings still requiring release. Observed
+    // physical onKey state alone is not synthetic input ownership.
+    bool hasSyntheticKeyBindings() const;
+
+    // A native release already delivered to the local OS can complete the
+    // mappings for its local button without synthesizing another release.
+    // The caller applies the physical state separately. Retiring ownership
+    // must not decrement that state or overwrite a newer press/modifier mask.
+    KeyButtonSet retireSyntheticKeyBindings(KeyButton localButton);
+    KeyButton syntheticKeyButton(KeyButton serverButton) const;
+
+
 protected:
     typedef barrier::KeyMap::Keystroke Keystroke;
 

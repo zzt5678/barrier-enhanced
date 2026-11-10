@@ -12,6 +12,13 @@
 #include <gtest/gtest.h>
 #include "../../lib/common/common.h"
 
+TEST(WindowLifecyclePolicyTests, nativeInputFailureStaysStoppedUntilExplicitStart)
+{
+    EXPECT_FALSE(WindowLifecyclePolicy::shouldRestartCore(true, kExitInputUnavailable));
+    EXPECT_FALSE(WindowLifecyclePolicy::shouldRestartCore(false, kExitInputUnavailable));
+    EXPECT_TRUE(WindowLifecyclePolicy::shouldRestartCore(true, kExitFailed));
+}
+
 TEST(WindowLifecyclePolicyTests, permanentPeerMismatchStopsRestartButTransientExitRetries)
 {
     EXPECT_FALSE(WindowLifecyclePolicy::shouldRestartCore(true, kExitIncompatible));

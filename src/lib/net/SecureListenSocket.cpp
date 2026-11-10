@@ -20,10 +20,12 @@
 #include "SecureSocket.h"
 #include "net/NetworkAddress.h"
 #include "net/SocketMultiplexer.h"
+#include "net/XSocket.h"
 #include "arch/Arch.h"
 #include "arch/XArch.h"
 #include "common/DataDirectories.h"
 #include "base/String.h"
+#include "base/Log.h"
 
 SecureListenSocket::SecureListenSocket(IEventQueue* events, SocketMultiplexer* socketMultiplexer,
                                        IArchNetwork::EAddressFamily family,
@@ -62,6 +64,12 @@ SecureListenSocket::accept()
             setListeningJob();
         }
         return NULL;
+    }
+    catch (const XSocketCreate& ex) {
+        delete socket;
+        setListeningJob();
+        LOG((CLOG_WARN "rejecting connection after TLS initialization failure: %s", ex.what()));
+        return nullptr;
     }
     catch (std::exception &ex) {
         if (socket != NULL) {

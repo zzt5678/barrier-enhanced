@@ -11,6 +11,7 @@
 #include "barrier/FileTransferReceiver.h"
 #include "barrier/FileTransferSendState.h"
 #include "barrier/IPlatformScreen.h"
+#include "barrier/XScreen.h"
 #include "barrier/RemoteFileClipboard.h"
 #include "barrier/StreamChunker.h"
 #include "arch/Arch.h"
@@ -344,6 +345,38 @@ public:
     UInt32 inputEpoch;
 };
 
+class HandoffInputClient : public RevocableRecordingClient
+{
+public:
+    explicit HandoffInputClient(const std::string& name) : RevocableRecordingClient(name) { }
+    bool revocable = true;
+    bool leaveSucceeds = true;
+    bool supportsInputLeaseRevokeAck() const override { return revocable; }
+    bool leave() override { return leaveSucceeds; }
+    std::vector<std::string> input;
+    std::vector<std::pair<SInt32, SInt32>> clickPositions;
+    void enter(SInt32 x, SInt32 y, UInt32 sequence, KeyModifierMask mask, bool screensaver) override {
+        RevocableRecordingClient::enter(x, y, sequence, mask, screensaver);
+        mouseMoveX = x; mouseMoveY = y;
+    }
+    void keyDown(KeyID, KeyModifierMask, KeyButton) override { input.push_back("key-down"); }
+    void keyUp(KeyID, KeyModifierMask, KeyButton) override { input.push_back("key-up"); }
+    void keyRepeat(KeyID, KeyModifierMask, SInt32, KeyButton) override { input.push_back("repeat"); }
+    void mouseDown(ButtonID) override {
+        input.push_back("down");
+        clickPositions.emplace_back(mouseMoveX, mouseMoveY);
+    }
+    void mouseUp(ButtonID) override { input.push_back("up"); }
+    void mouseWheel(SInt32, SInt32) override { input.push_back("wheel"); }
+    void mouseRelativeMove(SInt32 x, SInt32 y) override {
+        input.push_back("relative:" + std::to_string(x) + "," + std::to_string(y));
+    }
+    void mouseMove(SInt32 x, SInt32 y) override {
+        input.push_back("move:" + std::to_string(x) + "," + std::to_string(y));
+        RecordingClient::mouseMove(x, y);
+    }
+};
+
 class BulkRecordingClient : public RecordingClient
 {
 public:
@@ -520,7 +553,8 @@ class UnenterablePrimaryClient : public PrimaryClient
 public:
     explicit UnenterablePrimaryClient(barrier::Screen* screen = NULL) :
         PrimaryClient("primary", screen),
-        enterCount(0)
+        enterCount(0),
+        enterForScreensaver(false)
     {
     }
 
@@ -528,7 +562,10 @@ public:
     SInt32 getJumpZoneSize() const override { return 1; }
     bool isLockedToScreen() const override { return false; }
     KeyModifierMask getToggleMask() const override { return 0; }
-    void enter(SInt32, SInt32, UInt32, KeyModifierMask, bool) override { ++enterCount; }
+    void enter(SInt32, SInt32, UInt32, KeyModifierMask, bool screensaver) override {
+        ++enterCount;
+        enterForScreensaver = screensaver;
+    }
     void getShape(SInt32& x, SInt32& y, SInt32& width, SInt32& height) const override
     {
         x = 0;
@@ -543,6 +580,7 @@ public:
     }
 
     UInt32 enterCount;
+    bool enterForScreensaver;
 };
 
 class EnterablePrimaryClient : public PrimaryClient
@@ -930,6 +968,154 @@ void initializeServer(Server& server, Config& config, PrimaryClient& primary,
     server.m_clientSet.insert(&active);
 }
 
+class CaptureRecoveryPlatform : public DragPlatformScreen
+{
+public:
+    bool captured = false;
+    bool acceptEnter = true;
+    unsigned enterAttempts = 0;
+    unsigned warps = 0;
+    bool leave() override { captured = true; return true; }
+    bool tryEnter() override {
+        ++enterAttempts;
+        if (!acceptEnter) return false;
+        captured = false;
+        return true;
+    }
+    void warpCursor(SInt32, SInt32) override { ++warps; }
+};
+
+class CaptureRecoveryPrimary : public EnterablePrimaryClient
+{
+public:
+    using EnterablePrimaryClient::EnterablePrimaryClient;
+    bool available = true;
+    bool canEnter() const override { return available; }
+    void enter(SInt32 x, SInt32 y, UInt32 seq, KeyModifierMask mask, bool screensaver) override {
+        PrimaryClient::enter(x, y, seq, mask, screensaver);
+    }
+};
+
+class ServerCaptureRecoveryTests : public testing::Test
+{
+protected:
+    Config config;
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    CaptureRecoveryPlatform* platform = new CaptureRecoveryPlatform;
+    barrier::Screen screen{platform, &events};
+    CaptureRecoveryPrimary primary{&screen};
+    RecordingClient remote{"remote"};
+    Server server;
+    void SetUp() override {
+        config.addScreen("primary"); config.addScreen("remote");
+        setEventTypeDefaults(events, clientEvents, screenEvents, clipboardEvents, serverEvents);
+        initializeServer(server, config, primary, events, remote);
+        server.m_screen = &screen;
+        ASSERT_TRUE(screen.leave());
+    }
+    void TearDown() override {
+        platform->acceptEnter = true;
+        if (!screen.isOnScreen()) screen.enter(0);
+    }
+};
+
+TEST_F(ServerCaptureRecoveryTests, disconnectedRemoteReleasesCaptureWithoutWarpWhenPrimaryShapeUnavailable)
+{
+    primary.shapeW = primary.shapeH = 0;
+    server.forceLeaveClient(&remote);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, platform->enterAttempts);
+    EXPECT_EQ(0u, platform->warps);
+    EXPECT_FALSE(platform->captured);
+    EXPECT_TRUE(screen.isOnScreen());
+}
+
+TEST_F(ServerCaptureRecoveryTests, disconnectedRemoteRecoveryStillHonorsPlatformEntryRejection)
+{
+    primary.available = false;
+    platform->acceptEnter = false;
+    server.forceLeaveClient(&remote);
+    EXPECT_EQ(1u, platform->enterAttempts);
+    EXPECT_EQ(0u, platform->warps);
+    EXPECT_TRUE(platform->captured);
+    EXPECT_FALSE(screen.isOnScreen());
+}
+
+class HandoffLocalScreen : public DragPlatformScreen
+{
+public:
+    mutable std::vector<std::string> input;
+    std::map<KeyButton, std::uint64_t> keyGenerations;
+    std::map<ButtonID, std::uint64_t> buttonGenerations;
+    std::vector<std::pair<KeyButton, std::uint64_t>> keyReleases;
+    std::vector<std::pair<ButtonID, std::uint64_t>> buttonReleases;
+    void fakeInputBegin() override { input.push_back("begin"); }
+    void fakeInputEnd() override { input.push_back("end"); }
+    void fakeMouseButton(ButtonID, bool down) override { input.push_back(down ? "down" : "up"); }
+    void fakeMouseWheel(SInt32, SInt32) const override { input.push_back("wheel"); }
+    void fakeKeyDown(KeyID, KeyModifierMask, KeyButton) override { input.push_back("key-down"); }
+    bool fakeKeyUp(KeyButton) override { input.push_back("key-up"); return true; }
+    void fakeKeyDownForHandoff(KeyID id, KeyModifierMask mask, KeyButton button, std::uint64_t generation) override {
+        keyGenerations[button] = generation;
+        fakeKeyDown(id, mask, button);
+    }
+    bool fakeKeyUpForHandoff(KeyButton button, std::uint64_t generation) override {
+        keyReleases.emplace_back(button, generation);
+        return fakeKeyUp(button);
+    }
+    void fakeMouseButtonForHandoff(ButtonID button, bool down, std::uint64_t generation) override {
+        if (down) buttonGenerations[button] = generation;
+        else buttonReleases.emplace_back(button, generation);
+        fakeMouseButton(button, down);
+    }
+};
+
+class HandoffContinuityTests : public ::testing::Test
+{
+protected:
+    Config config;
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    HandoffLocalScreen* local = new HandoffLocalScreen();
+    barrier::Screen screen{local, &events};
+    EnterablePrimaryClient primary{&screen};
+    HandoffInputClient source{"source"}, target{"target"};
+    Server server;
+    void SetUp() override {
+        config.addScreen("primary"); config.addScreen("source"); config.addScreen("target");
+        setEventTypeDefaults(events, clientEvents, screenEvents, clipboardEvents, serverEvents);
+        initializeServer(server, config, primary, events, source);
+        server.m_screen = &screen;
+        server.m_clientSet.insert(&primary); server.m_clientSet.insert(&target);
+        server.m_clients.emplace("primary", &primary); server.m_clients.emplace("target", &target);
+        source.inputEpoch = 7;
+    }
+    void ack(BaseClientProxy& client, UInt32 seq, bool ready = true) {
+        BaseClientProxy::InputHandoffReadyInfo info(seq, ready);
+        Event event(Event::kUnknown, &client, &info, Event::kDontFreeData);
+        server.handleInputHandoffReady(event, &client);
+    }
+    void revoke() {
+        ASSERT_TRUE(server.switchScreen(&target, 30, 40, false, kRight));
+        ack(target, target.preparedSeqNum);
+        ASSERT_TRUE(server.m_inputHandoffSourceRevokePending);
+    }
+    void returnHeldInputs() {
+        ASSERT_TRUE(server.switchScreen(&primary, 100, 200, false));
+        server.onKeyDown('a', 0, 38, NULL);
+        server.onMouseDown(kButtonLeft);
+        ack(source, source.revokeHandoffSeqNum);
+        ASSERT_EQ(&primary, server.m_active);
+    }
+};
+
 Clipboard makeSourcePathsClipboard(const barrier::fs::path& path)
 {
     RemoteFileClipboard::Data payload;
@@ -987,6 +1173,441 @@ Clipboard makeTextClipboard(const std::string& text)
     return clipboard;
 }
 
+}
+
+TEST_F(HandoffContinuityTests, delayedRevokeAndCommitPreserveOrderedInputExactlyOnce)
+{
+    revoke();
+    server.onMouseMoveSecondary(5, 6);
+    server.onMouseDown(kButtonLeft);
+    server.onKeyDown('a', 0, 38, NULL);
+    server.onMouseWheel(0, 120);
+    server.onKeyUp('a', 0, 38, NULL);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_TRUE(source.input.empty());
+    ack(source, source.revokeHandoffSeqNum);
+    EXPECT_TRUE(target.input.empty());
+    server.onMouseMoveSecondary(2, 3);
+    ack(target, target.enterSeqNum);
+    EXPECT_EQ((std::vector<std::string>{"move:35,46", "down", "key-down", "wheel", "key-up", "up", "move:37,49"}), target.input);
+    ack(target, target.enterSeqNum);
+    EXPECT_EQ(7u, target.input.size());
+}
+
+TEST_F(HandoffContinuityTests, heldKeyReleaseIsPairedInNewLease)
+{
+    server.onKeyDown('a', 0, 38, NULL);
+    revoke();
+    server.onKeyUp('a', 0, 38, NULL);
+    EXPECT_EQ((std::vector<std::string>{"key-down"}), source.input);
+    ack(source, source.revokeHandoffSeqNum);
+    ack(target, target.enterSeqNum);
+    EXPECT_EQ((std::vector<std::string>{"key-down", "key-up"}), target.input);
+}
+
+TEST_F(HandoffContinuityTests, repeatedPendingTargetUsesNewestCoordinates)
+{
+    ASSERT_TRUE(server.switchScreen(&target, 30, 40, false, kRight));
+    ASSERT_TRUE(server.switchScreen(&target, 33, 47, false, kRight));
+    ack(target, target.preparedSeqNum);
+    ack(source, source.revokeHandoffSeqNum);
+    EXPECT_EQ(33, target.enterX);
+    EXPECT_EQ(47, target.enterY);
+}
+
+TEST_F(HandoffContinuityTests, overflowDiscardsWholeTransactionAndSuppressesUnpairedRelease)
+{
+    revoke();
+    for (int i = 0; i < 1024; ++i) server.onMouseWheel(0, 120);
+    server.onMouseDown(kButtonLeft);
+    ack(source, source.revokeHandoffSeqNum);
+    ack(target, target.enterSeqNum);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_TRUE(source.input.empty());
+    EXPECT_TRUE(target.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, rejectedRevokeDiscardsTargetActionsAndReleasesOriginalHeldKeys)
+{
+    server.onKeyDown('a', 0, 38, NULL);
+    revoke();
+    server.onMouseDown(kButtonLeft);
+    server.onMouseUp(kButtonLeft);
+    server.onKeyUp('a', 0, 38, NULL);
+    ack(source, source.revokeHandoffSeqNum, false);
+    EXPECT_EQ((std::vector<std::string>{"key-down", "key-up", "move:321,654"}), source.input);
+    EXPECT_TRUE(target.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, forcedLocalRecoveryRetiresPendingInputAndIgnoresLateAck)
+{
+    revoke();
+    server.onMouseDown(kButtonLeft);
+    server.forceLeaveClient(&source);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    ack(source, source.revokeHandoffSeqNum);
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_TRUE(source.input.empty());
+    EXPECT_TRUE(target.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, primaryReturnAppliesWaitingMotionWithoutASecondEdgeWarp)
+{
+    server.rememberPrimaryReturnAnchor(&source, 1023, 300, kRight);
+    ASSERT_TRUE(server.switchScreen(&primary, 1023, 300, false, kLeft));
+    ASSERT_TRUE(server.m_inputHandoffSourceRevokePending);
+    ASSERT_EQ(1007, server.m_inputHandoffX);
+
+    // The user's mouse keeps moving during the source revoke round-trip.
+    // Enter directly at its updated position instead of first warping back
+    // to the edge and then replaying the same movement a second time.
+    server.onMouseMoveSecondary(-400, 20);
+    ack(source, source.revokeHandoffSeqNum);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(607, primary.enterX);
+    EXPECT_EQ(320, primary.enterY);
+    EXPECT_EQ(607, server.m_x);
+    EXPECT_EQ(320, server.m_y);
+}
+
+TEST_F(HandoffContinuityTests, primaryReturnReplaysCapturedClickOnceWithoutReinjectingLocalEvents)
+{
+    ASSERT_TRUE(server.switchScreen(&primary, 100, 200, false));
+    server.onMouseDown(kButtonLeft);
+    server.onKeyDown('a', 0, 38, NULL);
+    server.onMouseWheel(0, 120);
+    server.onKeyUp('a', 0, 38, NULL);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_TRUE(local->input.empty());
+    EXPECT_TRUE(source.input.empty());
+    ack(source, source.revokeHandoffSeqNum);
+    EXPECT_EQ((std::vector<std::string>{"begin", "down", "key-down", "wheel", "key-up", "up", "end"}), local->input);
+    // Physical events captured after local enter are already delivered by the
+    // OS. The ordinary primary path must remain a no-op, even after replay.
+    server.onMouseDown(kButtonLeft);
+    server.onMouseUp(kButtonLeft);
+    server.onKeyDown('b', 0, 56, NULL);
+    server.onKeyUp('b', 0, 56, NULL);
+    ack(source, source.revokeHandoffSeqNum);
+    EXPECT_EQ(7u, local->input.size());
+}
+
+TEST_F(HandoffContinuityTests, primaryReturnReleasesKeyStillHeldAtCommit)
+{
+    ASSERT_TRUE(server.switchScreen(&primary, 100, 200, false));
+    server.onKeyDown('a', 0, 38, NULL);
+    ack(source, source.revokeHandoffSeqNum);
+    server.onKeyUp('a', 0, 38, NULL);
+    EXPECT_EQ((std::vector<std::string>{"begin", "key-down", "end", "begin", "key-up", "end"}), local->input);
+}
+
+TEST_F(HandoffContinuityTests, replayedHeldInputsAreReleasedBeforeLeavingPrimaryAgain)
+{
+    ASSERT_TRUE(server.switchScreen(&primary, 100, 200, false));
+    server.onMouseDown(kButtonLeft);
+    server.onKeyDown('a', 0, 38, NULL);
+    ack(source, source.revokeHandoffSeqNum);
+    ASSERT_EQ(&primary, server.m_active);
+    local->input.clear();
+
+    ASSERT_TRUE(server.switchScreen(&target, 30, 40, false, kRight));
+    ack(target, target.preparedSeqNum);
+
+    EXPECT_EQ(&target, server.m_active);
+    EXPECT_EQ((std::vector<std::string>{"begin", "key-up", "up", "end"}), local->input);
+    ack(target, target.enterSeqNum);
+    server.onKeyUp('a', 0, 38, NULL);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_EQ(4u, local->input.size());
+}
+
+TEST_F(HandoffContinuityTests, disconnectReleasesReplayedHeldInputsExactlyOnce)
+{
+    ASSERT_TRUE(server.switchScreen(&primary, 100, 200, false));
+    server.onMouseDown(kButtonLeft);
+    server.onKeyDown('a', 0, 38, NULL);
+    ack(source, source.revokeHandoffSeqNum);
+    ASSERT_EQ(&primary, server.m_active);
+    ASSERT_TRUE(server.removeClient(&source));
+    ASSERT_TRUE(server.removeClient(&target));
+    local->input.clear();
+
+    server.disconnect();
+    server.disconnect();
+
+    EXPECT_EQ((std::vector<std::string>{"begin", "key-up", "up", "end"}), local->input);
+    server.onKeyUp('a', 0, 38, NULL);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_EQ(4u, local->input.size());
+}
+
+TEST_F(HandoffContinuityTests, localCleanupCarriesTheCurrentOwnedPressGeneration)
+{
+    returnHeldInputs();
+    const auto keyGeneration = server.m_heldInputKeys.at(38).order;
+    const auto buttonGeneration = server.m_heldInputButtons.at(kButtonLeft).order;
+    EXPECT_NE(0u, keyGeneration);
+    EXPECT_NE(keyGeneration, buttonGeneration);
+    EXPECT_EQ(keyGeneration, local->keyGenerations.at(38));
+    EXPECT_EQ(buttonGeneration, local->buttonGenerations.at(kButtonLeft));
+    server.releaseLocalHandoffInput();
+    EXPECT_EQ((std::vector<std::pair<KeyButton, std::uint64_t>>{{38, keyGeneration}}), local->keyReleases);
+    EXPECT_EQ((std::vector<std::pair<ButtonID, std::uint64_t>>{{kButtonLeft, buttonGeneration}}), local->buttonReleases);
+    server.releaseLocalHandoffInput();
+    EXPECT_EQ(1u, local->keyReleases.size());
+    EXPECT_EQ(1u, local->buttonReleases.size());
+}
+
+TEST_F(HandoffContinuityTests, nativeCompletedLocalPressStillReleasesSameRemoteLeaseBeforeCommitAck)
+{
+    returnHeldInputs();
+    ASSERT_TRUE(server.switchScreen(&target, 30, 40, false, kRight));
+    ack(target, target.preparedSeqNum);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    server.onKeyUp('a', 0, 38, NULL);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_TRUE(target.input.empty());
+    ack(target, target.enterSeqNum);
+    EXPECT_EQ((std::vector<std::string>{"key-down", "down", "key-up", "up"}), target.input);
+    EXPECT_TRUE(server.m_heldInputKeys.empty());
+    EXPECT_TRUE(server.m_heldInputButtons.empty());
+}
+
+TEST_F(HandoffContinuityTests, nativeCompletedLocalPressStillReleasesAlreadyActiveRemoteLease)
+{
+    returnHeldInputs();
+    ASSERT_TRUE(server.switchScreen(&target, 30, 40, false, kRight));
+    ack(target, target.preparedSeqNum);
+    ack(target, target.enterSeqNum);
+    ASSERT_EQ((std::vector<std::string>{"key-down", "down"}), target.input);
+    server.onKeyUp('a', 0, 38, NULL);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_EQ((std::vector<std::string>{"key-down", "down", "key-up", "up"}), target.input);
+    EXPECT_TRUE(server.m_heldInputKeys.empty());
+    EXPECT_TRUE(server.m_heldInputButtons.empty());
+}
+
+TEST_F(HandoffContinuityTests, bufferedOldAndNewPressesKeepFifoAndNewHeldIdentity)
+{
+    returnHeldInputs();
+    const auto oldKey = server.m_heldInputKeys.at(38).order;
+    const auto oldButton = server.m_heldInputButtons.at(kButtonLeft).order;
+    server.startHandoffInputBuffer();
+    server.onKeyUp('a', 0, 38, NULL);
+    server.onMouseUp(kButtonLeft);
+    server.onKeyDown('a', 0, 38, NULL);
+    server.onMouseDown(kButtonLeft);
+    const auto newKey = server.m_heldInputKeys.at(38).order;
+    const auto newButton = server.m_heldInputButtons.at(kButtonLeft).order;
+    ASSERT_NE(oldKey, newKey);
+    ASSERT_NE(oldButton, newButton);
+    local->input.clear();
+    server.replayHandoffInputBuffer(&primary);
+    EXPECT_EQ((std::vector<std::string>{"begin", "key-down", "down", "key-up", "up", "key-down", "down", "end"}), local->input);
+    EXPECT_EQ(newKey, server.m_heldInputKeys.at(38).order);
+    EXPECT_EQ(newButton, server.m_heldInputButtons.at(kButtonLeft).order);
+    EXPECT_EQ(newKey, server.m_localHandoffKeys.at(38));
+    EXPECT_EQ(newButton, server.m_localHandoffButtons.at(kButtonLeft));
+    server.onKeyUp('a', 0, 38, NULL);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_EQ(std::make_pair(KeyButton(38), newKey), local->keyReleases.back());
+    EXPECT_EQ(std::make_pair(ButtonID(kButtonLeft), newButton), local->buttonReleases.back());
+}
+
+TEST_F(HandoffContinuityTests, relativeDeltasAndKeyRepeatsRemainOrdered)
+{
+    revoke();
+    server.m_relativeMoves = true;
+    server.m_lockedToScreen = true;
+    server.onKeyDown('a', 0, 38, NULL);
+    server.onMouseMoveSecondary(2, -3);
+    server.onKeyRepeat('a', 0, 2, 38);
+    server.onMouseMoveSecondary(-4, 7);
+    server.onKeyUp('a', 0, 38, NULL);
+    ack(source, source.revokeHandoffSeqNum);
+    ack(target, target.enterSeqNum);
+    EXPECT_EQ((std::vector<std::string>{"key-down", "relative:2,-3", "repeat", "relative:-4,7", "key-up"}), target.input);
+    EXPECT_TRUE(source.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, targetDisconnectDoesNotReplayClickOnLocalFallback)
+{
+    revoke();
+    server.onMouseDown(kButtonLeft);
+    server.onMouseUp(kButtonLeft);
+    ASSERT_TRUE(server.removeClient(&target));
+    ack(source, source.revokeHandoffSeqNum);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_TRUE(local->input.empty());
+    EXPECT_TRUE(source.input.empty());
+    EXPECT_TRUE(target.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, sourceDisconnectDiscardsTargetActions)
+{
+    revoke();
+    server.onMouseDown(kButtonLeft);
+    ASSERT_TRUE(server.removeClient(&source));
+    server.forceLeaveClient(&source);
+    ack(source, source.revokeHandoffSeqNum);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_TRUE(local->input.empty());
+    EXPECT_TRUE(target.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, commitTimeoutDoesNotReplayOldClickIntoRestoredLease)
+{
+    revoke();
+    server.onMouseDown(kButtonLeft);
+    ack(source, source.revokeHandoffSeqNum);
+    server.handleInputHandoffTimeout(Event(), NULL);
+    // Rollback prepares the source, fences the unacknowledged target, then
+    // restores the source under a fresh lease.
+    ack(source, source.preparedSeqNum);
+    ack(target, target.revokeHandoffSeqNum);
+    ack(source, source.enterSeqNum);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_EQ(&source, server.m_active);
+    EXPECT_TRUE(target.input.empty());
+    EXPECT_TRUE(source.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, wholeBufferAgeLimitDiscardsEvenBeforeCommitTimerRuns)
+{
+    revoke();
+    server.onMouseDown(kButtonLeft);
+    server.onMouseUp(kButtonLeft);
+    // Simulate a delayed event loop without waiting for or firing phase timers.
+    ARCH->sleep(2.01);
+    ack(source, source.revokeHandoffSeqNum);
+    ack(target, target.enterSeqNum);
+    EXPECT_TRUE(source.input.empty());
+    EXPECT_TRUE(target.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, failedSynchronousLeaveKeepsOriginalHeldKeyRelease)
+{
+    source.revocable = false;
+    source.leaveSucceeds = false;
+    server.onKeyDown('a', 0, 38, NULL);
+    ASSERT_FALSE(server.switchScreen(&target, 30, 40, false));
+    server.onKeyUp('a', 0, 38, NULL);
+    EXPECT_EQ((std::vector<std::string>{"key-down", "key-up"}), source.input);
+    EXPECT_TRUE(target.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, heldButtonsAndKeysRetainOriginalPressOrder)
+{
+    server.onMouseDown(kButtonLeft);
+    server.onKeyDown('a', 0, 38, NULL);
+    revoke();
+    server.onKeyUp('a', 0, 38, NULL);
+    server.onMouseUp(kButtonLeft);
+    ack(source, source.revokeHandoffSeqNum);
+    ack(target, target.enterSeqNum);
+    EXPECT_EQ((std::vector<std::string>{"down", "key-down", "key-up", "up"}), target.input);
+}
+
+TEST_F(HandoffContinuityTests, legacyRollbackRecordCannotDiscardNewDirectCommitInput)
+{
+    source.revocable = false;
+    source.commitAckSupported = false;
+    server.trackCommittedInputHandoff(&primary, &source, 7, 100, 100, kNoDirection);
+    ASSERT_TRUE(server.switchScreen(&target, 30, 40, false));
+    server.onMouseDown(kButtonLeft);
+    server.onMouseUp(kButtonLeft);
+    EXPECT_TRUE(target.input.empty());
+    ack(target, target.enterSeqNum);
+    EXPECT_EQ((std::vector<std::string>{"down", "up"}), target.input);
+}
+
+TEST_F(HandoffContinuityTests, excessiveHeldStateRejectsRevokeWithoutLeavingKeysStuck)
+{
+    for (KeyButton button = 1; button <= 257; ++button)
+        server.onKeyDown('a', 0, button, NULL);
+    revoke();
+    ack(source, source.revokeHandoffSeqNum, false);
+    // No bounded snapshot can safely reconstruct these synthetic held keys.
+    // Fence the old connection so its disconnect path releases the epoch.
+    EXPECT_EQ(0u, server.m_clientSet.count(&source));
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_TRUE(target.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, primaryReplayNestsInsideInputFilterFakeInputBlock)
+{
+    ASSERT_TRUE(server.switchScreen(&primary, 100, 200, false));
+    server.onMouseDown(kButtonLeft);
+    server.onMouseUp(kButtonLeft);
+    primary.fakeInputBegin();
+    ack(source, source.revokeHandoffSeqNum);
+    primary.fakeInputEnd();
+    EXPECT_EQ((std::vector<std::string>{"begin", "down", "up", "end"}), local->input);
+}
+
+TEST_F(HandoffContinuityTests, freshDragPreservesEveryPointAcrossRevokeAndCommitWait)
+{
+    revoke();
+    server.onMouseDown(kButtonLeft);
+    server.onMouseMoveSecondary(5, 6);
+    server.onMouseMoveSecondary(2, 3);
+    ack(source, source.revokeHandoffSeqNum);
+    server.onMouseMoveSecondary(4, 5);
+    server.onMouseMoveSecondary(1, 2);
+    server.onMouseUp(kButtonLeft);
+    ack(target, target.enterSeqNum);
+    // Enter installs the newest valid destination position, then replay must
+    // restore the original drag origin before delivering its first press.
+    EXPECT_EQ((std::vector<std::string>{"move:30,40", "down", "move:35,46", "move:37,49", "move:41,54", "move:42,56", "up"}), target.input);
+    EXPECT_EQ((std::vector<std::pair<SInt32, SInt32>>{{30, 40}}), target.clickPositions);
+    EXPECT_TRUE(source.input.empty());
+}
+
+TEST_F(HandoffContinuityTests, ordinaryMotionStillCoalescesToLatestPoint)
+{
+    revoke();
+    server.onMouseMoveSecondary(5, 6);
+    server.onMouseMoveSecondary(2, 3);
+    ack(source, source.revokeHandoffSeqNum);
+    server.onMouseMoveSecondary(4, 5);
+    server.onMouseMoveSecondary(1, 2);
+    ack(target, target.enterSeqNum);
+    EXPECT_EQ((std::vector<std::string>{"move:42,56"}), target.input);
+}
+
+TEST_F(HandoffContinuityTests, clickBeforeMotionReplaysAtOriginalPoint)
+{
+    revoke();
+    server.onMouseDown(kButtonLeft);
+    server.onMouseUp(kButtonLeft);
+    server.onMouseMoveSecondary(5, 6);
+    ack(source, source.revokeHandoffSeqNum);
+    EXPECT_EQ(35, target.enterX);
+    EXPECT_EQ(46, target.enterY);
+    ack(target, target.enterSeqNum);
+    EXPECT_EQ((std::vector<std::pair<SInt32, SInt32>>{{30, 40}}), target.clickPositions);
+    EXPECT_EQ((std::vector<std::string>{"move:30,40", "down", "up", "move:35,46"}), target.input);
+    EXPECT_EQ(35, target.mouseMoveX);
+    EXPECT_EQ(46, target.mouseMoveY);
+}
+
+TEST_F(HandoffContinuityTests, returnToOriginDuringCommitWaitStillRestoresClickPosition)
+{
+    revoke();
+    server.onMouseDown(kButtonLeft);
+    server.onMouseUp(kButtonLeft);
+    server.onMouseMoveSecondary(5, 6);
+    ack(source, source.revokeHandoffSeqNum);
+    ASSERT_EQ(35, target.enterX);
+    ASSERT_EQ(46, target.enterY);
+    server.onMouseMoveSecondary(-5, -6);
+    ack(target, target.enterSeqNum);
+    EXPECT_EQ((std::vector<std::pair<SInt32, SInt32>>{{30, 40}}), target.clickPositions);
+    EXPECT_EQ((std::vector<std::string>{"move:30,40", "down", "up", "move:30,40"}), target.input);
+    EXPECT_EQ(30, target.mouseMoveX);
+    EXPECT_EQ(40, target.mouseMoveY);
 }
 
 TEST(ServerReconnectTests, deviceRosterTracksRealAdmissionRemovalAndReconnect)
@@ -2577,6 +3198,49 @@ TEST(ServerReconnectTests, constructorInitializesTransferAndCursorState)
     EXPECT_EQ(0, server.m_y);
 }
 
+TEST(ServerReconnectTests, failedPrimaryEnableRetiresConstructorHandlersAndTimers)
+{
+    class ObservedQueue : public TestEventQueue {
+    public:
+        std::set<EventQueueTimer*> liveTimers;
+        std::vector<std::pair<Event::Type, void*>> registrations;
+        EventQueueTimer* newTimer(double interval, void* target) override {
+            auto* timer = TestEventQueue::newTimer(interval, target);
+            liveTimers.insert(timer);
+            return timer;
+        }
+        EventQueueTimer* newOneShotTimer(double interval, void* target) override {
+            auto* timer = TestEventQueue::newOneShotTimer(interval, target);
+            liveTimers.insert(timer);
+            return timer;
+        }
+        void deleteTimer(EventQueueTimer* timer) override {
+            liveTimers.erase(timer);
+            TestEventQueue::deleteTimer(timer);
+        }
+        void adoptHandler(Event::Type type, void* target, IEventJob* job) override {
+            registrations.emplace_back(type, target);
+            TestEventQueue::adoptHandler(type, target, job);
+        }
+    } events;
+    NiceMock<MockScreen> screen;
+    NiceMock<MockPrimaryClient> primary;
+    NiceMock<MockConfig> config;
+    NiceMock<MockInputFilter> inputFilter;
+    ON_CALL(config, isScreen(_)).WillByDefault(Return(true));
+    ON_CALL(config, getInputFilter()).WillByDefault(Return(&inputFilter));
+    ON_CALL(primary, getEventTarget()).WillByDefault(Return(&primary));
+    EXPECT_CALL(primary, enable()).WillOnce(Invoke([] { throw XInputUnavailable("tap unavailable"); }));
+    ServerArgs args;
+
+    EXPECT_THROW((Server(config, &primary, &screen, &events, args)), XInputUnavailable);
+
+    EXPECT_TRUE(events.liveTimers.empty());
+    for (const auto& registration : events.registrations) {
+        EXPECT_EQ(nullptr, events.getHandler(registration.first, registration.second));
+    }
+}
+
 TEST(ServerReconnectTests,
      asyncMaterializedClipboardQueueWaitsForPlatformCommit)
 {
@@ -3972,7 +4636,7 @@ TEST(ServerReconnectTests, activeClientDisconnectUsesCenterOnlyAfterInvalidLocal
     EXPECT_EQ(384, primary.enterY);
 }
 
-TEST(ServerReconnectTests, activeClientDisconnectDoesNotEnterUnavailablePrimary)
+TEST(ServerReconnectTests, activeClientDisconnectReleasesUnavailablePrimaryWithoutCoordinateEntry)
 {
     Config config;
     config.addScreen("primary");
@@ -4008,7 +4672,8 @@ TEST(ServerReconnectTests, activeClientDisconnectDoesNotEnterUnavailablePrimary)
     server.handleClientDisconnected(Event(), client);
 
     EXPECT_EQ(&primary, server.m_active);
-    EXPECT_EQ(0u, primary.enterCount);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_TRUE(primary.enterForScreensaver);
     EXPECT_EQ(NULL, server.m_switchScreen);
     EXPECT_EQ(0, server.m_xDelta);
     EXPECT_EQ(0, server.m_yDelta);
@@ -5766,8 +6431,8 @@ TEST(ServerReconnectTests, handoffTimersBoundEdgeWaitAndCoverWindowsCommitBudget
     server.handleInputHandoffReady(preparedEvent, &client);
 
     ASSERT_EQ(2u, timerIntervals.size());
-    EXPECT_GT(timerIntervals[0], 0.0);
-    EXPECT_LE(timerIntervals[0], 0.5);
+    EXPECT_GE(timerIntervals[0], 1.5);
+    EXPECT_LE(timerIntervals[0], 2.0);
     EXPECT_GE(timerIntervals[1], 1.5);
     EXPECT_LE(timerIntervals[1], 2.0);
 }
@@ -6322,6 +6987,86 @@ TEST(ServerReconnectTests, largeReverseMotionReturnsPrimaryDuringCommitAckWait)
     EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
 }
 
+TEST(ServerReconnectTests, reverseDuringCommitWaitDoesNotReanchorRevocableClient)
+{
+    Config config;
+    config.addScreen("primary");
+    config.addScreen("client");
+    ASSERT_TRUE(config.connect("primary", kLeft, 0.0f, 1.0f,
+                               "client", 0.0f, 1.0f));
+    ASSERT_TRUE(config.connect("client", kRight, 0.0f, 1.0f,
+                               "primary", 0.0f, 1.0f));
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+
+    DragPlatformScreen* platformScreen = new DragPlatformScreen();
+    barrier::Screen screen(platformScreen, &events);
+    EnterablePrimaryClient primary(&screen);
+    HandoffInputClient client("client");
+    Server server;
+    initializeServer(server, config, primary, events, client);
+    server.m_screen = &screen;
+    server.m_clients.insert(std::make_pair(primary.getName(), &primary));
+    server.m_clientSet.insert(&primary);
+    server.m_active = &primary;
+    server.m_x = 1;
+    server.m_y = 137;
+
+    ASSERT_TRUE(server.onMouseMovePrimary(0, 137));
+    const UInt32 commitSeqNum = client.preparedSeqNum;
+    BaseClientProxy::InputHandoffReadyInfo committed(commitSeqNum, true);
+    Event committedEvent(Event::kUnknown, &client, &committed,
+                         Event::kDontFreeData);
+    server.handleInputHandoffReady(committedEvent, &client);
+    ASSERT_EQ(&client, server.m_active);
+    ASSERT_TRUE(server.m_inputHandoffCommitAckPending);
+    ASSERT_TRUE(client.input.empty());
+
+    // Honor the first deliberate return without waiting for commit ACK, but
+    // keep the old target fenced while its asynchronous revoke is pending.
+    server.onMouseMoveSecondary(256, 0);
+    ASSERT_EQ(1u, client.revokeCount);
+    const UInt32 revokeSeqNum = client.revokeHandoffSeqNum;
+    EXPECT_NE(commitSeqNum, revokeSeqNum);
+    EXPECT_EQ(commitSeqNum, client.revokeInputEpoch);
+    ASSERT_TRUE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(0u, primary.enterCount);
+    EXPECT_TRUE(client.input.empty());
+
+    // The late commit ACK belongs to the superseded transaction, not revoke.
+    server.handleInputHandoffReady(committedEvent, &client);
+    EXPECT_TRUE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_EQ(revokeSeqNum, server.m_inputHandoffSeqNum);
+    EXPECT_EQ(&client, server.m_active);
+    EXPECT_EQ(0u, primary.enterCount);
+    EXPECT_TRUE(client.input.empty());
+
+    BaseClientProxy::InputHandoffReadyInfo revoked(revokeSeqNum, true);
+    Event revokedEvent(Event::kUnknown, &client, &revoked,
+                       Event::kDontFreeData);
+    server.handleInputHandoffReady(revokedEvent, &client);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(1u, client.enterCount);
+    EXPECT_TRUE(client.input.empty());
+    EXPECT_FALSE(server.m_inputHandoffPending);
+    EXPECT_FALSE(server.m_inputHandoffSourceRevokePending);
+    EXPECT_FALSE(server.m_inputHandoffCommitAckPending);
+
+    server.handleInputHandoffReady(committedEvent, &client);
+    server.handleInputHandoffReady(revokedEvent, &client);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(1u, primary.enterCount);
+    EXPECT_EQ(1u, client.revokeCount);
+}
+
 TEST(ServerReconnectTests, staleCommitAckCannotBreakImmediateSecondHandoff)
 {
     Config config;
@@ -6708,7 +7453,13 @@ TEST(ServerReconnectTests, transactionalSwitchTimeoutKeepsSourceAndAbortsTarget)
     EXPECT_EQ(1u, client.abortCount);
     EXPECT_EQ(client.preparedSeqNum, client.abortedSeqNum);
     EXPECT_EQ(0u, client.enterCount);
-    EXPECT_LT(server.m_x, 1023);
+    EXPECT_EQ(1023, server.m_x);
+    EXPECT_EQ(137, server.m_y);
+    EXPECT_FALSE(server.canLeavePrimaryNow("edge switch", kRight));
+    EXPECT_FALSE(server.canLeavePrimaryNow("edge switch", kRight));
+    EXPECT_TRUE(server.canLeavePrimaryNow("explicit switch", kNoDirection));
+    server.clearPrimaryLeaveFailureIfMovedAway(900, 137);
+    EXPECT_TRUE(server.canLeavePrimaryNow("edge switch", kRight));
 }
 
 TEST(ServerReconnectTests, transactionalTargetDisconnectKeepsAndReanchorsSource)
@@ -6744,7 +7495,7 @@ TEST(ServerReconnectTests, transactionalTargetDisconnectKeepsAndReanchorsSource)
     EXPECT_FALSE(server.m_inputHandoffPending);
     EXPECT_EQ(0u, client.abortCount);
     EXPECT_EQ(0u, client.enterCount);
-    EXPECT_LT(server.m_x, 1023);
+    EXPECT_EQ(1023, server.m_x);
 }
 
 TEST(ServerReconnectTests, leavingSwitchEdgeCancelsPreparedHandoff)

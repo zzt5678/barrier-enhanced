@@ -416,6 +416,122 @@ TEST(KeyStateTests, fakeKeyUp_buttonAlreadyDown_returnsTrue)
     ASSERT_TRUE(actual);
 }
 
+TEST(KeyStateTests, ownershipQueryDistinguishesPhysicalStateAndSyntheticBindings)
+{
+    NiceMock<MockKeyMap> keyMap;
+    MockEventQueue eventQueue;
+    KeyStateImpl keyState(eventQueue, keyMap);
+    EXPECT_FALSE(keyState.hasSyntheticKeyBindings());
+    keyState.onKey(12, true, 0);
+    EXPECT_FALSE(keyState.hasSyntheticKeyBindings());
+    keyState.updateKeyState();
+    EXPECT_FALSE(keyState.isKeyDown(12));
+    s_stubKeyItem = {};
+    s_stubKeyItem.m_button = 11;
+    s_stubKeyItem.m_client = 0x1234;
+    ON_CALL(keyMap, mapKey(_, _, _, _, _, _, _)).WillByDefault(Invoke(stubMapKey));
+    keyState.fakeKeyDown(kKeyTab, 0, 7);
+    EXPECT_TRUE(keyState.hasSyntheticKeyBindings());
+    EXPECT_CALL(keyState, fakeKey(_)).WillOnce(Invoke([](const barrier::KeyMap::Keystroke& key) {
+        EXPECT_EQ(barrier::KeyMap::Keystroke::kButton, key.m_type);
+        EXPECT_EQ(11, key.m_data.m_button.m_button);
+        EXPECT_FALSE(key.m_data.m_button.m_press);
+        EXPECT_EQ(0x1234u, key.m_data.m_button.m_client);
+    }));
+    EXPECT_TRUE(keyState.fakeKeyUp(7));
+    EXPECT_FALSE(keyState.hasSyntheticKeyBindings());
+    EXPECT_FALSE(keyState.fakeKeyUp(7));
+    EXPECT_FALSE(keyState.isKeyDown(11));
+}
+
+TEST(KeyStateTests, ownershipQueryClearsAfterReleaseAllAndFullRefresh)
+{
+    NiceMock<MockKeyMap> keyMap;
+    MockEventQueue eventQueue;
+    KeyStateImpl keyState(eventQueue, keyMap);
+    s_stubKeyItem = {};
+    s_stubKeyItem.m_button = 11;
+    ON_CALL(keyMap, mapKey(_, _, _, _, _, _, _)).WillByDefault(Invoke(stubMapKey));
+    keyState.fakeKeyDown(kKeyTab, 0, 7);
+    EXPECT_TRUE(keyState.hasSyntheticKeyBindings());
+    EXPECT_CALL(keyState, fakeKey(_)).WillOnce(Invoke([](const barrier::KeyMap::Keystroke& key) {
+        EXPECT_EQ(11, key.m_data.m_button.m_button);
+        EXPECT_FALSE(key.m_data.m_button.m_press);
+    }));
+    keyState.fakeAllKeysUp();
+    EXPECT_FALSE(keyState.hasSyntheticKeyBindings());
+    EXPECT_FALSE(keyState.isKeyDown(11));
+    EXPECT_FALSE(keyState.fakeKeyUp(7));
+    testing::Mock::VerifyAndClearExpectations(&keyState);
+    keyState.fakeKeyDown(kKeyTab, 0, 7);
+    EXPECT_TRUE(keyState.hasSyntheticKeyBindings());
+    // Preserve the generic full-reset contract used by Windows missed-up
+    // recovery and X11 layout changes. Only the Mac primary defers it.
+    EXPECT_CALL(keyState, pollPressedKeys(_)).WillOnce(Invoke([](IKeyState::KeyButtonSet& keys) {
+        keys.insert(12);
+    }));
+    keyState.updateKeyState();
+    EXPECT_FALSE(keyState.hasSyntheticKeyBindings());
+    EXPECT_TRUE(keyState.isKeyDown(12));
+}
+
+TEST(KeyStateTests, physicalReleaseBeforeSyntheticReleaseDoesNotUnderflowCounters)
+{
+    NiceMock<MockKeyMap> keyMap;
+    MockEventQueue eventQueue;
+    KeyStateImpl keyState(eventQueue, keyMap);
+    s_stubKeyItem = {};
+    s_stubKeyItem.m_button = 11;
+    ON_CALL(keyMap, mapKey(_, _, _, _, _, _, _)).WillByDefault(Invoke(stubMapKey));
+    keyState.fakeKeyDown(kKeyTab, 0, 7);
+    keyState.onKey(11, false, 0);
+    EXPECT_EQ(0, keyState.getKeyState(11));
+    EXPECT_CALL(keyState, fakeKey(_)).Times(1);
+    EXPECT_TRUE(keyState.fakeKeyUp(7));
+    EXPECT_EQ(0, keyState.getKeyState(11));
+    EXPECT_FALSE(keyState.hasSyntheticKeyBindings());
+    testing::Mock::VerifyAndClearExpectations(&keyState);
+    keyState.fakeKeyDown(kKeyTab, 0, 7);
+    EXPECT_EQ(1, keyState.getKeyState(11));
+    EXPECT_TRUE(keyState.fakeKeyUp(7));
+    EXPECT_EQ(0, keyState.getKeyState(11));
+}
+
+TEST(KeyStateTests, retiringDeliveredReleaseOnlyRemovesMatchingOwnership)
+{
+    NiceMock<MockKeyMap> keyMap;
+    MockEventQueue eventQueue;
+    KeyStateImpl keyState(eventQueue, keyMap);
+    s_stubKeyItem = {};
+    s_stubKeyItem.m_button = 11;
+    ON_CALL(keyMap, mapKey(_, _, _, _, _, _, _)).WillByDefault(Invoke(stubMapKey));
+    keyState.fakeKeyDown(kKeyTab, 0, 7);
+    keyState.fakeKeyDown(kKeyTab, 0, 8);
+    s_stubKeyItem.m_button = 12;
+    s_stubKeyItem.m_client = 0x1234;
+    keyState.fakeKeyDown(kKeyTab, 0, 9);
+    keyState.onKey(11, false, 0);
+    keyState.onKey(11, true, KeyModifierShift);
+    EXPECT_CALL(keyState, fakeKey(_)).Times(0);
+    EXPECT_EQ((IKeyState::KeyButtonSet{7, 8}), keyState.retireSyntheticKeyBindings(11));
+    EXPECT_TRUE(keyState.retireSyntheticKeyBindings(11).empty());
+    EXPECT_TRUE(keyState.retireSyntheticKeyBindings(0).empty());
+    EXPECT_EQ(1, keyState.getKeyState(11));
+    EXPECT_EQ(KeyModifierShift, keyState.getActiveModifiers());
+    EXPECT_FALSE(keyState.fakeKeyUp(7));
+    EXPECT_FALSE(keyState.fakeKeyUp(8));
+    EXPECT_TRUE(keyState.hasSyntheticKeyBindings());
+    testing::Mock::VerifyAndClearExpectations(&keyState);
+    EXPECT_CALL(keyState, fakeKey(_)).WillOnce(Invoke([](const barrier::KeyMap::Keystroke& key) {
+        EXPECT_EQ(12, key.m_data.m_button.m_button);
+        EXPECT_EQ(0x1234u, key.m_data.m_button.m_client);
+        EXPECT_FALSE(key.m_data.m_button.m_press);
+    }));
+    EXPECT_TRUE(keyState.fakeKeyUp(9));
+    EXPECT_FALSE(keyState.hasSyntheticKeyBindings());
+    EXPECT_EQ(1, keyState.getKeyState(11));
+}
+
 TEST(KeyStateTests, fakeAllKeysUp_keysWereDown_keysAreUp)
 {
     NiceMock<MockKeyMap> keyMap;

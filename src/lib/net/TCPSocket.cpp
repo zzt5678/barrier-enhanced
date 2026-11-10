@@ -448,9 +448,12 @@ TCPSocket::doRead()
     UInt8 buffer[65536];
     const bool wasEmpty = (m_inputBuffer.getSize() == 0);
     bool readAny = false;
+    size_t servicedBytes = 0;
+    const double readStarted = ARCH->time();
 
     while (true) {
-        const size_t readSize = getInputReadSizeNoLock(sizeof(buffer));
+        const size_t readSize = getInputReadSizeNoLock(
+            (std::min)(sizeof(buffer), kReadCallbackByteBudget - servicedBytes));
         if (readSize == 0) {
             LOG((CLOG_DEBUG1 "socket input backlog full; pausing reads until buffered input is drained"));
             if (readAny && wasEmpty) {
@@ -494,8 +497,10 @@ TCPSocket::doRead()
             return kNew;
         }
         readAny = true;
+        servicedBytes += bytesRead;
 
-        if (!canReadInputNoLock()) {
+        if (!canReadInputNoLock() || servicedBytes >= kReadCallbackByteBudget ||
+            ARCH->time() - readStarted >= kReadCallbackTimeBudget) {
             if (wasEmpty) {
                 sendEvent(m_events->forIStream().inputReady());
             }
@@ -639,7 +644,8 @@ std::unique_ptr<ISocketMultiplexerJob> TCPSocket::newJob()
         return std::make_unique<TSocketMultiplexerMethodJob>(
                     [this](auto j, auto r, auto w, auto e)
                     { return serviceConnected(j, r, w, e); },
-                    m_socket, readable, writable);
+                    m_socket, readable, writable, -1.0,
+                    readable && hasPendingInputNoLock());
     }
 }
 

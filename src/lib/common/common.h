@@ -37,5 +37,6 @@ enum {
     kExitArgs         = 3, // bad arguments
     kExitConfig       = 4, // cannot read configuration
     kExitSubscription = 5, // subscription error
-    kExitIncompatible = 6  // permanent peer protocol mismatch; do not auto-restart
+    kExitIncompatible = 6, // permanent peer protocol mismatch; do not auto-restart
+    kExitInputUnavailable = 7 // native input failed; restore local control and wait for Start
 };

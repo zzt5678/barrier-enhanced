@@ -155,3 +155,58 @@ TEST_F(CXWindowsClipboardTests, get_withFormatAdded_returnsExpected)
 }
 
 #endif
+
+#include "test/global/gtest.h"
+#include "platform/XWindowsClipboard.h"
+#include "platform/XWindowsImpl.h"
+#include "platform/XWindowsUtil.h"
+#include "barrier/Clipboard.h"
+#include <chrono>
+
+class XWindowsClipboardNativeTests : public ::testing::TestWithParam<int> {};
+
+TEST_P(XWindowsClipboardNativeTests, rereadingOwnedClipboardDoesNotRequestDataFromItself)
+{
+    XWindowsImpl impl;
+    Display* display = XOpenDisplay(NULL);
+    ASSERT_NE(nullptr, display);
+    Window window = XCreateSimpleWindow(display, DefaultRootWindow(display),
+                                       0, 0, 1, 1, 0, 0, 0);
+    {
+        XWindowsClipboard source(&impl, display, window, GetParam());
+        const auto timestamp = XWindowsUtil::getCurrentTime(display, window);
+        ASSERT_TRUE(source.open(timestamp));
+        ASSERT_TRUE(source.empty());
+        source.add(IClipboard::kText, "weave-owned-clipboard-regression");
+        source.close();
+        Clipboard copy;
+        const auto begin = std::chrono::steady_clock::now();
+        ASSERT_TRUE(Clipboard::copy(&copy, &source, timestamp + 1));
+        const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - begin).count();
+        EXPECT_LT(elapsed, 0.1);
+        ASSERT_TRUE(copy.open(0));
+        EXPECT_EQ("weave-owned-clipboard-regression", copy.get(IClipboard::kText));
+        copy.close();
+        // Repeat with a later caller timestamp: neither cache nor ownership
+        // time may be invalidated merely because the caller advanced time.
+        ASSERT_TRUE(Clipboard::copy(&copy, &source, timestamp + 2));
+        ASSERT_TRUE(copy.open(0));
+        EXPECT_EQ("weave-owned-clipboard-regression", copy.get(IClipboard::kText));
+        copy.close();
+
+        // SelectionClear has not been dispatched yet. The fast path must
+        // query actual X ownership rather than returning stale local bytes.
+        XSetSelectionOwner(display, source.getSelection(), None, CurrentTime);
+        XSync(display, False);
+        ASSERT_TRUE(Clipboard::copy(&copy, &source, timestamp + 3));
+        ASSERT_TRUE(copy.open(0));
+        EXPECT_FALSE(copy.has(IClipboard::kText));
+        copy.close();
+    }
+    XDestroyWindow(display, window);
+    XCloseDisplay(display);
+}
+
+INSTANTIATE_TEST_SUITE_P(BothSelections, XWindowsClipboardNativeTests,
+                        ::testing::Values(kClipboardClipboard, kClipboardSelection));

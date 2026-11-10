@@ -278,15 +278,13 @@ Log::setFilter(const char* maxPriority)
 void
 Log::setFilter(int maxPriority)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_maxPriority = maxPriority;
+    m_maxPriority.store(maxPriority, std::memory_order_relaxed);
 }
 
 int
 Log::getFilter() const
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_maxPriority;
+    return m_maxPriority.load(std::memory_order_relaxed);
 }
 
 void

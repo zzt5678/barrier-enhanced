@@ -375,6 +375,32 @@ OSXKeyState::getModifierStateAsOSXFlags()
 KeyModifierMask
 OSXKeyState::pollActiveModifiers() const
 {
+    return m_observedPrimaryModifiersValid ? m_observedPrimaryModifiers : pollNativeModifiers();
+}
+
+void
+OSXKeyState::setObservedPrimaryModifiers(KeyModifierMask mask, CGEventFlags flags)
+{
+    m_observedPrimaryModifiers = mask;
+    const UInt32 modifierFlags = NX_ALPHASHIFTMASK | NX_SHIFTMASK | NX_CONTROLMASK |
+        NX_ALTERNATEMASK | NX_COMMANDMASK | NX_SECONDARYFNMASK |
+        NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK |
+        NX_DEVICELCTLKEYMASK | NX_DEVICERCTLKEYMASK |
+        NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK |
+        NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK;
+    m_observedPrimaryNativeFlags = static_cast<UInt32>(flags) & modifierFlags;
+    m_observedPrimaryModifiersValid = true;
+}
+
+void
+OSXKeyState::clearObservedPrimaryModifiers()
+{
+    m_observedPrimaryModifiersValid = false;
+}
+
+KeyModifierMask
+OSXKeyState::pollNativeModifiers() const
+{
     // falsely assumed that the mask returned by GetCurrentKeyModifiers()
     // was the same as a CGEventFlags (which is what mapModifiersFromOSX
     // expects). patch by Marc
@@ -513,13 +539,16 @@ void
 OSXKeyState::postHIDVirtualKey(const UInt8 virtualKeyCode,
                 const bool postDown)
 {
-    static UInt32 modifiers = 0;
+    if (updateNativeModifierState(virtualKeyCode, postDown))
+        postNativeKeyEvent(NX_FLAGSCHANGED, virtualKeyCode, m_nativeModifiers, true);
+    else
+        postNativeKeyEvent(postDown ? NX_KEYDOWN : NX_KEYUP, virtualKeyCode, 0, false);
+}
 
-    NXEventData event;
-    IOGPoint loc = { 0, 0 };
+bool
+OSXKeyState::updateNativeModifierState(UInt8 virtualKeyCode, bool postDown)
+{
     UInt32 modifiersDelta = 0;
-
-    bzero(&event, sizeof(NXEventData));
 
     switch (virtualKeyCode)
     {
@@ -554,30 +583,61 @@ OSXKeyState::postHIDVirtualKey(const UInt8 virtualKeyCode,
 
         // update the modifier bit
         if (postDown) {
-            modifiers |= modifiersDelta;
+            m_nativeModifiers |= modifiersDelta;
         }
         else {
-            modifiers &= ~modifiersDelta;
+            m_nativeModifiers &= ~modifiersDelta;
         }
 
-        kern_return_t kr;
-        event.key.keyCode = virtualKeyCode;
-        kr = IOHIDPostEvent(getEventDriver(), NX_FLAGSCHANGED, loc,
-                &event, kNXEventDataVersion, modifiers, true);
-        assert(KERN_SUCCESS == kr);
-        break;
+        return true;
 
     default:
-        event.key.repeat = false;
-        event.key.keyCode = virtualKeyCode;
-        event.key.origCharSet = event.key.charSet = NX_ASCIISET;
-        event.key.origCharCode = event.key.charCode = 0;
-        kr = IOHIDPostEvent(getEventDriver(),
-                postDown ? NX_KEYDOWN : NX_KEYUP,
-                loc, &event, kNXEventDataVersion, 0, false);
-        assert(KERN_SUCCESS == kr);
-        break;
+        return false;
     }
+}
+
+void
+OSXKeyState::completeNativeKeyRelease(KeyButton button)
+{
+    updateNativeModifierState(mapKeyButtonToVirtualKey(button), false);
+}
+
+void
+OSXKeyState::completeSuppressedModifierReleases(KeyModifierMask released)
+{
+    if (!m_observedPrimaryModifiersValid || released == 0) return;
+    const auto nativeMask = pollNativeModifiers();
+    released &= nativeMask & ~m_observedPrimaryModifiers;
+    if (released == 0) return;
+
+    // Only complete observed, suppressed releases that are still down in the
+    // local native state. Use the actual observed flags, including the held
+    // modifier's left/right device bits; never reconstruct a down from Carbon.
+    const std::pair<KeyModifierMask, UInt8> modifiers[] = {
+        {KeyModifierShift, s_shiftVK}, {KeyModifierControl, s_controlVK},
+        {KeyModifierAlt, s_altVK}, {KeyModifierSuper, s_superVK},
+        {KeyModifierCapsLock, s_capsLockVK}
+    };
+    for (const auto& modifier : modifiers) {
+        if ((released & modifier.first) != 0) {
+            updateNativeModifierState(modifier.second, false);
+            // Physical held flags belong to this native completion, not to
+            // the persistent synthesis cache of owned fake modifier keys.
+            postNativeKeyEvent(NX_FLAGSCHANGED, modifier.second, m_observedPrimaryNativeFlags, true);
+        }
+    }
+}
+
+void
+OSXKeyState::postNativeKeyEvent(UInt32 type, UInt8 virtualKey, UInt32 modifiers, bool updateModifiers)
+{
+    NXEventData event = {};
+    IOGPoint loc = {0, 0};
+    event.key.keyCode = virtualKey;
+    event.key.origCharSet = event.key.charSet = NX_ASCIISET;
+    const auto result = IOHIDPostEvent(getEventDriver(), type, loc,
+        &event, kNXEventDataVersion, modifiers, updateModifiers);
+    assert(result == KERN_SUCCESS);
 }
 
 void

@@ -19,6 +19,7 @@
 #pragma once
 
 #include "barrier/App.h"
+#include <atomic>
 
 namespace barrier { class Screen; }
 class Event;
@@ -63,7 +64,7 @@ public:
     void handleClientConnected(const Event&, void*);
     void handleClientFailed(const Event& e, void*);
     void handleClientDisconnected(const Event&, void*);
-    Client* openClient(const String& name, const NetworkAddress& address,
+    virtual Client* openClient(const String& name, const NetworkAddress& address,
                 barrier::Screen* screen);
     void closeClient(Client* client);
     bool prepareClient();
@@ -90,4 +91,5 @@ private:
     NetworkAddress*    m_serverAddress;
     double             m_restartTimeout;
     bool               m_permanentFailure = false;
+    std::atomic<bool>  m_inputFailure{false};
 };

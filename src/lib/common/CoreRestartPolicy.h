@@ -7,7 +7,7 @@ namespace barrier {
 
 inline bool coreExitRequiresCorrection(int exitCode)
 {
-    return exitCode == kExitIncompatible;
+    return exitCode == kExitIncompatible || exitCode == kExitInputUnavailable;
 }
 
 inline bool coreGenerationMayRestart(bool hasPermanentFailure,

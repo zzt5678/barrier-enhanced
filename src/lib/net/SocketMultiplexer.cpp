@@ -28,6 +28,7 @@
 #include "arch/XArch.h"
 #include "base/Log.h"
 #include "common/stdvector.h"
+#include <algorithm>
 
 //
 // SocketMultiplexer
@@ -188,11 +189,38 @@ void SocketMultiplexer::service_thread()
             deleteCursor(cursor);
         }
 
+        // Readiness, absolute deadlines, and buffered plaintext all share the
+        // same fair sweep. A continuation never recursively services a socket.
+        double timeout = -1.0;
+        const double now = ARCH->time();
+        for (const auto& job : m_socketJobs) {
+            if (!job || job->isCursor()) {
+                continue;
+            }
+            if (job->hasPendingRead()) {
+                timeout = 0.0;
+                break;
+            }
+            const double deadline = job->getDeadline();
+            if (deadline >= 0.0) {
+                // Some backends truncate poll timeouts to milliseconds. Round
+                // a positive tail up so it cannot busy-poll before the deadline.
+                const double remaining = deadline <= now ? 0.0 :
+                    (std::max)(0.001, deadline - now);
+                if (timeout < 0.0 || remaining < timeout) {
+                    timeout = remaining;
+                }
+            }
+        }
+        // poll implementations can return early on EINTR without clearing flags.
+        for (auto& entry : pfds) {
+            entry.m_revents = 0;
+        }
         int status;
         try {
             // check for status
             if (!pfds.empty()) {
-                status = ARCH->pollSocket(&pfds[0], (int)pfds.size(), -1);
+                status = ARCH->pollSocket(&pfds[0], (int)pfds.size(), timeout);
             }
             else {
                 status = 0;
@@ -200,10 +228,10 @@ void SocketMultiplexer::service_thread()
         }
         catch (XArchNetwork& e) {
             LOG((CLOG_WARN "error in socket multiplexer: %s", e.what()));
-            status = 0;
+            status = -1;
         }
 
-        if (status != 0) {
+        if (status >= 0) {
             // iterate over socket jobs, invoking each and saving the
             // new job.
             UInt32 i             = 0;
@@ -217,6 +245,15 @@ void SocketMultiplexer::service_thread()
                     bool write = ((revents & IArchNetwork::kPOLLOUT) != 0);
                     bool error = ((revents & (IArchNetwork::kPOLLERR |
                                               IArchNetwork::kPOLLNVAL)) != 0);
+
+                    read = read || (*jobCursor)->hasPendingRead();
+                    const double deadline = (*jobCursor)->getDeadline();
+                    const bool due = deadline >= 0.0 && ARCH->time() >= deadline;
+                    if (!(read || write || error || due)) {
+                        ++i;
+                        jobCursor = nextCursor(cursor);
+                        continue;
+                    }
 
                     // run job
                     MultiplexerJobStatus status = (*jobCursor)->run(read, write, error);

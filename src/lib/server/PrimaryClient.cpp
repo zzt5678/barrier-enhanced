@@ -162,10 +162,9 @@ PrimaryClient::enter(SInt32 xAbs, SInt32 yAbs,
                 UInt32 seqNum, KeyModifierMask mask, bool screensaver)
 {
     m_screen->setSequenceNumber(seqNum);
-    if (!screensaver) {
-        m_screen->warpCursor(xAbs, yAbs);
-    }
-    if (!m_screen->enter(mask)) {
+    const bool entered = screensaver ? m_screen->enter(mask) :
+        m_screen->enterAt(mask, xAbs, yAbs);
+    if (!entered) {
         LOG((CLOG_ERR "primary platform rejected screen enter sequence %u",
             seqNum));
     }

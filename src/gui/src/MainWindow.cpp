@@ -42,6 +42,7 @@
 #include "WorkflowDisplayText.h"
 #include "base/String.h"
 #include "common/DataDirectories.h"
+#include "common/common.h"
 #include "net/FingerprintDatabase.h"
 #include "net/SecureUtils.h"
 
@@ -1369,7 +1370,11 @@ void MainWindow::barrierFinished(int exitCode, QProcess::ExitStatus)
         const bool permanentFailure = m_ExpectedRunningState == kStarted;
         m_ExpectedRunningState = kStopped;
         setBarrierState(barrierDisconnected);
-        if (permanentFailure) {
+        if (permanentFailure && exitCode == kExitInputUnavailable) {
+            appendLogError("Native input became unavailable. Automatic restart stopped to preserve local control; check input permissions, then press Start.");
+            setStatus(tr("Input unavailable. Sharing stopped to protect local control. Check input permissions, then press Start."));
+        }
+        else if (permanentFailure) {
             appendLogError("Peer protocol versions are incompatible. Automatic restart stopped; install compatible Weave versions, then press Start.");
             setStatus(tr("Incompatible peer version. Update Weave on both computers, then press Start."));
         }

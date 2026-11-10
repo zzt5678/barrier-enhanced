@@ -17,6 +17,7 @@
  */
 
 #include "platform/OSXScreen.h"
+#include "barrier/XScreen.h"
 
 #include "base/EventQueue.h"
 #include "client/Client.h"
@@ -45,6 +46,8 @@
 #include <math.h>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
+#include <mach/mach_time.h>
 #include <unistd.h>
 #include <mach-o/dyld.h>
 #include <AvailabilityMacros.h>
@@ -66,6 +69,38 @@ enum {
 // including when a downstream event source does not preserve the sender PID.
 static constexpr int64_t kWeavePointerEventMarker = 0x5745415645505452;
 
+static CGEventTimestamp nativeInputTimestampTicks()
+{
+	// Physical events at the primary HID tap use mach ticks on Apple silicon.
+	// Converting only this boundary to nanoseconds makes every later physical
+	// event look stale when the timebase is not 1:1. Explicitly timestamped
+	// synthetic events do not establish the hardware stream's clock domain.
+	return mach_absolute_time();
+}
+
+static CGEventTimestamp pointerEventTimestampTicks(CGEventRef event)
+{
+	// On the same Apple-silicon machine, physical HID timestamps are mach
+	// ticks whereas IOHIDPostEvent timestamps are uptime nanoseconds. Both
+	// sources have HIDSystemState provenance. Select the uptime representation
+	// nearest callback arrival, then compare only ticks. This does not discard
+	// events or use their PID, direction, or motion magnitude as a filter.
+	const uint64_t timestamp = CGEventGetTimestamp(event);
+	const uint64_t now = mach_absolute_time();
+	static const mach_timebase_info_data_t base = [] {
+		mach_timebase_info_data_t value;
+		mach_timebase_info(&value);
+		return value;
+	}();
+	const uint64_t nowNS = static_cast<uint64_t>((static_cast<__uint128_t>(now) * base.numer) / base.denom);
+	const auto distance = [](uint64_t a, uint64_t b) { return a > b ? a - b : b - a; };
+	const __uint128_t ticks = distance(timestamp, now) <= distance(timestamp, nowNS) ? timestamp :
+		(static_cast<__uint128_t>(timestamp) * base.denom) / base.numer;
+	// An absent/future/unrepresentable timestamp cannot order a native event
+	// against a warp. Let the owner handle this explicitly, never wrap it.
+	return ticks == 0 || ticks > now ? 0 : static_cast<uint64_t>(ticks);
+}
+
 // TODO: upgrade deprecated function usage in these functions.
 void setZeroSuppressionInterval();
 void avoidSupression();
@@ -79,7 +114,8 @@ void avoidHesitatingCursor();
 bool					OSXScreen::s_testedForGHOM = false;
 bool					OSXScreen::s_hasGHOM	    = false;
 
-OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCursor) :
+OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCursor,
+                     CFStringRef pasteboardName) :
 	PlatformScreen(events),
 	m_isPrimary(isPrimary),
 	m_isOnScreen(m_isPrimary),
@@ -89,6 +125,7 @@ OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCurso
 	m_dragNumButtonsDown(0),
 	m_dragTimer(NULL),
 	m_keyState(NULL),
+	m_clipboardWorker(new OSXClipboardWorker(pasteboardName)),
 	m_sequenceNumber(0),
 	m_screensaver(NULL),
 	m_screensaverNotify(false),
@@ -127,12 +164,12 @@ OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCurso
 #if defined(MAC_OS_X_VERSION_10_9)
 			// we can't pass options to show the dialog, this must be done by the gui.
 			if (!AXIsProcessTrusted()) {
-				throw XArch("assistive devices does not trust this process, allow it in system settings.");
+				throw XInputUnavailable("assistive devices does not trust this process, allow it in system settings.");
 			}
 #else
 			// now deprecated in mavericks.
 			if (!AXAPIEnabled()) {
-				throw XArch("assistive devices is not enabled, enable it in system settings.");
+				throw XInputUnavailable("assistive devices is not enabled, enable it in system settings.");
 			}
 #endif
 		}
@@ -184,6 +221,8 @@ OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCurso
 
 		delete m_keyState;
 		delete m_screensaver;
+		delete m_pmThreadReady;
+		delete m_pmMutex;
 		throw;
 	}
 
@@ -199,6 +238,7 @@ OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCurso
 OSXScreen::~OSXScreen()
 {
 	disable();
+	m_clipboardWorker.reset();
 	m_events->adoptBuffer(NULL);
 	m_events->removeHandler(Event::kSystem, m_events->getSystemTarget());
 
@@ -279,9 +319,18 @@ OSXScreen::getEventTarget() const
 }
 
 bool
-OSXScreen::getClipboard(ClipboardID, IClipboard* dst) const
+OSXScreen::getClipboard(ClipboardID id, IClipboard* dst) const
 {
-	return m_pasteboard.copyTo(dst);
+	std::shared_ptr<const String> snapshot;
+	if (!getClipboardSnapshot(id, &snapshot, nullptr)) return false;
+	IClipboard::unmarshall(dst, *snapshot, 0);
+	return true;
+}
+
+bool
+OSXScreen::getClipboardSnapshot(ClipboardID id, std::shared_ptr<const String>* data, UInt32* sequence) const
+{
+	return id < kClipboardEnd && m_clipboardWorker && m_clipboardWorker->snapshot(data, sequence);
 }
 
 void
@@ -317,16 +366,126 @@ OSXScreen::reconfigure(UInt32)
 void
 OSXScreen::warpCursor(SInt32 x, SInt32 y)
 {
+	if (m_inputLoop && !m_inputLoop->isOwner()) {
+		if (!m_inputLoop->invoke([this, x, y] { warpCursor(x, y); })) {
+			sendEvent(m_events->forIScreen().error());
+		}
+		return;
+	}
 	// move cursor without generating events
 	CGPoint pos;
 	pos.x = x;
 	pos.y = y;
-	CGWarpMouseCursorPosition(pos);
+	if (warpPointer(pos) != kCGErrorSuccess) {
+		sendEvent(m_events->forIScreen().error());
+		return;
+	}
 
 	// save new cursor position
 	m_xCursor        = x;
 	m_yCursor        = y;
 	m_cursorPosValid = true;
+}
+
+bool
+OSXScreen::recordPointerPosition(CGPoint position, CGEventTimestamp ticks, bool observedEvent)
+{
+	if (!std::isfinite(position.x) || !std::isfinite(position.y)) return false;
+	// The single tap delivers native and direct-CG events in order. Once a CG
+	// event is observed, older changes can be replaced by its final position;
+	// later owner warps must remain for already-captured native callbacks.
+	if (observedEvent) {
+		while (!m_pointerPositionChanges.empty() && m_pointerPositionChanges.front().ticks <= ticks)
+			m_pointerPositionChanges.pop_front();
+	}
+	if (m_pointerPositionChanges.size() >= 256) return false;
+	auto at = std::upper_bound(m_pointerPositionChanges.begin(), m_pointerPositionChanges.end(), ticks,
+		[](CGEventTimestamp t, const PointerPositionChange& change) { return t < change.ticks; });
+	m_pointerPositionChanges.insert(at, {ticks, position, observedEvent});
+	return true;
+}
+
+void
+OSXScreen::initializePointerMotion()
+{
+	m_pointerPositionChanges.clear();
+	CGEventRef snapshot = CGEventCreate(nullptr);
+	m_lastNativePointerValid = false;
+	if (snapshot) {
+		m_lastNativePointer = CGEventGetLocation(snapshot);
+		m_lastNativePointerValid = std::isfinite(m_lastNativePointer.x) && std::isfinite(m_lastNativePointer.y);
+		CFRelease(snapshot);
+	}
+}
+
+CGError
+OSXScreen::warpPointer(CGPoint position, bool skipIfAlreadyParked)
+{
+	if (!m_isPrimary) return CGWarpMouseCursorPosition(position);
+	CGEventRef snapshot = CGEventCreate(nullptr);
+	if (!snapshot) return kCGErrorFailure;
+	const CGPoint before = CGEventGetLocation(snapshot);
+	CFRelease(snapshot);
+	// A queued event can still describe the old position. Avoid another
+	// synchronous WindowServer warp if the live pointer is already parked.
+	if (skipIfAlreadyParked && CGPointEqualToPoint(before, position)) return kCGErrorSuccess;
+	if (!std::isfinite(before.x) || !std::isfinite(before.y) ||
+		!std::isfinite(position.x) || !std::isfinite(position.y) ||
+		m_pointerPositionChanges.size() >= 256) return kCGErrorFailure;
+	// Snapshot before the native call: old queued callbacks must not consume
+	// this position. Failed/no-op warps add no displacement obligation.
+	const auto ticks = mach_absolute_time();
+	const auto result = CGWarpMouseCursorPosition(position);
+	if (result == kCGErrorSuccess && !CGPointEqualToPoint(before, position)) {
+		if (!m_lastNativePointerValid) {
+			m_lastNativePointer = before;
+			m_lastNativePointerValid = true;
+		}
+		// Preserve unobserved/coalesced native movement between separate
+		// warps. A final target minus the last event position would lose it.
+		recordPointerPosition(CGPointMake(position.x - before.x, position.y - before.y), ticks, false);
+	}
+	return result;
+}
+
+void
+OSXScreen::compensatePointerMotion(CGEventRef event, CGEventTimestamp ticks, double& dx, double& dy)
+{
+	if (CGEventGetIntegerValueField(event, kCGEventSourceStateID) != kCGEventSourceStateHIDSystemState)
+		return;
+	if (ticks == 0) {
+		m_pointerPositionChanges.clear();
+		m_lastNativePointer = CGEventGetLocation(event);
+		m_lastNativePointerValid = std::isfinite(m_lastNativePointer.x) && std::isfinite(m_lastNativePointer.y);
+		return;
+	}
+	bool changed = false;
+	CGPoint imposed = CGPointZero;
+	while (!m_pointerPositionChanges.empty() && m_pointerPositionChanges.front().ticks <= ticks) {
+		const auto& change = m_pointerPositionChanges.front();
+		if (change.absolute) {
+			// Direct CG posting already applied its absolute position before
+			// the tap sees it. Reconcile that anchor separately; do not invent
+			// a pre-CG position from the current native cursor snapshot.
+			imposed = CGPointMake(change.value.x - m_lastNativePointer.x,
+				change.value.y - m_lastNativePointer.y);
+		}
+		else {
+			imposed.x += change.value.x;
+			imposed.y += change.value.y;
+		}
+		m_pointerPositionChanges.pop_front();
+		changed = true;
+	}
+	if (changed && m_lastNativePointerValid) {
+		// Position is fractional/clipped while these HID delta fields are
+		// integer. Remove only the whole-pixel imposed displacement, once;
+		// do not accumulate fractional quantization as future motion debt.
+		dx -= std::trunc(imposed.x);
+		dy -= std::trunc(imposed.y);
+	}
+	m_lastNativePointer = CGEventGetLocation(event);
+	m_lastNativePointerValid = std::isfinite(m_lastNativePointer.x) && std::isfinite(m_lastNativePointer.y);
 }
 
 void
@@ -350,6 +509,12 @@ OSXScreen::getJumpZoneSize() const
 bool
 OSXScreen::isAnyMouseButtonDown(UInt32& buttonID) const
 {
+	if (needsInputDispatch()) {
+		// A failed query must not permit an unsafe screen switch mid-drag.
+		bool down = true;
+		invokeInputState([this, &buttonID, &down] { down = isAnyMouseButtonDown(buttonID); });
+		return down;
+	}
 	if (m_buttonState.test(0)) {
 		buttonID = kButtonLeft;
 		return true;
@@ -370,6 +535,11 @@ OSXScreen::getCursorCenter(SInt32& x, SInt32& y) const
 UInt32
 OSXScreen::registerHotKey(KeyID key, KeyModifierMask mask)
 {
+	if (needsInputDispatch()) {
+		UInt32 id = 0;
+		invokeInputState([this, key, mask, &id] { id = registerHotKey(key, mask); });
+		return id;
+	}
 	// get mac virtual key and modifier mask matching barrier key and mask
 	UInt32 macKey, macMask;
 	if (!m_keyState->mapBarrierHotKeyToMac(key, mask, macKey, macMask)) {
@@ -425,6 +595,10 @@ OSXScreen::registerHotKey(KeyID key, KeyModifierMask mask)
 void
 OSXScreen::unregisterHotKey(UInt32 id)
 {
+	if (needsInputDispatch()) {
+		invokeInputState([this, id] { unregisterHotKey(id); });
+		return;
+	}
 	// look up hotkey
 	HotKeyMap::iterator i = m_hotKeys.find(id);
 	if (i == m_hotKeys.end()) {
@@ -562,6 +736,11 @@ OSXScreen::postMouseEvent(CGPoint& pos) const
 void
 OSXScreen::fakeMouseButton(ButtonID id, bool press)
 {
+	if (needsInputDispatch()) {
+		if (press) invokeInputState([this, id] { fakeMouseButton(id, true); });
+		else invokeInputRelease([this, id] { fakeMouseButton(id, false); });
+		return;
+	}
 	// Buttons are indexed from one, but the button down array is indexed from zero
 	UInt32 index = mapBarrierButtonToMac(id) - kButtonLeft;
 	if (index >= NumButtonIDs) {
@@ -624,6 +803,7 @@ OSXScreen::fakeMouseButton(ButtonID id, bool press)
     CGEventSetFlags(event, modifiers);
 
     m_buttonState.set(index, state);
+    if (!press) m_handoffButtonGenerations.erase(id);
     CGEventSetIntegerValueField(event, kCGEventSourceUserData, kWeavePointerEventMarker);
     CGEventPost(kCGHIDEventTap, event);
 
@@ -709,6 +889,10 @@ void OSXScreen::get_drop_target_thread()
 void
 OSXScreen::fakeMouseMove(SInt32 x, SInt32 y)
 {
+	if (needsInputDispatch()) {
+		invokeInputState([this, x, y] { fakeMouseMove(x, y); });
+		return;
+	}
 	if (m_fakeDraggingStarted) {
 		m_buttonState.set(0, kMouseButtonDown);
 	}
@@ -733,6 +917,10 @@ OSXScreen::fakeMouseMove(SInt32 x, SInt32 y)
 void
 OSXScreen::fakeMouseRelativeMove(SInt32 dx, SInt32 dy) const
 {
+	if (needsInputDispatch()) {
+		invokeInputState([this, dx, dy] { fakeMouseRelativeMove(dx, dy); });
+		return;
+	}
 	// OS X does not appear to have a fake relative mouse move function.
 	// simulate it by getting the current mouse position and adding to
 	// that.  this can yield the wrong answer but there's not much else
@@ -758,6 +946,10 @@ OSXScreen::fakeMouseRelativeMove(SInt32 dx, SInt32 dy) const
 void
 OSXScreen::fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const
 {
+	if (needsInputDispatch()) {
+		invokeInputState([this, xDelta, yDelta] { fakeMouseWheel(xDelta, yDelta); });
+		return;
+	}
 	if (xDelta != 0 || yDelta != 0) {
 		// create a scroll event, post it and release it.  not sure if kCGScrollEventUnitLine
 		// is the right choice here over kCGScrollEventUnitPixel
@@ -779,6 +971,9 @@ OSXScreen::fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const
 void
 OSXScreen::showCursor()
 {
+	// Input capture and visibility have independent lifetimes. In particular,
+	// a failed hide/show must never skip reconnecting the physical mouse.
+	if (m_isPrimary) setPointerDetached(false);
 	// CoreGraphics counts hide/show requests. Only release our own hide.
 	if (!m_cursorHidden) {
 		return;
@@ -801,7 +996,7 @@ OSXScreen::showCursor()
 	}
 
 	// appears to fix "mouse randomly not showing" bug
-	CGAssociateMouseAndMouseCursorPosition(true);
+	if (!m_isPrimary) CGAssociateMouseAndMouseCursorPosition(true);
 
 	logCursorVisibility();
 
@@ -832,11 +1027,26 @@ OSXScreen::hideCursor()
 	}
 
 	// appears to fix "mouse randomly not hiding" bug
-	CGAssociateMouseAndMouseCursorPosition(true);
+	if (!m_isPrimary) CGAssociateMouseAndMouseCursorPosition(true);
 
 	logCursorVisibility();
 
 	m_cursorHidden = true;
+}
+
+bool
+OSXScreen::setPointerDetached(bool detached)
+{
+	if (m_pointerDetached == detached) return true;
+	const CGError error = CGAssociateMouseAndMouseCursorPosition(!detached);
+	if (error != kCGErrorSuccess) {
+		LOG((CLOG_ERR "failed to %s physical mouse, error=%d",
+			detached ? "capture" : "restore", error));
+		return false;
+	}
+	m_pointerDetached = detached;
+	LOG((CLOG_INFO "physical mouse %s", detached ? "captured for remote input" : "restored locally"));
+	return true;
 }
 
 void
@@ -844,19 +1054,53 @@ OSXScreen::enable()
 {
 	// Reconnect/resume can occur without a display callback.
 	updateScreenShape();
+	m_scrollSettings.requestRefresh();
+	m_nextScrollSettingsRefresh = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 	// watch the clipboard
-	m_clipboardTimer = m_events->newTimer(1.0, NULL);
+	// Poll only memory on the input thread. Native polling and all conversion
+	// run on the worker; this also drains completions without a cross-thread
+	// callback retaining the screen or its event queue during teardown.
+	// The worker throttles unchanged native polling to the original 1 second.
+	m_clipboardTimer = m_events->newTimer(0.1, NULL);
 	m_events->adoptHandler(Event::kTimer, m_clipboardTimer,
 							new TMethodEventJob<OSXScreen>(this,
 								&OSXScreen::handleClipboardCheck));
 
+	try {
+		if (m_isPrimary) {
+			try {
+				m_inputLoop.reset(new OSXInputLoop);
+			}
+			catch (const std::exception& e) {
+				throw XInputUnavailable(String("cannot start primary input owner: ") + e.what());
+			}
+			if (!m_inputLoop->invoke([this] { createEventTap(); })) {
+				throw XInputUnavailable("primary input owner did not start");
+			}
+		}
+		else createEventTap();
+	}
+	catch (...) {
+		// Screen::enable has not committed m_enabled, so its normal disable
+		// path will not run. Roll back the partially created owner/timer here.
+		disable();
+		throw;
+	}
+}
+
+void
+OSXScreen::createEventTap()
+{
+	if (m_isPrimary) initializeInputState();
+
 	if (m_isPrimary) {
 		// FIXME -- start watching jump zones
+		initializePointerMotion();
 
 		// kCGEventTapOptionDefault = 0x00000000 (Missing in 10.4, so specified literally)
 		m_eventTapPort = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
 										kCGEventMaskForAllEvents,
-										handleCGInputEvent,
+										handleCapturedInput,
 										this);
 	}
 	else {
@@ -882,25 +1126,132 @@ OSXScreen::enable()
 	}
 
 	if (!m_eventTapPort) {
-		LOG((CLOG_ERR "failed to create quartz event tap"));
+		throw XInputUnavailable("failed to create quartz event tap");
 	}
 
 	m_eventTapRLSR = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, m_eventTapPort, 0);
 	if (!m_eventTapRLSR) {
-		LOG((CLOG_ERR "failed to create a CFRunLoopSourceRef for the quartz event tap"));
+		CFRelease(m_eventTapPort);
+		m_eventTapPort = nullptr;
+		throw XInputUnavailable("failed to create quartz event tap source");
 	}
 
 	CFRunLoopAddSource(CFRunLoopGetCurrent(), m_eventTapRLSR, kCFRunLoopDefaultMode);
+	if (m_isPrimary) {
+		// Local input must never wait for Weave's event queue or native state
+		// maintenance. Only remote ownership requires an active filter.
+		CGEventTapEnable(m_eventTapPort, false);
+		m_localEventTapPort = CGEventTapCreate(kCGHIDEventTap,
+			kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
+			kCGEventMaskForAllEvents, handleLocalInput, this);
+		if (!m_localEventTapPort)
+			throw XInputUnavailable("failed to create local input observer");
+		m_localEventTapSource = CFMachPortCreateRunLoopSource(
+			kCFAllocatorDefault, m_localEventTapPort, 0);
+		if (!m_localEventTapSource)
+			throw XInputUnavailable("failed to create local input observer source");
+		CFRunLoopAddSource(CFRunLoopGetCurrent(), m_localEventTapSource, kCFRunLoopDefaultMode);
+	}
+}
+
+void
+OSXScreen::setInputCapture(bool capture)
+{
+	if (!m_isPrimary || !m_eventTapPort || !m_localEventTapPort) return;
+	// Both callbacks run on this owner. Their ownership guards also reject
+	// queued observations left over from the previous mode.
+	if (capture) {
+		CGEventTapEnable(m_eventTapPort, true);
+		CGEventTapEnable(m_localEventTapPort, false);
+	}
+	else {
+		CGEventTapEnable(m_localEventTapPort, true);
+		CGEventTapEnable(m_eventTapPort, false);
+	}
+}
+
+CGEventRef
+OSXScreen::handleLocalInput(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void* context)
+{
+	auto* screen = static_cast<OSXScreen*>(context);
+	if (!screen->m_isOnScreen.load()) return event;
+	if (type == kCGEventTapDisabledByTimeout) {
+		if (screen->m_localEventTapPort) CGEventTapEnable(screen->m_localEventTapPort, true);
+		return event;
+	}
+	handleCGInputEvent(proxy, type, event, context);
+	return event; // A passive observation cannot consume the native event.
+}
+
+CGEventRef
+OSXScreen::handleCapturedInput(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void* context)
+{
+	auto* screen = static_cast<OSXScreen*>(context);
+	if (screen->m_isOnScreen.load()) {
+		// A queued remote motion must not move the pointer back after return.
+		const bool motion = type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged ||
+			type == kCGEventRightMouseDragged || type == kCGEventOtherMouseDragged;
+		const auto ticks = motion && event ? pointerEventTimestampTicks(event) : 0;
+		return ticks && ticks <= screen->m_localMotionAfterTicks ? nullptr : event;
+	}
+	return handleCGInputEvent(proxy, type, event, context);
 }
 
 void
 OSXScreen::disable()
 {
-	if (m_autoShowHideCursor) {
+	if (m_clipboardWorker) m_clipboardWorker->cancel();
+	if (m_inputLoop) {
+		m_inputLoop->stop([this] { destroyEventTap(); });
+		m_inputLoop.reset();
+	}
+	else destroyEventTap();
+
+	// disable drag handling
+	m_dragNumButtonsDown = 0;
+	enableDragTimer(false);
+
+	// uninstall clipboard timer
+	if (m_clipboardTimer != NULL) {
+		m_events->removeHandler(Event::kTimer, m_clipboardTimer);
+		m_events->deleteTimer(m_clipboardTimer);
+		m_clipboardTimer = NULL;
+	}
+	m_isOnScreen = m_isPrimary;
+}
+
+void
+OSXScreen::destroyEventTap()
+{
+	// stop() has drained accepted release commands. Settle any physical
+	// modifier-up suppressed while remote before invalidating its evidence.
+	if (m_isPrimary)
+		m_keyState->completeSuppressedModifierReleases(m_pendingNativeModifierReleases);
+	m_pointerPositionChanges.clear();
+	m_lastNativePointerValid = false;
+	m_primaryKeysDown.reset();
+	m_primaryModifiers = 0;
+	m_pendingNativeModifierReleases = 0;
+	m_keyState->clearObservedPrimaryModifiers();
+	m_handoffKeyGenerations.clear();
+	m_handoffButtonGenerations.clear();
+	// Called on the loop that created the tap, after its last callback.
+	if (m_autoShowHideCursor || m_isPrimary) {
 		showCursor();
 	}
 
 	// FIXME -- stop watching jump zones, stop capturing input
+
+	if (m_localEventTapSource) {
+		CFRunLoopRemoveSource(CFRunLoopGetCurrent(), m_localEventTapSource, kCFRunLoopDefaultMode);
+		CFRelease(m_localEventTapSource);
+		m_localEventTapSource = nullptr;
+	}
+	if (m_localEventTapPort) {
+		CGEventTapEnable(m_localEventTapPort, false);
+		CFRelease(m_localEventTapPort);
+		m_localEventTapPort = nullptr;
+	}
 
 	if (m_eventTapRLSR) {
 		CFRunLoopRemoveSource(CFRunLoopGetCurrent(), m_eventTapRLSR, kCFRunLoopDefaultMode);
@@ -913,29 +1264,36 @@ OSXScreen::disable()
 		CFRelease(m_eventTapPort);
 		m_eventTapPort = nullptr;
 	}
-	// FIXME -- allow system to enter power saving mode
-
-	// disable drag handling
-	m_dragNumButtonsDown = 0;
-	enableDragTimer(false);
-
-	// uninstall clipboard timer
-	if (m_clipboardTimer != NULL) {
-		m_events->removeHandler(Event::kTimer, m_clipboardTimer);
-		m_events->deleteTimer(m_clipboardTimer);
-		m_clipboardTimer = NULL;
-	}
-
-	m_isOnScreen = m_isPrimary;
 }
 
 void
 OSXScreen::enter()
 {
+	if (m_inputLoop && !m_inputLoop->isOwner()) {
+		if (!m_inputLoop->invoke([this] { enter(); })) {
+			sendEvent(m_events->forIScreen().error());
+		}
+		return;
+	}
 	showCursor();
 
 	if (m_isPrimary) {
+		if (m_pointerDetached) {
+			// Restoring the hardware pointer failed. Do not claim local input
+			// ownership and leave the user frozen until a manual quit. Normal
+			// event-loop shutdown runs disable(), which retries restoration.
+			LOG((CLOG_ERR "stopping sharing because physical mouse restoration failed"));
+			sendEvent(m_events->forIScreen().error());
+			return;
+		}
 		setZeroSuppressionInterval();
+		if (!m_isOnScreen.load()) {
+			m_localMotionAfterTicks = nativeInputTimestampTicks();
+			if (!m_keyState->hasSyntheticKeyBindings()) {
+				m_keyState->completeSuppressedModifierReleases(m_pendingNativeModifierReleases);
+				m_pendingNativeModifierReleases = 0;
+			}
+		}
 	}
 	else {
 		// reset buttons
@@ -958,17 +1316,93 @@ OSXScreen::enter()
 
 	// now on screen
 	m_isOnScreen = true;
+	setInputCapture(false);
+}
+
+bool
+OSXScreen::tryEnter()
+{
+	enter();
+	return m_isOnScreen.load();
+}
+
+bool
+OSXScreen::tryEnterAt(SInt32 x, SInt32 y)
+{
+	if (m_inputLoop && !m_inputLoop->isOwner()) {
+		bool accepted = false;
+		if (!m_inputLoop->invoke([this, x, y, &accepted] { accepted = tryEnterAt(x, y); })) {
+			sendEvent(m_events->forIScreen().error());
+			return false;
+		}
+		return accepted;
+	}
+	// One owner operation: no remote callback may park between this warp
+	// and the local transition. Keep no-position recovery in tryEnter().
+	if (warpPointer(CGPointMake(x, y)) != kCGErrorSuccess) {
+		showCursor();
+		m_isOnScreen = !m_pointerDetached;
+		sendEvent(m_events->forIScreen().error());
+		return false;
+	}
+	m_xCursor = x;
+	m_yCursor = y;
+	m_cursorPosValid = true;
+	return tryEnter();
 }
 
 bool
 OSXScreen::leave()
 {
-    hideCursor();
+	if (m_inputLoop && !m_inputLoop->isOwner()) {
+		bool accepted = false;
+		if (!m_inputLoop->invoke([this, &accepted] { accepted = leave(); })) return false;
+		return accepted;
+	}
+	if (m_isPrimary) {
+		if (!m_isOnScreen.load()) return true;
+		SInt32 exitX, exitY, cx, cy;
+		getCursorPos(exitX, exitY);
+		getCursorCenter(cx, cy);
+		m_parkPoint = CGPointMake(cx, cy);
+		// Native motion can already contain this warp before leave returns.
+		// Select the capturing tap first: the passive observer drops callbacks
+		// queued across the ownership change, which would otherwise lose the
+		// warp-bearing event and apply its compensation to a later real delta.
+		setInputCapture(true);
+		if (warpPointer(m_parkPoint) != kCGErrorSuccess) {
+			setInputCapture(false);
+			return false;
+		}
+
+		// A warp alone doesn't send a hover event. Give the Dock a leave
+		// before hiding, below our HID tap so this is never client motion.
+		CGEventRef hover = CGEventCreateMouseEvent(nullptr, kCGEventMouseMoved,
+			m_parkPoint, kCGMouseButtonLeft);
+		if (hover) {
+			CGEventSetIntegerValueField(hover, kCGMouseEventDeltaX, 0);
+			CGEventSetIntegerValueField(hover, kCGMouseEventDeltaY, 0);
+			CGEventPost(kCGSessionEventTap, hover);
+			CFRelease(hover);
+			hideCursor();
+		}
+		if (!hover || !m_cursorHidden || !setPointerDetached(true)) {
+			showCursor();
+			if (warpPointer(CGPointMake(exitX, exitY)) != kCGErrorSuccess)
+				sendEvent(m_events->forIScreen().error());
+			setInputCapture(false);
+			return false;
+		}
+	}
+	else hideCursor();
 
 	if (isDraggingStarted()) {
-		String& fileList = getDraggingFilename();
-
 		if (!m_isPrimary) {
+			// Only the secondary sends a file list here. Server-side drag
+			// metadata is prepared by Server::sendDragInfo before handoff.
+			// Never query a native pasteboard on the primary input owner after
+			// detaching the hardware mouse: a slow provider would freeze input.
+			String& fileList = getDraggingFilename();
 			if (fileList.empty() == false) {
 				ClientApp& app = ClientApp::instance();
 				Client* client = app.getClientPtr();
@@ -994,10 +1428,7 @@ OSXScreen::leave()
 		m_draggingStarted = false;
 	}
 
-	if (m_isPrimary) {
-		avoidHesitatingCursor();
-
-	}
+	if (m_isPrimary) avoidHesitatingCursor();
 
 	// now off screen
 	m_isOnScreen = false;
@@ -1006,24 +1437,48 @@ OSXScreen::leave()
 }
 
 bool
-OSXScreen::setClipboard(ClipboardID, const IClipboard* src)
+OSXScreen::setClipboard(ClipboardID id, const IClipboard* src)
 {
-	if (src != NULL) {
-		LOG((CLOG_DEBUG "setting clipboard"));
-		Clipboard::copy(&m_pasteboard, src);
-	}
-	return true;
+	if (src == nullptr) return true;
+	return setClipboardSnapshot(id, std::make_shared<const String>(IClipboard::marshall(src)), 0);
+}
+
+bool
+OSXScreen::setClipboardSnapshot(ClipboardID id, const std::shared_ptr<const String>& data)
+{
+	return setClipboardSnapshot(id, data, 0);
+}
+
+bool
+OSXScreen::setClipboardSnapshot(ClipboardID id, const std::shared_ptr<const String>& data,
+                                std::uint64_t publicationId)
+{
+	return m_clipboardWorker && m_clipboardWorker->publish(id, data, publicationId);
 }
 
 void
 OSXScreen::checkClipboards()
 {
-	LOG((CLOG_DEBUG2 "checking clipboard"));
-	if (m_pasteboard.synchronize()) {
-		LOG((CLOG_DEBUG "clipboard changed"));
-		sendClipboardEvent(m_events->forClipboard().clipboardGrabbed(), kClipboardClipboard);
-		sendClipboardEvent(m_events->forClipboard().clipboardGrabbed(), kClipboardSelection);
+	if (!m_clipboardWorker) return;
+	UInt32 sequence;
+	if (m_clipboardWorker->takeReady(&sequence)) {
+		for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+			for (auto type : {m_events->forClipboard().clipboardGrabbed(), m_events->forClipboard().clipboardChanged()}) {
+				auto* info = static_cast<ClipboardInfo*>(malloc(sizeof(ClipboardInfo)));
+				if (!info) continue;
+				info->m_id = id;
+				info->m_sequenceNumber = sequence;
+				sendEvent(type, info);
+			}
+		}
 	}
+	for (const auto& result : m_clipboardWorker->takePublications()) {
+		auto* info = static_cast<ClipboardPublicationInfo*>(malloc(sizeof(ClipboardPublicationInfo)));
+		if (!info) continue;
+		*info = result;
+		sendEvent(m_events->forClipboard().clipboardPublished(), info);
+	}
+	m_clipboardWorker->poll(m_sequenceNumber);
 }
 
 void
@@ -1183,68 +1638,20 @@ OSXScreen::handleSystemEvent(const Event& event, void*)
 bool
 OSXScreen::onMouseMove(CGFloat mx, CGFloat my)
 {
-	SInt32 sx, sy, sw, sh, cx, cy;
+	// Absolute positions are meaningful only on this screen. Remote motion is
+	// supplied by the HID event's delta fields, not a mutable warp baseline.
+	if (!m_isOnScreen.load()) return true;
 	{
 		std::lock_guard<std::mutex> lock(m_shapeMutex);
 		if (m_displayConfiguring || m_w <= 0 || m_h <= 0) return true;
-		sx = m_x; sy = m_y; sw = m_w; sh = m_h; cx = m_xCenter; cy = m_yCenter;
 	}
 	LOG((CLOG_DEBUG2 "mouse move %+f,%+f", mx, my));
-
-	CGFloat x = mx - m_xCursor;
-	CGFloat y = my - m_yCursor;
-
-	if ((x == 0 && y == 0) || (mx == cx && mx == cy)) {
-		return true;
-	}
-
-	// save position to compute delta of next motion
 	m_xCursor = (SInt32)mx;
 	m_yCursor = (SInt32)my;
-
-	if (m_isOnScreen) {
-		// motion on primary screen
-		sendEvent(m_events->forIPrimaryScreen().motionOnPrimary(),
-							MotionInfo::alloc(m_xCursor, m_yCursor));
-		if (m_buttonState.test(0)) {
-			m_draggingStarted = true;
-		}
-	}
-	else {
-		// motion on secondary screen.  warp mouse back to
-		// center.
-		warpCursor(cx, cy);
-
-		// examine the motion.  if it's about the distance
-		// from the center of the screen to an edge then
-		// it's probably a bogus motion that we want to
-		// ignore (see warpCursorNoFlush() for a further
-		// description).
-		static SInt32 bogusZoneSize = 10;
-		if (-x + bogusZoneSize > cx - sx ||
-			 x + bogusZoneSize > sx + sw - cx ||
-			-y + bogusZoneSize > cy - sy ||
-			 y + bogusZoneSize > sy + sh - cy) {
-			LOG((CLOG_DEBUG "dropped bogus motion %+d,%+d", x, y));
-		}
-		else {
-			// send motion
-			// Accumulate together the move into the running total
-			static CGFloat m_xFractionalMove = 0;
-			static CGFloat m_yFractionalMove = 0;
-
-			m_xFractionalMove += x;
-			m_yFractionalMove += y;
-
-			// Return the integer part
-			SInt32 intX = (SInt32)m_xFractionalMove;
-			SInt32 intY = (SInt32)m_yFractionalMove;
-
-			// And keep only the fractional part
-			m_xFractionalMove -= intX;
-			m_yFractionalMove -= intY;
-			sendEvent(m_events->forIPrimaryScreen().motionOnSecondary(), MotionInfo::alloc(intX, intY));
-		}
+	sendEvent(m_events->forIPrimaryScreen().motionOnPrimary(),
+		MotionInfo::alloc((SInt32)mx, (SInt32)my));
+	if (m_buttonState.test(0)) {
+		m_draggingStarted = true;
 	}
 
 	return true;
@@ -1259,14 +1666,14 @@ OSXScreen::onMouseButton(bool pressed, UInt16 macButton)
 	if (pressed) {
 		LOG((CLOG_DEBUG1 "event: button press button=%d", button));
 		if (button != kButtonNone) {
-			KeyModifierMask mask = m_keyState->getActiveModifiers();
+			KeyModifierMask mask = m_isPrimary ? m_primaryModifiers.load() : m_keyState->getActiveModifiers();
 			sendEvent(m_events->forIPrimaryScreen().buttonDown(), ButtonInfo::alloc(button, mask));
 		}
 	}
 	else {
 		LOG((CLOG_DEBUG1 "event: button release button=%d", button));
 		if (button != kButtonNone) {
-			KeyModifierMask mask = m_keyState->getActiveModifiers();
+			KeyModifierMask mask = m_isPrimary ? m_primaryModifiers.load() : m_keyState->getActiveModifiers();
 			sendEvent(m_events->forIPrimaryScreen().buttonUp(), ButtonInfo::alloc(button, mask));
 		}
 	}
@@ -1317,9 +1724,15 @@ OSXScreen::onMouseWheel(SInt32 xDelta, SInt32 yDelta) const
 void
 OSXScreen::handleClipboardCheck(const Event&, void*)
 {
+	// Reuse maintenance wakeups; never consult preferences in an input callback.
+	const auto now = std::chrono::steady_clock::now();
+	if (now >= m_nextScrollSettingsRefresh) {
+		m_scrollSettings.requestRefresh();
+		m_nextScrollSettingsRefresh = now + std::chrono::seconds(5);
+	}
 	SInt32 x, y, w, h;
 	getShape(x, y, w, h);
-	// Reuse the existing one-second timer, only while geometry is unavailable.
+	// Refresh geometry only while it is unavailable.
 	if (w <= 0 || h <= 0) updateScreenShape();
 	checkClipboards();
 }
@@ -1345,6 +1758,58 @@ OSXScreen::displayReconfigurationCallback(CGDirectDisplayID, CGDisplayChangeSumm
 	screen->m_events->addEvent(Event(screen->m_displayChangeEvent, screen));
 }
 
+void
+OSXScreen::onModifierFlags(CGEventFlags flags, bool flagsChanged)
+{
+	KeyModifierMask oldMask = m_isPrimary ? m_primaryModifiers.load() : getActiveModifiers();
+	KeyModifierMask newMask = m_keyState->mapModifiersFromOSX(flags);
+	if (!flagsChanged) {
+		// On ordinary events NumericPad describes the key's origin, not a
+		// NumLock transition. Preserve that logical modifier independently.
+		newMask = (newMask & ~KeyModifierNumLock) | (oldMask & KeyModifierNumLock);
+	}
+	m_keyState->handleModifierKeys(getEventTarget(), oldMask, newMask);
+	if (m_isPrimary) {
+		if (m_isOnScreen.load()) {
+			// This native event is delivered locally, so it already completes
+			// the local modifier state. Do not post a second flags-up later.
+			m_pendingNativeModifierReleases = 0;
+		}
+		else {
+			const KeyModifierMask momentary = KeyModifierShift | KeyModifierControl |
+				KeyModifierAlt | KeyModifierSuper;
+			m_pendingNativeModifierReleases |= oldMask & ~newMask & momentary;
+			m_pendingNativeModifierReleases &= ~newMask;
+		}
+		m_primaryModifiers = newMask;
+		m_keyState->setObservedPrimaryModifiers(newMask, flags);
+		m_keyState->onKey(0, false, newMask);
+	}
+	if (!flagsChanged && oldMask == newMask) return;
+
+	// Preserve exactly one hotkey release even if the flags callback was
+	// missed and a later ordinary event is the first evidence of the change.
+	if (m_activeModifierHotKey == 0) {
+		if (m_modifierHotKeys.count(newMask) > 0) {
+			m_activeModifierHotKey     = m_modifierHotKeys[newMask];
+			m_activeModifierHotKeyMask = newMask;
+			m_events->addEvent(Event(m_events->forIPrimaryScreen().hotKeyDown(),
+							getEventTarget(),
+							HotKeyInfo::alloc(m_activeModifierHotKey)));
+		}
+	}
+	else {
+		KeyModifierMask mask = (newMask & m_activeModifierHotKeyMask);
+		if (mask != m_activeModifierHotKeyMask) {
+			m_events->addEvent(Event(m_events->forIPrimaryScreen().hotKeyUp(),
+							getEventTarget(),
+							HotKeyInfo::alloc(m_activeModifierHotKey)));
+			m_activeModifierHotKey     = 0;
+			m_activeModifierHotKeyMask = 0;
+		}
+	}
+}
+
 bool
 OSXScreen::onKey(CGEventRef event)
 {
@@ -1355,40 +1820,14 @@ OSXScreen::onKey(CGEventRef event)
 	CGEventFlags macMask = CGEventGetFlags(event);
 	LOG((CLOG_DEBUG1 "event: Key event kind: %d, keycode=%d", eventKind, virtualKey));
 
-	// Special handling to track state of modifiers
-	if (eventKind == kCGEventFlagsChanged) {
-		// get old and new modifier state
-		KeyModifierMask oldMask = getActiveModifiers();
-		KeyModifierMask newMask = m_keyState->mapModifiersFromOSX(macMask);
-		m_keyState->handleModifierKeys(getEventTarget(), oldMask, newMask);
-
-		// if the current set of modifiers exactly matches a modifiers-only
-		// hot key then generate a hot key down event.
-		if (m_activeModifierHotKey == 0) {
-			if (m_modifierHotKeys.count(newMask) > 0) {
-				m_activeModifierHotKey     = m_modifierHotKeys[newMask];
-				m_activeModifierHotKeyMask = newMask;
-				m_events->addEvent(Event(m_events->forIPrimaryScreen().hotKeyDown(),
-								getEventTarget(),
-								HotKeyInfo::alloc(m_activeModifierHotKey)));
-			}
-		}
-
-		// if a modifiers-only hot key is active and should no longer be
-		// then generate a hot key up event.
-		else if (m_activeModifierHotKey != 0) {
-			KeyModifierMask mask = (newMask & m_activeModifierHotKeyMask);
-			if (mask != m_activeModifierHotKeyMask) {
-				m_events->addEvent(Event(m_events->forIPrimaryScreen().hotKeyUp(),
-								getEventTarget(),
-								HotKeyInfo::alloc(m_activeModifierHotKey)));
-				m_activeModifierHotKey     = 0;
-				m_activeModifierHotKeyMask = 0;
-			}
-		}
-
-		return true;
+	const bool flagsChanged = eventKind == kCGEventFlagsChanged;
+	if (flagsChanged || m_isPrimary) {
+		// This event's flags belong to its position in the native stream.
+		// They repair missed modifier callbacks without allowing a newer
+		// physical poll to rewrite the context of a queued event.
+		onModifierFlags(macMask, flagsChanged);
 	}
+	if (flagsChanged) return true;
 
 	HotKeyToIDMap::const_iterator i = m_hotKeyToIDMap.find(HotKeyItem(virtualKey, m_keyState->mapModifiersToCarbon(macMask) & 0xff00u));
 	if (i != m_hotKeyToIDMap.end()) {
@@ -1434,13 +1873,16 @@ OSXScreen::onKey(CGEventRef event)
 	// update button state
 	if (down) {
 		m_keyState->onKey(button, true, mask);
+		if (m_isPrimary) m_primaryKeysDown.set(button);
 	}
 	else if (up) {
-		if (!m_keyState->isKeyDown(button)) {
+		if (!m_keyState->isKeyDown(button) &&
+			!(m_isPrimary && m_primaryKeysDown.test(button))) {
 			// up event for a dead key.  throw it away.
 			return false;
 		}
 		m_keyState->onKey(button, false, mask);
+		if (m_isPrimary) m_primaryKeysDown.reset(button);
 	}
 
 	// send key events
@@ -1464,23 +1906,32 @@ OSXScreen::onMediaKey(CGEventRef event)
 		LOG ((CLOG_ERR "Failed to decode media key event"));
 		return;
 	}
+	if (m_isPrimary) onModifierFlags(CGEventGetFlags(event), false);
 
 	LOG ((CLOG_DEBUG2 "Media key event: keyID=0x%02x, %s, repeat=%s",
 						keyID, (down ? "down": "up"),
 						(isRepeat ? "yes" : "no")));
 
 	KeyButton button = 0;
-	KeyModifierMask mask = m_keyState->getActiveModifiers();
+	KeyModifierMask mask = m_isPrimary ? m_primaryModifiers.load() : m_keyState->getActiveModifiers();
 	m_keyState->sendKeyEvent(getEventTarget(), down, isRepeat, keyID, mask, 1, button);
 }
 
 bool
 OSXScreen::onHotKey(EventRef event) const
 {
+	if (needsInputDispatch()) {
+		bool handled = false;
+		invokeInputState([this, event, &handled] { handled = onHotKey(event); });
+		return handled;
+	}
 	// get the hotkey id
-	EventHotKeyID hkid;
-	GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID,
-							NULL, sizeof(EventHotKeyID), NULL, &hkid);
+	EventHotKeyID hkid = {};
+	if (GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID,
+				NULL, sizeof(EventHotKeyID), NULL, &hkid) != noErr ||
+		hkid.signature != 'SNRG' || m_hotKeys.count(hkid.id) == 0) {
+		return false;
+	}
 	UInt32 id = hkid.id;
 
 	// determine event type
@@ -1537,10 +1988,7 @@ OSXScreen::mapMacButtonToBarrier(UInt16 macButton) const
 SInt32
 OSXScreen::mapScrollWheelToBarrier(float x) const
 {
-	// return accelerated scrolling but not exponentially scaled as it is
-	// on the mac.
-	double d = (1.0 + getScrollSpeed()) * x / getScrollSpeedFactor();
-	return static_cast<SInt32>(120.0 * d);
+	return m_scrollSettings.convert(x);
 }
 
 SInt32
@@ -1549,38 +1997,6 @@ OSXScreen::mapScrollWheelFromBarrier(float x) const
 	// use server's acceleration with a little boost since other platforms
 	// take one wheel step as a larger step than the mac does.
 	return static_cast<SInt32>(3.0 * x / 120.0);
-}
-
-double
-OSXScreen::getScrollSpeed() const
-{
-	double scaling = 0.0;
-
-	CFPropertyListRef pref = ::CFPreferencesCopyValue(
-							CFSTR("com.apple.scrollwheel.scaling") ,
-							kCFPreferencesAnyApplication,
-							kCFPreferencesCurrentUser,
-							kCFPreferencesAnyHost);
-	if (pref != NULL) {
-		CFTypeID id = CFGetTypeID(pref);
-		if (id == CFNumberGetTypeID()) {
-			CFNumberRef value = static_cast<CFNumberRef>(pref);
-			if (CFNumberGetValue(value, kCFNumberDoubleType, &scaling)) {
-				if (scaling < 0.0) {
-					scaling = 0.0;
-				}
-			}
-		}
-		CFRelease(pref);
-	}
-
-	return scaling;
-}
-
-double
-OSXScreen::getScrollSpeedFactor() const
-{
-	return pow(10.0, getScrollSpeed());
 }
 
 void
@@ -1605,8 +2021,12 @@ OSXScreen::enableDragTimer(bool enable)
 }
 
 void
-OSXScreen::handleDrag(const Event&, void*)
+OSXScreen::handleDrag(const Event& timerEvent, void* context)
 {
+	if (needsInputDispatch()) {
+		invokeInputState([this, &timerEvent, context] { handleDrag(timerEvent, context); });
+		return;
+	}
 	CGEventRef event = CGEventCreate(NULL);
 	CGPoint p = CGEventGetLocation(event);
 	CFRelease(event);
@@ -1621,6 +2041,10 @@ OSXScreen::handleDrag(const Event&, void*)
 void
 OSXScreen::updateButtons()
 {
+	if (needsInputDispatch()) {
+		invokeInputState([this] { updateButtons(); });
+		return;
+	}
 	UInt32 buttons = GetCurrentButtonState();
 
 	m_buttonState.overwrite(buttons);
@@ -1630,6 +2054,236 @@ IKeyState*
 OSXScreen::getKeyState() const
 {
 	return m_keyState;
+}
+
+bool
+OSXScreen::needsInputDispatch() const
+{
+	return m_isPrimary && m_inputLoop && !m_inputLoop->isOwner();
+}
+
+void
+OSXScreen::initializeInputState()
+{
+	m_primaryKeysDown.reset();
+	for (KeyButton button = 1; button < IKeyState::kNumButtons; ++button) {
+		m_primaryKeysDown.set(button, m_keyState->isKeyDown(button));
+	}
+	m_primaryModifiers = m_keyState->getActiveModifiers();
+	m_pendingNativeModifierReleases = 0;
+	m_keyState->setObservedPrimaryModifiers(m_primaryModifiers.load());
+}
+
+bool
+OSXScreen::invokeInputState(std::function<void()> operation) const
+{
+	if (m_isPrimary && m_inputLoop) {
+		if (!m_inputLoop->invoke(std::move(operation))) {
+			LOG((CLOG_WARN "primary input state operation cancelled before execution"));
+			return false;
+		}
+	}
+	else operation();
+	return true;
+}
+
+OSXInputLoop::ReleaseResult
+OSXScreen::invokeInputRelease(std::function<void()> operation) const
+{
+	if (m_isPrimary && m_inputLoop) {
+		return m_inputLoop->invokeRelease(std::move(operation));
+	}
+	operation();
+	return OSXInputLoop::ReleaseResult::Completed;
+}
+
+void
+OSXScreen::updateKeyMap()
+{
+	// Only explicit map updates rebuild the native layout. Ordinary input
+	// and the periodic physical-state refresh never request a map rebuild.
+	invokeInputState([this] { PlatformScreen::updateKeyMap(); });
+}
+
+void
+OSXScreen::updateKeyState()
+{
+	invokeInputState([this] {
+		// A primary refresh (including leavePrimary) must not erase the
+		// binding needed to release local replay. Resume polling after release.
+		if (m_isPrimary && m_keyState->hasSyntheticKeyBindings()) {
+			updateButtons();
+			return;
+		}
+		if (m_isPrimary && m_isOnScreen.load()) {
+			m_keyState->completeSuppressedModifierReleases(m_pendingNativeModifierReleases);
+			m_pendingNativeModifierReleases = 0;
+		}
+		PlatformScreen::updateKeyState();
+	});
+}
+
+void
+OSXScreen::setHalfDuplexMask(KeyModifierMask mask)
+{
+	invokeInputState([this, mask] { PlatformScreen::setHalfDuplexMask(mask); });
+}
+
+void
+OSXScreen::fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button)
+{
+	invokeInputState([this, id, mask, button] { PlatformScreen::fakeKeyDown(id, mask, button); });
+}
+
+bool
+OSXScreen::fakeKeyRepeat(KeyID id, KeyModifierMask mask, SInt32 count, KeyButton button)
+{
+	bool repeated = false;
+	invokeInputState([this, id, mask, count, button, &repeated] {
+		repeated = PlatformScreen::fakeKeyRepeat(id, mask, count, button);
+	});
+	return repeated;
+}
+
+bool
+OSXScreen::fakeKeyUp(KeyButton button)
+{
+	// A pending release can execute after this method returns. Keep its result
+	// owned by the command; the owner remains alive until disable() joins it.
+	const auto released = std::make_shared<bool>(false);
+	const auto result = invokeInputRelease([this, button, released] {
+		*released = PlatformScreen::fakeKeyUp(button);
+	});
+	return result == OSXInputLoop::ReleaseResult::Pending ||
+		(result == OSXInputLoop::ReleaseResult::Completed && *released);
+}
+
+void
+OSXScreen::fakeAllKeysUp()
+{
+	invokeInputRelease([this] {
+		// A suppressed physical up can zero the shadow count without reaching
+		// the local OS. Explicit replay mappings still owe their native up.
+		for (const auto& held : m_handoffKeyGenerations)
+			PlatformScreen::fakeKeyUp(held.first);
+		PlatformScreen::fakeAllKeysUp();
+		m_handoffKeyGenerations.clear();
+	});
+}
+
+void
+OSXScreen::fakeKeyDownForHandoff(KeyID id, KeyModifierMask mask, KeyButton button, std::uint64_t generation)
+{
+	invokeInputState([this, id, mask, button, generation] {
+		PlatformScreen::fakeKeyDown(id, mask, button);
+		if (m_keyState->syntheticKeyButton(button) != 0)
+			m_handoffKeyGenerations[button] = generation;
+	});
+}
+
+bool
+OSXScreen::fakeKeyUpForHandoff(KeyButton button, std::uint64_t generation)
+{
+	const auto released = std::make_shared<bool>(false);
+	const auto result = invokeInputRelease([this, button, generation, released] {
+		auto held = m_handoffKeyGenerations.find(button);
+		if (held == m_handoffKeyGenerations.end()) {
+			*released = true; // Native delivery or an all-up already completed it.
+		}
+		else if (held->second == generation) {
+			m_handoffKeyGenerations.erase(held);
+			*released = PlatformScreen::fakeKeyUp(button);
+		}
+	});
+	return result == OSXInputLoop::ReleaseResult::Pending ||
+		(result == OSXInputLoop::ReleaseResult::Completed && *released);
+}
+
+void
+OSXScreen::fakeMouseButtonForHandoff(ButtonID button, bool press, std::uint64_t generation)
+{
+	if (press) {
+		invokeInputState([this, button, generation] {
+			fakeMouseButton(button, true);
+			m_handoffButtonGenerations[button] = generation;
+		});
+	}
+	else {
+		invokeInputRelease([this, button, generation] {
+			auto held = m_handoffButtonGenerations.find(button);
+			if (held != m_handoffButtonGenerations.end() && held->second == generation)
+				fakeMouseButton(button, false);
+		});
+	}
+}
+
+bool
+OSXScreen::completeLocalKeyRelease(KeyButton localButton)
+{
+	bool owned = false;
+	for (const auto& held : m_handoffKeyGenerations) {
+		if (m_keyState->syntheticKeyButton(held.first) == localButton) {
+			owned = true;
+			break;
+		}
+	}
+	if (owned) {
+		const auto retired = m_keyState->retireSyntheticKeyBindings(localButton);
+		for (const auto button : retired) m_handoffKeyGenerations.erase(button);
+		m_keyState->completeNativeKeyRelease(localButton);
+	}
+	return owned;
+}
+
+bool
+OSXScreen::fakeCtrlAltDel()
+{
+	bool handled = false;
+	invokeInputState([this, &handled] { handled = PlatformScreen::fakeCtrlAltDel(); });
+	return handled;
+}
+
+bool
+OSXScreen::isKeyDown(KeyButton button) const
+{
+	bool down = false;
+	invokeInputState([this, button, &down] { down = PlatformScreen::isKeyDown(button); });
+	return down;
+}
+
+KeyModifierMask
+OSXScreen::getActiveModifiers() const
+{
+	KeyModifierMask mask = 0;
+	invokeInputState([this, &mask] { mask = PlatformScreen::getActiveModifiers(); });
+	return mask;
+}
+
+KeyModifierMask
+OSXScreen::pollActiveModifiers() const
+{
+	// The input owner already publishes every observed modifier transition.
+	// Waiting for it here stalls the server's handoff and socket event queue.
+	if (m_isPrimary && m_inputLoop) {
+		return m_primaryModifiers.load();
+	}
+	KeyModifierMask mask = 0;
+	invokeInputState([this, &mask] { mask = PlatformScreen::pollActiveModifiers(); });
+	return mask;
+}
+
+SInt32
+OSXScreen::pollActiveGroup() const
+{
+	SInt32 group = 0;
+	invokeInputState([this, &group] { group = PlatformScreen::pollActiveGroup(); });
+	return group;
+}
+
+void
+OSXScreen::pollPressedKeys(KeyButtonSet& pressedKeys) const
+{
+	invokeInputState([this, &pressedKeys] { PlatformScreen::pollPressedKeys(pressedKeys); });
 }
 
 void
@@ -2076,31 +2730,124 @@ OSXScreen::handleCGInputEvent(CGEventTapProxy proxy,
 							   CGEventRef event,
 							   void* refcon)
 {
+	@autoreleasepool {
 	OSXScreen* screen = (OSXScreen*)refcon;
 	CGPoint pos;
+	const bool local = screen->m_isOnScreen.load();
+	const bool pointerEvent = type == kCGEventMouseMoved ||
+		type == kCGEventLeftMouseDragged || type == kCGEventRightMouseDragged ||
+		type == kCGEventOtherMouseDragged || type == kCGEventLeftMouseDown ||
+		type == kCGEventLeftMouseUp || type == kCGEventRightMouseDown ||
+		type == kCGEventRightMouseUp || type == kCGEventOtherMouseDown ||
+		type == kCGEventOtherMouseUp || type == kCGEventScrollWheel;
+	const bool keyboardEvent = type == kCGEventKeyDown ||
+		type == kCGEventKeyUp || type == kCGEventFlagsChanged;
+	const bool motionEvent = type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged ||
+		type == kCGEventRightMouseDragged || type == kCGEventOtherMouseDragged;
+	CGEventTimestamp motionTicks = 0;
+	double motionX = 0, motionY = 0;
+	if (event && pointerEvent && type != kCGEventScrollWheel) {
+		motionTicks = pointerEventTimestampTicks(event);
+		const auto state = CGEventGetIntegerValueField(event, kCGEventSourceStateID);
+		// Direct CG posting changes the next HID position baseline even when
+		// it is our replay and the input-routing filter below bypasses it.
+		if (state == kCGEventSourceStateCombinedSessionState || state == kCGEventSourceStatePrivate) {
+			if (!screen->recordPointerPosition(CGEventGetLocation(event),
+				motionTicks ? motionTicks : mach_absolute_time(), true)) {
+				screen->showCursor();
+				screen->m_isOnScreen = !screen->m_pointerDetached;
+				screen->sendEvent(screen->m_events->forIScreen().error());
+				return screen->m_isOnScreen ? event : nullptr;
+			}
+		}
+		if (motionEvent) {
+			motionX = CGEventGetIntegerValueField(event, kCGMouseEventDeltaX);
+			motionY = CGEventGetIntegerValueField(event, kCGMouseEventDeltaY);
+			const bool unsafeTiming = !local && motionTicks == 0 &&
+				state == kCGEventSourceStateHIDSystemState && !screen->m_pointerPositionChanges.empty();
+			screen->compensatePointerMotion(event, motionTicks, motionX, motionY);
+			if (unsafeTiming) {
+				// The raw delta may contain a whole-screen warp. Restore native
+				// input instead of forwarding an unorderable delta to the peer.
+				screen->showCursor();
+				screen->m_isOnScreen = !screen->m_pointerDetached;
+				screen->sendEvent(screen->m_events->forIScreen().error());
+				return screen->m_isOnScreen ? event : nullptr;
+			}
+		}
+	}
+	if (event != nullptr &&
+		((pointerEvent && CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kWeavePointerEventMarker) ||
+		 ((pointerEvent || keyboardEvent) && CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid()))) {
+		// Our keyboard replay must not rewrite physical key/modifier pairing
+		// or retrigger hotkeys. Keep OS delivery even after re-leaving: an own
+		// key-up may be the required cleanup of a locally replayed press.
+		return event;
+	}
 
 	switch(type) {
 		case kCGEventLeftMouseDown:
 		case kCGEventRightMouseDown:
 		case kCGEventOtherMouseDown:
+			screen->onModifierFlags(CGEventGetFlags(event), false);
 			screen->onMouseButton(true, CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) + 1);
 			break;
 		case kCGEventLeftMouseUp:
 		case kCGEventRightMouseUp:
-		case kCGEventOtherMouseUp:
-			screen->onMouseButton(false, CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) + 1);
+		case kCGEventOtherMouseUp: {
+			const auto macButton = CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) + 1;
+			if (local) {
+				auto held = screen->m_handoffButtonGenerations.find(screen->mapMacButtonToBarrier(macButton));
+				if (held != screen->m_handoffButtonGenerations.end()) {
+					screen->m_handoffButtonGenerations.erase(held);
+					// onMouseButton's legacy drag path only updates the left
+					// button. The completed native release also retires any
+					// replayed right/other button's cached down state.
+					if (macButton > 0 && macButton <= NumButtonIDs)
+						screen->m_buttonState.set(macButton - 1, kMouseButtonUp);
+				}
+			}
+			screen->onModifierFlags(CGEventGetFlags(event), false);
+			screen->onMouseButton(false, macButton);
 			break;
+		}
 		case kCGEventLeftMouseDragged:
 		case kCGEventRightMouseDragged:
 		case kCGEventOtherMouseDragged:
 		case kCGEventMouseMoved:
+			if (event == nullptr) return nullptr;
+			if (local && motionTicks != 0 && screen->m_localMotionAfterTicks != 0 &&
+				motionTicks <= screen->m_localMotionAfterTicks) {
+				// Discard queued native motion from the previous remote lease.
+				// It must not put the local pointer back on the crossing edge.
+				return nullptr;
+			}
+			if (!local) {
+				// Association(false) alone is not durable for background apps.
+				// Compensate the captured delta before parking: this new warp
+				// belongs to a later native event, not to the current one.
+				if (!CGPointEqualToPoint(CGEventGetLocation(event), screen->m_parkPoint) &&
+					screen->warpPointer(screen->m_parkPoint, true) != kCGErrorSuccess) {
+					screen->showCursor();
+					screen->m_isOnScreen = !screen->m_pointerDetached;
+					screen->sendEvent(screen->m_events->forIScreen().error());
+					return nullptr;
+				}
+				const double x = motionX, y = motionY;
+				if (x > std::numeric_limits<SInt32>::max() || x < std::numeric_limits<SInt32>::min() ||
+					y > std::numeric_limits<SInt32>::max() || y < std::numeric_limits<SInt32>::min()) {
+					return nullptr;
+				}
+				const SInt32 ix = static_cast<SInt32>(x), iy = static_cast<SInt32>(y);
+				if (ix != 0 || iy != 0) {
+					screen->sendEvent(screen->m_events->forIPrimaryScreen().motionOnSecondary(),
+						MotionInfo::alloc(ix, iy));
+				}
+				// Suppress native movement while the remote screen owns input.
+				return nullptr;
+			}
 			pos = CGEventGetLocation(event);
 			screen->onMouseMove(pos.x, pos.y);
-
-			// The system ignores our cursor-centering calls if
-			// we don't return the event. This should be harmless,
-			// but might register as slight movement to other apps
-			// on the system. It hasn't been a problem before, though.
 			return event;
 			break;
 		case kCGEventScrollWheel:
@@ -2111,9 +2858,28 @@ OSXScreen::handleCGInputEvent(CGEventTapProxy proxy,
 			break;
 		case kCGEventKeyDown:
 		case kCGEventKeyUp:
-		case kCGEventFlagsChanged:
+		case kCGEventFlagsChanged: {
+			const auto code = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+			bool released = type == kCGEventKeyUp;
+			if (type == kCGEventFlagsChanged) {
+				CGEventFlags modifier = 0;
+				switch (code) {
+				case kVK_Shift: case kVK_RightShift: modifier = kCGEventFlagMaskShift; break;
+				case kVK_Control: case kVK_RightControl: modifier = kCGEventFlagMaskControl; break;
+				case kVK_Option: case kVK_RightOption: modifier = kCGEventFlagMaskAlternate; break;
+				case kVK_Command: case kVK_RightCommand: modifier = kCGEventFlagMaskCommand; break;
+				default: break;
+				}
+				released = modifier != 0 && (CGEventGetFlags(event) & modifier) == 0;
+			}
+			const KeyButton button = code >= 0 && code + 1 < IKeyState::kNumButtons ? code + 1 : 0;
+			const bool completed = local && released && button != 0 &&
+				screen->completeLocalKeyRelease(button);
 			screen->onKey(event);
+			if (completed)
+				screen->m_keyState->onKey(button, false, screen->m_primaryModifiers.load());
 			break;
+		}
 		case kCGEventTapDisabledByTimeout:
 			// Re-enable our event-tap
 			CGEventTapEnable(screen->m_eventTapPort, true);
@@ -2121,6 +2887,12 @@ OSXScreen::handleCGInputEvent(CGEventTapProxy proxy,
 			break;
 		case kCGEventTapDisabledByUserInput:
 			LOG((CLOG_ERR "quartz event tap was disabled by user input"));
+			// A permanently disabled primary tap cannot capture remote input or
+			// the emergency-return shortcut. Restore local control now, then let
+			// the business loop end the peer lease and retry any failed restore.
+			screen->showCursor();
+			screen->m_isOnScreen = !screen->m_pointerDetached;
+			screen->sendEvent(screen->m_events->forIScreen().error());
 			break;
 		case NX_NULLEVENT:
 			break;
@@ -2143,6 +2915,7 @@ OSXScreen::handleCGInputEvent(CGEventTapProxy proxy,
 		return event;
 	} else {
 		return NULL;
+	}
 	}
 }
 

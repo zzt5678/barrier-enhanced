@@ -82,7 +82,23 @@ target_link_libraries(integtests
     arch base client common io ipc mt net platform server synlib ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES} ${libs} ${OPENSSL_LIBS})
 
 option(BARRIER_RUN_INTEGRATION_TESTS "Register display/network integration tests with CTest" OFF)
+if (APPLE)
+    # This probe exercises the actual Cocoa helper loop, not a policy mock.
+    # It requires a logged-in desktop, just like the other integration tests.
+    add_executable(osxcocoalifecycleprobe
+        platform/OSXCocoaLifecycleProbe.mm
+        ../../lib/platform/OSXDragSimulator.mm
+        ../../lib/platform/OSXDragView.mm)
+    target_include_directories(osxcocoalifecycleprobe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/lib")
+    target_link_libraries(osxcocoalifecycleprobe ${COCOA_LIBRARY})
+endif()
 if (BARRIER_RUN_INTEGRATION_TESTS)
     add_test(NAME integtests COMMAND $<TARGET_FILE:integtests>)
     set_tests_properties(integtests PROPERTIES LABELS "integration")
+    if (APPLE)
+        add_test(NAME osxcocoalifecycleprobe COMMAND $<TARGET_FILE:osxcocoalifecycleprobe>)
+        set_tests_properties(osxcocoalifecycleprobe PROPERTIES
+            LABELS "integration;macos;dock" TIMEOUT 10)
+    endif()
 endif()

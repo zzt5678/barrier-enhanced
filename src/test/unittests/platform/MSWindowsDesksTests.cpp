@@ -10,6 +10,7 @@
 #include "platform/MSWindowsDesks.h"
 
 #include "test/global/gtest.h"
+#include <limits>
 
 TEST(MSWindowsDesksTests, desktopMustBeAttachedBeforeItCanAcceptInput)
 {
@@ -257,9 +258,9 @@ TEST(MSWindowsDesksTests, highRateAbsoluteMotionPreservesTrajectorySamples)
     SInt32 pendingY = 200;
     int postedCommands = 1;
 
-    // Model a half-second desktop-thread pause at the 240 Hz server rate.
-    // Every absolute point must remain a separate queue entry; replacing the
-    // pending point here is the visible jump regression this test locks down.
+    // Enqueue must preserve absolute points without any age evidence. The
+    // portable MotionBacklogTests separately cover stale-only recovery at
+    // consumption, including a half-second pause at the 240 Hz server rate.
     for (SInt32 sample = 1; sample <= 120; ++sample) {
         if (!MSWindowsDesks::coalesceMouseMotionForTest(
                 MSWindowsDesks::kDeskInputAbsoluteMove,
@@ -295,6 +296,21 @@ TEST(MSWindowsDesksTests, highRateRelativeMotionPreservesAccumulatedDistance)
     EXPECT_EQ(1, postedCommands);
     EXPECT_EQ(10000, dx);
     EXPECT_EQ(-10000, dy);
+}
+
+TEST(MSWindowsDesksTests, relativeOverflowKeepsSeparateCommandsAndBothCoordinates)
+{
+    const SInt32 maximum = (std::numeric_limits<SInt32>::max)();
+    const SInt32 minimum = (std::numeric_limits<SInt32>::min)();
+    for (const bool overflowX : {false, true}) {
+        SInt32 x = overflowX ? maximum : 7;
+        SInt32 y = overflowX ? -3 : minimum;
+        EXPECT_FALSE(MSWindowsDesks::coalesceMouseMotionForTest(
+            MSWindowsDesks::kDeskInputRelativeMove, x, y,
+            MSWindowsDesks::kDeskInputRelativeMove, 1, -1));
+        EXPECT_EQ(overflowX ? maximum : 7, x);
+        EXPECT_EQ(overflowX ? -3 : minimum, y);
+    }
 }
 
 TEST(MSWindowsDesksTests, absoluteRelativeModeChangeSealsMotionBatch)

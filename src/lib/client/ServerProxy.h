@@ -311,6 +311,9 @@ private:
     };
     std::map<KeyButton, PressedKey> m_epochPressedKeys;
     std::set<ButtonID> m_epochPressedButtons;
+    // Legacy protocols also need drag trajectory protection, without changing
+    // the epoch-owned key/button release contract.
+    std::set<ButtonID> m_legacyPressedButtons;
 
     bool                m_compressMouse;
     bool                m_compressMouseRelative;

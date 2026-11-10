@@ -32,6 +32,7 @@
 #include "base/TMethodEventJob.h"
 
 #include <malloc.h>
+#include <algorithm>
 #include <limits>
 #include <vector>
 #include <VersionHelpers.h>
@@ -208,7 +209,11 @@ MSWindowsDesks::DeskCommand::DeskCommand(
     message(commandMessage),
     wParam(commandWParam),
     lParam(commandLParam),
-    sequence(commandSequence)
+    sequence(commandSequence),
+    motion{commandMessage == BARRIER_MSG_FAKE_REL_MOVE ?
+        barrier::QueuedMotion::Relative : barrier::QueuedMotion::Absolute,
+        static_cast<SInt32>(commandWParam), static_cast<SInt32>(commandLParam),
+        barrier::QueuedMotion::Clock::now(), 0, true}
 {
 }
 
@@ -774,11 +779,14 @@ MSWindowsDesks::coalesceMouseMotionForTest(
         (std::numeric_limits<SInt32>::min)();
     const std::int64_t maximum =
         (std::numeric_limits<SInt32>::max)();
-    pendingFirst = static_cast<SInt32>(
-        first < minimum ? minimum : (first > maximum ? maximum : first));
-    pendingSecond = static_cast<SInt32>(
-        second < minimum ? minimum :
-            (second > maximum ? maximum : second));
+    // Refuse the merge before mutating either axis. The caller will enqueue
+    // the next delta separately, preserving its full displacement.
+    if (first < minimum || first > maximum ||
+        second < minimum || second > maximum) {
+        return false;
+    }
+    pendingFirst = static_cast<SInt32>(first);
+    pendingSecond = static_cast<SInt32>(second);
     return true;
 }
 
@@ -941,7 +949,8 @@ MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam,
             rejected = true;
         }
         else if (asyncMotionCommand &&
-            desk->m_pendingMotionCommand != NULL) {
+            desk->m_pendingMotionCommand != NULL &&
+            desk->m_motionButtons == 0) {
             DeskCommand* pending = desk->m_pendingMotionCommand;
             SInt32 pendingFirst = static_cast<SInt32>(pending->wParam);
             SInt32 pendingSecond = static_cast<SInt32>(pending->lParam);
@@ -1049,20 +1058,68 @@ MSWindowsDesks::sendMessage(UINT msg, WPARAM wParam, LPARAM lParam,
     }
 
     DeskCommand* command = new DeskCommand(msg, wParam, lParam, sequence);
-    if (motionCommand) {
+    bool posted = false;
+    DWORD postError = ERROR_SUCCESS;
+    {
         Lock lock(&m_mutex);
-        desk->m_lastMotionCommandSequence = sequence;
-        if (asyncMotionCommand) {
-            desk->m_pendingMotionCommand = command;
+        DeskCommand* const previousMotion = desk->m_motionTail;
+        if (!asyncMotionCommand) {
+            // Includes every key/button/wheel/control/lease boundary, even
+            // when its preceding motion has already completed.
+            desk->m_motionTail = nullptr;
+            ++desk->m_motionSegment;
+        }
+        if (msg == BARRIER_MSG_FAKE_BUTTON) {
+            const DWORD flags = static_cast<DWORD>(wParam);
+            const DWORD down = flags & (MOUSEEVENTF_LEFTDOWN |
+                MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_MIDDLEDOWN);
+            const DWORD up = (flags & (MOUSEEVENTF_LEFTUP |
+                MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_MIDDLEUP)) >> 1;
+            desk->m_motionButtons = (desk->m_motionButtons | down) & ~up;
+            const DWORD extra = static_cast<DWORD>(lParam) << 16;
+            if (flags & MOUSEEVENTF_XDOWN) desk->m_motionButtons |= extra;
+            if (flags & MOUSEEVENTF_XUP) desk->m_motionButtons &= ~extra;
+        }
+        if (motionCommand) {
+            desk->m_lastMotionCommandSequence = sequence;
+            command->motion.segment = desk->m_motionSegment;
+            command->motion.protectedPath =
+                !asyncMotionCommand || desk->m_motionButtons != 0;
+            if (asyncMotionCommand) {
+                desk->m_pendingMotionCommand = command;
+                if (desk->m_motionTail != nullptr) {
+                    desk->m_motionTail->nextMotion = command;
+                }
+                desk->m_motionTail = command;
+            }
+        }
+        // Publish the forward link and OS message atomically with respect to
+        // consumption, including rollback if posting fails.
+        posted = PostThreadMessage(desk->m_threadID, BARRIER_MSG_DESK_COMMAND,
+            reinterpret_cast<WPARAM>(command), 0) != 0;
+        if (posted) {
+            ++desk->m_commandDepth;
+            desk->m_motionDepthHighWater =
+                (std::max)(desk->m_motionDepthHighWater, desk->m_commandDepth);
+        }
+        else {
+            postError = GetLastError();
+            if (previousMotion != nullptr && previousMotion->nextMotion == command) {
+                previousMotion->nextMotion = nullptr;
+            }
         }
     }
-    if (PostThreadMessage(desk->m_threadID, BARRIER_MSG_DESK_COMMAND,
-                          reinterpret_cast<WPARAM>(command), 0) == 0) {
-        const DWORD error = GetLastError();
+    if (!posted) {
+        const DWORD error = postError;
         {
             Lock lock(&m_mutex);
             if (desk->m_pendingMotionCommand == command) {
                 desk->m_pendingMotionCommand = NULL;
+            }
+            // A failed post must not leave a link to a freed command. The
+            // predecessor may still be queued; terminate its chain first.
+            if (desk->m_motionTail == command) {
+                desk->m_motionTail = nullptr;
             }
             if (desk->m_lastMotionCommandSequence == sequence) {
                 desk->m_lastMotionCommandSequence =
@@ -1559,18 +1616,65 @@ void MSWindowsDesks::desk_thread(Desk* desk)
         }
 
         bool processCommand = true;
+        bool compactedCommand = false;
         bool commandSucceeded = true;
         DWORD commandError = ERROR_SUCCESS;
         if (command != NULL) {
             Lock lock(&m_mutex);
+            const auto depth = desk->m_commandDepth;
+            if (desk->m_commandDepth != 0) {
+                --desk->m_commandDepth;
+            }
             if (desk->m_pendingMotionCommand == command) {
                 desk->m_pendingMotionCommand = NULL;
+            }
+            if (desk->m_motionTail == command) {
+                desk->m_motionTail = nullptr;
+            }
+            if (isMouseMotionCommand(command->message)) {
+                const auto now = barrier::QueuedMotion::Clock::now();
+                const double ageMs = std::chrono::duration<double, std::milli>(
+                    now - command->motion.received).count();
+                desk->m_motionAgeHighWaterMs =
+                    (std::max)(desk->m_motionAgeHighWaterMs, ageMs);
+                DeskCommand* next = command->nextMotion;
+                if (next != nullptr &&
+                    shouldProcessDeskCommandForTest(command->sequence,
+                        desk->m_cancelledCommandSequence) &&
+                    shouldProcessDeskCommandForTest(next->sequence,
+                        desk->m_cancelledCommandSequence)) {
+                    auto pendingMotion = command->motion;
+                    pendingMotion.x = static_cast<SInt32>(command->wParam);
+                    pendingMotion.y = static_cast<SInt32>(command->lParam);
+                    auto nextMotion = next->motion;
+                    nextMotion.x = static_cast<SInt32>(next->wParam);
+                    nextMotion.y = static_cast<SInt32>(next->lParam);
+                    compactedCommand = barrier::compactStaleMotion(
+                        pendingMotion, nextMotion, now);
+                    if (compactedCommand) {
+                        next->wParam = static_cast<WPARAM>(pendingMotion.x);
+                        next->lParam = static_cast<LPARAM>(pendingMotion.y);
+                        ++desk->m_compactedMotion;
+                    }
+                }
+                if (!compactedCommand && ageMs >= 100.0 &&
+                    now - desk->m_lastMotionReport >= std::chrono::seconds(5)) {
+                    desk->m_lastMotionReport = now;
+                    LOG((CLOG_DEBUG
+                        "Windows local motion backlog age_ms=%.1f max_age_ms=%.1f depth=%llu max_depth=%llu compacted=%llu desktop=%s",
+                        ageMs, desk->m_motionAgeHighWaterMs,
+                        static_cast<unsigned long long>(depth),
+                        static_cast<unsigned long long>(desk->m_motionDepthHighWater),
+                        static_cast<unsigned long long>(desk->m_compactedMotion),
+                        desk->m_name.c_str()));
+                }
             }
             msg.message = command->message;
             msg.wParam = command->wParam;
             msg.lParam = command->lParam;
             processCommand = shouldProcessDeskCommandForTest(
-                command->sequence, desk->m_cancelledCommandSequence);
+                command->sequence, desk->m_cancelledCommandSequence) &&
+                !compactedCommand;
             if (processCommand) {
                 desk->m_executingCommandSequence = command->sequence;
             }
@@ -1583,7 +1687,7 @@ void MSWindowsDesks::desk_thread(Desk* desk)
                     static_cast<unsigned int>(command->message),
                     static_cast<unsigned long long>(command->sequence)));
             }
-            else {
+            else if (!compactedCommand) {
                 LOG((CLOG_DEBUG1
                     "dropping expired Windows input command sequence=%llu",
                     static_cast<unsigned long long>(command->sequence)));
@@ -1814,6 +1918,9 @@ void MSWindowsDesks::desk_thread(Desk* desk)
             if (desk->m_pendingMotionCommand == command) {
                 desk->m_pendingMotionCommand = NULL;
             }
+            if (desk->m_motionTail == command) {
+                desk->m_motionTail = nullptr;
+            }
         }
         delete command;
     }
@@ -1828,6 +1935,8 @@ void MSWindowsDesks::desk_thread(Desk* desk)
         desk->m_commandResponsive = false;
         desk->m_executingCommandSequence = 0;
         desk->m_pendingMotionCommand = NULL;
+        desk->m_motionTail = nullptr;
+        desk->m_commandDepth = 0;
         desk->m_threadRunning = false;
         m_deskReady.broadcast();
     }

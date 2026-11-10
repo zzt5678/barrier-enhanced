@@ -23,6 +23,7 @@
 #include "net/SecureListenSocket.h"
 #include "arch/Arch.h"
 #include "base/Log.h"
+#include <memory>
 
 //
 // TCPSocketFactory
@@ -44,10 +45,10 @@ IDataSocket* TCPSocketFactory::create(IArchNetwork::EAddressFamily family,
                                       ConnectionSecurityLevel security_level) const
 {
     if (security_level != ConnectionSecurityLevel::PLAINTEXT) {
-        SecureSocket* secureSocket = new SecureSocket(m_events, m_socketMultiplexer, family,
-                                                      security_level);
-        secureSocket->initSsl (false);
-        return secureSocket;
+        auto secureSocket = std::make_unique<SecureSocket>(
+            m_events, m_socketMultiplexer, family, security_level);
+        secureSocket->initSsl(false);
+        return secureSocket.release();
     }
     else {
         return new TCPSocket(m_events, m_socketMultiplexer, family);

@@ -32,7 +32,8 @@ public:
 
     //! Get the current time
     /*!
-    Returns the number of seconds since some arbitrary starting time.
+    Returns monotonic seconds since some arbitrary starting time, independent
+    of civil-clock corrections. Use only for durations and deadlines.
     This should return as high a precision as reasonable.
     */
     virtual double        time() = 0;

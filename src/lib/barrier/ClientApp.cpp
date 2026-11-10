@@ -221,7 +221,8 @@ ClientApp::nextRestartTimeout()
 void
 ClientApp::handleScreenError(const Event&, void*)
 {
-    LOG((CLOG_CRIT "error on screen"));
+    m_inputFailure = true;
+    LOG((CLOG_CRIT "native input unavailable; stopping sharing until explicitly started"));
     m_events->addEvent(Event(Event::kQuit));
 }
 
@@ -392,6 +393,14 @@ ClientApp::prepareClient()
 {
     double retryTime;
     barrier::Screen* clientScreen = NULL;
+    const auto cleanupPreparation = [this, &clientScreen] {
+        // A failed factory leaves a local screen; a later backend failure
+        // leaves an adopted client/screen pair. Release each exactly once,
+        // keeping the screen alive until its client has been destroyed.
+        if (clientScreen != m_clientScreen) closeClientScreen(clientScreen);
+        stopClient();
+        clientScreen = NULL;
+    };
     try {
         if (m_clientScreen == NULL) {
             clientScreen = openClientScreen();
@@ -409,20 +418,26 @@ ClientApp::prepareClient()
         updateStatus();
         return true;
     }
+    catch (const XInputUnavailable& e) {
+        LOG((CLOG_CRIT "native input unavailable: %s", e.what()));
+        m_inputFailure = true;
+        cleanupPreparation();
+        return false;
+    }
     catch (XScreenUnavailable& e) {
         LOG((CLOG_WARN "secondary screen unavailable: %s", e.what()));
-        closeClientScreen(clientScreen);
+        cleanupPreparation();
         updateStatus(String("secondary screen unavailable: ") + e.what());
         retryTime = e.getRetryTime();
     }
     catch (XScreenOpenFailure& e) {
         LOG((CLOG_CRIT "failed to start client: %s", e.what()));
-        closeClientScreen(clientScreen);
+        cleanupPreparation();
         return false;
     }
     catch (XBase& e) {
         LOG((CLOG_CRIT "failed to start client: %s", e.what()));
-        closeClientScreen(clientScreen);
+        cleanupPreparation();
         return false;
     }
 
@@ -484,6 +499,7 @@ int
 ClientApp::mainLoop()
 {
     m_permanentFailure = false;
+    m_inputFailure = false;
     // create socket multiplexer.  this must happen after daemonization
     // on unix because threads evaporate across a fork().
     setSocketMultiplexer(std::make_unique<SocketMultiplexer>());
@@ -493,7 +509,7 @@ ClientApp::mainLoop()
             "preparing client in service standby without connecting to the peer"));
         if (!prepareClient() || m_client == NULL || m_clientScreen == NULL) {
             stopClient();
-            return kExitFailed;
+            return m_inputFailure ? kExitInputUnavailable : kExitFailed;
         }
     }
     else {
@@ -558,6 +574,9 @@ ClientApp::mainLoop()
         cleanupIpcClient();
     }
 
+    if (m_inputFailure) {
+        return kExitInputUnavailable;
+    }
 #if defined(MAC_OS_X_VERSION_10_7)
     return m_permanentFailure ? kExitIncompatible : kExitSuccess;
 #else
@@ -593,6 +612,7 @@ ClientApp::runInner(int argc, char** argv, ILogOutputter* outputter, StartupFunc
     std::unique_ptr<NetworkAddress> serverAddress(new NetworkAddress);
     m_serverAddress = serverAddress.get();
     const auto releaseRunState = barrier::finally([this]() {
+        stopClient();
         delete m_taskBarReceiver;
         m_taskBarReceiver = NULL;
         m_serverAddress = NULL;
@@ -615,7 +635,8 @@ ClientApp::startNode()
     // we shouldn't retry.
     LOG((CLOG_DEBUG1 "starting client"));
     if (!startClient()) {
-        m_bye(kExitFailed);
+        stopClient();
+        m_bye(m_inputFailure ? kExitInputUnavailable : kExitFailed);
     }
 }
 

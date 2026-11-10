@@ -19,6 +19,9 @@
 #pragma once
 
 #include "platform/OSXClipboard.h"
+#include "platform/OSXClipboardWorker.h"
+#include "platform/OSXInputLoop.h"
+#include "platform/OSXScrollSettings.h"
 #include "barrier/PlatformScreen.h"
 #include "barrier/DragInformation.h"
 #include "base/EventTypes.h"
@@ -26,8 +29,10 @@
 #include "common/stdvector.h"
 
 #include <bitset>
+#include <atomic>
 #include <mutex>
 #include <chrono>
+#include <deque>
 #include <Carbon/Carbon.h>
 #include <mach/mach_port.h>
 #include <mach/mach_interface.h>
@@ -55,7 +60,8 @@ class Mutex;
 //! Implementation of IPlatformScreen for OS X
 class OSXScreen : public PlatformScreen {
 public:
-    OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCursor=true);
+    OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCursor=true,
+              CFStringRef pasteboardName=kPasteboardClipboard);
     virtual ~OSXScreen();
 
     IEventQueue*        getEvents() const { return m_events; }
@@ -84,12 +90,39 @@ public:
     virtual void        fakeMouseRelativeMove(SInt32 dx, SInt32 dy) const override;
     virtual void        fakeMouseWheel(SInt32 xDelta, SInt32 yDelta) const override;
 
+    // IKeyState overrides: the primary tap and all shadow-state access share
+    // the input owner. Secondary/disabled screens remain synchronous.
+    void                updateKeyMap() override;
+    void                updateKeyState() override;
+    void                setHalfDuplexMask(KeyModifierMask mask) override;
+    void                fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button) override;
+    bool                fakeKeyRepeat(KeyID id, KeyModifierMask mask, SInt32 count, KeyButton button) override;
+    bool                fakeKeyUp(KeyButton button) override;
+    void                fakeKeyDownForHandoff(KeyID, KeyModifierMask, KeyButton, std::uint64_t) override;
+    bool                fakeKeyUpForHandoff(KeyButton, std::uint64_t) override;
+    void                fakeMouseButtonForHandoff(ButtonID, bool, std::uint64_t) override;
+    void                fakeAllKeysUp() override;
+    bool                fakeCtrlAltDel() override;
+    bool                isKeyDown(KeyButton button) const override;
+    KeyModifierMask     getActiveModifiers() const override;
+    KeyModifierMask     pollActiveModifiers() const override;
+    SInt32              pollActiveGroup() const override;
+    void                pollPressedKeys(KeyButtonSet& pressedKeys) const override;
+
     // IPlatformScreen overrides
     virtual void        enable() override;
     virtual void        disable() override;
     virtual void        enter() override;
+    bool                tryEnter() override;
+    bool                tryEnterAt(SInt32 x, SInt32 y) override;
     virtual bool        leave() override;
     virtual bool        setClipboard(ClipboardID, const IClipboard*) override;
+    bool                getClipboardSnapshot(ClipboardID, std::shared_ptr<const String>*, UInt32*) const override;
+    bool                setClipboardSnapshot(ClipboardID, const std::shared_ptr<const String>&) override;
+    bool                setClipboardSnapshot(ClipboardID, const std::shared_ptr<const String>&,
+                                             std::uint64_t publicationId) override;
+    bool                hasAsyncClipboardSnapshots() const override { return true; }
+    bool                hasAsyncClipboardPublications() const override { return true; }
     virtual void        checkClipboards() override;
     virtual void        openScreensaver(bool notify) override;
     virtual void        closeScreensaver() override;
@@ -114,6 +147,11 @@ protected:
 private:
     friend class OSXScreenCursorTestAccess;
     friend class OSXScreenShapeTestAccess;
+    friend class OSXScreenInputStateTestAccess;
+    bool                needsInputDispatch() const;
+    bool                invokeInputState(std::function<void()> operation) const;
+    OSXInputLoop::ReleaseResult invokeInputRelease(std::function<void()> operation) const;
+    void                initializeInputState();
     void                updateScreenShape();
     void                handleDisplayChange(const Event&, void*);
     void                postMouseEvent(CGPoint&) const;
@@ -128,11 +166,13 @@ private:
     // event, false if it is a mouseup event.  macButton is the index
     // of the button pressed using the mac button mapping.
     bool                onMouseButton(bool pressed, UInt16 macButton);
+    bool                completeLocalKeyRelease(KeyButton localButton);
     bool                onMouseWheel(SInt32 xDelta, SInt32 yDelta) const;
 
     void                constructMouseButtonEventMap();
 
     bool                onKey(CGEventRef event);
+    void                onModifierFlags(CGEventFlags flags, bool flagsChanged);
 
     void                onMediaKey(CGEventRef event);
 
@@ -141,6 +181,16 @@ private:
     // Added here to allow the carbon cursor hack to be called.
     void                showCursor();
     void                hideCursor();
+    bool                setPointerDetached(bool detached);
+    void                createEventTap();
+    void                destroyEventTap();
+    void                setInputCapture(bool capture);
+    static CGEventRef handleLocalInput(CGEventTapProxy, CGEventType, CGEventRef, void*);
+    static CGEventRef handleCapturedInput(CGEventTapProxy, CGEventType, CGEventRef, void*);
+    void                initializePointerMotion();
+    CGError             warpPointer(CGPoint, bool skipIfAlreadyParked = false);
+    bool                recordPointerPosition(CGPoint, CGEventTimestamp, bool);
+    void                compensatePointerMotion(CGEventRef, CGEventTimestamp, double&, double&);
 
     // map barrier mouse button to mac buttons
     ButtonID            mapBarrierButtonToMac(UInt16) const;
@@ -153,12 +203,6 @@ private:
 
     // map barrier scroll wheel value to a mac scroll wheel value
     SInt32                mapScrollWheelFromBarrier(float) const;
-
-    // get the current scroll wheel speed
-    double                getScrollSpeed() const;
-
-    // get the current scroll wheel speed
-    double                getScrollSpeedFactor() const;
 
     // enable/disable drag handling for buttons 3 and up
     void                enableDragTimer(bool enable);
@@ -255,7 +299,7 @@ private:
     bool                m_isPrimary;
 
     // true if mouse has entered the screen
-    bool                m_isOnScreen;
+    std::atomic<bool>   m_isOnScreen;
 
     // the display
     CGDirectDisplayID    m_displayID;
@@ -272,8 +316,8 @@ private:
     Event::Type           m_displayChangeEvent = Event::kUnknown;
 
     // mouse state
-    mutable SInt32        m_xCursor, m_yCursor;
-    mutable bool        m_cursorPosValid;
+    mutable std::atomic<SInt32> m_xCursor{0}, m_yCursor{0};
+    mutable std::atomic<bool> m_cursorPosValid;
 
     /* FIXME: this data structure is explicitly marked mutable due
        to a need to track the state of buttons since the remote
@@ -286,15 +330,42 @@ private:
     std::vector<MouseButtonEventMapType> MouseButtonEventMap;
 
     bool                m_cursorHidden;
+    bool                m_pointerDetached = false;
+    CGPoint             m_parkPoint = CGPointZero;
+    CGEventTimestamp    m_localMotionAfterTicks = 0;
+    // Input-owner only. Programmatic positions enter the next native HID
+    // delta, but not direct CGEventPost deltas. Preserve capture ordering.
+    struct PointerPositionChange {
+        CGEventTimestamp ticks;
+        CGPoint value;
+        bool absolute; // direct-CG anchor, otherwise an actual warp offset
+    };
+    std::deque<PointerPositionChange> m_pointerPositionChanges;
+    CGPoint             m_lastNativePointer = CGPointZero;
+    bool                m_lastNativePointerValid = false;
     SInt32                m_dragNumButtonsDown;
     Point                m_dragLastPoint;
     EventQueueTimer*    m_dragTimer;
 
     // keyboard stuff
     OSXKeyState*        m_keyState;
+    // Physical polling can be newer than queued Quartz releases. Keep the
+    // event stream's pairing independently of the reconciled shadow state.
+    std::bitset<IKeyState::kNumButtons> m_primaryKeysDown;
+    // Publish the observed mask without making the server wait for input work.
+    std::atomic<KeyModifierMask> m_primaryModifiers{0};
+    KeyModifierMask     m_pendingNativeModifierReleases = 0;
+    // Input-owner only. A locally delivered native up retires the exact
+    // replay generation immediately; queued release commands carry that id.
+    std::map<KeyButton, std::uint64_t> m_handoffKeyGenerations;
+    std::map<ButtonID, std::uint64_t> m_handoffButtonGenerations;
+
+    // Native settings refresh is asynchronous; input only reads a scalar.
+    OSXScrollSettings   m_scrollSettings;
+    std::chrono::steady_clock::time_point m_nextScrollSettingsRefresh{};
 
     // clipboards
-    OSXClipboard       m_pasteboard;
+    std::unique_ptr<OSXClipboardWorker> m_clipboardWorker;
     UInt32                m_sequenceNumber;
 
     // screen saver stuff
@@ -337,6 +408,9 @@ private:
     // Quartz input event support
     CFMachPortRef            m_eventTapPort;
     CFRunLoopSourceRef        m_eventTapRLSR;
+    std::unique_ptr<OSXInputLoop> m_inputLoop;
+    CFMachPortRef m_localEventTapPort = nullptr;
+    CFRunLoopSourceRef m_localEventTapSource = nullptr;
 
     // for double click coalescing.
     double                    m_lastClickTime;

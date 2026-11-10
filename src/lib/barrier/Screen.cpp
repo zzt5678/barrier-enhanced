@@ -133,6 +133,26 @@ Screen::enter(KeyModifierMask toggleMask)
         LOG((CLOG_WARN "platform rejected screen enter"));
         return false;
     }
+    finishEnter(toggleMask);
+    return true;
+}
+
+bool
+Screen::enterAt(KeyModifierMask toggleMask, SInt32 x, SInt32 y)
+{
+    assert(m_entered == false);
+    LOG((CLOG_DEBUG1 "requesting positioned platform screen enter"));
+    if (!m_screen->tryEnterAt(x, y)) {
+        LOG((CLOG_WARN "platform rejected positioned screen enter"));
+        return false;
+    }
+    finishEnter(toggleMask);
+    return true;
+}
+
+void
+Screen::finishEnter(KeyModifierMask toggleMask)
+{
     if (m_isPrimary) {
         enterPrimary();
     }
@@ -143,7 +163,6 @@ Screen::enter(KeyModifierMask toggleMask)
     // now on screen
     m_entered = true;
     LOG((CLOG_INFO "platform screen enter applied"));
-    return true;
 }
 
 bool

@@ -29,6 +29,7 @@
 #include "base/EventTypes.h"
 
 #include <map>
+#include <atomic>
 
 enum EServerState {
     kUninitialized,
@@ -91,8 +92,8 @@ public:
     void handleScreenError(const Event&, void*);
     void handleSuspend(const Event&, void*);
     void handleResume(const Event&, void*);
-    ClientListener* openClientListener(const NetworkAddress& address);
-    Server* openServer(Config& config, PrimaryClient* primaryClient);
+    virtual ClientListener* openClientListener(const NetworkAddress& address);
+    virtual Server* openServer(Config& config, PrimaryClient* primaryClient);
     void handleNoClients(const Event&, void*);
     bool startServer();
     int mainLoop();
@@ -119,6 +120,8 @@ public:
     NetworkAddress*        m_barrierAddress;
 
 private:
+    friend class ServerAppTestAccess;
+    std::atomic<bool> m_inputFailure{false};
     void handleScreenSwitched(const Event&, void*  data);
 };
 
