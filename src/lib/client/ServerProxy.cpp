@@ -1021,7 +1021,8 @@ ServerProxy::detachForDeferredCleanup()
 void
 ServerProxy::flushCompressedMouse()
 {
-    if (!m_inputActive) {
+    // Pending coordinates are invalid while new display geometry awaits ACK.
+    if (!m_inputActive || m_ignoreMouse) {
         discardCompressedMouse();
         return;
     }
@@ -1637,7 +1638,7 @@ ServerProxy::mouseMove()
     }
 
     // if compressing then ignore the motion but record it
-    if (m_compressMouse && m_inputFrameAccepted) {
+    if (m_compressMouse && !ignore) {
         m_compressMouseRelative = false;
         ignore    = true;
         m_xMouse  = x;
@@ -1681,7 +1682,7 @@ ServerProxy::mouseRelativeMove()
     }
 
     // if compressing then ignore the motion but record it
-    if (m_compressMouseRelative && m_inputFrameAccepted) {
+    if (m_compressMouseRelative && !ignore) {
         ignore     = true;
         m_dxMouse += dx;
         m_dyMouse += dy;

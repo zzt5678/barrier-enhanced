@@ -25,6 +25,19 @@ Use the same current Weave build on every peer. Protocol 1.13 is required so
 input epochs, transactional handoff, and the connection-bound bulk channel
 cannot be bypassed by a legacy peer.
 
+## Pointer latency
+
+Queued ordinary absolute pointer positions are coalesced to the latest position,
+including in low-latency and nested-remote modes. A lone move is delivered
+immediately: the client does not wait to fill a batch. Button/keyboard/wheel
+boundaries flush the pending position; held-button drag paths retain every
+coordinate. Immediate-mode relative input retains every delta. Lease revocation
+and display-info gating prevent queued positions from being replayed after
+ownership or display geometry changes.
+
+This reduces replay of obsolete positions after a transport stall. It cannot
+remove the delay before new input reaches the client.
+
 ## Release status
 
 The `codex/weave-modernization` branch is under active hardening. A

@@ -3444,3 +3444,29 @@ TEST(ServerProxyTests, backlogRejectsStaleEpochAndCannotReplayAfterRevocation)
     EXPECT_TRUE(client.moves.empty());
     EXPECT_FALSE(proxy.m_compressMouse);
 }
+
+TEST(ServerProxyTests, displayInfoGateCannotReplayQueuedHoverPositions)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents; ClipboardEvents clipboardEvents; FileEvents fileEvents;
+    ClientEvents clientEvents; IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(events, streamEvents, clipboardEvents,
+        fileEvents, clientEvents, screenEvents);
+    TestScreen screen;
+    RecordingMouseClient client(&events, &screen);
+    DuplexMemoryStream stream;
+    stream.queueInput({0,10,0,20, 0,99,0,99});
+    ServerProxy proxy(&client, &stream, &events);
+    proxy.m_inputActive = true;
+    proxy.m_lowLatencyMode = true;
+    proxy.mouseMove();
+    ASSERT_TRUE(proxy.m_compressMouse);
+    // The display changed while these positions were queued. The info-ACK
+    // gate must cover the pending position as well as subsequent motion.
+    proxy.m_ignoreMouse = true;
+    proxy.mouseMove();
+    EXPECT_EQ(10, proxy.m_xMouse);
+    proxy.flushCompressedMouse();
+    EXPECT_TRUE(client.moves.empty());
+    EXPECT_FALSE(proxy.m_compressMouse);
+}
