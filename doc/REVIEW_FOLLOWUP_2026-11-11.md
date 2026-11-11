@@ -60,6 +60,28 @@ Cross-host wall-clock offsets must be measured separately; raw timestamps
 must not be interpreted as one-way latency without that correction. Native
 call completion still does not establish visible display scanout time.
 
+### Follow-up live observations
+
+A subsequent 3,328 matched MacBook motion records showed up to 72.5 ms of
+additional send-to-dispatch delay above the fastest event in the same epoch
+(p95 55.3 ms, p99 67.1 ms). Dispatch-to-native-call-return was p95 0.082 ms,
+maximum 3.02 ms. Server sends continued approximately every 5 ms during observed
+70 ms client delivery gaps, followed by batches of old coordinates.
+
+The host wall-clock offset changed during collection. Consequently these are
+**relative delays from per-host monotonic timestamps**, not absolute one-way
+latency; subtracting a later wall-clock calibration from older records produced
+invalid negative estimates and was discarded. The physical capture and display
+scanout portions remain unmeasured.
+
+An independent TCP echo probe, separate from Weave, reproduced approximately
+73 ms p99 RTT spikes. Four short runs covered the overlay path twice, direct
+LAN, and direct LAN with macOS Responsive Data service class. Direct LAN and
+service class did not remove the spikes. This reproduces a network-path delay
+outside Weave; it does not identify whether the remaining cause is Wi-Fi/AP
+scheduling, peer-to-peer wireless activity, or OS networking. Wired comparison
+requires a physical cable/adapter and has not yet been performed.
+
 Other findings in the supplied review remain unverified or unaddressed in this
 batch, including B2–B4, C1–C4, D1–D4/D6–D14, GUI/UX items E/F, CI/packaging G1/G2,
 and the remaining cleanup/architecture suggestions. They are not marked closed
