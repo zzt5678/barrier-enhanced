@@ -10,6 +10,7 @@
 #include "server/ClientProxy1_8.h"
 
 #include "barrier/ProtocolUtil.h"
+#include "base/InputMotionTrace.h"
 #include "barrier/protocol_types.h"
 
 ClientProxy1_8::ClientProxy1_8(const std::string& name,
@@ -111,8 +112,10 @@ ClientProxy1_8::mouseUp(ButtonID button)
 void
 ClientProxy1_8::mouseMove(SInt32 xAbs, SInt32 yAbs)
 {
+    const UInt32 sequence = nextInputSequence();
+    barrier::traceInputMotion('S', m_inputEpoch, sequence, xAbs, yAbs);
     ProtocolUtil::writef(getStream(), kMsgDMouseMove1_8,
-                         m_inputEpoch, nextInputSequence(), xAbs, yAbs);
+                         m_inputEpoch, sequence, xAbs, yAbs);
 }
 
 void

@@ -31,6 +31,7 @@
 #include "barrier/XBarrier.h"
 #include "io/IStream.h"
 #include "base/Log.h"
+#include "base/InputMotionTrace.h"
 #include "base/IEventQueue.h"
 #include "base/TMethodEventJob.h"
 #include "base/XBase.h"
@@ -1641,7 +1642,9 @@ ServerProxy::mouseMove()
 
     // forward
     if (!ignore) {
+        barrier::traceInputMotion('R', m_seqNum, m_lastInputSequence, x, y);
         m_client->mouseMove(x, y);
+        barrier::traceInputMotion('P', m_seqNum, m_lastInputSequence, x, y);
     }
 }
 
