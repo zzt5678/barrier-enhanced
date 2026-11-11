@@ -79,8 +79,18 @@ An independent TCP echo probe, separate from Weave, reproduced approximately
 LAN, and direct LAN with macOS Responsive Data service class. Direct LAN and
 service class did not remove the spikes. This reproduces a network-path delay
 outside Weave; it does not identify whether the remaining cause is Wi-Fi/AP
-scheduling, peer-to-peer wireless activity, or OS networking. Wired comparison
-requires a physical cable/adapter and has not yet been performed.
+scheduling, peer-to-peer wireless activity, or OS networking. A subsequent wired comparison was performed after the MacBook route changed
+to its USB gigabit Ethernet adapter. The same independent TCP probe over the
+existing overlay connection measured approximately 1.6 ms p99 and 2.2 ms maximum
+(two runs, 1,351 round trips), versus approximately 73 ms p99 on the earlier
+wireless path. Direct wired LAN measured below 1 ms in the sampled runs.
+
+Live interface checks also confirmed that Ubuntu uses Wi-Fi, not Ethernet.
+Its concurrent 100-packet ping sample had median 1.79 ms and p95 3.22 ms, with
+one 66.6 ms outlier. Thus the evidence concerns the MacBook's particular wireless
+path and frequency of stalls, not a blanket claim that wireless cannot work.
+Both Weave peers use direct LAN Tailscale paths. Whether the user's visible
+cursor catch-up disappeared on Ethernet still awaits physical confirmation.
 
 Other findings in the supplied review remain unverified or unaddressed in this
 batch, including B2–B4, C1–C4, D1–D4/D6–D14, GUI/UX items E/F, CI/packaging G1/G2,
