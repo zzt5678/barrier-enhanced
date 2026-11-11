@@ -344,7 +344,7 @@ ServerProxy::parseHandshakeMessage(const UInt8* code)
     }
 
     else if (memcmp(code, kMsgDSetOptions, 4) == 0) {
-        setOptions();
+        if (!setOptions()) return kDisconnect;
 
         // handshake is complete
         m_parser = &ServerProxy::parseMessage;
@@ -542,7 +542,7 @@ ServerProxy::parseMessage(const UInt8* code)
     }
 
     else if (memcmp(code, kMsgCLeave, 4) == 0) {
-        leave();
+        if (!leave()) return kDisconnect;
     }
 
     else if (memcmp(code, kMsgCClipboard, 4) == 0) {
@@ -582,7 +582,7 @@ ServerProxy::parseMessage(const UInt8* code)
     }
 
     else if (memcmp(code, kMsgDSetOptions, 4) == 0) {
-        setOptions();
+        if (!setOptions()) return kDisconnect;
     }
 
     else if (m_protocolMinorVersion >= 12 &&
@@ -1384,7 +1384,7 @@ ServerProxy::revokeInputLeaseRequest()
                          static_cast<UInt8>(revoked ? 1 : 0));
 }
 
-void
+bool
 ServerProxy::leave()
 {
     // parse
@@ -1393,7 +1393,7 @@ ServerProxy::leave()
     if (!m_inputActive) {
         discardCompressedMouse();
         LOG((CLOG_DEBUG1 "ignoring leave without an active input lease"));
-        return;
+        return true;
     }
 
     // send last mouse motion
@@ -1407,14 +1407,14 @@ ServerProxy::leave()
         LOG((CLOG_ERR
             "input backend could not release active lease %u; disconnecting",
             m_seqNum));
-        m_client->disconnect("input backend rejected screen leave");
-        return;
+        return false;
     }
     m_inputActive = false;
     m_legacyPressedButtons.clear();
     m_hasPreparedEnter = false;
     m_preparedEnterReady = false;
     m_preparedInputGeneration = 0;
+    return true;
 }
 
 void
@@ -1911,20 +1911,18 @@ ServerProxy::resetOptions()
     m_nestedRemoteMode = false;
 }
 
-void
+bool
 ServerProxy::setOptions()
 {
     // parse
     OptionsList options;
     if (!ProtocolUtil::readf(m_stream, kMsgDSetOptions + 4, &options)) {
         LOG((CLOG_ERR "invalid options from server: could not read options list"));
-        m_client->disconnect("invalid options from server");
-        return;
+        return false;
     }
     if (!hasCompleteOptionPairs(options)) {
         LOG((CLOG_ERR "invalid options from server: odd option list size=%d", options.size()));
-        m_client->disconnect("invalid options from server");
-        return;
+        return false;
     }
     LOG((CLOG_DEBUG1 "recv set options size=%d", options.size()));
 
@@ -1976,6 +1974,7 @@ ServerProxy::setOptions()
     if (m_nestedRemoteMode) {
         LOG((CLOG_NOTE "server requested nested remote mode - immediate mouse delivery enabled while input is current"));
     }
+    return true;
 }
 
 bool

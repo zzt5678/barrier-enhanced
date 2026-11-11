@@ -789,7 +789,8 @@ bool
 TCPSocket::shouldResumeInputNoLock(UInt32 previousSize) const
 {
     return m_readable &&
-        previousSize >= MAX_INPUT_BUFFER_SIZE &&
+        // Detect the low-watermark crossing even when packets drain in 4 KiB reads.
+        previousSize > kResumeInputBufferSize &&
         m_inputBuffer.getSize() <= kResumeInputBufferSize;
 }
 

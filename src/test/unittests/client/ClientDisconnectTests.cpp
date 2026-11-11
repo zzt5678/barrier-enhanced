@@ -2192,7 +2192,7 @@ TEST(ClientDisconnectTests, replacementEnterLeaveFailureRejectsNewLease)
     platform->failLeave = false;
 }
 
-TEST(ClientDisconnectTests, leaveFailureRetainsProxyLeaseAndRequestsDisconnect)
+TEST(ClientDisconnectTests, leaveFailureRetainsProxyLeaseUntilParserDisconnects)
 {
     NiceMock<MockEventQueue> events;
     ClientEvents clientEvents;
@@ -2219,23 +2219,12 @@ TEST(ClientDisconnectTests, leaveFailureRetainsProxyLeaseAndRequestsDisconnect)
     ASSERT_TRUE(proxy.enter());
     ASSERT_TRUE(proxy.m_inputActive);
 
-    bool disconnectRequested = false;
-    EXPECT_CALL(events, addEvent(_)).WillOnce(Invoke(
-        [&disconnectRequested](const Event& event) {
-            Client::FailInfo* info =
-                static_cast<Client::FailInfo*>(event.getData());
-            ASSERT_TRUE(info != NULL);
-            EXPECT_EQ("input backend rejected screen leave", info->m_what);
-            EXPECT_TRUE(info->m_retry);
-            disconnectRequested = true;
-            delete info;
-        }));
+    EXPECT_CALL(events, addEvent(_)).Times(0);
 
     stream.clearData();
     platform->failLeave = true;
-    proxy.leave();
+    EXPECT_FALSE(proxy.leave());
 
-    EXPECT_TRUE(disconnectRequested);
     EXPECT_TRUE(proxy.m_inputActive);
     EXPECT_EQ(203u, proxy.m_seqNum);
     EXPECT_EQ(1u, platform->leaveCount);

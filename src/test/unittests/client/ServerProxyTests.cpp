@@ -3228,3 +3228,46 @@ TEST(ServerProxyTests, terminalAckArmsReaperUntilSenderThreadExits)
     client.testSetServerProxy(NULL);
     client.testSetStreamOnly(NULL);
 }
+
+TEST(ServerProxyTests, failedLeaveReturnsDisconnectWithoutWritingAfterFailure)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents; ClipboardEvents clipboardEvents; FileEvents fileEvents;
+    ClientEvents clientEvents; IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(events, streamEvents, clipboardEvents,
+        fileEvents, clientEvents, screenEvents);
+    class RejectingClient : public RecordingMouseClient {
+    public:
+        using RecordingMouseClient::RecordingMouseClient;
+        bool leave() override { return false; }
+    };
+    TestScreen screen;
+    RejectingClient client(&events, &screen);
+    DuplexMemoryStream stream;
+    ServerProxy proxy(&client, &stream, &events);
+    proxy.m_inputActive = true;
+    EXPECT_EQ(ServerProxy::kDisconnect,
+        proxy.parseMessage(reinterpret_cast<const UInt8*>(kMsgCLeave)));
+    EXPECT_TRUE(stream.output.empty());
+}
+
+TEST(ServerProxyTests, malformedOptionsStopBothParsersWithoutAcknowledgement)
+{
+    for (bool handshake : {false, true}) {
+        NiceMock<MockEventQueue> events;
+        IStreamEvents streamEvents; ClipboardEvents clipboardEvents; FileEvents fileEvents;
+        ClientEvents clientEvents; IScreenEvents screenEvents;
+        setServerProxyClientEventDefaults(events, streamEvents, clipboardEvents,
+            fileEvents, clientEvents, screenEvents);
+        TestScreen screen;
+        RecordingMouseClient client(&events, &screen);
+        DuplexMemoryStream stream;
+        // DSOP's list length followed by a lone option identifier.
+        stream.queueInput({0,0,0,1,0,0,0,1});
+        ServerProxy proxy(&client, &stream, &events);
+        const UInt8* code = reinterpret_cast<const UInt8*>(kMsgDSetOptions);
+        EXPECT_EQ(ServerProxy::kDisconnect, handshake ?
+            proxy.parseHandshakeMessage(code) : proxy.parseMessage(code));
+        EXPECT_TRUE(stream.output.empty());
+    }
+}

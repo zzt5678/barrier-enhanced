@@ -4967,8 +4967,8 @@ TEST(ServerReconnectTests, modernActiveReplacementTimeoutFencesBeforeNewEnter)
 
     server.handleClientDisconnected(Event(), oldClient);
 
-    EXPECT_EQ(&newClient, server.m_active);
-    EXPECT_EQ(1u, newClient.enterCount);
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(0u, newClient.enterCount);
     EXPECT_EQ(NULL, server.m_activeReplacementSource);
     EXPECT_EQ(NULL, server.m_activeReplacementTarget);
 }
@@ -9056,4 +9056,53 @@ TEST(ServerReconnectTests, newerClipboardRevisionRejectsOlderFileCompletion)
     EXPECT_TRUE(server.m_readyFileClipboardSession.empty());
     EXPECT_TRUE(server.m_readyFileClipboardPaths.empty());
     EXPECT_EQ(0u, primary.setClipboardCount);
+}
+
+TEST(ServerReconnectTests, replacementTransfersScreensaverOwnershipBeforeOldClientRetires)
+{
+    Config config;
+    config.addScreen("client");
+
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientProxyEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    setEventTypeDefaults(events, clientProxyEvents, screenEvents,
+                         clipboardEvents, serverEvents);
+    ON_CALL(events, addEvent(_)).WillByDefault(Invoke([](const Event& event) {
+        Event::deleteData(event);
+    }));
+
+    NiceMock<MockPrimaryClient> primary;
+    ON_CALL(primary, getToggleMask()).WillByDefault(Return(0));
+    ON_CALL(primary, getEventTarget()).WillByDefault(Return(&primary));
+
+    RevocableRecordingClient oldClient("client");
+    RecordingClient newClient("client");
+    Server server;
+    initializeServer(server, config, primary, events, oldClient);
+    oldClient.inputEpoch = 41;
+    server.m_seqNum = 41;
+
+    server.adoptClient(&newClient);
+
+    EXPECT_EQ(&oldClient, server.m_active);
+    EXPECT_EQ(1u, oldClient.revokeCount);
+    EXPECT_EQ(41u, oldClient.revokeInputEpoch);
+    EXPECT_EQ(0u, newClient.enterCount);
+
+    server.m_activeSaver = &oldClient;
+    server.m_active = &primary;
+
+    BaseClientProxy::InputHandoffReadyInfo revoked(
+        oldClient.revokeHandoffSeqNum, true);
+    Event revokedEvent(Event::kUnknown, &oldClient, &revoked,
+                       Event::kDontFreeData);
+    server.handleInputHandoffReady(revokedEvent, &oldClient);
+
+    EXPECT_EQ(&primary, server.m_active);
+    EXPECT_EQ(&newClient, server.m_activeSaver);
+    EXPECT_EQ(0u, newClient.enterCount);
+    EXPECT_EQ(0u, oldClient.leaveCount);
 }

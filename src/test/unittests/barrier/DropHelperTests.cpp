@@ -430,3 +430,45 @@ TEST(DropHelperTests, writeToDirFromFile_removesStagingAndClearsTransferStateWhe
 
     barrier::fs::remove_all(tempRoot);
 }
+
+TEST(DragInformationTests, rejectsMalformedMetadataWithoutPartialFilesOrExceptions)
+{
+    for (const String& data : {String("D:\\,0,D,"), String(",0,F,"),
+            String("a,b.pdf,3,F,"), String("file,not-a-size,F,"),
+            String("file,184467440737095516160,F,"), String("file,1"),
+            String("good,2,F,bad,not-a-size,F,")}) {
+        DragFileList files;
+        const UInt32 count = data.find("good,") == 0 ? 2 : 1;
+        EXPECT_NO_THROW(DragInformation::parseDragInfo(files, count, data));
+        EXPECT_TRUE(files.empty()) << data;
+    }
+}
+
+TEST(DragInformationTests, acceptsTypedAndLegacyMetadata)
+{
+    DragFileList files;
+    DragInformation::parseDragInfo(files, 2, "/tmp/a,3,F,/tmp/b,0,D,");
+    ASSERT_EQ(2u, files.size());
+    EXPECT_EQ("a", files[0].getFilename());
+    EXPECT_EQ(3u, files[0].getFilesize());
+    EXPECT_TRUE(files[1].isDirectory());
+    DragInformation::parseDragInfo(files, 2, "C:\\a,3,C:\\b,4,");
+    ASSERT_EQ(2u, files.size());
+    EXPECT_EQ("b", files[1].getFilename());
+    EXPECT_EQ(4u, files[1].getFilesize());
+    DragInformation::parseDragInfo(files, 2, "a,3,D,4,");
+    ASSERT_EQ(2u, files.size());
+    EXPECT_EQ("D", files[1].getFilename());
+}
+
+TEST(DragInformationTests, missingFileDoesNotThrowOrProduceMetadata)
+{
+    String filename = (barrier::fs::temp_directory_path() /
+        "weave-review-file-that-does-not-exist-20261111").u8string();
+    ASSERT_FALSE(barrier::fs::exists(barrier::fs::u8path(filename)));
+    DragFileList files = makeSingleFileList(filename, 1);
+    String encoded;
+    EXPECT_NO_THROW(EXPECT_EQ(0, DragInformation::setupDragInfo(files, encoded)));
+    EXPECT_TRUE(encoded.empty());
+    EXPECT_TRUE(files.empty());
+}

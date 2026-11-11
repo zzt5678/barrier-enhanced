@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include "io/filesystem.h"
 #include <functional>
 #include <stdexcept>
 #include <vector>
@@ -396,7 +397,9 @@ StreamChunker::sendFile(const char* filename,
             "transaction state transfer id does not match sendFile");
     }
 
-    std::fstream file(filename, std::ios::in | std::ios::binary);
+    std::fstream file;
+    barrier::open_utf8_path(file, barrier::fs::u8path(filename),
+                            std::ios::in | std::ios::binary);
 
     if (!file.is_open()) {
         if (transactionState) {

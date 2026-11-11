@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -791,4 +792,22 @@ TEST(FileChunkTests, receiveSessionCanStartAgainAfterFailure)
     ASSERT_TRUE(waitForReceiveState(session, FileReceiveSession::kComplete));
     EXPECT_EQ(3u, barrier::fs::file_size(session.spoolPath()));
     EXPECT_EQ(1u, session.spoolOpenCount());
+}
+
+TEST(FileChunkTests, failedSpoolRemovalIsIdempotentAndDoesNotThrow)
+{
+    const auto root = barrier::fs::temp_directory_path() /
+        ("weave-release-test-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    ASSERT_TRUE(barrier::fs::create_directory(root));
+    ASSERT_TRUE(barrier::fs::create_directory(root / "occupied"));
+    auto spool = root;
+    String received = "payload";
+    size_t expected = 7;
+    EXPECT_NO_THROW(FileChunk::releaseReceiveBuffer(received, expected, &spool));
+    EXPECT_TRUE(spool.empty());
+    EXPECT_EQ(0u, expected);
+    EXPECT_TRUE(received.empty());
+    EXPECT_NO_THROW(FileChunk::releaseReceiveBuffer(received, expected, &spool));
+    barrier::fs::remove_all(root);
 }

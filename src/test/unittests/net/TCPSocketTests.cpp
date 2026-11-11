@@ -513,3 +513,27 @@ TEST(TCPSocketTests, eofWithoutPayloadSignalsInputShutdown)
     EXPECT_EQ(0u, events.count(inputReady));
     EXPECT_EQ(1u, events.count(inputShutdown));
 }
+
+TEST(TCPSocketTests, incrementalPacketReadsResumeAtLowWatermark)
+{
+    TestEventQueue events;
+    SocketMultiplexer multiplexer;
+    class RecordingResumeSocket : public InputBackpressureTCPSocket {
+    public:
+        using InputBackpressureTCPSocket::InputBackpressureTCPSocket;
+        std::unique_ptr<ISocketMultiplexerJob> newJob() override {
+            ++resumeRequests;
+            return nullptr; // observe registration without a real network peer
+        }
+        unsigned resumeRequests = 0;
+    } socket(&events, &multiplexer);
+    ASSERT_TRUE(socket.queueInputBytes(32 * 1024 * 1024));
+    while (socket.getSize() > 16 * 1024 * 1024 + 4096) {
+        ASSERT_EQ(4096u, socket.read(nullptr, 4096));
+    }
+    EXPECT_EQ(0u, socket.resumeRequests);
+    ASSERT_EQ(4096u, socket.read(nullptr, 4096));
+    EXPECT_EQ(1u, socket.resumeRequests);
+    ASSERT_EQ(4096u, socket.read(nullptr, 4096));
+    EXPECT_EQ(1u, socket.resumeRequests);
+}

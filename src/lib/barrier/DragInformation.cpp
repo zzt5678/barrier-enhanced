@@ -17,6 +17,10 @@
 
 #include "barrier/DragInformation.h"
 #include "base/Log.h"
+#include "io/filesystem.h"
+#include <charconv>
+#include <algorithm>
+#include <cstdint>
 
 #include <fstream>
 #include <sstream>
@@ -34,64 +38,48 @@ DragInformation::DragInformation() :
 void
 DragInformation::parseDragInfo(DragFileList& dragFileList, UInt32 fileNum, String data)
 {
-    size_t startPos = 0;
-    size_t findResult1 = 0;
-    size_t findResult2 = 0;
     dragFileList.clear();
-    String slash("\\");
-    if (data.find("/", startPos) != string::npos) {
-        slash = "/";
+    DragFileList parsed;
+    size_t offset = 0;
+    const size_t fields = std::count(data.begin(), data.end(), ',');
+    const bool typed = fields == static_cast<uint64_t>(fileNum) * 3;
+    if (!typed && fields != static_cast<uint64_t>(fileNum) * 2) {
+        LOG((CLOG_WARN "discarding malformed drag metadata field count"));
+        return;
     }
-
-    UInt32 index = 0;
-    while (index < fileNum) {
-        findResult1 = data.find(',', startPos);
-        findResult2 = data.find_last_of(slash, findResult1);
-
-        if (findResult1 == startPos) {
-            //TODO: file number does not match, something goes wrong
-            break;
+    auto reject = [] { LOG((CLOG_WARN "discarding malformed drag metadata")); };
+    for (UInt32 index = 0; index < fileNum; ++index) {
+        const size_t nameEnd = data.find(',', offset);
+        if (nameEnd == String::npos || nameEnd == offset) { reject(); return; }
+        const String path = data.substr(offset, nameEnd - offset);
+        const size_t slash = path.find_last_of("/\\");
+        String name = path.substr(slash == String::npos ? 0 : slash + 1);
+        if (name.empty() || name == "." || name == "..") { reject(); return; }
+        offset = nameEnd + 1;
+        const size_t sizeEnd = data.find(',', offset);
+        if (sizeEnd == String::npos || sizeEnd == offset) { reject(); return; }
+        size_t size = 0;
+        const char* first = data.data() + offset;
+        const char* last = data.data() + sizeEnd;
+        const auto converted = std::from_chars(first, last, size);
+        if (converted.ec != std::errc() || converted.ptr != last) { reject(); return; }
+        offset = sizeEnd + 1;
+        EntryType type = File;
+        if (typed) {
+            if (offset + 1 >= data.size() || data[offset + 1] != ',' ||
+                (data[offset] != 'F' && data[offset] != 'D')) { reject(); return; }
+            type = data[offset] == 'D' ? Directory : File;
+            offset += 2;
         }
-
-        // set filename
-        if (findResult1 - findResult2 > 1) {
-            String filename = data.substr(findResult2 + 1,
-                findResult1 - findResult2 - 1);
-            DragInformation di;
-            di.setFilename(filename);
-            dragFileList.push_back(di);
-        }
-        startPos = findResult1 + 1;
-
-        //set filesize
-        findResult2 = data.find(',', startPos);
-        if (findResult2 - findResult1 > 1) {
-            String filesize = data.substr(findResult1 + 1,
-                                           findResult2 - findResult1 - 1);
-            size_t size = stringToNum(filesize);
-            dragFileList.at(index).setFilesize(size);
-        }
-
-        startPos = findResult2 + 1;
-        size_t findResult3 = data.find(',', startPos);
-        if (findResult3 != String::npos && findResult3 > startPos) {
-            const String typeToken = data.substr(startPos, findResult3 - startPos);
-            dragFileList.at(index).setEntryType(
-                typeToken == "D" ? Directory : File);
-            startPos = findResult3 + 1;
-        }
-
-        ++index;
+        DragInformation entry;
+        entry.setFilename(name);
+        entry.setFilesize(size);
+        entry.setEntryType(type);
+        parsed.push_back(entry);
     }
+    if (offset != data.size()) { reject(); return; }
+    dragFileList.swap(parsed);
 
-    LOG((CLOG_DEBUG "drag info received, total drag file number: %i",
-        dragFileList.size()));
-
-    for (size_t i = 0; i < dragFileList.size(); ++i) {
-        LOG((CLOG_DEBUG "dragging file %i name: %s",
-            i + 1,
-            dragFileList.at(i).getFilename().c_str()));
-    }
 }
 
 String
@@ -110,26 +98,34 @@ DragInformation::getDragFileExtension(String filename)
 int
 DragInformation::setupDragInfo(DragFileList& fileList, String& output)
 {
-    int size = static_cast<int>(fileList.size());
-    for (int i = 0; i < size; ++i) {
-        output.append(fileList.at(i).getFilename());
-        output.append(",");
-        String filesize = fileList.at(i).isDirectory()
-            ? String("0")
-            : getFileSize(fileList.at(i).getFilename());
-        output.append(filesize);
-        output.append(",");
-        output.push_back(static_cast<char>(fileList.at(i).getEntryType()));
-        output.append(",");
+    DragFileList valid;
+    for (auto& entry : fileList) {
+        // This wire format has no escaping. Do not emit ambiguous metadata.
+        if (entry.getFilename().empty() || entry.getFilename().find(',') != String::npos) {
+            LOG((CLOG_WARN "cannot encode drag filename in legacy metadata"));
+            continue;
+        }
+        const String size = entry.isDirectory() ? String("0") : getFileSize(entry.getFilename());
+        if (size.empty()) {
+            LOG((CLOG_WARN "skipping unreadable drag file"));
+            continue;
+        }
+        output += entry.getFilename() + "," + size + ",";
+        output.push_back(static_cast<char>(entry.getEntryType()));
+        output.push_back(',');
+        valid.push_back(entry);
     }
-    return size;
+    fileList.swap(valid);
+    return static_cast<int>(fileList.size());
+
 }
 
 bool
 DragInformation::isFileValid(String filename)
 {
     bool result = false;
-    std::fstream file(filename.c_str(), ios::in|ios::binary);
+    std::fstream file;
+    barrier::open_utf8_path(file, barrier::fs::u8path(filename), ios::in|ios::binary);
 
     if (file.is_open()) {
         result = true;
@@ -140,32 +136,10 @@ DragInformation::isFileValid(String filename)
     return result;
 }
 
-size_t
-DragInformation::stringToNum(String& str)
-{
-    istringstream iss(str.c_str());
-    size_t size;
-    iss >> size;
-    return size;
-}
-
 String
 DragInformation::getFileSize(String& filename)
 {
-    std::fstream file(filename.c_str(), ios::in|ios::binary);
-
-    if (!file.is_open()) {
-      throw std::runtime_error("failed to get file size");
-    }
-
-    // check file size
-    file.seekg (0, std::ios::end);
-    size_t size = (size_t)file.tellg();
-
-    stringstream ss;
-    ss << size;
-
-    file. close();
-
-    return ss.str();
+    std::error_code ec;
+    const auto size = barrier::fs::file_size(barrier::fs::u8path(filename), ec);
+    return ec ? String() : std::to_string(size);
 }

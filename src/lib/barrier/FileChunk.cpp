@@ -62,8 +62,10 @@ FileChunk::releaseReceiveBuffer(String& dataReceived,
     String().swap(dataReceived);
     expectedSize = 0;
     if (spoolPath != NULL && !spoolPath->empty()) {
-        barrier::fs::remove(*spoolPath);
+        std::error_code ec;
+        barrier::fs::remove(*spoolPath, ec);
         spoolPath->clear();
+        if (ec) LOG((CLOG_WARN "could not remove receive spool: %s", ec.message().c_str()));
     }
 }
 

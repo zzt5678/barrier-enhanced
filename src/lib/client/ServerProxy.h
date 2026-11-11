@@ -220,7 +220,7 @@ private:
     void                prepareEnter();
     void                abortEnter();
     void                revokeInputLeaseRequest();
-    void                leave();
+    bool                leave();
     void                setClipboard();
     void                setClipboard(barrier::IStream* stream);
     void                grabClipboard();
@@ -242,7 +242,7 @@ private:
     void                mouseWheel1_8();
     void                screensaver();
     void                resetOptions();
-    void                setOptions();
+    bool                setOptions();
     void                queryInfo();
     void                infoAcknowledgment();
     int                 fileChunkReceived();

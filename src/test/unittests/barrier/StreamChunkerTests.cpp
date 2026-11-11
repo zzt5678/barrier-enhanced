@@ -100,7 +100,7 @@ std::string uniqueToken()
 barrier::fs::path writeTempFile(size_t size)
 {
     const barrier::fs::path path =
-        barrier::fs::temp_directory_path() / barrier::fs::u8path("stream-chunker-" + uniqueToken());
+        barrier::fs::temp_directory_path() / barrier::fs::u8path(u8"stream-chunker-简历-é-" + uniqueToken());
     std::ofstream output;
     barrier::open_utf8_path(output, path, std::ios::out | std::ios::binary | std::ios::trunc);
     std::string block(4096, 'x');

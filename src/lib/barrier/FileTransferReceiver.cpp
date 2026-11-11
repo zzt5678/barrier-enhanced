@@ -292,7 +292,8 @@ FileTransferReceiver::takeCompleted(
         (completed.spoolPath.empty() &&
          completed.data.size() != completed.expectedSize)) {
         if (!completed.spoolPath.empty()) {
-            fs::remove(completed.spoolPath);
+            std::error_code ec;
+            fs::remove(completed.spoolPath, ec);
         }
         m_activeTransferId = 0;
         m_nextOffset = 0;

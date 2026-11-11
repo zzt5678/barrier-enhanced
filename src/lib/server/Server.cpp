@@ -881,12 +881,16 @@ Server::completeActiveClientReplacement()
 	m_activeReplacementTarget = NULL;
 	m_activeReplacementSeqNum = 0;
 
+	// A disconnected/timed-out source may already have restored local input.
+	// Never enter its replacement unless that source still owns the lease.
+	const bool replaceActive = source != NULL && m_active == source;
+	const bool replaceSaver = source != NULL && m_activeSaver == source;
 	if (source != NULL && m_clientSet.count(source) != 0) {
 		// A positive revoke ACK proves the old input backend is inactive.
 		// Retire its transport without forcing another local lease transition.
 		closeClient(source, kMsgEBusy, false);
 	}
-	finishAdoptingClient(target, true, false);
+	finishAdoptingClient(target, replaceActive, replaceSaver);
 }
 
 void

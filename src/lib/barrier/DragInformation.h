@@ -52,7 +52,6 @@ public:
     static bool            isFileValid(String filename);
 
 private:
-    static size_t        stringToNum(String& str);
     static String        getFileSize(String& filename);
 
 private:
