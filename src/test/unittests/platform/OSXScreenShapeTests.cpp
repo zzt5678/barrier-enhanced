@@ -290,6 +290,21 @@ TEST_F(OSXScreenShapeTests, failedLocalObserverSourceReleasesBothTapsAndOwner)
     EXPECT_FALSE(OSXScreenShapeTestAccess::hasInputResources(screen));
 }
 
+TEST_F(OSXScreenShapeTests, secondaryCursorObservationDoesNotBlockNativeInputDelivery)
+{
+    EventQueue events;
+    ShapeScreen screen(events);
+    screen.enable();
+    ASSERT_EQ(1u, taps.size());
+    // The client only restores cursor visibility for local activity. It
+    // never consumes an event, and injected motion must not wait for this
+    // helper's Cocoa run loop before reaching the rest of the system.
+    EXPECT_EQ(kCGEventTapOptionListenOnly, taps[0].options);
+    EXPECT_TRUE(taps[0].enabled);
+    screen.disable();
+    EXPECT_FALSE(OSXScreenShapeTestAccess::hasInputResources(screen));
+}
+
 TEST_F(OSXScreenShapeTests, failedSecondaryTapCreationReleasesTimerBeforeThrow)
 {
     EventQueue events; ShapeScreen screen(events); failTap = true;

@@ -1116,10 +1116,10 @@ OSXScreen::createEventTap()
 		getCursorCenter(cx, cy);
 		if (w > 0 && h > 0) fakeMouseMove(cx, cy);
 
-                // there may be a better way to do this, but we register an event handler even if we're
-                // not on the primary display (acting as a client). This way, if a local event comes in
-                // (either keyboard or mouse), we can make sure to show the cursor if we've hidden it.
-		m_eventTapPort = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
+		// A client only observes local pointer activity to restore its cursor.
+		// It never consumes input: native delivery, including our injected
+		// motion, must not wait for this helper's Cocoa run loop.
+		m_eventTapPort = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
 										kCGEventMaskForAllEvents,
 										handleCGInputEventSecondary,
 										this);
