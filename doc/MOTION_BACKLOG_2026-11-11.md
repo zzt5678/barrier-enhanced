@@ -1,7 +1,7 @@
 # Pointer backlog recovery — 2026-11-11
 
-Runtime code commit: `c3547559`; build ID
-`2.4.0-release+c3547559.20261111`, protocol 1.13.
+Runtime code commit: `e113183c`; build ID
+`2.4.0-release+e113183c.20261111`, protocol 1.13.
 
 ## Behavior
 
@@ -29,8 +29,8 @@ It cannot eliminate a period during which the network delivers no fresh input.
 ## Verification
 
 - The old implementation failed the new queued-hover behavior checks.
-- The display-info gate test also failed before its corresponding protection.
-- macOS and Ubuntu: 175 related client/parser tests passed on each platform.
+- The display-info gate and subsequent-ACK tests failed before their corresponding protections.
+- macOS and Ubuntu: 176 related client/parser tests passed on each platform.
 - Six component/version/release-policy checks passed on each platform.
 - An isolated Xvfb/TLS test paused only its own private-display client, queued
   fourteen 3-pixel movements, then resumed it. The original build injected all
