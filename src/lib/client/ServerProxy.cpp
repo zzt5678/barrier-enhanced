@@ -731,6 +731,8 @@ ServerProxy::handleKeepAliveEvent(const Event&, void*)
 void
 ServerProxy::onInfoChanged()
 {
+    // Retire old geometry immediately; a later ACK must not revive its backlog.
+    discardCompressedMouse();
     // ignore mouse motion until we receive acknowledgment of our info
     // change message.
     m_ignoreMouse = true;

@@ -3359,7 +3359,15 @@ TEST(ServerProxyTests, stalledNetworkBurstSkipsOldHoverPositionsButPreservesInpu
         proxy.m_hasEnterSequence = true;
         proxy.m_seqNum = 7;
         proxy.m_inputActive = true;
-        proxy.handleDataForTest();
+        // Decode one already-available burst deterministically. handleData's
+        // wall-clock fairness budget can yield under unrelated host load;
+        // that path is covered separately and by the real Xvfb/TLS burst test.
+        while (stream.getSize() != 0) {
+            UInt8 code[4];
+            ASSERT_EQ(4u, stream.read(code, sizeof(code)));
+            ASSERT_EQ(ServerProxy::kOkay, proxy.parseMessage(code));
+        }
+        proxy.flushCompressedMouse();
         EXPECT_EQ("ADAAUAKAkAWA", client.motionKinds);
         const std::vector<std::pair<SInt32,SInt32>> expected = {
             {113,200},{114,200},{115,200},{117,200},{119,200},{121,200},{123,200}};
@@ -3466,6 +3474,37 @@ TEST(ServerProxyTests, displayInfoGateCannotReplayQueuedHoverPositions)
     proxy.m_ignoreMouse = true;
     proxy.mouseMove();
     EXPECT_EQ(10, proxy.m_xMouse);
+    proxy.flushCompressedMouse();
+    EXPECT_TRUE(client.moves.empty());
+    EXPECT_FALSE(proxy.m_compressMouse);
+}
+
+TEST(ServerProxyTests, displayInfoAckCannotResurrectPreChangeHover)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents; ClipboardEvents clipboardEvents; FileEvents fileEvents;
+    ClientEvents clientEvents; IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(events, streamEvents, clipboardEvents,
+        fileEvents, clientEvents, screenEvents);
+    class GeometryClient : public RecordingMouseClient {
+    public:
+        using RecordingMouseClient::RecordingMouseClient;
+        void getShape(SInt32& x, SInt32& y, SInt32& w, SInt32& h) const override {
+            x=y=0; w=1920; h=1080;
+        }
+        void getCursorPos(SInt32& x, SInt32& y) const override { x=10; y=20; }
+    };
+    TestScreen screen;
+    GeometryClient client(&events, &screen);
+    DuplexMemoryStream stream;
+    stream.queueInput({0,10,0,20, 0,99,0,99});
+    ServerProxy proxy(&client, &stream, &events);
+    proxy.m_inputActive = true;
+    proxy.m_lowLatencyMode = true;
+    proxy.mouseMove();
+    ASSERT_TRUE(proxy.m_compressMouse);
+    proxy.onInfoChanged();
+    proxy.infoAcknowledgment();
     proxy.flushCompressedMouse();
     EXPECT_TRUE(client.moves.empty());
     EXPECT_FALSE(proxy.m_compressMouse);
