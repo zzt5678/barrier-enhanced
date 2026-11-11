@@ -317,6 +317,7 @@ private:
 
     bool                m_compressMouse;
     bool                m_compressMouseRelative;
+    UInt32              m_compressedMouseSequence;
     SInt32                m_xMouse, m_yMouse;
     SInt32                m_dxMouse, m_dyMouse;
 

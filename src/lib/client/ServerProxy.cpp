@@ -118,6 +118,7 @@ ServerProxy::ServerProxy(Client* client, barrier::IStream* stream, IEventQueue* 
     m_epochPressedButtons(),
     m_compressMouse(false),
     m_compressMouseRelative(false),
+    m_compressedMouseSequence(0),
     m_xMouse(0),
     m_yMouse(0),
     m_dxMouse(0),
@@ -1028,6 +1029,8 @@ ServerProxy::flushCompressedMouse()
     if (m_compressMouse) {
         m_compressMouse = false;
         m_client->mouseMove(m_xMouse, m_yMouse);
+        barrier::traceInputMotion('P', m_seqNum, m_compressedMouseSequence,
+                                  m_xMouse, m_yMouse);
     }
     if (m_compressMouseRelative) {
         m_compressMouseRelative = false;
@@ -1060,12 +1063,12 @@ ServerProxy::hasActivePointerLease(const char* inputType) const
 bool
 ServerProxy::shouldCompressMouseMoves() const
 {
-    // Callers also require a complete message to be waiting. Coalescing only
-    // after input is already backlogged prevents motion floods from delaying
-    // control messages in normal mode. Immediate-delivery modes already apply
-    // their own pacing and must not lose another set of coordinates here.
-    return !m_lowLatencyMode && !m_nestedRemoteMode &&
-        m_epochPressedButtons.empty() && m_legacyPressedButtons.empty();
+    // Only collapse positions that are already queued; never wait for a future
+    // move. Server pacing cannot prevent a network stall from creating a new
+    // backlog. Even low-latency modes should catch up to the latest hover point.
+    // Held buttons preserve the entire drag/drawing path. Input boundaries and
+    // the end of every bounded parse batch flush the pending position.
+    return m_epochPressedButtons.empty() && m_legacyPressedButtons.empty();
 }
 
 void
@@ -1623,6 +1626,10 @@ ServerProxy::mouseMove()
         flushCompressedMouse();
     }
 
+    if (!ignore) {
+        barrier::traceInputMotion('R', m_seqNum, m_lastInputSequence, x, y);
+    }
+
     // compress mouse motion events if more input follows
     if (!ignore && shouldCompressMouseMoves() &&
         !m_compressMouse && m_stream->isReady()) {
@@ -1635,6 +1642,7 @@ ServerProxy::mouseMove()
         ignore    = true;
         m_xMouse  = x;
         m_yMouse  = y;
+        m_compressedMouseSequence = m_lastInputSequence;
         m_dxMouse = 0;
         m_dyMouse = 0;
     }
@@ -1642,7 +1650,6 @@ ServerProxy::mouseMove()
 
     // forward
     if (!ignore) {
-        barrier::traceInputMotion('R', m_seqNum, m_lastInputSequence, x, y);
         m_client->mouseMove(x, y);
         barrier::traceInputMotion('P', m_seqNum, m_lastInputSequence, x, y);
     }
@@ -1666,7 +1673,9 @@ ServerProxy::mouseRelativeMove()
     }
 
     // compress mouse motion events if more input follows
-    if (!ignore && shouldCompressMouseMoves() &&
+    // Relative motion may drive camera/raw-input paths. Keep immediate modes'
+    // per-delta delivery instead of applying the hover-position optimization.
+    if (!ignore && !m_lowLatencyMode && !m_nestedRemoteMode && shouldCompressMouseMoves() &&
         !m_compressMouseRelative && m_stream->isReady()) {
         m_compressMouseRelative = true;
     }

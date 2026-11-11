@@ -605,7 +605,7 @@ TEST(ServerProxyTests, setKeepAliveRateAllowsTransientSchedulingPause)
     proxy.setKeepAliveRate(1.0);
 }
 
-TEST(ServerProxyTests, mouseMoveCompressionIsDisabledForImmediateDeliveryModes)
+TEST(ServerProxyTests, absoluteMouseBacklogMayCoalesceInImmediateDeliveryModes)
 {
     NiceMock<MockEventQueue> events;
     IStreamEvents streamEvents;
@@ -627,17 +627,17 @@ TEST(ServerProxyTests, mouseMoveCompressionIsDisabledForImmediateDeliveryModes)
     proxy.m_epochPressedButtons.clear();
 
     proxy.m_lowLatencyMode = true;
-    EXPECT_FALSE(proxy.shouldCompressMouseMoves());
+    EXPECT_TRUE(proxy.shouldCompressMouseMoves());
 
     proxy.m_lowLatencyMode = false;
     proxy.m_nestedRemoteMode = true;
-    EXPECT_FALSE(proxy.shouldCompressMouseMoves());
+    EXPECT_TRUE(proxy.shouldCompressMouseMoves());
 
     proxy.m_lowLatencyMode = true;
-    EXPECT_FALSE(proxy.shouldCompressMouseMoves());
+    EXPECT_TRUE(proxy.shouldCompressMouseMoves());
 }
 
-TEST(ServerProxyTests, lowLatencyMouseMovesDeliverEveryCoordinateInBackloggedBatch)
+TEST(ServerProxyTests, lowLatencyMouseMovesKeepLatestCoordinateInBackloggedBatch)
 {
     NiceMock<MockEventQueue> events;
     IStreamEvents streamEvents;
@@ -677,11 +677,11 @@ TEST(ServerProxyTests, lowLatencyMouseMovesDeliverEveryCoordinateInBackloggedBat
     proxy.mouseMove();
     proxy.mouseMove();
 
-    ASSERT_EQ(2u, client.moves.size());
-    EXPECT_EQ(10, client.moves[0].first);
-    EXPECT_EQ(20, client.moves[0].second);
-    EXPECT_EQ(11, client.moves[1].first);
-    EXPECT_EQ(21, client.moves[1].second);
+    EXPECT_TRUE(client.moves.empty());
+    proxy.flushCompressedMouse();
+    ASSERT_EQ(1u, client.moves.size());
+    EXPECT_EQ(11, client.moves[0].first);
+    EXPECT_EQ(21, client.moves[0].second);
 }
 
 TEST(ServerProxyTests, dragRetainsEveryCoordinateAcrossLegacyAndEpochButtons)
@@ -3315,4 +3315,132 @@ TEST(ServerProxyTests, parserFailureSafelyDeletesTheOwnedProxy)
         EXPECT_FALSE(client.isConnected());
         EXPECT_TRUE(stream.output.empty());
     }
+}
+
+TEST(ServerProxyTests, stalledNetworkBurstSkipsOldHoverPositionsButPreservesInputBoundaries)
+{
+    for (bool nested : {false, true}) {
+        NiceMock<MockEventQueue> events;
+        IStreamEvents streamEvents; ClipboardEvents clipboardEvents; FileEvents fileEvents;
+        ClientEvents clientEvents; IScreenEvents screenEvents;
+        setServerProxyClientEventDefaults(events, streamEvents, clipboardEvents,
+            fileEvents, clientEvents, screenEvents);
+        class OrderedClient : public RecordingMouseClient {
+        public:
+            using RecordingMouseClient::RecordingMouseClient;
+            void keyDown(KeyID, KeyModifierMask, KeyButton) override { motionKinds += 'K'; }
+            void keyUp(KeyID, KeyModifierMask, KeyButton) override { motionKinds += 'k'; }
+            void mouseWheel(SInt32, SInt32) override { motionKinds += 'W'; }
+        };
+        TestScreen screen;
+        OrderedClient client(&events, &screen);
+        DuplexMemoryStream encoded, stream;
+        UInt32 sequence = 0;
+        auto move = [&](int x) {
+            ProtocolUtil::writef(&encoded, kMsgDMouseMove1_8, 7, ++sequence, x, 200);
+        };
+        // Fourteen positions, like a 70 ms network stall at 200 Hz.
+        for (int x=100; x<114; ++x) move(x);
+        ProtocolUtil::writef(&encoded, kMsgDMouseDown1_8, 7, ++sequence, 1);
+        move(114); move(115); // never compact a held-button drag/drawing path
+        ProtocolUtil::writef(&encoded, kMsgDMouseUp1_8, 7, ++sequence, 1);
+        move(116); move(117);
+        ProtocolUtil::writef(&encoded, kMsgDKeyDown1_8, 7, ++sequence, 0, 65, 0, 38);
+        move(118); move(119);
+        ProtocolUtil::writef(&encoded, kMsgDKeyUp1_8, 7, ++sequence, 0, 65, 0, 38);
+        move(120); move(121);
+        ProtocolUtil::writef(&encoded, kMsgDMouseWheel1_8, 7, ++sequence, 0, 120);
+        move(122); move(123);
+        stream.queueInput(encoded.output);
+        ServerProxy proxy(&client, &stream, &events);
+        proxy.testUseMessageParser();
+        proxy.m_lowLatencyMode = !nested;
+        proxy.m_nestedRemoteMode = nested;
+        proxy.m_hasEnterSequence = true;
+        proxy.m_seqNum = 7;
+        proxy.m_inputActive = true;
+        proxy.handleDataForTest();
+        EXPECT_EQ("ADAAUAKAkAWA", client.motionKinds);
+        const std::vector<std::pair<SInt32,SInt32>> expected = {
+            {113,200},{114,200},{115,200},{117,200},{119,200},{121,200},{123,200}};
+        EXPECT_EQ(expected, client.moves);
+        EXPECT_TRUE(proxy.m_epochPressedButtons.empty());
+        EXPECT_TRUE(proxy.m_epochPressedKeys.empty());
+    }
+}
+
+TEST(ServerProxyTests, lowLatencySingleMoveIsDeliveredImmediatelyWithoutWaiting)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents; ClipboardEvents clipboardEvents; FileEvents fileEvents;
+    ClientEvents clientEvents; IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(events, streamEvents, clipboardEvents,
+        fileEvents, clientEvents, screenEvents);
+    TestScreen screen;
+    RecordingMouseClient client(&events, &screen);
+    DuplexMemoryStream stream;
+    stream.queueInput({0,10,0,20});
+    ServerProxy proxy(&client, &stream, &events);
+    proxy.m_inputActive = true;
+    proxy.m_lowLatencyMode = true;
+    proxy.mouseMove();
+    ASSERT_EQ(1u, client.moves.size());
+    EXPECT_EQ(std::make_pair(SInt32(10),SInt32(20)), client.moves[0]);
+    EXPECT_FALSE(proxy.m_compressMouse);
+}
+
+TEST(ServerProxyTests, lowLatencyRelativeMovesRetainEveryDeltaAndFollowPendingAbsolute)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents; ClipboardEvents clipboardEvents; FileEvents fileEvents;
+    ClientEvents clientEvents; IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(events, streamEvents, clipboardEvents,
+        fileEvents, clientEvents, screenEvents);
+    TestScreen screen;
+    RecordingMouseClient client(&events, &screen);
+    DuplexMemoryStream stream;
+    stream.queueInput({0,10,0,20, 0,8,255,253, 255,251,0,9});
+    ServerProxy proxy(&client, &stream, &events);
+    proxy.m_inputActive = true;
+    proxy.m_lowLatencyMode = true;
+    proxy.mouseMove();
+    proxy.mouseRelativeMove();
+    proxy.mouseRelativeMove();
+    EXPECT_EQ("ARR", client.motionKinds);
+    ASSERT_EQ(2u, client.relativeMoves.size());
+    EXPECT_EQ(std::make_pair(SInt32(8),SInt32(-3)), client.relativeMoves[0]);
+    EXPECT_EQ(std::make_pair(SInt32(-5),SInt32(9)), client.relativeMoves[1]);
+}
+
+TEST(ServerProxyTests, backlogRejectsStaleEpochAndCannotReplayAfterRevocation)
+{
+    NiceMock<MockEventQueue> events;
+    IStreamEvents streamEvents; ClipboardEvents clipboardEvents; FileEvents fileEvents;
+    ClientEvents clientEvents; IScreenEvents screenEvents;
+    setServerProxyClientEventDefaults(events, streamEvents, clipboardEvents,
+        fileEvents, clientEvents, screenEvents);
+    TestScreen screen;
+    RecordingMouseClient client(&events, &screen);
+    DuplexMemoryStream encoded, stream;
+    ProtocolUtil::writef(&encoded, "%4i%4i%2i%2i", 7, 10, 10, 20);
+    ProtocolUtil::writef(&encoded, "%4i%4i%2i%2i", 6, 900, 999, 999);
+    ProtocolUtil::writef(&encoded, "%4i%4i%2i%2i", 7, 11, 30, 40);
+    stream.queueInput(encoded.output);
+    ServerProxy proxy(&client, &stream, &events);
+    proxy.m_inputActive = true;
+    proxy.m_hasEnterSequence = true;
+    proxy.m_seqNum = 7;
+    proxy.m_lowLatencyMode = true;
+    proxy.mouseMove1_8();
+    proxy.mouseMove1_8();
+    EXPECT_EQ(10, proxy.m_xMouse);
+    EXPECT_EQ(10u, proxy.m_compressedMouseSequence);
+    proxy.mouseMove1_8();
+    EXPECT_EQ(30, proxy.m_xMouse);
+    EXPECT_EQ(11u, proxy.m_compressedMouseSequence);
+    EXPECT_TRUE(client.moves.empty());
+    proxy.revokeInputLease();
+    proxy.flushCompressedMouse();
+    EXPECT_TRUE(client.moves.empty());
+    EXPECT_FALSE(proxy.m_compressMouse);
 }

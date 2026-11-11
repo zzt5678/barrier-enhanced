@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolated real TLS/input/clipboard smoke test; never uses the user's DISPLAY."""
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -34,6 +35,8 @@ def main():
     parser.add_argument("--cycles", type=int, default=1, help="Additional cross-screen/return cycles (1-10000)")
     parser.add_argument("--file-mib", type=int, default=0,
                         help="Synthetic file size in MiB (0 retains the 112 KiB smoke fixture; max 64)")
+    parser.add_argument("--motion-burst", action="store_true",
+                        help="Pause only the isolated client and verify hover backlog coalescing")
     args = parser.parse_args()
     if not 1 <= args.cycles <= 10000:
         parser.error("--cycles must be between 1 and 10000")
@@ -46,6 +49,7 @@ def main():
     root = Path(tempfile.mkdtemp(prefix="weave-xvfb-smoke-"))
     root.chmod(0o700)
     processes, streams = [], []
+    burst_window = None
     report = {"artifacts": str(root), "checks": [], "ok": False}
 
     def run(command, env=None, **kwargs):
@@ -114,6 +118,7 @@ def main():
             raise RuntimeError("Refusing reserved production port")
         report["port"] = port
         server = start([str(binaries / "weaves"), "-f", "--no-restart", "--enable-drag-drop", "--debug", "DEBUG",
+               *(["--low-latency-mode"] if args.motion_burst else []),
                "--name", "smoke-server", "--profile-dir", str(server_profile),
                "--config", str(config), "--address", f"127.0.0.1:{port}"], "server", server_env)
         wait_for(lambda: "started server" in logs("server"), "server start")
@@ -129,6 +134,8 @@ def main():
             untrusted.wait(timeout=3)
         report["checks"].append("untrusted client certificate rejected")
         (server_profile / "SSL/Fingerprints/TrustedClients.txt").write_text(client_fp)
+        if args.motion_burst:
+            client_env["WEAVE_INPUT_TRACE_PREFIX"] = str(root / "motion-trace")
         client = start(client_command, "client", client_env)
         wait_for(lambda: "connected to server" in logs("client"), "authenticated application handshake")
         report["checks"].append("mutually-trusted TLS application handshake")
@@ -151,6 +158,24 @@ def main():
         report["client_pointer_before"] = initial_pointer
         report["client_pointer_after"] = pointer(client_env)
         report["checks"].append("client X pointer changed from injected server motion")
+        if args.motion_burst:
+            before = pointer(client_env)
+            begin = time.time_ns()
+            # This is our child on a private Xvfb display, never a live desktop.
+            os.kill(client.pid, signal.SIGSTOP)
+            try:
+                for _ in range(14):
+                    run(["xdotool", "mousemove_relative", "--", "3", "0"], server_env)
+                    time.sleep(0.005)
+                time.sleep(0.02)
+            finally:
+                os.kill(client.pid, signal.SIGCONT)
+            expected = [before[0] + 42, before[1]]
+            wait_for(lambda: pointer(client_env) == expected, "latest queued pointer position")
+            burst_window = (begin, time.time_ns(), client.pid)
+            report["burst_pointer_expected"] = expected
+            report["burst_pointer_actual"] = pointer(client_env)
+
         def clipboard_matches():
             try:
                 received = subprocess.run(["xclip", "-selection", "clipboard", "-out"],
@@ -294,6 +319,22 @@ def main():
                     process.wait(timeout=3)
         for stream in streams:
             stream.close()
+        if burst_window is not None:
+            try:
+                begin, end, pid = burst_window
+                with (root / f"motion-trace.{pid}.csv").open() as trace:
+                    rows = [row for row in csv.DictReader(trace)
+                            if begin <= int(row["wall_ns"]) <= end]
+                received = sum(row["stage"] == "R" for row in rows)
+                posted = sum(row["stage"] == "P" for row in rows)
+                report["burst_received_positions"] = received
+                report["burst_native_posts"] = posted
+                if received < 8 or not 0 < posted < received:
+                    raise RuntimeError(f"hover backlog was not coalesced: received={received}, posts={posted}")
+                report["checks"].append("queued hover positions coalesced with exact final X pointer")
+            except Exception as error:
+                report["ok"] = False
+                report["error"] = str(error)
         # The ephemeral certificate keys are not useful artifacts.
         for name in ("server-profile", "client-profile"):
             if (root / name).exists():
