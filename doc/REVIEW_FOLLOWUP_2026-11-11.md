@@ -89,8 +89,11 @@ Live interface checks also confirmed that Ubuntu uses Wi-Fi, not Ethernet.
 Its concurrent 100-packet ping sample had median 1.79 ms and p95 3.22 ms, with
 one 66.6 ms outlier. Thus the evidence concerns the MacBook's particular wireless
 path and frequency of stalls, not a blanket claim that wireless cannot work.
-Both Weave peers use direct LAN Tailscale paths. Whether the user's visible
-cursor catch-up disappeared on Ethernet still awaits physical confirmation.
+Both Weave peers use direct LAN Tailscale paths. After the wired comparison,
+the user explicitly reported that the MacBook pointer was now responsive
+("现在跟手了"). This closes the observed pointer-lag issue for the current wired
+configuration. The cause of the former wireless-path stalls is not repaired
+or attributed to a specific Wi-Fi driver, access point, or system feature.
 
 Other findings in the supplied review remain unverified or unaddressed in this
 batch, including B2–B4, C1–C4, D1–D4/D6–D14, GUI/UX items E/F, CI/packaging G1/G2,
