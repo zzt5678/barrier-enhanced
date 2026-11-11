@@ -3271,3 +3271,48 @@ TEST(ServerProxyTests, malformedOptionsStopBothParsersWithoutAcknowledgement)
         EXPECT_TRUE(stream.output.empty());
     }
 }
+
+TEST(ServerProxyTests, parserFailureSafelyDeletesTheOwnedProxy)
+{
+    for (int failure = 0; failure < 3; ++failure) {
+        NiceMock<MockEventQueue> events;
+        IStreamEvents streamEvents; ClipboardEvents clipboardEvents; FileEvents fileEvents;
+        ClientEvents clientEvents; IScreenEvents screenEvents;
+        setServerProxyClientEventDefaults(events, streamEvents, clipboardEvents,
+            fileEvents, clientEvents, screenEvents);
+        ON_CALL(events, addEvent(_)).WillByDefault(Invoke(consumeClientFailureEvent));
+        class RejectingClient : public RecordingMouseClient {
+        public:
+            using RecordingMouseClient::RecordingMouseClient;
+            bool leave() override { return false; }
+        };
+        class OwnedProxy : public ServerProxy {
+        public:
+            OwnedProxy(Client* c, barrier::IStream* s, IEventQueue* e, bool& gone) :
+                ServerProxy(c, s, e), destroyed(gone) {}
+            ~OwnedProxy() override { destroyed = true; }
+            bool& destroyed;
+        };
+        TestScreen screen;
+        RejectingClient client(&events, &screen);
+        DuplexMemoryStream stream;
+        bool destroyed = false;
+        auto* proxy = new OwnedProxy(&client, &stream, &events, destroyed);
+        client.testSetServerProxy(proxy); // disconnect owns and deletes this object
+        if (failure == 0) {
+            proxy->testUseMessageParser();
+            proxy->m_inputActive = true;
+            stream.queueInput({'C','O','U','T'});
+        }
+        else if (failure == 1) {
+            stream.queueInput({'D','S','O','P',0,0,0,1,0,0,0,1});
+        }
+        else {
+            stream.queueInput({'D','S','O','P',0,0,0,1});
+        }
+        proxy->handleDataForTest();
+        EXPECT_TRUE(destroyed);
+        EXPECT_FALSE(client.isConnected());
+        EXPECT_TRUE(stream.output.empty());
+    }
+}

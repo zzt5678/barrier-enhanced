@@ -21,13 +21,13 @@ input.
 - A GUI that may be hidden or minimized without stopping the data plane;
   explicit **Quit** stops it.
 
-Use the same current Weave build on every peer. Protocol 1.12 is required so
+Use the same current Weave build on every peer. Protocol 1.13 is required so
 input epochs, transactional handoff, and the connection-bound bulk channel
 cannot be bypassed by a legacy peer.
 
 ## Release status
 
-The `codex/weave-stability-optimization` branch is under active hardening. A
+The `codex/weave-modernization` branch is under active hardening. A
 successful local build is not, by itself, a public-release qualification.
 Windows UAC/secure-desktop, sleep/resume, RDP/session switching, installer
 upgrade, long-running soak, and cross-machine transfer tests must pass for the
