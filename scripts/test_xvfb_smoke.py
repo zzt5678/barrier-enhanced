@@ -271,12 +271,27 @@ def main():
                           + "section: options\n clipboardSharing = true\nend\n")
             wait_for(lambda: logs("client").count("clipboard sharing is disabled") > disabled_before,
                      "client received effective disabled policy")
+            # Only this isolated child is restarted. A fresh bulk attachment
+            # used to bypass routing policy and retry an initial empty snapshot.
+            os.kill(client.pid, signal.SIGTERM); client.wait(timeout=3)
+            client = start(client_command, "client", client_env)
+            wait_for(lambda: "connected to server" in logs("client") and
+                     "clipboard sharing is disabled" in logs("client"),
+                     "excluded client reconnected with policy")
+            entered = logs("server").count('switch from "smoke-server" to "smoke-client"')
+            run(["xdotool", "mousemove", "400", "300"], server_env)
+            run(["xdotool", "mousemove_relative", "--", "900", "0"], server_env)
+            wait_for(lambda: logs("server").count('switch from "smoke-server" to "smoke-client"') > entered,
+                     "entry into reconnected excluded client")
             server_only, client_only = token + "-server-only", token + "-client-only"
             own_text(client_env, client_only, "excluded-client-copy")
             own_text(server_env, server_only, "server-policy-copy")
             time.sleep(1.5)
             if read_text(client_env) != client_only or read_text(server_env) != server_only:
                 raise RuntimeError("Excluded device clipboard was overwritten")
+            if "snapshot was rejected" in logs("client") or "snapshot was queued for publication" in logs("client"):
+                raise RuntimeError("Clipboard retry bypassed excluded-device policy after reconnect")
+            report["checks"].append("excluded client reconnect produced no clipboard publication or rejection")
             before = pointer(client_env)
             run(["xdotool", "mousemove_relative", "--", "25", "0"], server_env)
             wait_for(lambda: pointer(client_env) != before, "input still delivered to clipboard-excluded client")

@@ -83,6 +83,7 @@ ClientProxy1_6::~ClientProxy1_6()
 void
 ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard* clipboard)
 {
+    if (m_server != NULL && !m_server->clipboardAllowed(this)) return;
     // ignore if this clipboard is already clean
     if (m_clipboard[id].m_dirty) {
         // Clipboard and primary selection share a sender, not ownership.
@@ -177,6 +178,13 @@ ClientProxy1_6::setClipboard(ClipboardID id, const IClipboard* clipboard)
 void
 ClientProxy1_6::retryOneDirtyClipboard()
 {
+    if (m_server != NULL && !m_server->clipboardAllowed(this)) {
+        // Bulk attachment and retry timers bypass Server's active-screen
+        // routing. Honor the same policy before replaying their cached data.
+        if (!cleanupClipboardSendThread(true)) scheduleClipboardSendRetry();
+        for (auto& clipboard : m_clipboard) clipboard.m_dirty = false;
+        return;
+    }
     if (!cleanupClipboardSendThread(false)) {
         scheduleClipboardSendRetry();
         return;
@@ -209,7 +217,8 @@ ClientProxy1_6::retryOneDirtyClipboard()
 bool
 ClientProxy1_6::queueFileClipboardMetadata(const IClipboard* clipboard)
 {
-    if (clipboard == NULL || !supportsTransactionalFileTransfer() ||
+    if ((m_server != NULL && !m_server->clipboardAllowed(this)) ||
+        clipboard == NULL || !supportsTransactionalFileTransfer() ||
         !cleanupClipboardSendThread(false)) {
         return false;
     }
@@ -273,10 +282,6 @@ void
 ClientProxy1_6::handleClipboardSendRetry(const Event&, void*)
 {
     cleanupClipboardSendRetry();
-    if (!cleanupClipboardSendThread(false)) {
-        scheduleClipboardSendRetry();
-        return;
-    }
     retryOneDirtyClipboard();
 }
 
@@ -362,7 +367,8 @@ ClientProxy1_6::handleClipboardSendingChunk(ClipboardChunk* chunk)
     if (chunk == NULL) {
         return;
     }
-    if (!chunk->isSendRouteActive()) {
+    if ((m_server != NULL && !m_server->clipboardAllowed(this)) ||
+        !chunk->isSendRouteActive()) {
         chunk->failSendAttempt();
         const std::shared_ptr<barrier::ClipboardSendAttempt> attempt =
             chunk->getSendAttempt();

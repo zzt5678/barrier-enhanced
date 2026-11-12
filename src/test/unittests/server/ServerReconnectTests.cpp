@@ -9185,3 +9185,21 @@ TEST_F(DeviceClipboardPolicyTests, FileReplayToExcludedDeviceDoesNotStartTransfe
     EXPECT_EQ(nullptr,server.m_pendingFileClipboardPrefetchTarget);
     EXPECT_EQ(nullptr,server.m_sendFileThread);
 }
+
+TEST_F(DeviceClipboardPolicyTests, BulkRetryDoesNotSendCachedClipboardToExcludedDevice)
+{
+    FileEvents fileEvents; fileEvents.setEvents(&events);
+    ON_CALL(events, forFile()).WillByDefault(ReturnRef(fileEvents));
+    IStreamEvents streamEvents; streamEvents.setEvents(&events);
+    ON_CALL(events, forIStream()).WillByDefault(ReturnRef(streamEvents));
+    auto* stream = new NiceMock<MockStream>;
+    ON_CALL(*stream, getEventTarget()).WillByDefault(Return(stream));
+    ClientProxy1_6 proxy("book",stream,&server,&events);
+    auto data = makeTextClipboard("excluded retry fixture");
+    EXPECT_CALL(*stream, write(_, _)).Times(0);
+    proxy.setClipboard(kClipboardClipboard,&data);
+    proxy.testRunClipboardSendRetry();
+    EXPECT_FALSE(proxy.testClipboardDirty(kClipboardClipboard));
+    EXPECT_FALSE(proxy.testHasClipboardSendRetryTimer());
+    EXPECT_FALSE(proxy.queueFileClipboardMetadata(&data));
+}

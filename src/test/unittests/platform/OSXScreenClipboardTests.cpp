@@ -606,7 +606,7 @@ struct BlockedClipboardHelper {
         file << "#!/bin/sh\nif [ \"$1\" = --warmup ]; then exit 0; fi\nprintf '%s\\n' \"$$\" > '" << directory << "/pid'\nexec /bin/sleep 30\n";
         file.close();
         if (chmod(executable.c_str(), 0700) != 0) throw std::runtime_error("helper mode failed");
-        // macOS cold script validation can exceed the one-second read test.
+        // macOS cold script startup can exceed the one-second read test.
         // Warm separately so the test proves a recorded child was reaped.
         char* args[] = {const_cast<char*>(executable.c_str()), const_cast<char*>("--warmup"), nullptr};
         pid_t child = 0;
