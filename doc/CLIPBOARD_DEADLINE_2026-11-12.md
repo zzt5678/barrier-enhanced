@@ -6,7 +6,9 @@ The MacBook client recorded native clipboard reads taking 55,003.9 ms and
 120,084.3 ms (120,086.3 ms total snapshot time). These are actual native data
 read stalls, not evidence that the input event loop itself was blocked for
 that entire duration. The user reports recurring clipboard-related freezes;
-the scope of the affected applications still needs real-use confirmation.
+the user subsequently confirmed both application/copy-paste freezes and
+freezes affecting the MacBook pointer, clicks and keys. No correlated trace
+yet establishes that the native data read directly blocked those input paths.
 
 Disabling clipboard sharing stopped the protocol exchange but did not stop
 the macOS worker from polling the native clipboard. Its native data read also
@@ -66,3 +68,13 @@ sharing acceptance is therefore pending, not implied by the connection checks.
 
 The intermittent source Mac mini cursor remaining visible/moving is a
 separate unresolved report; these clipboard changes do not claim to fix it.
+
+## Subsequent user feedback
+
+The user pointed out that the Macs already have Apple's Universal Clipboard
+and do not need a second clipboard-sharing mechanism between them. Interaction
+between the two mechanisms is a hypothesis, not an established cause of the
+freezes. The current configuration still has Weave clipboard sharing disabled
+globally, including Ubuntu. The current screen configuration parser does not
+support a per-screen clipboard-sharing override. A decision on retaining
+Ubuntu clipboard sharing is pending; no Apple Handoff settings were changed.
