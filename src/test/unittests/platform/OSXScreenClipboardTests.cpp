@@ -1,3 +1,9 @@
+#include <future>
+#include <fstream>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <cerrno>
+#include "barrier/option_types.h"
 #include "platform/OSXScreen.h"
 #include "barrier/Clipboard.h"
 #include "barrier/RemoteFileClipboard.h"
@@ -119,7 +125,7 @@ TEST(OSXScreenClipboardTests, slowPrivateProviderNeverRunsOnInputThread)
     callerThread = std::this_thread::get_id();
     callerReads = 0;
     EventQueue events;
-    OSXScreen screen(&events, false, false, privateName);
+    OSXScreen screen(&events, false, false, privateName, OSXClipboardWorker::readInProcess);
     OSXClipboard writer(privateName);
     ASSERT_TRUE(writer.open(0));
     ASSERT_TRUE(writer.empty());
@@ -156,7 +162,7 @@ TEST(OSXScreenClipboardTests, slowPrivateProviderNeverRunsOnInputThread)
 TEST(OSXScreenClipboardTests, immutableRemoteSnapshotPublishesWithoutLocalFeedback)
 {
     EventQueue events;
-    OSXScreen screen(&events, false, false, privateName);
+    OSXScreen screen(&events, false, false, privateName, OSXClipboardWorker::readInProcess);
     Clipboard source;
     ASSERT_TRUE(source.open(0));
     ASSERT_TRUE(source.empty());
@@ -190,7 +196,7 @@ TEST(OSXScreenClipboardTests, remotePublicationSupersedesInFlightLocalRead)
     callerThread = std::this_thread::get_id();
     privateReads = 0;
     EventQueue events;
-    OSXScreen screen(&events, false, false, privateName);
+    OSXScreen screen(&events, false, false, privateName, OSXClipboardWorker::readInProcess);
     OSXClipboard writer(privateName);
     ASSERT_TRUE(writer.open(0));
     ASSERT_TRUE(writer.empty());
@@ -298,7 +304,7 @@ TEST(OSXClipboardPublicationTests, localNativeChangeDuringPreparationSupersedesR
 
 TEST(OSXClipboardWorkerTests, cancelDoesNotDeliverPriorLifetimePublicationCompletion)
 {
-    OSXClipboardWorker worker(privateName);
+    OSXClipboardWorker worker(privateName, OSXClipboardWorker::readInProcess);
     Clipboard remote;
     ASSERT_TRUE(remote.open(0));
     ASSERT_TRUE(remote.empty());
@@ -331,7 +337,7 @@ TEST(OSXClipboardWorkerTests, completionPollingDoesNotMultiplyIdleNativePolling)
     ASSERT_TRUE(writer.empty());
     writer.add(IClipboard::kText, "idle polling sample");
     writer.close();
-    OSXClipboardWorker worker(privateName);
+    OSXClipboardWorker worker(privateName, OSXClipboardWorker::readInProcess);
     privateSynchronizes = 0;
     countPrivateSynchronizes = true;
     struct Reset { ~Reset() { countPrivateSynchronizes = false; } } reset;
@@ -353,7 +359,7 @@ TEST(OSXClipboardWorkerTests, completionPollingDoesNotMultiplyIdleNativePolling)
 
 TEST(OSXClipboardWorkerTests, partialRemoteWriteFailureNeverBecomesLocalFeedback)
 {
-    OSXClipboardWorker worker(privateName);
+    OSXClipboardWorker worker(privateName, OSXClipboardWorker::readInProcess);
     Clipboard remote;
     ASSERT_TRUE(remote.open(0));
     ASSERT_TRUE(remote.empty());
@@ -388,7 +394,7 @@ TEST(OSXClipboardWorkerTests, staleReadCannotConsumeNewLocalChangeAheadOfQueuedR
     ASSERT_TRUE(writer.empty());
     writer.add(IClipboard::kText, "old local A");
     writer.close();
-    OSXClipboardWorker worker(privateName);
+    OSXClipboardWorker worker(privateName, OSXClipboardWorker::readInProcess);
     privateReadEntered = false;
     blockPrivateRead = true;
     struct Reset { ~Reset() { blockPrivateRead = false; injectLocalAfterPrivateRead = false; } } reset;
@@ -422,7 +428,7 @@ TEST(OSXClipboardWorkerTests, staleReadCannotConsumeNewLocalChangeAheadOfQueuedR
 
 TEST(OSXClipboardWorkerTests, publishesNativePngTextHtmlAndMaterializedFilePaths)
 {
-    OSXClipboardWorker worker(privateName);
+    OSXClipboardWorker worker(privateName, OSXClipboardWorker::readInProcess);
     const auto publish = [&](Clipboard& source, std::uint64_t token) {
         if (!worker.publish(kClipboardClipboard, std::make_shared<const String>(source.marshall()), token))
             return false;
@@ -456,6 +462,14 @@ TEST(OSXClipboardWorkerTests, publishesNativePngTextHtmlAndMaterializedFilePaths
     EXPECT_EQ(png, actual.get(IClipboard::kPNG));
     EXPECT_FALSE(actual.has(IClipboard::kBitmap));
     actual.close();
+    const auto isolatedImage = OSXClipboardSnapshot::read(privateName, [] { return true; });
+    ASSERT_TRUE(isolatedImage.data);
+    Clipboard copiedImage;
+    copiedImage.unmarshall(*isolatedImage.data,0);
+    ASSERT_TRUE(copiedImage.open(0));
+    EXPECT_EQ(png,copiedImage.get(IClipboard::kPNG));
+    EXPECT_EQ("native image with text",copiedImage.get(IClipboard::kText));
+    copiedImage.close();
 
     char path[] = "/tmp/weave-native-clipboard-XXXXXX";
     const int file = mkstemp(path);
@@ -480,6 +494,16 @@ TEST(OSXClipboardWorkerTests, publishesNativePngTextHtmlAndMaterializedFilePaths
     ASSERT_EQ(1u, readPaths.paths.size());
     EXPECT_EQ(path, readPaths.paths[0].u8string());
     actual.close();
+    const auto isolatedFiles = OSXClipboardSnapshot::read(privateName, [] { return true; });
+    ASSERT_TRUE(isolatedFiles.data);
+    Clipboard copiedFiles;
+    copiedFiles.unmarshall(*isolatedFiles.data,0);
+    ASSERT_TRUE(copiedFiles.open(0));
+    RemoteFileClipboard::Data processPaths;
+    ASSERT_TRUE(RemoteFileClipboard::parseLocalClipboard(copiedFiles.get(IClipboard::kFileList),processPaths));
+    ASSERT_EQ(1u,processPaths.paths.size());
+    EXPECT_EQ(path,processPaths.paths[0].u8string());
+    copiedFiles.close();
     EXPECT_TRUE(reader.empty());
 }
 
@@ -490,7 +514,7 @@ TEST(OSXClipboardWorkerTests, cancelledReadRetainsNativeChangeEvidenceForNewLife
     ASSERT_TRUE(writer.empty());
     writer.add(IClipboard::kText, "old lifetime A");
     writer.close();
-    OSXClipboardWorker worker(privateName);
+    OSXClipboardWorker worker(privateName, OSXClipboardWorker::readInProcess);
     privateReadEntered = false;
     blockPrivateRead = true;
     struct Reset { ~Reset() { blockPrivateRead = false; injectLocalAfterPrivateRead = false; } } reset;
@@ -521,4 +545,224 @@ TEST(OSXClipboardWorkerTests, cancelledReadRetainsNativeChangeEvidenceForNewLife
     ASSERT_TRUE(writer.open(0));
     EXPECT_EQ("local B copied after remote P was queued", writer.get(IClipboard::kText));
     writer.close();
+}
+
+TEST(OSXScreenClipboardTests, disablingSharingStopsNativePollingAndRejectsPublication)
+{
+    EventQueue events;
+    OSXScreen screen(&events, false, false, privateName, OSXClipboardWorker::readInProcess);
+    privateSynchronizes = 0;
+    countPrivateSynchronizes = true;
+    struct Reset { ~Reset() { countPrivateSynchronizes = false; } } reset;
+    screen.setOptions({kOptionClipboardSharing, 0});
+    for (int i=0; i<15; ++i) {
+        screen.checkClipboards();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(0u, privateSynchronizes.load());
+    Clipboard value;
+    ASSERT_TRUE(value.open(0));
+    ASSERT_TRUE(value.empty());
+    value.add(IClipboard::kText, "must not be published while disabled");
+    value.close();
+    EXPECT_FALSE(screen.setClipboardSnapshot(kClipboardClipboard,
+        std::make_shared<const String>(value.marshall()), 99));
+}
+
+TEST(OSXClipboardSnapshotTests, readsTextAndHtmlFromPrivateBoardInSeparateProcess)
+{
+    OSXClipboard writer(privateName);
+    ASSERT_TRUE(writer.open(0));
+    ASSERT_TRUE(writer.empty());
+    const String text = u8"独立剪贴板 Café";
+    writer.add(IClipboard::kText, text);
+    writer.add(IClipboard::kHTML, "<b>private</b>");
+    writer.close();
+    const auto result = OSXClipboardSnapshot::read(privateName, [] { return true; });
+    ASSERT_FALSE(result.timedOut);
+    ASSERT_TRUE(result.data);
+    Clipboard decoded;
+    decoded.unmarshall(*result.data, 0);
+    ASSERT_TRUE(decoded.open(0));
+    EXPECT_EQ(text, decoded.get(IClipboard::kText));
+    EXPECT_EQ("<b>private</b>", decoded.get(IClipboard::kHTML));
+    decoded.close();
+    EXPECT_TRUE(writer.empty());
+}
+
+namespace {
+struct BlockedClipboardHelper {
+    std::string directory;
+    std::string executable;
+    BlockedClipboardHelper() {
+        char root[] = "/tmp/weave-clipboard-helper-test.XXXXXX";
+        const char* name = mkdtemp(root);
+        if (!name) throw std::runtime_error("failed to create isolated helper directory");
+        directory = name;
+        executable = directory + "/helper";
+        std::ofstream file(executable);
+        file << "#!/bin/sh\nprintf '%s\\n' \"$$\" > '" << directory << "/pid'\nexec /bin/sleep 30\n";
+        file.close();
+        if (chmod(executable.c_str(), 0700) != 0) throw std::runtime_error("helper mode failed");
+    }
+    ~BlockedClipboardHelper() { barrier::fs::remove_all(directory); }
+    pid_t pid() const { std::ifstream file(directory + "/pid"); pid_t value=0;file>>value;return value; }
+};
+}
+
+TEST(OSXClipboardSnapshotTests, stalledHelperTimesOutWithoutEmptySnapshotAndIsReaped)
+{
+    BlockedClipboardHelper helper;
+    const auto began = std::chrono::steady_clock::now();
+    const auto result = OSXClipboardSnapshot::read(privateName, [] { return true; },
+        std::chrono::milliseconds(1000), helper.executable);
+    EXPECT_TRUE(result.timedOut);
+    EXPECT_FALSE(result.data);
+    EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count(), 3.0);
+    const auto pid = helper.pid();
+    ASSERT_GT(pid, 0);
+    EXPECT_EQ(-1, waitpid(pid, nullptr, WNOHANG));
+    EXPECT_EQ(ECHILD, errno);
+}
+
+TEST(OSXClipboardSnapshotTests, cancellationStopsStalledHelperBeforeItsDeadline)
+{
+    BlockedClipboardHelper helper;
+    std::atomic<bool> current{true};
+    auto read = std::async(std::launch::async, [&] {
+        return OSXClipboardSnapshot::read(privateName, [&] { return current.load(); },
+            std::chrono::seconds(10), helper.executable);
+    });
+    const auto deadline = std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while (!helper.pid() && std::chrono::steady_clock::now()<deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto pid = helper.pid();
+    current = false;
+    EXPECT_EQ(std::future_status::ready, read.wait_for(std::chrono::seconds(1)));
+    const auto result = read.get();
+    EXPECT_FALSE(result.timedOut);
+    EXPECT_FALSE(result.data);
+    ASSERT_GT(pid, 0);
+    EXPECT_EQ(-1, waitpid(pid, nullptr, WNOHANG));
+    EXPECT_EQ(ECHILD, errno);
+}
+
+TEST(OSXClipboardWorkerTests, destructionCancelsAndReapsStalledSnapshotReader)
+{
+    BlockedClipboardHelper helper;
+    auto worker = std::make_unique<OSXClipboardWorker>(privateName,
+        [&](OSXClipboard&, CFStringRef name, const std::function<bool()>& current) {
+            return OSXClipboardSnapshot::read(name, current, std::chrono::seconds(10), helper.executable);
+        });
+    worker->poll(1);
+    const auto deadline = std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while (!helper.pid() && std::chrono::steady_clock::now()<deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto pid=helper.pid();
+    const auto began=std::chrono::steady_clock::now();
+    worker.reset();
+    EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count(),1.0);
+    ASSERT_GT(pid,0);
+    EXPECT_EQ(-1,waitpid(pid,nullptr,WNOHANG));
+    EXPECT_EQ(ECHILD,errno);
+}
+
+TEST(OSXClipboardWorkerTests, timedOutUnchangedProviderIsNotImmediatelyRetried)
+{
+    OSXClipboard writer(privateName);
+    ASSERT_TRUE(writer.empty());
+    writer.add(IClipboard::kText, "unchanged slow provider");
+    std::atomic<unsigned> attempts{0};
+    OSXClipboardWorker worker(privateName,
+        [&](OSXClipboard&, CFStringRef, const std::function<bool()>&) {
+            ++attempts;
+            OSXClipboardSnapshotResult result;
+            result.timedOut = true;
+            return result;
+        });
+    for (int i=0; i<130; ++i) {
+        worker.poll(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(1u,attempts.load());
+    std::shared_ptr<const String> data;
+    EXPECT_FALSE(worker.snapshot(&data,nullptr));
+}
+
+TEST(OSXClipboardWorkerTests, defaultProcessReaderPublishesPrivateSnapshot)
+{
+    OSXClipboard writer(privateName);
+    ASSERT_TRUE(writer.empty());
+    writer.add(IClipboard::kText, "default isolated reader");
+    OSXClipboardWorker worker(privateName);
+    worker.poll(73);
+    UInt32 sequence=0;
+    bool ready=false;
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(4);
+    while (!(ready=worker.takeReady(&sequence)) && std::chrono::steady_clock::now()<deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_TRUE(ready);
+    EXPECT_EQ(73u,sequence);
+    std::shared_ptr<const String> data;
+    ASSERT_TRUE(worker.snapshot(&data,nullptr));
+    Clipboard decoded;
+    decoded.unmarshall(*data,0);
+    ASSERT_TRUE(decoded.open(0));
+    EXPECT_EQ("default isolated reader",decoded.get(IClipboard::kText));
+    decoded.close();
+}
+
+TEST(OSXClipboardSnapshotTests, truncatedHelperReplyIsNotAnEmptyClipboard)
+{
+    BlockedClipboardHelper helper;
+    {
+        std::ofstream file(helper.executable);
+        file << "#!/bin/sh\nprintf 'broken' >&3\n";
+    }
+    const auto result=OSXClipboardSnapshot::read(privateName,[]{return true;},
+        std::chrono::seconds(2),helper.executable);
+    EXPECT_FALSE(result.data);
+    EXPECT_FALSE(result.timedOut);
+}
+
+TEST(OSXClipboardSnapshotTests, nativePromisedDataStallIsBoundedWithoutTouchingGeneralClipboard)
+{
+    PasteboardRef board=nullptr;
+    ASSERT_EQ(noErr,PasteboardCreate(kPasteboardUniqueName,&board));
+    struct Board { PasteboardRef p; ~Board(){CFRelease(p);} } owner{board};
+    ASSERT_EQ(noErr,PasteboardClear(board));
+    struct State { std::atomic<bool> entered{false}, release{false}; } state;
+    struct ClearKeeper { PasteboardRef p; ~ClearKeeper(){PasteboardSetPromiseKeeper(p,nullptr,nullptr);} } clearKeeper{board};
+    const auto keeper=+[](PasteboardRef p, PasteboardItemID item, CFStringRef flavor, void* raw)->OSStatus {
+        auto* s=static_cast<State*>(raw);
+        s->entered=true;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while (!s->release && std::chrono::steady_clock::now()<deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const UInt8 bytes[]={'l','a','t','e'};
+        CFDataRef data=CFDataCreate(nullptr,bytes,sizeof(bytes));
+        const auto result=PasteboardPutItemFlavor(p,item,flavor,data,kPasteboardFlavorNoFlags);
+        CFRelease(data);
+        return result;
+    };
+    ASSERT_EQ(noErr,PasteboardSetPromiseKeeper(board,keeper,&state));
+    ASSERT_EQ(noErr,PasteboardPutItemFlavor(board,reinterpret_cast<PasteboardItemID>(1),
+        CFSTR("public.utf8-plain-text"),nullptr,kPasteboardFlavorNoFlags));
+    CFStringRef name=nullptr;
+    ASSERT_EQ(noErr,PasteboardCopyName(board,&name));
+    struct Name { CFStringRef p; ~Name(){CFRelease(p);} } named{name};
+    const auto began=std::chrono::steady_clock::now();
+    auto pending=std::async(std::launch::async,[&] {
+        auto result=OSXClipboardSnapshot::read(name,[]{return true;},std::chrono::seconds(2));
+        state.release=true;
+        return result;
+    });
+    while (pending.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.01,false);
+    const auto result=pending.get();
+    EXPECT_TRUE(state.entered.load());
+    EXPECT_TRUE(result.timedOut);
+    EXPECT_FALSE(result.data);
+    EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count(),3.5);
+    PasteboardSetPromiseKeeper(board,nullptr,nullptr);
 }

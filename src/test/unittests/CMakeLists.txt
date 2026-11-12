@@ -87,6 +87,10 @@ if (MSVC)
 endif()
 target_link_libraries(unittests
     arch base client server common io net platform server synlib mt ipc ${GTEST_LIBRARIES} ${GMOCK_LIBRARIES} ${libs} ${OPENSSL_LIBS})
+if (APPLE)
+    # Native snapshot tests exercise the same disposable reader shipped in the app.
+    add_dependencies(unittests barrierc)
+endif()
 add_test(NAME unittests COMMAND $<TARGET_FILE:unittests>)
 
 if (WIN32)

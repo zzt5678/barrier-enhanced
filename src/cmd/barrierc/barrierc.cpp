@@ -30,6 +30,7 @@
 #include "XWindowsClientTaskBarReceiver.h"
 #elif WINAPI_CARBON
 #include "OSXClientTaskBarReceiver.h"
+#include "platform/OSXClipboardSnapshot.h"
 #else
 #error Platform not supported.
 #endif
@@ -52,6 +53,12 @@ main(int argc, char** argv)
             return 2;
         }
         return MSWindowsClipboardBridge::runHelper(argv[2]);
+    }
+#endif
+
+#if WINAPI_CARBON
+    if (argc > 1 && std::strcmp(argv[1], "--clipboard-snapshot") == 0) {
+        return argc == 3 ? OSXClipboardSnapshot::runHelper(argv[2]) : 2;
     }
 #endif
 

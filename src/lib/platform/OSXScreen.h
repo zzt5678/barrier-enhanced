@@ -61,7 +61,8 @@ class Mutex;
 class OSXScreen : public PlatformScreen {
 public:
     OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCursor=true,
-              CFStringRef pasteboardName=kPasteboardClipboard);
+              CFStringRef pasteboardName=kPasteboardClipboard,
+              OSXClipboardWorker::SnapshotReader clipboardReader = {});
     virtual ~OSXScreen();
 
     IEventQueue*        getEvents() const { return m_events; }
@@ -366,6 +367,7 @@ private:
 
     // clipboards
     std::unique_ptr<OSXClipboardWorker> m_clipboardWorker;
+    std::atomic<bool> m_clipboardSharingEnabled{true};
     UInt32                m_sequenceNumber;
 
     // screen saver stuff

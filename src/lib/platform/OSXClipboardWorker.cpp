@@ -7,7 +7,12 @@
 #include <mutex>
 
 struct OSXClipboardWorker::Context {
-    explicit Context(CFStringRef value) : name(value) { if (name) CFRetain(name); }
+    Context(CFStringRef value, SnapshotReader read) : name(value), reader(std::move(read)) {
+        if (name) CFRetain(name);
+        if (!reader) reader = [](OSXClipboard&, CFStringRef name, const std::function<bool()>& current) {
+            return OSXClipboardSnapshot::read(name, current);
+        };
+    }
     ~Context() { if (name) CFRelease(name); }
     struct Publication {
         ClipboardID id = kClipboardClipboard;
@@ -15,6 +20,7 @@ struct OSXClipboardWorker::Context {
         std::shared_ptr<const String> data;
     };
     CFStringRef name;
+    SnapshotReader reader;
     std::mutex mutex;
     std::condition_variable wake;
     bool stopping = false, exited = false, poll = false, ready = false;
@@ -32,7 +38,24 @@ struct OSXClipboardWorker::Context {
     }
 };
 
-OSXClipboardWorker::OSXClipboardWorker(CFStringRef name) : m_context(std::make_shared<Context>(name)) {}
+OSXClipboardWorker::OSXClipboardWorker(CFStringRef name, SnapshotReader reader) :
+    m_context(std::make_shared<Context>(name, std::move(reader))) {}
+
+OSXClipboardSnapshotResult OSXClipboardWorker::readInProcess(OSXClipboard& clipboard,
+    CFStringRef, const std::function<bool()>& current)
+{
+    OSXClipboardSnapshotResult result;
+    if (current && !current()) return result;
+    Clipboard candidate;
+    if (clipboard.copyTo(&candidate)) {
+        const auto began = std::chrono::steady_clock::now();
+        result.data = std::make_shared<const String>(candidate.marshall());
+        result.marshallingMilliseconds = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now()-began).count();
+    }
+    result.timings = clipboard.lastReadTimings();
+    return result;
+}
 
 OSXClipboardWorker::~OSXClipboardWorker()
 {
@@ -149,6 +172,7 @@ void OSXClipboardWorker::run(const std::shared_ptr<Context>& context)
         OSXClipboard clipboard(context->name);
         bool localContent = true;
         unsigned failures = 0;
+        std::chrono::steady_clock::time_point retryAfter{};
         auto lastSlowLog = std::chrono::steady_clock::now() - std::chrono::seconds(5);
         const auto reportSlow = [&](double milliseconds) {
             const auto now = std::chrono::steady_clock::now();
@@ -240,7 +264,9 @@ void OSXClipboardWorker::run(const std::shared_ptr<Context>& context)
                 localContent = true;
                 observedLocalChange();
             }
-            if (!changed && (hasSnapshot || !localContent)) continue;
+            if (changed) retryAfter = {};
+            if (!changed && (hasSnapshot || !localContent ||
+                std::chrono::steady_clock::now() < retryAfter)) continue;
             {
                 std::lock_guard<std::mutex> lock(context->mutex);
                 if (context->stopping) return;
@@ -249,21 +275,25 @@ void OSXClipboardWorker::run(const std::shared_ptr<Context>& context)
                 context->ready = false;
             }
             const auto began = std::chrono::steady_clock::now();
-            std::shared_ptr<const String> snapshot;
-            double marshallingMilliseconds = 0;
-            try {
-                Clipboard candidate;
-                if (clipboard.copyTo(&candidate)) {
-                    const auto marshalBegan = std::chrono::steady_clock::now();
-                    snapshot = std::make_shared<const String>(candidate.marshall());
-                    marshallingMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - marshalBegan).count();
-                }
+            OSXClipboardSnapshotResult read;
+            try { read = context->reader(clipboard, context->name, current); }
+            catch (const std::exception&) { }
+            auto snapshot = std::move(read.data);
+            const double marshallingMilliseconds = read.marshallingMilliseconds;
+            if (read.timedOut) {
+                retryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                LOG((CLOG_WARN "macOS clipboard provider read timed out; reader stopped, unchanged content retry paused for 30s"));
             }
-            catch (const std::exception&) { snapshot.reset(); }
+            else if (!snapshot && current()) {
+                retryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            }
             const bool changedDuringRead = clipboard.synchronize();
-            if (changedDuringRead) observedLocalChange();
+            if (changedDuringRead) {
+                retryAfter = {};
+                observedLocalChange();
+            }
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
-            const auto timings = clipboard.lastReadTimings();
+            const auto timings = read.timings;
             if (reportSlow(elapsed)) {
                 LOG((CLOG_INFO "slow macOS clipboard snapshot: total=%.1fms native-read=%.1fms conversion=%.1fms marshal=%.1fms valid=%d",
                     elapsed, timings.nativeReadMilliseconds, timings.conversionMilliseconds, marshallingMilliseconds,

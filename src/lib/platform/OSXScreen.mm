@@ -31,6 +31,7 @@
 #include "barrier/Clipboard.h"
 #include "barrier/KeyMap.h"
 #include "barrier/ClientApp.h"
+#include "barrier/option_types.h"
 #include "mt/CondVar.h"
 #include "mt/Lock.h"
 #include "mt/Mutex.h"
@@ -115,7 +116,7 @@ bool					OSXScreen::s_testedForGHOM = false;
 bool					OSXScreen::s_hasGHOM	    = false;
 
 OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCursor,
-                     CFStringRef pasteboardName) :
+                     CFStringRef pasteboardName, OSXClipboardWorker::SnapshotReader clipboardReader) :
 	PlatformScreen(events),
 	m_isPrimary(isPrimary),
 	m_isOnScreen(m_isPrimary),
@@ -125,7 +126,7 @@ OSXScreen::OSXScreen(IEventQueue* events, bool isPrimary, bool autoShowHideCurso
 	m_dragNumButtonsDown(0),
 	m_dragTimer(NULL),
 	m_keyState(NULL),
-	m_clipboardWorker(new OSXClipboardWorker(pasteboardName)),
+	m_clipboardWorker(new OSXClipboardWorker(pasteboardName, std::move(clipboardReader))),
 	m_sequenceNumber(0),
 	m_screensaver(NULL),
 	m_screensaverNotify(false),
@@ -330,7 +331,7 @@ OSXScreen::getClipboard(ClipboardID id, IClipboard* dst) const
 bool
 OSXScreen::getClipboardSnapshot(ClipboardID id, std::shared_ptr<const String>* data, UInt32* sequence) const
 {
-	return id < kClipboardEnd && m_clipboardWorker && m_clipboardWorker->snapshot(data, sequence);
+	return m_clipboardSharingEnabled && id < kClipboardEnd && m_clipboardWorker && m_clipboardWorker->snapshot(data, sequence);
 }
 
 void
@@ -1453,13 +1454,13 @@ bool
 OSXScreen::setClipboardSnapshot(ClipboardID id, const std::shared_ptr<const String>& data,
                                 std::uint64_t publicationId)
 {
-	return m_clipboardWorker && m_clipboardWorker->publish(id, data, publicationId);
+	return m_clipboardSharingEnabled && m_clipboardWorker && m_clipboardWorker->publish(id, data, publicationId);
 }
 
 void
 OSXScreen::checkClipboards()
 {
-	if (!m_clipboardWorker) return;
+	if (!m_clipboardSharingEnabled || !m_clipboardWorker) return;
 	UInt32 sequence;
 	if (m_clipboardWorker->takeReady(&sequence)) {
 		for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
@@ -1512,13 +1513,18 @@ OSXScreen::screensaver(bool activate)
 void
 OSXScreen::resetOptions()
 {
-	// no options
+	m_clipboardSharingEnabled = true;
 }
 
 void
-OSXScreen::setOptions(const OptionsList&)
+OSXScreen::setOptions(const OptionsList& options)
 {
-	// no options
+    for (size_t i = 0; i + 1 < options.size(); i += 2) {
+        if (options[i] == kOptionClipboardSharing) {
+            m_clipboardSharingEnabled = options[i + 1] != 0;
+            if (!m_clipboardSharingEnabled && m_clipboardWorker) m_clipboardWorker->cancel();
+        }
+    }
 }
 
 void

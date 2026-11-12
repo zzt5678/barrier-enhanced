@@ -1,6 +1,7 @@
 #pragma once
 
 #include "platform/OSXClipboard.h"
+#include "platform/OSXClipboardSnapshot.h"
 #include "barrier/IScreen.h"
 #include <memory>
 #include <thread>
@@ -10,7 +11,12 @@
 // while holding the short-lived result/request mutex used by the input loop.
 class OSXClipboardWorker {
 public:
-    explicit OSXClipboardWorker(CFStringRef name);
+    using SnapshotReader = std::function<OSXClipboardSnapshotResult(
+        OSXClipboard&, CFStringRef, const std::function<bool()>&)>;
+    explicit OSXClipboardWorker(CFStringRef name, SnapshotReader reader = {});
+    // Explicit injection for private-board/native-conversion tests.
+    static OSXClipboardSnapshotResult readInProcess(OSXClipboard&, CFStringRef,
+                                                   const std::function<bool()>&);
     ~OSXClipboardWorker();
     void poll(UInt32 sequence);
     // Cancels queued/preparing work and all notifications for this lifetime.
