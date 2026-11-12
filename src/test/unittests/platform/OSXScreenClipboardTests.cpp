@@ -725,7 +725,7 @@ TEST(OSXClipboardSnapshotTests, truncatedHelperReplyIsNotAnEmptyClipboard)
     EXPECT_FALSE(result.timedOut);
 }
 
-TEST(OSXClipboardSnapshotTests, nativePromisedDataStallIsBoundedWithoutTouchingGeneralClipboard)
+static void verifyNativePromisedDataDeadline()
 {
     PasteboardRef board=nullptr;
     ASSERT_EQ(noErr,PasteboardCreate(kPasteboardUniqueName,&board));
@@ -765,4 +765,17 @@ TEST(OSXClipboardSnapshotTests, nativePromisedDataStallIsBoundedWithoutTouchingG
     EXPECT_FALSE(result.data);
     EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count(),3.5);
     PasteboardSetPromiseKeeper(board,nullptr,nullptr);
+}
+
+TEST(OSXClipboardSnapshotTests, nativePromisedDataStallIsBoundedWithoutTouchingGeneralClipboard)
+{
+    // Cancelling a request while its Carbon promise callback is servicing IPC
+    // leaves process-global pasteboard caches unsuitable for later tests on
+    // macOS 26. Isolate the deliberately stalled provider in a fresh process,
+    // just as the production reader is isolated from its external provider.
+    ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
+    EXPECT_EXIT({
+        verifyNativePromisedDataDeadline();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }, ::testing::ExitedWithCode(0), "");
 }
