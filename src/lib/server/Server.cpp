@@ -644,6 +644,13 @@ Server::setConfig(const Config& config)
 
 	// cut over
 	processOptions();
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        if (!m_config->isClipboardSharingEnabled(m_clipboards[id].m_clipboardOwner)) {
+            // Revoke queued file completions from an owner that just opted out.
+            supersedeFileClipboard("clipboard owner disabled by configuration");
+            break;
+        }
+    }
 
 	// add ScrollLock as a hotkey to lock to the screen.  this was a
 	// built-in feature in earlier releases and is now supported via
@@ -1020,6 +1027,9 @@ Server::prepareTransactionalFileReceive(
 			start, barrier::FileTransferRole::kSecondary)) {
 		return barrier::FileTransferReason::kProtocolError;
 	}
+	if (start.kind == barrier::FileTransferKind::kClipboard && !clipboardAllowed(source)) {
+        return barrier::FileTransferReason::kCancelled;
+    }
 	if (!m_mock && m_clientSet.count(source) == 0) {
 		return barrier::FileTransferReason::kConnectionLost;
 	}
@@ -1066,6 +1076,7 @@ Server::acceptTransactionalFileReceive(
 	barrier::ClipboardRevision clipboardRevision;
 	if (context.kind == barrier::FileTransferKind::kClipboard) {
 		const bool currentClipboardMatches =
+            clipboardAllowed(context.source) &&
 			context.senderClipboardRevision != 0 &&
 			!context.clipboardSessionId.empty() &&
 			m_clipboardRevision.valid() &&
@@ -2466,7 +2477,7 @@ Server::reanchorActiveAfterFailedSwitch(BaseClientProxy* dst)
 void
 Server::fetchPendingPrimaryClipboards()
 {
-    if (!m_enableClipboard) {
+    if (!m_enableClipboard || !clipboardAllowed(m_primaryClient)) {
         return;
     }
 
@@ -2599,7 +2610,7 @@ Server::handleClipboardSync(const Event&, void*)
 void
 Server::replayClipboardsToActive()
 {
-    if (!m_enableClipboard || m_active == NULL) {
+    if (!m_enableClipboard || !clipboardAllowed(m_active)) {
         return;
     }
 
@@ -2607,6 +2618,8 @@ Server::replayClipboardsToActive()
     const std::string primaryName = getName(m_primaryClient);
     for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         ClipboardInfo& clipboard = m_clipboards[id];
+        if (m_config != NULL &&
+            !m_config->isClipboardSharingEnabled(clipboard.m_clipboardOwner)) continue;
         if (clipboard.m_clipboardOwner == activeName) {
             LOG((CLOG_DEBUG "not replaying clipboard %d to its current owner \"%s\"",
                  id, activeName.c_str()));
@@ -3448,6 +3461,12 @@ Server::addDefaultConnectionOptions(OptionsList& optionsList)
 	}
 }
 
+bool Server::clipboardAllowed(const BaseClientProxy* client) const
+{
+    return client != NULL && (m_config == NULL ||
+        m_config->isClipboardSharingEnabled(getName(client)));
+}
+
 void
 Server::sendOptions(BaseClientProxy* client) const
 {
@@ -3477,6 +3496,13 @@ Server::sendOptions(BaseClientProxy* client) const
 			optionsList.push_back(static_cast<UInt32>(index->second));
 		}
 	}
+
+    for (auto i = optionsList.begin(); i != optionsList.end();) {
+        if (*i == kOptionClipboardSharing) i = optionsList.erase(i, i + 2);
+        else i += 2;
+    }
+    optionsList.push_back(kOptionClipboardSharing);
+    optionsList.push_back(clipboardAllowed(client) ? 1 : 0);
 
 	addDefaultConnectionOptions(optionsList);
 
@@ -3680,7 +3706,7 @@ Server::handleClipboardGrabbed(const Event& event, void* vclient)
 
 	// ignore events from unknown clients
 	BaseClientProxy* grabber = static_cast<BaseClientProxy*>(vclient);
-	if (m_clientSet.count(grabber) == 0) {
+	if (m_clientSet.count(grabber) == 0 || !clipboardAllowed(grabber)) {
 		return;
 	}
 	const IScreen::ClipboardInfo* info =
@@ -4198,6 +4224,7 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 					ClipboardID id, UInt32 seqNum,
 					const Clipboard* snapshot)
 {
+	if (!clipboardAllowed(sender)) return false;
 	ClipboardInfo& clipboard = m_clipboards[id];
 
 	// ignore update if sequence number is old
@@ -4372,7 +4399,7 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 		for (ClientList::const_iterator index = m_clients.begin();
 									index != m_clients.end(); ++index) {
 			BaseClientProxy* client = index->second;
-			client->setClipboardDirty(id, client != sender);
+			client->setClipboardDirty(id, client != sender && clipboardAllowed(client));
 		}
 		commitClipboardFetch(id);
 		return true;
@@ -4389,11 +4416,11 @@ Server::onClipboardChanged(BaseClientProxy* sender,
 	for (ClientList::const_iterator index = m_clients.begin();
 								index != m_clients.end(); ++index) {
 		BaseClientProxy* client = index->second;
-		client->setClipboardDirty(id, client != sender);
+		client->setClipboardDirty(id, client != sender && clipboardAllowed(client));
 	}
 
-	// send the new clipboard to the active screen
-	m_active->setClipboard(id, &clipboard.m_clipboard);
+	// A device using native sharing must never receive a second clipboard copy.
+    if (clipboardAllowed(m_active)) m_active->setClipboard(id, &clipboard.m_clipboard);
 	return true;
 }
 
@@ -5787,7 +5814,7 @@ Server::sendClipboardSelectionToClient(BaseClientProxy* target,
 									   const std::string& sessionId,
 									   const barrier::ClipboardRevision& revision)
 {
-	if (target == NULL || sourcePaths.empty() || sessionId.empty() ||
+	if (!clipboardAllowed(target) || sourcePaths.empty() || sessionId.empty() ||
 		!revision.valid() || revision != m_clipboardRevision) {
 		return;
 	}
@@ -5821,7 +5848,7 @@ Server::startPendingFileClipboardPrefetch()
 {
 	BaseClientProxy* pendingTarget = m_pendingFileClipboardPrefetchTarget;
 	if (pendingTarget != NULL &&
-		!pendingTarget->supportsTransactionalFileTransfer()) {
+        (!clipboardAllowed(pendingTarget) || !pendingTarget->supportsTransactionalFileTransfer())) {
 		m_pendingFileClipboardPrefetchTarget = NULL;
 		m_pendingFileClipboardPrefetchPaths.clear();
 		m_pendingFileClipboardPrefetchSession.clear();

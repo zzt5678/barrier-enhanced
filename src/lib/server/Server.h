@@ -611,6 +611,7 @@ private:
 
     // send screen options to \c client
     void                sendOptions(BaseClientProxy* client) const;
+    bool                clipboardAllowed(const BaseClientProxy* client) const;
     static void         addDefaultConnectionOptions(OptionsList& optionsList);
 
     // process options from configuration

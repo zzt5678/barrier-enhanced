@@ -531,6 +531,19 @@ const Config::ScreenOptions* Config::getOptions(const std::string& name) const
 	return options;
 }
 
+bool Config::isClipboardSharingEnabled(const std::string& name) const
+{
+    // The global switch is a master switch; a device may opt out, never
+    // override a global disable. Missing options preserve existing behavior.
+    for (const auto& key : {std::string(), getCanonicalName(name)}) {
+        const auto* options = getOptions(key);
+        if (!options) continue;
+        const auto option = options->find(kOptionClipboardSharing);
+        if (option != options->end() && option->second == 0) return false;
+    }
+    return true;
+}
+
 bool
 Config::hasLockToScreenAction() const
 {
@@ -851,7 +864,10 @@ Config::readSectionScreens(ConfigReadContext& s)
 			}
 
 			// handle argument
-			if (name == "halfDuplexCapsLock") {
+            if (name == "clipboardSharing") {
+                addOption(screen, kOptionClipboardSharing, s.parseBoolean(value));
+            }
+			else if (name == "halfDuplexCapsLock") {
 				addOption(screen, kOptionHalfDuplexCapsLock,
 					s.parseBoolean(value));
 			}

@@ -5265,3 +5265,27 @@ TEST(ClientDisconnectTests, legacyMaterializedFileListClipboardIsNotSentToServer
     client.testSendClipboard(kClipboardClipboard);
     EXPECT_FALSE(client.testHasSendFileThread());
 }
+
+TEST(ClientDisconnectTests, disabledClipboardRejectsQueuedSnapshotsAndClearsPendingState)
+{
+    NiceMock<MockEventQueue> events;
+    ClientEvents clientEvents; IScreenEvents screenEvents; FileEvents fileEvents;
+    setClientEventDefaults(events, clientEvents, screenEvents, fileEvents);
+    EnterPlatformScreen* platform = new EnterPlatformScreen();
+    barrier::Screen screen(platform, &events);
+    ClientArgs args;
+    Client client(&events,"book",NetworkAddress(),new DummySocketFactory(),&screen,args);
+    client.testSetFileClipboardSessions("stale-source","stale-ready",{"/tmp/stale"});
+    client.setOptions({kOptionClipboardSharing,0});
+    Clipboard clipboard; clipboard.open(0); clipboard.empty();
+    clipboard.add(IClipboard::kText,"private fixture"); clipboard.close();
+    auto data=std::make_shared<const String>(clipboard.marshall());
+    client.setClipboard(kClipboardClipboard,&clipboard);
+    EXPECT_FALSE(client.setClipboardData(kClipboardClipboard,data));
+    EXPECT_EQ(0u,platform->setClipboardCount);
+    EXPECT_TRUE(client.testRemoteFileClipboardSession().empty());
+    EXPECT_TRUE(client.testReadyFileClipboardSession().empty());
+    client.setOptions({kOptionClipboardSharing,1});
+    client.setClipboard(kClipboardClipboard,&clipboard);
+    EXPECT_EQ(1u,platform->setClipboardCount);
+}

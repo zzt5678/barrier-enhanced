@@ -390,6 +390,7 @@ public:
     options.
     */
     const ScreenOptions* getOptions(const std::string& name) const;
+    bool isClipboardSharingEnabled(const std::string& name) const;
 
     //! Check for lock to screen action
     /*!

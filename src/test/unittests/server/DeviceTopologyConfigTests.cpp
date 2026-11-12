@@ -37,3 +37,30 @@ TEST(DeviceTopologyConfigTests, PartialIntervalsAndImpossibleCyclesAreUnavailabl
     config.connect("b",kRight,0,1,"a",0,1);
     EXPECT_EQ(Layout::Contradictory,topologyFromConfig(config,"a",{},1,1).layout);
 }
+
+#include "barrier/option_types.h"
+#include <sstream>
+
+TEST(DeviceClipboardConfigTests, ScreenOptOutSurvivesRoundTripAndAliases)
+{
+    TestEventQueue events; Config config(&events);
+    std::istringstream input("section: screens\nmini:\nbook:\n clipboardSharing = false\nubuntu:\nend\nsection: aliases\nbook:\n laptop\nend\nsection: options\n clipboardSharing = true\nend\n");
+    input >> config;
+    EXPECT_TRUE(config.isClipboardSharingEnabled("mini"));
+    EXPECT_FALSE(config.isClipboardSharingEnabled("book"));
+    EXPECT_FALSE(config.isClipboardSharingEnabled("laptop"));
+    EXPECT_TRUE(config.isClipboardSharingEnabled("ubuntu"));
+    std::stringstream encoded; encoded << config;
+    Config decoded(&events); encoded >> decoded;
+    EXPECT_FALSE(decoded.isClipboardSharingEnabled("book"));
+    EXPECT_TRUE(decoded.isClipboardSharingEnabled("ubuntu"));
+}
+
+TEST(DeviceClipboardConfigTests, GlobalDisableCannotBeOverriddenByDevice)
+{
+    TestEventQueue events; Config config(&events);
+    config.addScreen("book");
+    config.addOption("book", kOptionClipboardSharing, 1);
+    config.addOption("", kOptionClipboardSharing, 0);
+    EXPECT_FALSE(config.isClipboardSharingEnabled("book"));
+}

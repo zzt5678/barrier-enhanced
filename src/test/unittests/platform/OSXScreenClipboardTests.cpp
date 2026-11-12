@@ -2,6 +2,8 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <spawn.h>
+extern char** environ;
 #include <cerrno>
 #include "barrier/option_types.h"
 #include "platform/OSXScreen.h"
@@ -601,9 +603,28 @@ struct BlockedClipboardHelper {
         directory = name;
         executable = directory + "/helper";
         std::ofstream file(executable);
-        file << "#!/bin/sh\nprintf '%s\\n' \"$$\" > '" << directory << "/pid'\nexec /bin/sleep 30\n";
+        file << "#!/bin/sh\nif [ \"$1\" = --warmup ]; then exit 0; fi\nprintf '%s\\n' \"$$\" > '" << directory << "/pid'\nexec /bin/sleep 30\n";
         file.close();
         if (chmod(executable.c_str(), 0700) != 0) throw std::runtime_error("helper mode failed");
+        // macOS cold script validation can exceed the one-second read test.
+        // Warm separately so the test proves a recorded child was reaped.
+        char* args[] = {const_cast<char*>(executable.c_str()), const_cast<char*>("--warmup"), nullptr};
+        pid_t child = 0;
+        if (posix_spawn(&child, executable.c_str(), nullptr, nullptr, args, environ) != 0)
+            throw std::runtime_error("helper warmup spawn failed");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        int status = 0;
+        pid_t reaped;
+        while ((reaped = waitpid(child, &status, WNOHANG)) == 0 || (reaped < 0 && errno == EINTR)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                kill(child, SIGKILL);
+                while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+                throw std::runtime_error("helper warmup timed out");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (reaped != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            throw std::runtime_error("helper warmup failed");
     }
     ~BlockedClipboardHelper() { barrier::fs::remove_all(directory); }
     pid_t pid() const { std::ifstream file(directory + "/pid"); pid_t value=0;file>>value;return value; }

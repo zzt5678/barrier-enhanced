@@ -37,6 +37,8 @@ def main():
                         help="Synthetic file size in MiB (0 retains the 112 KiB smoke fixture; max 64)")
     parser.add_argument("--motion-burst", action="store_true",
                         help="Pause only the isolated client and verify hover backlog coalescing")
+    parser.add_argument("--clipboard-policy", action="store_true",
+                        help="Verify a device opt-out blocks both directions while input remains active")
     args = parser.parse_args()
     if not 1 <= args.cycles <= 10000:
         parser.error("--cycles must be between 1 and 10000")
@@ -250,6 +252,51 @@ def main():
         text_owner.stdin.write(token.encode())
         text_owner.stdin.close()
         wait_for(clipboard_matches, "text clipboard restored before input stress")
+        if args.clipboard_policy:
+            original_config = config.read_text()
+            def reload_config(contents):
+                before = logs("server").count("reloaded configuration")
+                config.write_text(contents)
+                os.kill(server.pid, signal.SIGHUP)
+                wait_for(lambda: logs("server").count("reloaded configuration") > before,
+                         "isolated policy reload")
+            def own_text(env, value, label):
+                owner = start(["xclip", "-selection", "clipboard", "-in", "-quiet"],
+                              label, env, stdin=subprocess.PIPE)
+                owner.stdin.write(value.encode()); owner.stdin.close()
+            def read_text(env):
+                return run(["xclip", "-selection", "clipboard", "-out"], env).stdout.decode()
+            disabled_before = logs("client").count("clipboard sharing is disabled")
+            reload_config(original_config.replace(" smoke-client:\n", " smoke-client:\n  clipboardSharing = false\n", 1)
+                          + "section: options\n clipboardSharing = true\nend\n")
+            wait_for(lambda: logs("client").count("clipboard sharing is disabled") > disabled_before,
+                     "client received effective disabled policy")
+            server_only, client_only = token + "-server-only", token + "-client-only"
+            own_text(client_env, client_only, "excluded-client-copy")
+            own_text(server_env, server_only, "server-policy-copy")
+            time.sleep(1.5)
+            if read_text(client_env) != client_only or read_text(server_env) != server_only:
+                raise RuntimeError("Excluded device clipboard was overwritten")
+            before = pointer(client_env)
+            run(["xdotool", "mousemove_relative", "--", "25", "0"], server_env)
+            wait_for(lambda: pointer(client_env) != before, "input still delivered to clipboard-excluded client")
+            returned = logs("server").count('switch from "smoke-client" to "smoke-server"')
+            run(["xdotool", "mousemove_relative", "--", "-900", "0"], server_env)
+            wait_for(lambda: logs("server").count('switch from "smoke-client" to "smoke-server"') > returned,
+                     "return from excluded client")
+            time.sleep(1.2)
+            if read_text(server_env) != server_only:
+                raise RuntimeError("Excluded client clipboard leaked on return")
+            report["checks"].append("device opt-out blocked both clipboard directions; pointer and return still worked")
+            reload_config(original_config)
+            token += "-reenabled"
+            own_text(server_env, token, "reenabled-server-copy")
+            entered = logs("server").count('switch from "smoke-server" to "smoke-client"')
+            run(["xdotool", "mousemove_relative", "--", "900", "0"], server_env)
+            wait_for(lambda: logs("server").count('switch from "smoke-server" to "smoke-client"') > entered,
+                     "entry after clipboard opt-in")
+            wait_for(clipboard_matches, "clipboard policy opt-in restored exact text")
+            report["checks"].append("clipboard opt-in restored on the existing connection")
         inward_before = logs("server").count('switch from "smoke-client" to "smoke-server"')
         outward_before = logs("server").count('switch from "smoke-server" to "smoke-client"')
         run(["xdotool", "mousemove_relative", "--", "-900", "0"], server_env)

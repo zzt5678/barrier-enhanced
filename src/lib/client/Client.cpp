@@ -807,6 +807,7 @@ Client::leave()
 void
 Client::setClipboard(ClipboardID id, const IClipboard* clipboard)
 {
+    if (!m_enableClipboard || id >= kClipboardEnd) return;
     if (m_ownClipboard[id] && !m_sentClipboard[id]) {
         LOG((CLOG_INFO "preserving unsent local clipboard %d instead of applying remote clipboard", id));
         return;
@@ -869,7 +870,7 @@ bool
 Client::setClipboardData(
     ClipboardID id, const std::shared_ptr<const String>& data)
 {
-    if (id >= kClipboardEnd || !data) {
+    if (!m_enableClipboard || id >= kClipboardEnd || !data) {
         return false;
     }
     if (!Clipboard::isValidMarshalled(*data)) {
@@ -979,6 +980,9 @@ Client::beginTransactionalFileReceive(
         !barrier::FileTransferProtocol::validate(
             startFrame, barrier::FileTransferRole::kPrimary)) {
         return barrier::FileTransferReason::kProtocolError;
+    }
+    if (!m_enableClipboard && startFrame.kind == barrier::FileTransferKind::kClipboard) {
+        return barrier::FileTransferReason::kCancelled;
     }
     if (m_transactionalReceiveId != 0 || m_transactionalReceive) {
         return barrier::FileTransferReason::kBusy;
@@ -1154,6 +1158,7 @@ Client::signalTransactionalFileTransferAck(
 void
 Client::grabClipboard(ClipboardID id)
 {
+    if (!m_enableClipboard || id >= kClipboardEnd) return;
     if (id == kClipboardClipboard) {
         supersedeFileClipboard("remote clipboard grab");
     }
@@ -1264,7 +1269,16 @@ Client::setOptions(const OptionsList& options)
             if (*index == static_cast<OptionValue>(false)) {
                 LOG((CLOG_NOTE "clipboard sharing is disabled"));
             }
-            m_enableClipboard = *index;
+            const bool enabled = *index != 0;
+            if (m_enableClipboard && !enabled) {
+                supersedeFileClipboard("clipboard sharing disabled");
+                for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+                    m_clipboardSendPending[id] = false;
+                    m_pendingImmutableClipboard[id].reset();
+                    m_pendingClipboardData[id].clear();
+                }
+            }
+            m_enableClipboard = enabled;
 
             break;
         }

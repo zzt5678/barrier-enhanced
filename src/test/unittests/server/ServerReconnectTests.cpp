@@ -214,7 +214,8 @@ public:
     void mouseWheel(SInt32, SInt32) override { }
     void screensaver(bool) override { }
     void resetOptions() override { }
-    void setOptions(const OptionsList&) override { }
+    void setOptions(const OptionsList& value) override { receivedOptions = value; }
+    OptionsList receivedOptions;
     void sendDragInfo(UInt32 fileCount, const char* info, size_t size) override
     {
         ++dragInfoCount;
@@ -9105,4 +9106,82 @@ TEST(ServerReconnectTests, replacementTransfersScreensaverOwnershipBeforeOldClie
     EXPECT_EQ(&newClient, server.m_activeSaver);
     EXPECT_EQ(0u, newClient.enterCount);
     EXPECT_EQ(0u, oldClient.leaveCount);
+}
+
+class DeviceClipboardPolicyTests : public ::testing::Test {
+protected:
+    Config config;
+    NiceMock<MockEventQueue> events;
+    ClientProxyEvents clientEvents;
+    IScreenEvents screenEvents;
+    ClipboardEvents clipboardEvents;
+    ServerEvents serverEvents;
+    ClipboardPrimaryClient primary;
+    RecordingClient book{"book"}, ubuntu{"ubuntu"};
+    Server server;
+    void SetUp() override {
+        config.addScreen("primary"); config.addScreen("book"); config.addScreen("ubuntu");
+        config.addOption("", kOptionClipboardSharing, 1);
+        config.addOption("book", kOptionClipboardSharing, 0);
+        setEventTypeDefaults(events, clientEvents, screenEvents, clipboardEvents, serverEvents);
+        initializeServer(server, config, primary, events, book);
+        server.m_enableClipboard = true;
+        server.m_clients["ubuntu"] = &ubuntu; server.m_clientSet.insert(&ubuntu);
+        server.m_clients[primary.getName()] = &primary; server.m_clientSet.insert(&primary);
+        auto& clipboard = server.m_clipboards[kClipboardClipboard];
+        clipboard.m_clipboardOwner = primary.getName();
+        clipboard.m_clipboard = makeTextClipboard("private fixture");
+        server.m_clipboards[kClipboardSelection].m_clipboardOwner = "ubuntu";
+    }
+};
+
+TEST_F(DeviceClipboardPolicyTests, SendsOneEffectiveOptionAndKeepsInputConnection)
+{
+    for (auto* client : {&book, &ubuntu}) {
+        server.sendOptions(client);
+        unsigned count=0;
+        for (size_t i=0; i+1<client->receivedOptions.size(); i+=2) {
+            if(client->receivedOptions[i]==kOptionClipboardSharing) {
+                ++count;
+                EXPECT_EQ(client==&book ? 0u : 1u, client->receivedOptions[i+1]);
+            }
+        }
+        EXPECT_EQ(1u,count);
+        EXPECT_EQ(1u,server.m_clientSet.count(client));
+    }
+}
+
+TEST_F(DeviceClipboardPolicyTests, ExcludedDeviceReceivesNeitherReplayNorImmediateUpdate)
+{
+    server.replayClipboardsToActive();
+    EXPECT_EQ(0u,book.setClipboardCount);
+    auto next=makeTextClipboard("new private fixture");
+    ASSERT_TRUE(server.onClipboardChanged(&primary,kClipboardClipboard,0,&next));
+    EXPECT_EQ(0u,book.setClipboardCount);
+    EXPECT_FALSE(book.lastClipboardDirty);
+    EXPECT_TRUE(ubuntu.lastClipboardDirty);
+    server.m_active=&ubuntu;
+    server.replayClipboardsToActive();
+    EXPECT_GT(ubuntu.setClipboardCount,0u);
+    EXPECT_EQ("new private fixture",ubuntu.lastSetClipboard.get(IClipboard::kText));
+}
+
+TEST_F(DeviceClipboardPolicyTests, ExcludedDeviceCannotTakeOwnershipOrPublishLateData)
+{
+    IScreen::ClipboardInfo info{kClipboardClipboard,10};
+    server.handleClipboardGrabbed(Event(Event::kUnknown,NULL,&info,Event::kDontFreeData),&book);
+    EXPECT_EQ(primary.getName(),server.m_clipboards[kClipboardClipboard].m_clipboardOwner);
+    auto data=makeTextClipboard("excluded fixture");
+    EXPECT_FALSE(server.onClipboardChanged(&book,kClipboardClipboard,10,&data));
+    EXPECT_EQ("private fixture",server.m_clipboards[kClipboardClipboard].m_clipboard.get(IClipboard::kText));
+}
+
+TEST_F(DeviceClipboardPolicyTests, FileReplayToExcludedDeviceDoesNotStartTransfer)
+{
+    server.m_clipboards[kClipboardClipboard].m_clipboard =
+        makeSourcePathsClipboard(barrier::fs::u8path("/tmp/nonexistent-policy-fixture"));
+    server.replayClipboardsToActive();
+    EXPECT_EQ(0u,book.setClipboardCount);
+    EXPECT_EQ(nullptr,server.m_pendingFileClipboardPrefetchTarget);
+    EXPECT_EQ(nullptr,server.m_sendFileThread);
 }
