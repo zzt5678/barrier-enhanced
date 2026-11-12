@@ -74,7 +74,10 @@ separate unresolved report; these clipboard changes do not claim to fix it.
 The user pointed out that the Macs already have Apple's Universal Clipboard
 and do not need a second clipboard-sharing mechanism between them. Interaction
 between the two mechanisms is a hypothesis, not an established cause of the
-freezes. The current configuration still has Weave clipboard sharing disabled
-globally, including Ubuntu. The current screen configuration parser does not
-support a per-screen clipboard-sharing override. A decision on retaining
-Ubuntu clipboard sharing is pending; no Apple Handoff settings were changed.
+freezes. At that point the configuration still had Weave sharing disabled
+globally and the parser did not support per-screen overrides. The user then
+requested retaining Mac mini–Ubuntu sharing. The subsequent
+[device policy repair](DEVICE_CLIPBOARD_POLICY.md) added that override and was
+deployed with the MacBook excluded. No Apple Handoff settings were changed.
+The user reported Ubuntu copying works and the MacBook had not frozen again
+so far; that is short-term feedback, not proof of long-run resolution.

@@ -40,3 +40,30 @@ precedence, option delivery, excluded-device traffic and ownership rejection,
 and preserving the enabled device's path. `scripts/test_xvfb_smoke.py
 --clipboard-policy --bin-dir ...` checks opt-out, input continuity and opt-in
 using private X displays and a loopback TLS connection.
+
+## Validation and deployment — 2026-11-12
+
+- The main policy change passed 1,245 macOS core tests. The subsequent bulk
+  retry correction passed 170 related macOS tests; the final Ubuntu build
+  passed 503 related tests. Each final platform build passed six identity and
+  release-policy checks.
+- The isolated TLS smoke passed text, PNG and file clipboard checks; device
+  opt-out blocked both directions while pointer movement and screen return
+  continued. A disabled client was restarted and produced neither clipboard
+  publication nor rejected snapshots after its fresh bulk connection. Opt-in
+  restored exact text on the existing connection. Modifier release and three
+  additional crossing/return cycles passed.
+- Live inspection of the first policy build caught an initial dirty-cache
+  retry bypassing Server routing on bulk attachment. The client rejected it,
+  but the sender now checks policy for cached retries, file metadata and queued
+  chunks too. The final live MacBook reconnect showed its disabled option and
+  no attempted snapshot publication/rejection in that observed startup.
+- All three machines were updated to `2.4.0-release+69045bef.20261112` and
+  reconnected. The Mac mini keeps its external configuration, with global
+  sharing enabled and only the MacBook's screen entry opting out. Control-to-
+  cross remains off. No native Apple sharing settings were changed.
+- User acceptance: **Ubuntu copying works; MacBook has not frozen again so
+  far.** This is short-term real-use feedback. The proposed interaction with
+  Apple's Universal Clipboard remains unproven, and long-run freeze freedom
+  has not been established. The separate intermittent dual-cursor report also
+  remains unresolved.
